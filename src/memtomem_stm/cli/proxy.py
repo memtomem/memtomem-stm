@@ -4612,12 +4612,21 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError) as exc:
         return (False, f"parse error: {exc}")
+    except RecursionError:
+        return (False, f"{path} is nested too deeply to parse")
     if not isinstance(data, dict):
         return (False, f"{path} top-level is not an object")
     servers = data.get("mcpServers")
     if not isinstance(servers, dict) or name not in servers:
         return (False, f"'{name}' not registered in {path}")
     del servers[name]
+    # Serialized before the write, as the restore writer does: the depth the
+    # encoder survives differs by interpreter (#1279), and a failure here must
+    # leave the host file as it was.
+    try:
+        serialized = _json_dumps(data, indent=2, ensure_ascii=False) + "\n"
+    except RecursionError:
+        return (False, f"{path} is nested too deeply to rewrite")
     # Keep the host's own mode, as the restore counterpart
     # (``_json_config_set_entry``) does; removing an entry is not a reason
     # to change who can read the file.
@@ -4627,9 +4636,7 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
     except OSError:
         mode = None
     try:
-        atomic_write_text(
-            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", mode=mode, durable=True
-        )
+        atomic_write_text(path, serialized, mode=mode, durable=True)
     except OSError as exc:
         return (False, f"write error: {exc}")
     return (True, None)

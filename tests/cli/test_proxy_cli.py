@@ -2213,6 +2213,81 @@ class TestAtomicSave:
         )
         assert desktop_path.read_bytes() == prefix + b"\xff}}"
 
+    def test_desktop_remove_entry_refuses_decoder_recursion(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # Discovery skips a file the decoder cannot parse (#1273), so prune
+        # reaches this branch only if the file changes after discovery (#1279).
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        host_dir = tmp_path / "Claude"
+        host_dir.mkdir()
+        desktop_path = host_dir / "claude_desktop_config.json"
+        desktop_path.write_text(
+            json.dumps({"mcpServers": {"demo": {"command": "x"}}}), encoding="utf-8"
+        )
+        before = desktop_path.read_bytes()
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+        real_loads = json.loads
+
+        def loads(text, *args, **kwargs):
+            if text == before.decode():
+                raise RecursionError("private-canary")
+            return real_loads(text, *args, **kwargs)
+
+        monkeypatch.setattr(proxy_mod.json, "loads", loads)
+
+        result = proxy_mod._desktop_json_remove_entry("demo")
+
+        assert result == (False, f"{desktop_path} is nested too deeply to parse")
+        assert desktop_path.read_bytes() == before
+        assert list(host_dir.iterdir()) == [desktop_path]
+
+    def test_desktop_remove_entry_refuses_encoder_recursion(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        host_dir = tmp_path / "Claude"
+        host_dir.mkdir()
+        desktop_path = host_dir / "claude_desktop_config.json"
+        desktop_path.write_text(
+            json.dumps({"mcpServers": {"demo": {"command": "x"}}}), encoding="utf-8"
+        )
+        before = desktop_path.read_bytes()
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+
+        def fail_encode(*args, **kwargs):
+            raise RecursionError("private-canary")
+
+        monkeypatch.setattr(proxy_mod, "_json_dumps", fail_encode)
+
+        result = proxy_mod._desktop_json_remove_entry("demo")
+
+        assert result == (False, f"{desktop_path} is nested too deeply to rewrite")
+        assert desktop_path.read_bytes() == before
+        assert list(host_dir.iterdir()) == [desktop_path]
+
+    def test_desktop_remove_entry_handles_a_real_deep_sibling(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # Interpreter-dependent coverage, not a pin of the fix: Python 3.12's
+        # encoder fails at this depth and 3.13's does not (#1279, #1275).
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop_path = tmp_path / "claude_desktop_config.json"
+        raw = '{"mcpServers": {"demo": {"command": "x"}}, "deep": ' + "[" * 1500 + "]" * 1500 + "}"
+        desktop_path.write_text(raw, encoding="utf-8")
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+
+        ok, err = proxy_mod._desktop_json_remove_entry("demo")
+
+        if ok:
+            assert json.loads(desktop_path.read_text(encoding="utf-8"))["mcpServers"] == {}
+        else:
+            assert err == f"{desktop_path} is nested too deeply to rewrite"
+            assert desktop_path.read_text(encoding="utf-8") == raw
+
     @pytest.mark.parametrize("writer", ["remove", "set"])
     def test_json_host_writers_survive_a_failing_inspection(
         self, tmp_path: Path, monkeypatch, writer
@@ -9542,6 +9617,32 @@ class TestAddFromClientsNonInteractive:
         }
 
 
+_DESKTOP_MARKER = "__desktop_encode_probe__"
+
+
+def _fail_encoding_the_desktop_document(monkeypatch) -> list[dict]:
+    """Make ``_json_dumps`` raise only for the Desktop document (#1279).
+
+    The add path saves the STM config and every prune row appends a backup
+    through the same serializer before the Desktop writer runs, so a blanket
+    patch fails at the wrong site. The marker key is written only into the
+    test's Desktop file; the returned list records each injected failure.
+    """
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    real_dumps = proxy_mod._json_dumps
+    fired: list[dict] = []
+
+    def dumps(obj, *args, **kwargs):
+        if isinstance(obj, dict) and _DESKTOP_MARKER in obj:
+            fired.append(obj)
+            raise RecursionError("private-canary")
+        return real_dumps(obj, *args, **kwargs)
+
+    monkeypatch.setattr(proxy_mod, "_json_dumps", dumps)
+    return fired
+
+
 class TestAddFromClientsPrune:
     """`mms add --from-clients --prune` (and the TTY prompt variant) removes
     the direct registration from each source MCP client after a successful
@@ -9784,6 +9885,57 @@ class TestAddFromClientsPrune:
         updated = json.loads(desktop_path.read_text(encoding="utf-8"))
         assert "from-desktop" not in updated["mcpServers"]
         assert "keep-me" in updated["mcpServers"]
+
+    def test_prune_flag_reports_a_desktop_document_too_deep_to_rewrite(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """An encoder RecursionError on the Desktop rewrite is a failed prune
+        row, not a traceback, and the import stays (#1279)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop_path = tmp_path / "claude_desktop_config.json"
+        desktop_path.write_text(
+            json.dumps(
+                {
+                    _DESKTOP_MARKER: True,
+                    "mcpServers": {"from-desktop": {"command": "npx", "args": ["-y", "@d"]}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        before = desktop_path.read_bytes()
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                _cand(
+                    "from-desktop",
+                    "Claude Desktop",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+                ),
+            ],
+        )
+        fired = _fail_encoding_the_desktop_document(monkeypatch)
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.exception is None
+        assert len(fired) == 1
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "from-desktop" in data["upstream_servers"]
+        assert "could not remove 1 direct registration" in result.stderr
+        assert (
+            f"from-desktop (Claude Desktop): {desktop_path} is nested too deeply to rewrite"
+            in result.stderr
+        )
+        assert "private-canary" not in result.output
+        assert desktop_path.read_bytes() == before
 
     def test_prune_flag_nonfatal_on_failure_falls_back_to_manual_hint(
         self, runner, config, monkeypatch, fake_claude
@@ -10854,6 +11006,47 @@ class TestPruneCommand:
         assert data["failed"][0]["hint"] == "claude mcp remove docs-langchain -s user"
         # Human failure diagnostics still print to stderr in --json mode.
         assert "could not remove" in result.stderr
+
+    def test_json_reports_a_desktop_document_too_deep_to_rewrite(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The standalone pruner reports the same writer failure as a failed
+        row with exit 1 and a pure JSON stdout (#1279)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop_path = tmp_path / "claude_desktop_config.json"
+        desktop_path.write_text(
+            json.dumps(
+                {_DESKTOP_MARKER: True, "mcpServers": {"docs-langchain": {"command": "npx"}}}
+            ),
+            encoding="utf-8",
+        )
+        before = desktop_path.read_bytes()
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch, [_cand("docs-langchain", "Claude Desktop", raw={"command": "npx"})]
+        )
+        fired = _fail_encoding_the_desktop_document(monkeypatch)
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 1, result.output
+        assert len(fired) == 1
+        assert result.stdout.startswith("{")
+        data = json.loads(result.stdout)
+        assert data["ok"] is False
+        assert data["pruned"] == []
+        assert data["failed"] == [
+            {
+                "name": "docs-langchain",
+                "source": "Claude Desktop",
+                "error": f"{desktop_path} is nested too deeply to rewrite",
+                "hint": proxy_mod._source_removal_hint("docs-langchain", "Claude Desktop"),
+            }
+        ]
+        assert "private-canary" not in result.output
+        assert desktop_path.read_bytes() == before
 
     def test_json_not_dual_registered_error_shape(self, runner, config, monkeypatch):
         self._seed_config(config, ["docs-langchain"])
