@@ -42,6 +42,22 @@ changes inline only. See the deprecation policy in
   a value too deep to serialize instead of a traceback and leave their file
   unchanged. (#1280)
 
+- `mms eject` on an entry whose stored `origin.original` (or its target host
+  config) is nested too deeply now reports the entry as `cannot eject`
+  instead of exiting with a traceback, in `--dry-run` and `--json` too; the
+  STM entry and the host config are left unchanged. A depth failure during
+  the restore itself is a failed row that keeps the STM entry, and with
+  `--force` a payload too deep for `claude mcp add-json` is refused before
+  the existing host registration is removed. The manual restore hint names
+  where the value is kept instead of printing it. Import does not record a
+  value this deep, so this takes a hand-edited STM config or a deep entry
+  already present in the target host config. (#1282)
+  **Behavior change**: when the post-restore verify cannot read or decode the
+  host config, or finds no entry there at all, the entry is a failed row and
+  stays in STM even with `--accept-schema-loss`. Both used to count as a
+  schema mismatch, which that flag accepts, so the STM entry was removed
+  without a verified host copy.
+
 ### Added
 
 - Host setup, import, registry and doctor commands report enabled Codex MCP

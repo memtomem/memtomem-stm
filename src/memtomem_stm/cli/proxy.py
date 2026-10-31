@@ -7867,7 +7867,15 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
     fragment invalid, while a defined one (``\\b``) parsed silently into a
     *different* key.
     """
-    payload_json = json.dumps(payload, ensure_ascii=False)
+    try:
+        payload_json = json.dumps(payload, ensure_ascii=False)
+    except RecursionError:
+        # Rendered on failure rows too, including ones that failed for another
+        # reason, so it must not raise (#1282). The value stays where it is.
+        return (
+            f"# the restore payload for {_disp(name)} is nested too deeply to print; the "
+            f"entry is still in the STM config under upstream_servers.{_disp(name)}"
+        )
     if kind == "claude-user":
         return _shell_join(["claude", "mcp", "add-json", name, payload_json, "-s", "user"])
     if kind == "claude-project":
@@ -8150,6 +8158,11 @@ def _resolve_eject_plan(
             label_spec = _SOURCE_BY_KIND.get(dup.get("kind", ""))
             pruned_dups.append(label_spec.label if label_spec else str(dup.get("kind")))
 
+    # Every writer and the manual hint encode the payload, so prove it encodes
+    # before anything runs, ``--dry-run`` included. Discarded; a
+    # ``RecursionError`` here becomes the caller's plan error (#1282).
+    json.dumps(payload, ensure_ascii=False)
+
     return _EjectPlan(
         name=name,
         kind=kind,
@@ -8164,20 +8177,25 @@ def _resolve_eject_plan(
     )
 
 
-def _argv_is_encodable(name: str, payload: dict[str, Any]) -> bool:
-    """True when both halves of the ``claude mcp add-json`` argv can be spawned.
+def _argv_spawn_error(name: str, payload: dict[str, Any]) -> str | None:
+    """Why the ``claude mcp add-json`` argv cannot be built and spawned, or None.
 
     ``subprocess`` encodes arguments to UTF-8 and raises ``UnicodeEncodeError``
     on a lone surrogate — a raise the callers' ``FileNotFoundError`` /
     ``OSError`` handlers do not cover. Asking before a destructive step turns
     that into the ordinary non-fatal failure those callers already report.
+    A payload nested past the encoder's recursion limit is the same kind of
+    answer (#1282): it runs at the depth ``_claude_mcp_add_json``'s own encode
+    will, so a pass here leaves no window after the ``--force`` pre-remove.
     """
     try:
         name.encode("utf-8")
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
     except UnicodeEncodeError:
-        return False
-    return True
+        return "server name or payload is not valid UTF-8"
+    except RecursionError:
+        return "payload is nested too deeply to pass to `claude mcp add-json`"
+    return None
 
 
 def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
@@ -8203,8 +8221,9 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
         # nor the new one, and on the plain path an uncaught traceback
         # replaces the "cannot eject" diagnostic this function exists to
         # return.
-        if not _argv_is_encodable(plan.name, plan.payload):
-            return (False, "server name or payload is not valid UTF-8")
+        spawn_error = _argv_spawn_error(plan.name, plan.payload)
+        if spawn_error is not None:
+            return (False, spawn_error)
         if plan.overwrite:
             # `claude mcp add-json` has no overwrite flag (same probe lineage
             # as `claude mcp add`, cli/proxy.py:274) — remove-then-add. The
@@ -8233,13 +8252,20 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     AND on the skipped-write path, where the no-clobber identity match
     normalizes (dangerous env keys dropped, header names folded) and
     ignores host-only fields. Only a host entry deep-equal to
-    the payload may release the STM entry. A `None` read (entry not where
-    expected) reports as a full mismatch rather than crashing.
+    the payload may release the STM entry.
+
+    Two outcomes are not mismatches and raise :class:`_HostConfigReadError`
+    instead, because ``--accept-schema-loss`` accepts a mismatch: a host file
+    that cannot be read or decoded (the read is strict), and an entry that is
+    not there at all. Accepting either removed the STM entry with no host
+    copy behind it (#1282).
     """
     assert plan.payload is not None
-    actual = _host_existing_entry(plan.kind, plan.path, plan.name)
+    actual = _host_existing_entry(plan.kind, plan.path, plan.name, strict=True)
     if actual is None:
-        return ["<entry not found at the expected host location after write>"]
+        raise _HostConfigReadError(
+            f"'{plan.name}' is not at the expected host location after the restore"
+        )
     return _dict_diff_paths(plan.payload, actual)
 
 
@@ -8353,19 +8379,32 @@ def eject(
         sys.exit(1)
 
     to_spec = _parse_eject_to(to_target) if to_target else None
-    plans = [
-        _resolve_eject_plan(
-            n,
-            servers[n],
-            to_spec,
-            force=force,
-            allow_argv_secrets=allow_argv_secrets,
-            # --json never prompts; route the secret gate to its non-TTY
-            # branch so the entry fails with the same wording either way.
-            interactive=not as_json,
-        )
-        for n in names
-    ]
+    plans: list[_EjectPlan] = []
+    for n in names:
+        try:
+            plan = _resolve_eject_plan(
+                n,
+                servers[n],
+                to_spec,
+                force=force,
+                allow_argv_secrets=allow_argv_secrets,
+                # --json never prompts; route the secret gate to its non-TTY
+                # branch so the entry fails with the same wording either way.
+                interactive=not as_json,
+            )
+        except RecursionError:
+            # One catch for every walk resolution makes over the entry and
+            # the live host config — the copy, normalization, identity, the
+            # secret classifier and the trial encode — rather than a guard per
+            # site (#1282). Nothing is written during resolution.
+            plan = _EjectPlan(
+                name=n,
+                error=(
+                    "the entry or its target configuration is nested too deeply to "
+                    "prepare a restore (value withheld). This STM entry was not changed"
+                ),
+            )
+        plans.append(plan)
 
     def _eject_json_payload(
         restored_names: list[str],
@@ -8496,50 +8535,71 @@ def eject(
     config_changed = False
     for plan in actionable:
         assert plan.payload is not None
-        if plan.needs_secret_confirm:
-            ok = click.confirm(
-                f"  '{_disp(plan.name)}': pass the secret value(s) above on `claude` argv "
-                "(visible in the process list while it runs)?",
-                default=False,
-            )
-            if not ok:
-                failed.append((plan, "secret gate declined"))
-                continue
+        try:
+            if plan.needs_secret_confirm:
+                ok = click.confirm(
+                    f"  '{_disp(plan.name)}': pass the secret value(s) above on `claude` argv "
+                    "(visible in the process list while it runs)?",
+                    default=False,
+                )
+                if not ok:
+                    failed.append((plan, "secret gate declined"))
+                    continue
 
-        wrote = False
-        if not plan.skip_write:
-            ok, err = _eject_host_write(plan)
-            if not ok:
-                failed.append((plan, err or "host write failed"))
-                continue
-            wrote = True
+            wrote = False
+            if not plan.skip_write:
+                ok, err = _eject_host_write(plan)
+                if not ok:
+                    failed.append((plan, err or "host write failed"))
+                    continue
+                wrote = True
 
-        # Verify on BOTH paths — written and skipped. A same-identity host
-        # entry is not necessarily structurally equal to the original:
-        # identity normalizes (dangerous env keys dropped, header names
-        # folded) and ignores host-only fields, so removing the STM entry on
-        # identity alone could destroy the only complete copy.
-        # The invariant: STM removal requires a host entry deep-equal to the
-        # payload, or the operator's explicit --accept-schema-loss.
-        mismatches = _eject_verify(plan)
-        if mismatches:
-            detail = ", ".join(mismatches)
-            state = "restored host entry" if wrote else "existing host entry"
-            if not accept_schema_loss:
+            # Verify on BOTH paths — written and skipped. A same-identity host
+            # entry is not necessarily structurally equal to the original:
+            # identity normalizes (dangerous env keys dropped, header names
+            # folded) and ignores host-only fields, so removing the STM entry on
+            # identity alone could destroy the only complete copy.
+            # The invariant: STM removal requires a host entry deep-equal to the
+            # payload, or the operator's explicit --accept-schema-loss.
+            try:
+                mismatches = _eject_verify(plan)
+            except _HostConfigReadError as exc:
+                # Unverifiable is not a schema difference: keep the STM entry
+                # even under --accept-schema-loss (#1282).
                 failed.append(
-                    (
-                        plan,
-                        f"{state} does not match the captured original "
-                        f"({detail}) — the STM entry is kept (dual registration); "
-                        "re-run with --accept-schema-loss to remove from STM anyway",
-                    )
+                    (plan, f"cannot verify the host entry: {exc} — the STM entry is kept")
                 )
                 continue
-            click.echo(
-                f"  {_warn('Warning:')} '{_disp(plan.name)}' {state} deviates from the "
-                f"original (schema loss accepted): {_disp(detail)}",
-                err=True,
+            if mismatches:
+                detail = ", ".join(mismatches)
+                state = "restored host entry" if wrote else "existing host entry"
+                if not accept_schema_loss:
+                    failed.append(
+                        (
+                            plan,
+                            f"{state} does not match the captured original "
+                            f"({detail}) — the STM entry is kept (dual registration); "
+                            "re-run with --accept-schema-loss to remove from STM anyway",
+                        )
+                    )
+                    continue
+                click.echo(
+                    f"  {_warn('Warning:')} '{_disp(plan.name)}' {state} deviates from the "
+                    f"original (schema loss accepted): {_disp(detail)}",
+                    err=True,
+                )
+        except RecursionError:
+            # Resolution already encoded this payload once, so reaching here
+            # takes a deeper stack in a writer or the verify. The STM entry is
+            # kept: its removal below needs a completed verify (#1282).
+            failed.append(
+                (
+                    plan,
+                    "the entry or its target configuration is nested too deeply to "
+                    "restore — the STM entry is kept",
+                )
             )
+            continue
 
         if not keep:
             del servers[plan.name]

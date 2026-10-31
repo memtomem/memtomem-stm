@@ -102,10 +102,11 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
         "open on an unencodable reply (#758).",
     ),
     "cli/proxy.py": (
-        5,
-        "All five are the ``claude mcp`` surfaces rather than documents: the "
+        6,
+        "All six are the ``claude mcp`` surfaces rather than documents: the "
         "add-json argv and the three manual-hint renderings, plus the probe in "
-        "``_argv_is_encodable`` itself. The argv is checked before either "
+        "``_argv_spawn_error`` itself and the discarded encode preflight in "
+        "``_resolve_eject_plan`` (#1282). The argv is checked before either "
         "verb spawns and every hint branch goes through ``_shell_join`` or "
         "``_disp`` (#754/#756/#758). The third hint branch renders the same "
         "fragment for a source mms does not write, where hand-editing is the "
