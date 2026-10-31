@@ -24,9 +24,10 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 class ConfigWriteError(click.ClickException):
     """An ``OSError`` from the proxy-config write path, after the command
-    decided to write (#1176).
+    decided to write (#1176) — or a ``RecursionError`` from serializing the
+    config before that write (#1280).
 
-    Raised by ``_save`` (the atomic replace) and ``_backup_config_snapshot``
+    Raised by ``_save`` (the serialize and the atomic replace) and ``_backup_config_snapshot``
     (the pre-apply backup) in ``cli.proxy``; rendered by
     :func:`with_config_write_lock`, which every ``stm_proxy.json`` mutator
     already carries, so no caller needs its own ``except``. Both steps leave
@@ -45,7 +46,7 @@ class ConfigWriteError(click.ClickException):
 
     code = "config_write_failed"
 
-    def __init__(self, step: str, path: Path, exc: OSError) -> None:
+    def __init__(self, step: str, path: Path, exc: OSError | RecursionError) -> None:
         tail = f"({type(exc).__name__}); the file was not replaced by this write"
         self.raw_message = f"cannot {step} {path} {tail}"
         super().__init__(f"cannot {step} {_disp(str(path))} {tail}")
