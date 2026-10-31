@@ -11304,6 +11304,64 @@ class TestPruneUnderClaudeConfigDir:
         )
         assert removals == []
 
+    @pytest.mark.parametrize("tty", [True, False])
+    @pytest.mark.parametrize("yes", [True, False])
+    def test_an_all_manual_prune_asks_nothing_and_exits_0(
+        self, runner, config, monkeypatch, removals, _hermetic_home, tmp_path, tty, yes
+    ):
+        """No planned row means no consent to ask for: neither a prompt nor
+        the no-TTY ``--yes`` exit."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: tty)
+        self._seed(config, monkeypatch, names=("u", "l"))
+
+        args = ["prune", "--all", *(["--yes"] if yes else []), *_cfg_args(config)]
+        result = runner.invoke(cli, args)
+
+        assert result.exit_code == 0, result.output
+        assert "Remove from source(s)?" not in result.output
+        assert "pass --yes" not in result.output
+        assert "Nothing to remove automatically" in result.output
+        assert removals == []
+        assert self._backed_up(_hermetic_home) == []
+
+    def test_an_all_manual_json_prune_still_requires_yes(
+        self, runner, config, monkeypatch, removals, tmp_path
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+        self._seed(config, monkeypatch, names=("u", "l"))
+
+        result = runner.invoke(cli, ["prune", "--all", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 2, result.output
+        assert json.loads(result.stdout)["error"] == "confirmation_required"
+        assert removals == []
+
+    def test_a_cursor_only_prune_asks_nothing_either(self, runner, config, monkeypatch, removals):
+        """The same rule, on the manual rows that predate #1287 (no env)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {"enabled": True, "upstream_servers": {"c": {"prefix": "c", **self._ENTRY}}}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            proxy_mod,
+            "_discover_candidates",
+            lambda _cwd: [_cand("c", "Cursor (user)", entry=self._ENTRY)],
+        )
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: False)
+
+        result = runner.invoke(cli, ["prune", "--all", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "Nothing to remove automatically" in result.output
+        assert removals == []
+
     def test_failure_report_prints_the_manual_hint(self, monkeypatch, capsys, tmp_path):
         from memtomem_stm.cli.proxy import _report_prune_results
 

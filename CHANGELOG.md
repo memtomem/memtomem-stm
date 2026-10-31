@@ -39,7 +39,10 @@ changes inline only. See the deprecation policy in
   and project entries are manual-only rows (`manual` in `--json`), as Cursor
   entries are, and their hint says to compare the entry in the active config
   before removing it by hand instead of printing a `claude mcp remove`
-  command. `.mcp.json` entries are still pruned.
+  command. `.mcp.json` entries are still pruned. A standalone `mms prune`
+  whose plan is entirely manual-only (these rows, or Cursor ones) now prints
+  the rows and exits 0 instead of asking to confirm, or exiting 1 without a
+  TTY; `--json` still requires `--yes`.
 
 ## [0.7.3] — 2026-10-31
 

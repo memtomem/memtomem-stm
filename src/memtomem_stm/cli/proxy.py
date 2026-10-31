@@ -7611,6 +7611,19 @@ def prune(
         click.echo(f"{_ok('Dry run:')} no writes performed.")
         return
 
+    if not planned and not as_json:
+        # Nothing here is this run's to write, so there is no consent to ask
+        # for: a prompt (or a "pass --yes" exit without a TTY) would gate an
+        # action the run cannot take, which the import path already skips
+        # (#955). A nonempty CLAUDE_CONFIG_DIR makes this the common case
+        # for Claude Code rows (#1287). ``--json`` keeps its own contract.
+        click.echo("")
+        click.echo(
+            f"{_ok('Nothing to remove automatically:')} remove the (manual) rows by hand. "
+            "No changes made."
+        )
+        return
+
     if assume_yes:
         proceed = True
     elif as_json:
