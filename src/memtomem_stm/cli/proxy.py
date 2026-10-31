@@ -1662,6 +1662,15 @@ class _LazyGroup(click.Group):
     registered ones. Error suggestions do NOT — see ``resolve_command``.
     """
 
+    def main(self, *args: Any, **kwargs: Any) -> Any:
+        # First, before Click does anything: shell completion runs ``bash`` by
+        # name before any callback, and every subcommand may start another
+        # program by bare name while the cwd is the user's project.
+        from memtomem_stm.utils.exec_env import harden_exec_search
+
+        harden_exec_search()
+        return super().main(*args, **kwargs)
+
     def list_commands(self, ctx: click.Context) -> list[str]:
         return sorted(set(super().list_commands(ctx)) | set(_LAZY_SUBCOMMANDS))
 

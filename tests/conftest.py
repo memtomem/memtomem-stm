@@ -14,6 +14,8 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback_store import FeedbackStore
 from helpers import set_home
 
+_EXEC_SEARCH_KEYS = ("PATH", "NoDefaultCurrentDirectoryInExePath")
+
 
 @pytest.fixture(autouse=True)
 def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
@@ -48,7 +50,19 @@ def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
         for name in reversed(list(os.environ)):
             if name.lower().startswith("memtomem_stm_"):
                 patch.delenv(name, raising=False)
-        yield
+        # Every CLI invocation and ``server.main`` rewrite these in this process
+        # (``harden_exec_search``). Under a simulated ``win32`` on POSIX the
+        # rewrite empties PATH, and an empty PATH would break every later
+        # test that runs a program by name, so put them back after each test.
+        saved = {k: os.environ.get(k) for k in _EXEC_SEARCH_KEYS}
+        try:
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 @pytest.fixture

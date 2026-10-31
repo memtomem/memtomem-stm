@@ -9,23 +9,51 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.3] — 2026-10-31
+
+### Upgrade notes
+
+- **STM no longer finds a program through the current directory.** A program
+  reachable only through a relative, empty, drive-relative or root-relative
+  `PATH` entry, or only from the current directory on Windows, is no longer
+  found by STM, and the processes it starts inherit the hardened `PATH` unless
+  their own configuration sets `env.PATH`. Configure an absolute command or a
+  fully qualified `PATH` instead. (GHSA-hqh4-75hx-xq46)
+- **`mms init`, `mms add --from-clients` and `mms prune` run
+  `claude plugin list --json`** in the current directory when `claude` is on
+  `PATH` (about 0.6 s), report the plugin MCP servers that bypass STM, and
+  gain a `plugin_bypass` array in their `--json` documents.
+  `MMS_NO_HOST_PROBE=1` skips the listing. (#1108)
+- **Host setup, import, registry and doctor commands can run optional host
+  CLI listings that make network requests;** `MMS_NO_HOST_PROBE=1` skips
+  them. Init, add-from-clients and prune JSON gains `codex_extra_servers`.
+  `mms doctor` adds a WARN row for enabled Codex registrations and for Claude
+  Code plugin servers outside STM, so `doctor --json` can report `"status":
+  "warn"` where it reported `"pass"`; the exit code still changes only on a
+  FAIL. (#1269, #1108)
+- **`mms eject` refuses an unreadable or malformed target config even with
+  `--force`,** and automatic Claude user/project eject refuses a nonempty
+  `CLAUDE_CONFIG_DIR`. Restore manually from
+  `upstream_servers.<name>.origin.original`. (#1273)
+- **An eject whose post-restore verify cannot read the host config, or finds
+  no entry there, keeps the STM entry even with `--accept-schema-loss`,** and
+  reports a failed row. (#1282)
+
+### Security
+
+- STM no longer finds the programs it starts by bare name through the current
+  directory. At startup it drops `PATH` entries that are not fully qualified
+  (relative, empty, drive-relative or root-relative) and, on Windows, sets
+  `NoDefaultCurrentDirectoryInExePath`; an empty or absent `PATH` becomes the
+  platform default without its current-directory entry. Processes STM starts
+  inherit the hardened `PATH`, except a server whose configuration sets its own
+  `env.PATH` (an upstream, the toolgraph consult server), which is used as
+  given. (GHSA-hqh4-75hx-xq46)
+  **Behavior change**: a program reachable only through such a `PATH` entry, or
+  only from the current directory on Windows, is no longer found by STM.
+  Configure an absolute command or a fully qualified `PATH` instead.
 
 ### Fixed
-
-- The report of Claude Code plugin servers that bypass STM now leaves out a
-  server disabled in `/mcp` when the command runs from a subdirectory of the
-  repository: the disable is read from the project entry Claude Code uses,
-  keyed by the repository root, instead of the exact directory. A disable left
-  under a subdirectory key, which Claude Code does not read, no longer hides a
-  server. In a linked worktree, a submodule or behind a symlinked `.git`, no
-  disables are read. Discovery and import of project-scope servers still use
-  the directory itself. (#1288, #1271)
-  **Behavior change**: a plugin server hidden only by a disable filed under a
-  subdirectory's own key, or by any disable while the command runs in a linked
-  worktree, a submodule or behind a symlinked `.git`, is listed again. In the
-  first case, disabling it in `/mcp` again files it under the repository root,
-  where it is read; in the others, the report keeps listing it.
 
 - Host discovery ignores JSON decoder recursion failures, and direct host
   restore leaves the file unchanged when JSON cannot be decoded or re-encoded.
@@ -96,6 +124,9 @@ changes inline only. See the deprecation policy in
   `codex_extra_servers` (list after a successful probe, null if unavailable).
   Registry JSON shapes are unchanged; successful `init --json` replays a
   failed-probe note on stderr while stdout remains a single JSON document.
+  `mms doctor` reports those registrations, and Claude Code plugin servers
+  that bypass STM, as WARN rows (`codex_extra_servers`, `plugin_bypass`), so
+  its overall status can become `warn`; its exit code is unchanged.
 
 - `mms init`, `mms add --from-clients` and `mms prune` now report the MCP
   servers that enabled Claude Code plugins register, which STM does not
@@ -110,10 +141,12 @@ changes inline only. See the deprecation policy in
   `claude plugin list --json` in the current directory (about 0.6 s), and
   their `--json` documents gain a `plugin_bypass` array, also on the
   `unknown_server` and `not_dual_registered` failures. They also read
-  `~/.claude.json`: a server `/mcp` disabled for exactly the current
-  directory is left out. From a subdirectory, on Windows, or with
-  `CLAUDE_CONFIG_DIR` set to a nonempty value it may still be listed, and
-  disable data that cannot be read never hides a server. (#1268)
+  `~/.claude.json`: a server disabled in `/mcp` is left out when the disable
+  sits under the project entry Claude Code uses, keyed by the repository root
+  (the directory itself outside a repository). In a linked worktree, a
+  submodule or behind a symlinked `.git`, or with `CLAUDE_CONFIG_DIR` set to
+  a nonempty value, no disables are read, and disable data that cannot be
+  read never hides a server. (#1268, #1271)
   A local- or project-scope install made in another, unrelated repository
   contributes no servers either, since Claude Code does not run them here;
   with a linked worktree, a submodule, Windows or a `GIT_DIR` override in
