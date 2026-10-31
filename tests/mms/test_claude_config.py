@@ -56,7 +56,7 @@ class TestMeasuredLayouts:
 
         assert claude_project_key(base / "C" / "wt" / "src") == _key(base / "C" / "main")
 
-    def test_backpointer_naming_another_path_keys_thegit_worktree(self, base):
+    def test_backpointer_naming_another_path_keys_the_worktree(self, base):
         (base / "D" / "main" / ".git").mkdir(parents=True)
         elsewhere = base / "D" / "elsewhere" / ".git"
         git_worktree(
@@ -65,6 +65,23 @@ class TestMeasuredLayouts:
         (base / "D" / "wt" / "src").mkdir()
 
         assert claude_project_key(base / "D" / "wt" / "src") == _key(base / "D" / "wt")
+
+    def test_backpointer_is_normalized_before_symlinks_are_followed(self, base):
+        # Claude Code resolves the back-pointer lexically (``..`` first), then
+        # takes its realpath: ``<wt>/jump/../.git`` is ``<wt>/.git`` even when
+        # ``jump`` is a symlink elsewhere.
+        (base / "J" / "main" / ".git").mkdir(parents=True)
+        (base / "J" / "other" / "child").mkdir(parents=True)
+        wt = base / "J" / "wt"
+        git_worktree(
+            base / "J" / "main" / ".git", wt, "wt", backpointer=str(wt / "jump" / ".." / ".git")
+        )
+        try:
+            (wt / "jump").symlink_to(base / "J" / "other" / "child", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        assert claude_project_key(wt) == _key(base / "J" / "main")
 
     def test_submodule_style_git_file_keys_its_own_root(self, base):
         modules = base / "E" / "super" / ".git" / "modules" / "m"
@@ -124,7 +141,24 @@ class TestFallbacks:
 
         assert claude_project_key(base / "R") == _key(base / "R")
 
-    def test_missing_admin_directory_keys_thegit_worktree(self, base):
+    @pytest.mark.parametrize(
+        ("prefix", "expected"),
+        [("\ufeff", "main"), ("\x1c", "wt")],
+        ids=["bom-trimmed", "info-separator-kept"],
+    )
+    def test_metadata_is_trimmed_like_javascript(self, base, prefix, expected):
+        # Claude Code trims each file with JavaScript's ``trim()``: a leading
+        # BOM goes, a ``\x1c`` stays and the line no longer starts ``gitdir:``.
+        (base / "main" / ".git").mkdir(parents=True)
+        wt = base / "wt"
+        git_worktree(base / "main" / ".git", wt, "wt")
+        (wt / ".git").write_text(
+            prefix + (wt / ".git").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+        assert claude_project_key(wt) == _key(base / expected)
+
+    def test_missing_admin_directory_keys_the_worktree(self, base):
         (base / "W").mkdir()
         (base / "W" / ".git").write_text(f"gitdir: {base / 'gone'}\n", encoding="utf-8")
 

@@ -35,6 +35,14 @@ _METADATA_LIMIT = 64 * 1024
 # paths, and a Windows drive letter not followed by a separator.
 _UNSUPPORTED_PATH = re.compile(r"^(?:[\\/]{2}|[A-Za-z]:(?![\\/]))")
 
+# What JavaScript's ``String.prototype.trim`` removes, which Claude Code applies
+# to each metadata file. ``str.strip()`` differs: it keeps a BOM (``\ufeff``)
+# and also removes ``\x1c``-``\x1f`` and ``\x85``.
+_JS_WHITESPACE = (
+    "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+
 
 class _Unknown(Exception):
     """The layout takes a branch STM cannot reproduce, so the key is unknown."""
@@ -87,28 +95,29 @@ def _canonical_root(root: str) -> str:
     try:
         if stat.S_ISDIR(os.lstat(git).st_mode):
             return root
-        content = _read_metadata(git).strip()
+        content = _read_metadata(git).strip(_JS_WHITESPACE)
         if not content.startswith("gitdir:"):
             return root
-        gitdir = _checked_path(content[len("gitdir:") :].strip())
+        gitdir = _checked_path(content[len("gitdir:") :].strip(_JS_WHITESPACE))
         admin = os.path.normpath(os.path.join(root, gitdir))
         commondir_file = os.path.join(admin, "commondir")
         if not _is_regular_file(commondir_file):
             return root
         common = os.path.normpath(
-            os.path.join(admin, _checked_path(_read_metadata(commondir_file).strip()))
+            os.path.join(admin, _checked_path(_read_metadata(commondir_file).strip(_JS_WHITESPACE)))
         )
         if os.path.normpath(os.path.dirname(admin)) != os.path.join(common, "worktrees"):
             return root
         backpointer_file = os.path.join(admin, "gitdir")
         if not _is_regular_file(backpointer_file):
             return root
-        backpointer = _checked_path(_read_metadata(backpointer_file).strip())
+        backpointer = _checked_path(_read_metadata(backpointer_file).strip(_JS_WHITESPACE))
         if os.sep == "/" and any("\\" in p for p in (root, admin, backpointer, common)):
             return root
-        if os.path.realpath(os.path.join(admin, backpointer)) != os.path.join(
-            os.path.realpath(root), ".git"
-        ):
+        # Lexically first, as Claude Code does, so ``..`` never climbs out of a
+        # symlink target.
+        resolved = os.path.normpath(os.path.join(admin, backpointer))
+        if os.path.realpath(resolved) != os.path.join(os.path.realpath(root), ".git"):
             return root
         if os.path.basename(common) != ".git":
             # A bare repository's common directory, unless it is itself inside
