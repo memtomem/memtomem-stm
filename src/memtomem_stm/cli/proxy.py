@@ -307,13 +307,14 @@ _SETUP_RESOLVED_CLIENT: ContextVar[str | None] = ContextVar("setup_resolved_clie
 # invisible and hangs the caller (or dies as a bare "Aborted!" on EOF).
 _SETUP_JSON_MODE: ContextVar[bool] = ContextVar("setup_json_mode", default=False)
 
-# Plugin MCP servers ``init`` found bypassing STM (#1108), as JSON rows. Under
-# ``--json`` they travel in the result document instead of as text: the
-# decorator captures stderr too and replays it only on success, so a report
-# printed inside ``init`` would vanish on a prompt EOF or a failed write.
-# ``None`` means init never asked (``--demo``, ``--resume``, or a failure
-# before discovery) and renders as ``null``: ``[]`` would claim none exist.
-_SETUP_PLUGIN_BYPASS: ContextVar[list[dict[str, str]] | None] = ContextVar(
+# Plugin MCP servers ``init`` found bypassing STM (#1108), as the JSON keys
+# ``_plugin_bypass_json`` builds. Under ``--json`` they travel in the result
+# document instead of as text: the decorator captures stderr too and replays
+# it only on success, so a report printed inside ``init`` would vanish on a
+# prompt EOF or a failed write. ``None`` means init never asked (``--demo``,
+# ``--resume``, or a failure before discovery) and renders both keys as
+# ``null``: ``[]`` would claim none exist.
+_SETUP_PLUGIN_BYPASS: ContextVar[dict[str, Any] | None] = ContextVar(
     "setup_plugin_bypass", default=None
 )
 _SETUP_CODEX_EXTRAS: ContextVar[list[str] | None] = ContextVar("setup_codex_extras", default=None)
@@ -401,7 +402,10 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 or kwargs.get("mcp_mode"),
             }
             if action == "init":
-                payload["plugin_bypass"] = _SETUP_PLUGIN_BYPASS.get()
+                payload.update(
+                    _SETUP_PLUGIN_BYPASS.get()
+                    or {"plugin_bypass": None, "plugin_bypass_disables_unread": None}
+                )
                 payload["codex_extra_servers"] = _SETUP_CODEX_EXTRAS.get()
             if write_failure is not None:
                 payload["error"] = write_failure.code
@@ -4429,10 +4433,31 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
     )
 
 
+def _disables_unread_reason(rows: list[_PluginBypass]) -> str | None:
+    """Why ``/mcp`` disables were not read for ``rows`` (a ``_DISABLES_UNREAD_CAVEAT`` key).
+
+    None when no row records a reason, which includes no rows at all and disable
+    data that was consulted but could not be read: no caveat, not a check passed.
+    """
+    return next((row.disables_unread for row in rows if row.disables_unread), None)
+
+
 def _disables_unread_caveat(rows: list[_PluginBypass]) -> str | None:
-    """Why ``/mcp`` disables were not read for ``rows``, or None when they were."""
-    reason = next((row.disables_unread for row in rows if row.disables_unread), None)
+    """The caveat text for :func:`_disables_unread_reason`, or None without one."""
+    reason = _disables_unread_reason(rows)
     return None if reason is None else _DISABLES_UNREAD_CAVEAT[reason]
+
+
+def _plugin_bypass_json(rows: list[_PluginBypass]) -> dict[str, Any]:
+    """The ``plugin_bypass`` keys of a JSON document, built together (#1294).
+
+    The reason sits beside the array rather than on each row: it belongs to the
+    directory probed, and the row shape is documented with five keys.
+    """
+    return {
+        "plugin_bypass": [row.as_json() for row in rows],
+        "plugin_bypass_disables_unread": _disables_unread_reason(rows),
+    }
 
 
 def _echo_plugin_bypass(rows: list[_PluginBypass], *, err: bool) -> None:
@@ -5613,7 +5638,7 @@ def _add_from_clients(
                 "validated": validate,
                 "warnings": warnings,
                 "prune": prune_result,
-                "plugin_bypass": [row.as_json() for row in plugin_bypass],
+                **_plugin_bypass_json(plugin_bypass),
                 "codex_extra_servers": codex_extras,
             }
         )
@@ -5667,7 +5692,7 @@ def _add_from_clients(
                     msg,
                     unknown=unknown,
                     available=available,
-                    plugin_bypass=[row.as_json() for row in plugin_bypass],
+                    **_plugin_bypass_json(plugin_bypass),
                     codex_extra_servers=codex_extras,
                 )
             sys.exit(1)
@@ -6201,7 +6226,7 @@ def init(
     candidates = [] if demo else _discover_candidates(Path.cwd())
     if not demo:
         plugin_bypass = _plugin_bypass_servers(Path.cwd())
-        _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
+        _SETUP_PLUGIN_BYPASS.set(_plugin_bypass_json(plugin_bypass))
         if not json_mode:
             _echo_plugin_bypass(plugin_bypass, err=False)
         from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
@@ -7444,7 +7469,7 @@ def prune(
             # Plugin servers STM never imported, so prune has nothing to
             # remove for them; reported so "nothing to prune" is not read as
             # "everything routes through STM" (#1108).
-            "plugin_bypass": [row.as_json() for row in plugin_bypass],
+            **_plugin_bypass_json(plugin_bypass),
             "codex_extra_servers": codex_extras,
         }
 
@@ -7491,7 +7516,7 @@ def prune(
                     "not_dual_registered",
                     f"not dual-registered: {', '.join(sorted(missing))}",
                     names=sorted(missing),
-                    plugin_bypass=[row.as_json() for row in plugin_bypass],
+                    **_plugin_bypass_json(plugin_bypass),
                     codex_extra_servers=codex_extras,
                 )
             sys.exit(1)

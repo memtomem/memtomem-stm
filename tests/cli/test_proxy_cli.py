@@ -3207,6 +3207,7 @@ class TestInit:
             "servers": ["demo"],
             "client": "skip",
             "plugin_bypass": None,
+            "plugin_bypass_disables_unread": None,
             "codex_extra_servers": None,
         }
 
