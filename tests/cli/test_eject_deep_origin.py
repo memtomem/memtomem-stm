@@ -411,9 +411,14 @@ class TestManualHint:
         assert [(row["name"], row["hint"]) for row in doc["failed"]] == [("probe", _HINT_FALLBACK)]
 
     def test_hint_still_renders_a_shallow_payload(self):
+        """The fallback is only for a payload that cannot encode. Quoting is
+        the platform's (``_shell_join``), so the expected line is built the
+        same way rather than spelled in POSIX quotes."""
         hint = proxy_mod._eject_manual_hint("probe", "claude-user", None, {"command": "x"})
 
-        assert hint == 'claude mcp add-json probe \'{"command": "x"}\' -s user'
+        assert hint == proxy_mod._shell_join(
+            ["claude", "mcp", "add-json", "probe", '{"command": "x"}', "-s", "user"]
+        )
 
 
 def test_argv_spawn_error_names_each_cause(monkeypatch):
