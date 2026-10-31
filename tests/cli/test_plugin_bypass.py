@@ -1298,6 +1298,7 @@ class TestCommandsReport:
         document = json.loads(result.stdout)
         assert document["action"] == "register"
         assert "plugin_bypass" not in document
+        assert "plugin_bypass_disables_unread" not in document
         assert probe["calls"] == []
 
     def test_init_lock_failure_is_the_shared_envelope_without_the_key(
@@ -1322,4 +1323,169 @@ class TestCommandsReport:
         document = json.loads(result.stdout)
         assert document["error"] == "config_lock_unavailable"
         assert "plugin_bypass" not in document
+        assert "plugin_bypass_disables_unread" not in document
         assert probe["calls"] == []
+
+
+_INIT_ARGV = ["init", "--no-validate", "--client", "skip", "--lang", "en", "--json"]
+_INIT_ANSWERS = "filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n"
+_FS = {"fs": {"prefix": "fs", "transport": "stdio", "command": "npx"}}
+
+
+def _write_denied(*args, **kwargs):
+    raise PermissionError(13, "Permission denied")
+
+
+# Every JSON document that carries ``plugin_bypass``: (argv, stdin, exit code,
+# ``error``, upstreams in the config or None for a fresh init path,
+# write failure). The reason must ride on each one (#1294).
+_BYPASS_DOCUMENTS = {
+    "add": (["add", "--from-clients", "--all", "--json"], None, 0, None, {}, False),
+    "add-unknown-server": (
+        ["add", "--from-clients", "--select", "firebase", "--json"],
+        None,
+        1,
+        "unknown_server",
+        {},
+        False,
+    ),
+    "prune": (["prune", "--all", "--json"], None, 0, None, _FS, False),
+    "prune-no-upstreams": (["prune", "--all", "--json"], None, 0, None, {}, False),
+    "prune-not-dual-registered": (
+        ["prune", "firebase", "--json"],
+        None,
+        1,
+        "not_dual_registered",
+        _FS,
+        False,
+    ),
+    "init": (_INIT_ARGV, _INIT_ANSWERS, 0, None, None, False),
+    "init-prompt-eof": (_INIT_ARGV, "", 1, "setup_failed", None, False),
+    "init-write-failure": (_INIT_ARGV, _INIT_ANSWERS, 1, "config_write_failed", None, True),
+}
+
+
+class TestDisablesUnreadInJson:
+    """The JSON documents say why ``/mcp`` disables were not read (#1294).
+
+    The reason is an envelope key beside ``plugin_bypass``, so the rows keep
+    their five documented keys.
+    """
+
+    @staticmethod
+    def _document(sandbox, monkeypatch, surface: str) -> dict:
+        argv, answers, exit_code, error, upstreams, write_fails = _BYPASS_DOCUMENTS[surface]
+        if upstreams is None:
+            config = sandbox["home"] / "new.json"
+        else:
+            config = _config(sandbox["home"], upstreams)
+        if write_fails:
+            monkeypatch.setattr(proxy_mod, "atomic_write_text", _write_denied)
+        result = CliRunner().invoke(cli, [*argv, "--config", str(config)], input=answers)
+        assert result.exit_code == exit_code, result.output
+        document = json.loads(result.stdout)
+        assert document.get("error") == error
+        return document
+
+    @pytest.mark.parametrize("surface", sorted(_BYPASS_DOCUMENTS))
+    def test_config_dir_reason_rides_beside_the_rows(self, sandbox, probe, monkeypatch, surface):
+        (sandbox["cwd"] / ".git").mkdir()  # only CLAUDE_CONFIG_DIR can give a reason
+        probe["out"] = [FIREBASE]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+
+        document = self._document(sandbox, monkeypatch, surface)
+
+        assert document["plugin_bypass_disables_unread"] == "config_dir"
+        assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
+            "plugin:firebase:firebase"
+        ]
+        assert all(set(row) == _ROW_KEYS for row in document["plugin_bypass"])
+        keys = list(document)
+        assert keys.index("plugin_bypass_disables_unread") == keys.index("plugin_bypass") + 1
+
+    @pytest.mark.parametrize("surface", sorted(_BYPASS_DOCUMENTS))
+    def test_read_disables_give_null(self, sandbox, probe, monkeypatch, surface):
+        (sandbox["cwd"] / ".git").mkdir()
+        probe["out"] = [FIREBASE]
+
+        document = self._document(sandbox, monkeypatch, surface)
+
+        assert document["plugin_bypass_disables_unread"] is None
+        assert len(document["plugin_bypass"]) == 1
+
+    @pytest.mark.parametrize("layout", ["linked-worktree", "symlinked-dotgit"])
+    @pytest.mark.parametrize("surface", ["add", "init"])
+    def test_no_key_reason(self, sandbox, probe, monkeypatch, tmp_path, layout, surface):
+        skip_if_inside_git(tmp_path.resolve())
+        (tmp_path / "layout").mkdir()
+        start, _main = GIT_FILE_LAYOUTS[layout](tmp_path / "layout")
+        monkeypatch.chdir(start)
+        probe["out"] = [FIREBASE]
+
+        document = self._document(sandbox, monkeypatch, surface)
+
+        assert document["plugin_bypass_disables_unread"] == "no_key"
+        assert len(document["plugin_bypass"]) == 1
+
+    @pytest.mark.parametrize("surface", ["add", "prune", "init"])
+    def test_no_rows_give_null_even_when_disables_were_not_read(
+        self, sandbox, probe, monkeypatch, surface
+    ):
+        probe["out"] = []
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+
+        document = self._document(sandbox, monkeypatch, surface)
+
+        assert document["plugin_bypass"] == []
+        assert document["plugin_bypass_disables_unread"] is None
+
+    @pytest.mark.parametrize("content", ["{not json", '{"projects": []}'], ids=["invalid", "list"])
+    def test_unreadable_disable_data_is_null_not_a_reason(
+        self, sandbox, probe, monkeypatch, content
+    ):
+        # Consulted but unreadable: no caveat, and no claim it was checked.
+        (sandbox["cwd"] / ".git").mkdir()
+        _write_claude_json(sandbox["home"], content)
+        probe["out"] = [FIREBASE_TWO]
+
+        document = self._document(sandbox, monkeypatch, "add")
+
+        assert len(document["plugin_bypass"]) == 2
+        assert document["plugin_bypass_disables_unread"] is None
+
+    def test_init_reason_does_not_leak_into_the_next_document(self, sandbox, probe, monkeypatch):
+        # One process, as the reset at the decorator's entry has to hold it.
+        from memtomem_stm.mms import state
+
+        probe["out"] = [FIREBASE]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        runner = CliRunner()
+
+        def init(*argv: str, config: Path, answers: str | None = None) -> dict:
+            result = runner.invoke(cli, [*argv, "--config", str(config)], input=answers)
+            return json.loads(result.stdout)
+
+        first = init(*_INIT_ARGV, config=sandbox["home"] / "a.json", answers=_INIT_ANSWERS)
+        assert first["plugin_bypass_disables_unread"] == "config_dir"
+
+        demo = init(*_INIT_ARGV, "--demo", config=sandbox["home"] / "b.json")
+        assert demo["plugin_bypass"] is None
+        assert demo["plugin_bypass_disables_unread"] is None
+
+        refused = init("init", "--json", config=sandbox["home"] / "a.json")
+        assert refused["ok"] is False
+        assert refused["plugin_bypass"] is None
+        assert refused["plugin_bypass_disables_unread"] is None
+
+        register = init("register", "--mcp", "json", "--json", config=sandbox["home"] / "a.json")
+        assert "plugin_bypass_disables_unread" not in register
+
+        with monkeypatch.context() as m:
+
+            def denied(path):
+                raise IsADirectoryError(21, "Is a directory", str(path))
+
+            m.setattr(state, "open_lock_fd", denied)
+            locked = init("init", "--json", config=sandbox["home"] / "c.json")
+        assert locked["error"] == "config_lock_unavailable"
+        assert "plugin_bypass_disables_unread" not in locked

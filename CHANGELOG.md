@@ -11,6 +11,17 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- The `--json` documents of `init`, `add --from-clients` and `prune` carry
+  why `/mcp` disables were not read next to `plugin_bypass`, as
+  `plugin_bypass_disables_unread` (`"no_key"`, `"config_dir"` or `null`), so
+  a consumer can tell that a listed server may be one already disabled.
+  `init --json` prints no note, so this key is the only place it gives the
+  reason. `null` records no reason, not a completed check. The rows keep
+  their five keys.
+  (#1294)
+
 ### Fixed
 
 - The Claude Code plugin-server note (`init`, `add --from-clients`, `prune`,
