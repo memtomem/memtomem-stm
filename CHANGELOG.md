@@ -27,8 +27,20 @@ changes inline only. See the deprecation policy in
   failed removal with the manual edit instead of exiting with a traceback;
   the file is left unchanged. On Python 3.12 a value about 1,500 levels deep
   elsewhere in the file triggered this. A config discovery cannot decode is
-  still skipped without a note, and deep nesting inside a server entry still
-  fails during discovery (#1280). (#1279)
+  still skipped without a note. (#1279)
+
+- A host server entry holding a deeply nested value no longer crashes
+  `mms init`, `mms add --from-clients` or `mms prune`. An entry too deep to
+  copy is skipped during discovery with a note naming it, and the other
+  servers in the same file are still offered; a skipped entry is never
+  pruned. A value nested more than about 250 levels, past what
+  `origin.original` can record, makes `mms init` and `mms add --from-clients`
+  stop with an error naming the entry before anything is written
+  (`mms add --json` reports `origin_too_deep`); `mms prune` still backs such
+  an entry up and removes it. The prune backup
+  log, the STM config writer and the `.mcp.json` registration writer report
+  a value too deep to serialize instead of a traceback and leave their file
+  unchanged. (#1280)
 
 ### Added
 

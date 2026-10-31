@@ -765,7 +765,6 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
     ``mode=0o600`` keeps the rendered file out of a permissive listing
     even if the parent directory is shared.
     """
-    payload = _json_dumps(data, indent=2, ensure_ascii=False) + "\n"
     # The path the error names is fixed BEFORE the write: ``resolve()`` of a
     # relative path reads the cwd, and an error handler must not repeat a
     # filesystem call that can fail the same way (a cwd deleted mid-command
@@ -775,6 +774,13 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
         shown = shown.resolve()
     except OSError:
         pass
+    try:
+        payload = _json_dumps(data, indent=2, ensure_ascii=False) + "\n"
+    except RecursionError as exc:
+        # A hand-edited config can hold a value the decoder parsed but the
+        # encoder cannot re-emit at this stack depth; nothing was written yet
+        # (#1280).
+        raise ConfigWriteError("serialize", shown, exc) from exc
     try:
         atomic_write_text(config_path, payload, mode=0o600, durable=True)
     except OSError as exc:
@@ -1334,10 +1340,22 @@ def _write_mcp_json_for_stm(
     # explicit mode the helper's mkstemp temp (0600) survives the rename and
     # silently makes the file unreadable to group/other.
     try:
+        serialized = json.dumps(existing, indent=2) + "\n"
+    except RecursionError as exc:
+        # The decoder above survived this file's nesting; the encoder runs at
+        # a deeper stack and may not (#1280). Same outcome as a parse failure.
+        click.echo(
+            f"{_err('Error:')} Failed to rewrite {_disp(str(mcp_path))}: nested too deeply "
+            "to serialize (RecursionError).",
+            err=True,
+        )
+        click.echo("    Registration aborted; the file was not modified.", err=True)
+        raise SystemExit(1) from exc
+    try:
         file_mode = mcp_path.stat().st_mode & 0o777
     except OSError:
         file_mode = 0o644
-    atomic_write_text(mcp_path, json.dumps(existing, indent=2) + "\n", mode=file_mode, durable=True)
+    atomic_write_text(mcp_path, serialized, mode=file_mode, durable=True)
     return mcp_path, True
 
 
@@ -4027,9 +4045,23 @@ def _discover_candidates(cwd: Path) -> list[_DiscoveredCandidate]:
             # Each reader that re-derived it from ``raw`` plus a transport had
             # its own chance to derive it differently, which is how the scoped
             # gate came to read an unknown transport as HTTP (#984 codex R4).
-            candidate = _DiscoveredCandidate.from_scan(
-                name, spec, raw=raw, entry=entry, source_ref=source_ref
-            )
+            try:
+                candidate = _DiscoveredCandidate.from_scan(
+                    name, spec, raw=raw, entry=entry, source_ref=source_ref
+                )
+            except RecursionError:
+                # The verbatim copy of ``raw`` recursed past the interpreter's
+                # limit: the reader parsed the file, but this entry holds a
+                # value nested deeper than the copy survives at this stack
+                # depth (#1280). Skipped like the encoding cases above, so the
+                # rest of the file is still offered, and a skipped entry is
+                # never pruned.
+                click.echo(
+                    f"{_warn('Note:')} skipping {name!r} from {spec.label} — "
+                    "it holds a value nested too deeply to copy (value withheld).",
+                    err=True,
+                )
+                continue
             if candidate.identity_unreadable:
                 # Nothing else says so. The normalizer takes ``env`` /
                 # ``headers`` only when they are already mappings, and drops
@@ -4380,6 +4412,25 @@ def _echo_plugin_bypass(rows: list[_PluginBypass], *, err: bool) -> None:
         )
 
 
+class _OriginTooDeep(Exception):
+    """A candidate's verbatim host entry cannot be serialized as ``origin.original``.
+
+    pydantic-core's serializer refuses nesting past a fixed depth (254 levels
+    under pydantic-core 2.50, on every interpreter) with a plain
+    ``ValueError``, well before the interpreter's own recursion limit, so an
+    entry discovery could copy can still fail here (#1280). Raised before any
+    write; each import command turns it into its own abort.
+    """
+
+    def __init__(self, cand: _DiscoveredCandidate) -> None:
+        self.name = cand.name
+        self.source = cand.source
+        super().__init__(
+            f"'{_disp(cand.name)}' in {cand.source} holds a value nested too deeply to "
+            "record as origin.original (value withheld); nothing was written"
+        )
+
+
 def _build_origin(cand: _DiscoveredCandidate, imported_at: str) -> dict[str, Any]:
     """Build the per-entry ``origin`` provenance block for an import (#475).
 
@@ -4387,6 +4438,10 @@ def _build_origin(cand: _DiscoveredCandidate, imported_at: str) -> dict[str, Any
     shape the CLI writes cannot drift from the schema the server documents
     (``proxy/config.py``). ``pruned`` / ``pruned_at`` stay at their defaults
     here; the prune writers update them per source (PR2 of #475).
+
+    Raises :class:`_OriginTooDeep` when the dump fails on nesting depth. Only
+    the dump is covered: a ``ValidationError`` from construction is a
+    ``ValueError`` too, and is not a depth failure.
     """
     # Deferred import: ``proxy.config`` materializes the full pydantic model
     # tree, which only the two import commands need — keep it off the CLI's
@@ -4399,7 +4454,10 @@ def _build_origin(cand: _DiscoveredCandidate, imported_at: str) -> dict[str, Any
         imported_at=imported_at,
         original=cand.raw,
     )
-    return origin.model_dump(mode="json", exclude_none=True)
+    try:
+        return origin.model_dump(mode="json", exclude_none=True)
+    except (ValueError, RecursionError) as exc:
+        raise _OriginTooDeep(cand) from exc
 
 
 def _format_candidate_detail(entry: dict[str, Any]) -> str:
@@ -4719,6 +4777,11 @@ def _append_pruned_backup(
             loaded = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             return (False, f"backup log {path} is unreadable ({exc}) — move it aside and retry")
+        except RecursionError:
+            return (
+                False,
+                f"backup log {path} is nested too deeply to parse — move it aside and retry",
+            )
         if not isinstance(loaded, dict) or not isinstance(loaded.get("entries"), list):
             return (
                 False,
@@ -4733,12 +4796,18 @@ def _append_pruned_backup(
             "pruned_at": pruned_at,
         }
     )
+    # Serialized before the write: every append re-encodes the whole log, and
+    # a row ``mms prune`` recorded from a deep host entry can push the encoder
+    # past the recursion limit at this stack depth. The log stays as it was
+    # and the caller skips the host delete (#1280).
+    try:
+        serialized = _json_dumps(data, indent=2, ensure_ascii=False) + "\n"
+    except RecursionError:
+        return (False, f"backup log {path} cannot be rewritten: nested too deeply to serialize")
     # 0600 like ``stm_proxy.json`` (``_save``): ``original`` carries verbatim
     # host env/headers, secrets included.
     try:
-        atomic_write_text(
-            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600, durable=True
-        )
+        atomic_write_text(path, serialized, mode=0o600, durable=True)
     except OSError as exc:
         return (False, f"backup log write failed: {exc}")
     return (True, None)
@@ -5721,7 +5790,17 @@ def _add_from_clients(
             suggested = _suggest_prefix(cand.name, used_prefixes)
             prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
         used_prefixes.add(prefix)
-        entry = {"prefix": prefix, **cand.entry, "origin": _build_origin(cand, imported_at)}
+        try:
+            origin = _build_origin(cand, imported_at)
+        except _OriginTooDeep as exc:
+            # Abort rather than skip: the operator picked this server, and
+            # ``--prune`` acts on the imported set, so a quiet partial import
+            # would prune the rest and report success (#1280).
+            click.echo(f"{_err('Error:')} {exc}.", err=True)
+            if as_json:
+                _json_fail("add", "origin_too_deep", str(exc), names=[cand.name])
+            raise SystemExit(1) from exc
+        entry = {"prefix": prefix, **cand.entry, "origin": origin}
         imported[cand.name] = entry
         imported_rows.append(
             {"name": cand.name, "prefix": prefix, "source": cand.source, "server": None}
@@ -6147,11 +6226,15 @@ def init(
             suggested = _suggest_prefix(cand.name, used_prefixes)
             prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
             used_prefixes.add(prefix)
-            imported[cand.name] = {
-                "prefix": prefix,
-                **cand.entry,
-                "origin": _build_origin(cand, imported_at),
-            }
+            try:
+                origin = _build_origin(cand, imported_at)
+            except _OriginTooDeep as exc:
+                # Nothing is saved until every pick is configured, so this
+                # leaves no config behind; ``_setup_json_result`` turns the
+                # exit into init's own failure document (#1280).
+                click.echo(f"{_err('Error:')} {exc}.", err=True)
+                raise SystemExit(1) from exc
+            imported[cand.name] = {"prefix": prefix, **cand.entry, "origin": origin}
             imported_candidates.append(cand)
     else:
         # Zero discovered candidates → true first-time user without any
