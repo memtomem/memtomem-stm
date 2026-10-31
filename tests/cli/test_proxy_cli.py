@@ -12589,8 +12589,9 @@ class TestEjectCommand:
         assert "schema loss" in result.output
 
     def test_clean_exit_but_no_visible_write_fails(self, runner, config, fake_claude_host):
-        """rc=0 with the entry absent from the expected host slot is a full
-        mismatch — the safety net for a CLI writing somewhere unexpected."""
+        """rc=0 with the entry absent from the expected host slot is a failed
+        verify — the safety net for a CLI writing somewhere unexpected. Not a
+        mismatch, so ``--accept-schema-loss`` cannot release it (#1282)."""
         self._seed_config(config, {"demo": _eject_entry()})
         fake_claude_host["write"] = False
 
@@ -12598,7 +12599,10 @@ class TestEjectCommand:
 
         assert result.exit_code == 1
         assert "demo" in self._stm_servers(config)
-        assert "not found at the expected host location" in result.output
+        assert (
+            "demo: cannot verify the host entry: 'demo' is not at the expected host "
+            "location after the restore — the STM entry is kept" in result.stderr
+        )
 
     # ── host-write failure / capability message ──
 
