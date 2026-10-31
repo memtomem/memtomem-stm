@@ -259,3 +259,59 @@ def held_empty_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
             proc.wait()
         if proc.stdout is not None:
             proc.stdout.close()
+
+
+def skip_if_inside_git(root: Path) -> None:
+    """Skip when ``root`` sits in a git checkout: its ``.git`` would change every key."""
+    import os
+
+    if any(os.path.lexists(p / ".git") for p in (root, *root.parents)):
+        pytest.skip("the temporary directory sits inside a git repository")
+
+
+def git_worktree(main_common: Path, wt: Path, name: str, *, backpointer: str | None = None) -> Path:
+    """Lay out a linked worktree the way git does, without running git.
+
+    Writes the worktree's ``.git`` file, and ``commondir`` plus the back-pointer
+    ``gitdir`` in its admin directory under ``main_common/worktrees/<name>``,
+    which it returns.
+    """
+    admin = main_common / "worktrees" / name
+    admin.mkdir(parents=True)
+    (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    (admin / "gitdir").write_text(f"{backpointer or wt / '.git'}\n", encoding="utf-8")
+    wt.mkdir(parents=True, exist_ok=True)
+    (wt / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    return admin
+
+
+# Each worktree metadata file, and each way it can take a branch of Claude
+# Code's project-key resolution that STM does not reproduce (#1271).
+CLAUDE_UNKNOWN_CASES = [
+    f"{target}:{how}"
+    for target in ("dotgit", "commondir", "gitdir")
+    for how in ("oversize", "not-utf8", "unc", "drive-relative")
+]
+
+
+def claude_unknown_worktree(base: Path, case: str, limit: int) -> tuple[Path, Path]:
+    """A linked worktree under ``base`` whose metadata takes ``case``.
+
+    ``limit`` is the resolver's metadata size cap. Returns ``(worktree, main)``.
+    """
+    common = base / "main" / ".git"
+    common.mkdir(parents=True)
+    wt = base / "wt"
+    admin = git_worktree(common, wt, "wt")
+    target, how = case.split(":")
+    files = {"dotgit": wt / ".git", "commondir": admin / "commondir", "gitdir": admin / "gitdir"}
+    file = files[target]
+    if how == "oversize":
+        text = file.read_text(encoding="utf-8").strip() + "\n" + "x" * (limit + 1)
+        file.write_text(text, encoding="utf-8")
+    elif how == "not-utf8":
+        file.write_bytes(file.read_bytes().strip() + b"\xff\n")
+    else:
+        value = {"unc": "//server/share/x", "drive-relative": "C:x"}[how]
+        file.write_text(f"gitdir: {value}\n" if target == "dotgit" else f"{value}\n")
+    return wt, base / "main"

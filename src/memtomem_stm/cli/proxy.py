@@ -53,6 +53,7 @@ from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import has_lone_surrogate, unencodable_field
 from memtomem_stm.cli._write_lock import ConfigWriteError, with_config_write_lock
 from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
+from memtomem_stm.mms.claude_config import claude_project_key
 from memtomem_stm.mms.import_hosts import (
     _DANGEROUS_ENV_KEYS,
     _desktop_config_path,
@@ -4199,26 +4200,31 @@ def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
     """Names disabled for ``cwd`` in ``/mcp``, from ``~/.claude.json`` (#1268).
 
     ``/mcp`` records a disabled plugin server under
-    ``projects[<resolved cwd>].disabledMcpServers`` as the name it shows,
+    ``projects[<key>].disabledMcpServers`` as the name it shows,
     ``plugin:<plugin>:<server>``, while ``claude plugin list --json`` keeps
     listing it unchanged (measured), so this file is the only place to learn it.
     Names are matched exactly: how ``/mcp`` spells unusual plugin names was not
     measured, and a name that does not match is still reported.
 
-    The key is the exact resolved ``cwd``. Claude Code appears to key a
-    project by its repository root, and on Windows with ``/`` separators, so
-    from a subdirectory or on Windows a disabled server may still be reported.
+    The key is the one Claude Code uses for ``cwd``
+    (:func:`~memtomem_stm.mms.claude_config.claude_project_key`): the
+    repository root, or the main checkout for a linked worktree. A layout
+    whose key STM cannot reproduce reads no disables, and an entry under any
+    other key is not one Claude Code reads for ``cwd``, so it hides nothing.
     With ``CLAUDE_CONFIG_DIR`` set to a nonempty value, Claude Code reads its
     config elsewhere and ``~/.claude.json`` may hold stale disables, so
-    nothing is read (#1271).
+    nothing is read.
 
     Anything unreadable yields no names, so it never hides a server.
     """
     if os.environ.get("CLAUDE_CONFIG_DIR"):
         return frozenset()
+    key = claude_project_key(cwd)
+    if key is None:
+        return frozenset()
     cc = _read_json_safely(Path("~/.claude.json").expanduser())
     projects = cc.get("projects") if cc else None
-    entry = projects.get(str(cwd.resolve())) if isinstance(projects, dict) else None
+    entry = projects.get(key) if isinstance(projects, dict) else None
     disabled = entry.get("disabledMcpServers") if isinstance(entry, dict) else None
     if not isinstance(disabled, list):
         return frozenset()
