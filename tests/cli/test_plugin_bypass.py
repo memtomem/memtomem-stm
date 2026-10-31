@@ -614,6 +614,9 @@ class TestMcpDisabledServers:
         return capsys.readouterr().out
 
     def test_disabled_server_is_dropped_and_its_sibling_kept(self, probe, home, tmp_path):
+        # A repository root of its own, so a `.git` file above tmp_path (a
+        # basetemp inside a linked worktree) cannot take the key away (#1295).
+        (tmp_path / ".git").mkdir()
         # The string `/mcp` wrote for a disabled firebase server (2026-10-30,
         # Claude Code 2.1.314); `claude plugin list --json` was unchanged.
         probe["out"] = [FIREBASE_TWO]
@@ -622,6 +625,7 @@ class TestMcpDisabledServers:
         assert self._names(tmp_path) == ["plugin:firebase:emulator"]
 
     def test_without_a_disable_both_are_reported(self, probe, home, tmp_path):
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, []))
 
@@ -629,8 +633,9 @@ class TestMcpDisabledServers:
 
     def test_another_projects_disable_does_not_apply(self, probe, home, tmp_path):
         probe["out"] = [FIREBASE_TWO]
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         other = tmp_path / "other"
-        other.mkdir()
+        (other / ".git").mkdir(parents=True)  # a project of its own, not a stale subdirectory
         _write_claude_json(home, _disabled_for(other, ["plugin:firebase:firebase"]))
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
@@ -638,7 +643,7 @@ class TestMcpDisabledServers:
     def test_symlinked_cwd_reads_the_resolved_key(self, probe, home, tmp_path):
         probe["out"] = [FIREBASE_TWO]
         real = tmp_path / "real"
-        real.mkdir()
+        (real / ".git").mkdir(parents=True)  # pins the key at the resolved directory
         link = tmp_path / "link"
         link.symlink_to(real, target_is_directory=True)
         _write_claude_json(home, _disabled_for(real, ["plugin:firebase:firebase"]))
@@ -646,6 +651,7 @@ class TestMcpDisabledServers:
         assert self._names(link) == ["plugin:firebase:emulator"]
 
     def test_bare_server_key_does_not_disable(self, probe, home, tmp_path):
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, ["firebase", "PLUGIN:FIREBASE:FIREBASE"]))
 
@@ -654,6 +660,7 @@ class TestMcpDisabledServers:
     def test_claude_config_dir_reads_no_disables(self, probe, home, tmp_path, monkeypatch):
         # Claude Code reads its config from the override, so a disable left in
         # ~/.claude.json may be stale: it must not hide a running server.
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
@@ -780,7 +787,8 @@ class TestMcpDisabledServers:
         assert _says("no_key", note)
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows key form")
-    def test_backslash_key_hides_nothing_on_windows(self, probe, home, tmp_path):
+    def test_backslash_key_hides_nothing_on_windows(self, probe, home, tmp_path, capsys):
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         key = str(tmp_path.resolve())
         _write_claude_json(
@@ -788,8 +796,10 @@ class TestMcpDisabledServers:
         )
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+        assert _UNREAD_HEADER not in self._note(tmp_path, capsys)  # the key was resolved
 
     def test_non_string_members_are_ignored_not_fatal(self, probe, home, tmp_path):
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase", None, 3]))
 
@@ -1009,6 +1019,7 @@ class TestCommandsReport:
             assert canary not in result.output
 
     def test_add_from_clients_json_omits_a_server_disabled_in_mcp(self, sandbox, probe):
+        (sandbox["cwd"] / ".git").mkdir()  # pins the key: no caveat wherever tmp lives
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(
             sandbox["home"], _disabled_for(sandbox["cwd"], ["plugin:firebase:firebase"])
@@ -1052,6 +1063,7 @@ class TestCommandsReport:
     def test_prune_without_upstreams_survives_a_deeply_nested_claude_json(self, sandbox, probe):
         # prune returns before discovery when nothing is configured, so the
         # disable read is the only parse of ~/.claude.json on this path.
+        (sandbox["cwd"] / ".git").mkdir()  # pins the key, so that parse is reached
         probe["out"] = [FIREBASE]
         _write_claude_json(sandbox["home"], '{"projects": ' + "[" * 100_000 + "]" * 100_000 + "}")
         config = _config(sandbox["home"])
@@ -1063,11 +1075,14 @@ class TestCommandsReport:
         assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
             "plugin:firebase:firebase"
         ]
+        assert document["plugin_bypass_disables_unread"] is None  # the file was read
 
     @pytest.mark.skipif(sys.platform == "win32", reason="the project match is off on Windows")
     def test_add_from_clients_json_omits_an_install_from_another_project(self, sandbox, probe):
+        # Both roots known, so the install is told apart from this project.
+        (sandbox["cwd"] / ".git").mkdir()
         elsewhere = sandbox["home"] / "elsewhere"
-        elsewhere.mkdir()
+        (elsewhere / ".git").mkdir(parents=True)
         probe["out"] = [{**FIREBASE, "projectPath": str(elsewhere)}]
         config = _config(sandbox["home"])
 
