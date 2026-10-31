@@ -68,7 +68,9 @@ changes inline only. See the deprecation policy in
   backup or config write that fails (a read-only directory, a full disk) is
   reported as an error saying the config was not changed and, when the
   backup was written, where it is. Each of these used to exit with a
-  traceback. (#1285)
+  traceback. (#1286, #1285)
+  **Behavior change**: none external — every case changed here used to end
+  in a traceback.
 
 ### Added
 
