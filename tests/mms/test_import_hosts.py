@@ -354,6 +354,33 @@ class TestScanCodex:
         assert ih._read_toml_safely(codex_dir / "config.toml") is None
         assert ih.scan_codex(tmp_path) == []
 
+    @pytest.mark.parametrize(
+        "text",
+        ["a = " + "[" * 600 + "]" * 600 + "\n", "x = " + "9" * 5000 + "\n"],
+        ids=["deep-array", "huge-int"],
+    )
+    def test_unparseable_toml_is_skipped(self, sandbox_home, tmp_path, text):
+        # tomllib raises RecursionError on a 500-deep array and a plain
+        # ValueError (not TOMLDecodeError) past int()'s 4,300-digit limit,
+        # measured on 3.12-3.14 (#1285).
+        codex_dir = sandbox_home / ".codex"
+        codex_dir.mkdir()
+        (codex_dir / "config.toml").write_text(text, encoding="utf-8")
+        assert ih._read_toml_safely(codex_dir / "config.toml") is None
+        assert ih.scan_codex(tmp_path) == []
+        assert ih.codex_declared_names(tmp_path) == set()
+
+    @pytest.mark.parametrize("exc", [RecursionError, ValueError])
+    def test_injected_parser_failure_is_skipped(self, sandbox_home, monkeypatch, exc):
+        path = sandbox_home / "config.toml"
+        path.write_text("x = 1\n", encoding="utf-8")
+
+        def fail(_f):
+            raise exc("private-canary")
+
+        monkeypatch.setattr(ih.tomllib, "load", fail)
+        assert ih._read_toml_safely(path) is None
+
     def test_honors_codex_home(self, sandbox_home, tmp_path, monkeypatch):
         codex_home = tmp_path / "portable-codex"
         codex_home.mkdir()

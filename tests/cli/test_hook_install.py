@@ -888,3 +888,224 @@ def test_hook_install_malformed_bare_payload_fails_cleanly(
     assert result.exit_code == 1
     assert "invalid MEMTOMEM_STM_* configuration" in result.output
     assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+# ── deep or unwritable host configs fail as HookInstallError (#1285) ─────────
+#
+# ``copy.deepcopy`` recurses in Python, so a config nested 1,000 deep fails it
+# on every supported interpreter while every decoder still parses it. The
+# parser and serializer branches depend on the stack, so they are injected.
+
+_DEEP = 1000
+_CANARY = "private-canary"
+
+
+def _deep_object(depth: int) -> dict:
+    value: dict = {"leaf": 0}
+    for _ in range(depth):
+        value = {"a": value}
+    return value
+
+
+def _plan(action: str, host: str):
+    if action == "install":
+        return plan_install(host, f"memtomem-stm hook --host {host}")
+    return plan_uninstall(host)
+
+
+@pytest.mark.parametrize("action", ["install", "uninstall"])
+def test_cli_refuses_a_config_too_deep_to_rewrite(redirect, action) -> None:
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    before = json.dumps({"deep": _deep_object(_DEEP)})
+    path.write_text(before, encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["hook", action, "--host", "claude", "--apply"])
+
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code == 1
+    assert "is nested too deeply to rewrite (RecursionError); refusing to modify it" in (
+        result.output
+    )
+    assert path.read_text(encoding="utf-8") == before
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]
+
+
+@pytest.mark.parametrize("action", ["install", "uninstall"])
+@pytest.mark.parametrize("host", ["claude", "codex"])
+def test_plan_refuses_a_config_the_parser_recurses_on(redirect, monkeypatch, action, host) -> None:
+    from memtomem_stm.cli import hook_hosts
+
+    path = redirect(host)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}" if host == "claude" else "x = 1\n", encoding="utf-8")
+
+    def recurse(_text, *args, **kwargs):
+        raise RecursionError(_CANARY)
+
+    if host == "claude":
+        monkeypatch.setattr(hook_hosts.json, "loads", recurse)
+    else:
+        monkeypatch.setattr(hook_hosts.tomllib, "loads", recurse)
+
+    with pytest.raises(HookInstallError) as exc_info:
+        _plan(action, host)
+
+    message = str(exc_info.value)
+    assert message == (
+        f"{path} is nested too deeply to parse (RecursionError); refusing to "
+        "modify it. Fix or remove the file, then re-run."
+    )
+
+
+@pytest.mark.parametrize("action", ["install", "uninstall"])
+@pytest.mark.parametrize("stage", ["copy", "serialize"])
+def test_plan_refuses_a_config_too_deep_to_copy_or_serialize(
+    redirect, monkeypatch, action, stage
+) -> None:
+    from memtomem_stm.cli import hook_hosts
+
+    path = redirect("codex")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # An STM block to remove, so uninstall reaches the serializer too.
+    path.write_text(
+        _plan("install", "codex").new_text if action == "uninstall" else "x = 1\n",
+        encoding="utf-8",
+    )
+    fired: list[str] = []
+
+    def recurse(*args, **kwargs):
+        fired.append(stage)
+        raise RecursionError(_CANARY)
+
+    if stage == "copy":
+        monkeypatch.setattr(hook_hosts.copy, "deepcopy", recurse)
+    else:
+        monkeypatch.setattr(hook_hosts, "_serialize", recurse)
+
+    with pytest.raises(HookInstallError) as exc_info:
+        _plan(action, "codex")
+
+    assert fired
+    assert str(exc_info.value) == (
+        f"{path} is nested too deeply to rewrite (RecursionError); refusing to "
+        "modify it. Fix or remove the file, then re-run."
+    )
+
+
+def test_plan_reports_an_unsearchable_config_directory(redirect, monkeypatch) -> None:
+    """Python 3.12/3.13 ``Path.exists`` raises ``PermissionError`` for a file
+    under a directory without search permission; 3.14 returns False."""
+    path = redirect("claude")
+    real_exists = Path.exists
+
+    def exists(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", exists)
+
+    with pytest.raises(HookInstallError, match=r"^cannot read .*Permission denied"):
+        plan_install("claude", "memtomem-stm hook --host claude")
+
+
+def _fail_with_permission_error(*args, **kwargs):
+    raise PermissionError(13, "Permission denied")
+
+
+@pytest.mark.parametrize("failure", ["open", "partial-and-cleanup"])
+def test_apply_change_reports_a_backup_it_cannot_write(redirect, monkeypatch, failure) -> None:
+    """Through the real ``_write_backup``. When a partial backup cannot be
+    removed either, the leftover file exists, so the message claims only that
+    the config is unchanged (#1285 review)."""
+    from memtomem_stm.cli import hook_hosts
+
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}", encoding="utf-8")
+    backup = path.parent / (path.name + ".bak")
+    change = plan_install("claude", "memtomem-stm hook --host claude")
+    writes: list = []
+    monkeypatch.setattr(hook_hosts, "atomic_write_text", lambda *a, **k: writes.append(a))
+    if failure == "open":
+        real_open = hook_hosts.os.open
+
+        def os_open(target, *args, **kwargs):
+            if str(target) == str(backup):
+                raise PermissionError(13, "Permission denied")
+            return real_open(target, *args, **kwargs)
+
+        monkeypatch.setattr(hook_hosts.os, "open", os_open)
+    else:
+        real_unlink = Path.unlink
+
+        def fdopen(fd, *args, **kwargs):
+            hook_hosts.os.close(fd)
+            raise OSError(28, "No space left on device")
+
+        def unlink(self, *args, **kwargs):
+            if self == backup:
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(hook_hosts.os, "fdopen", fdopen)
+        monkeypatch.setattr(Path, "unlink", unlink)
+
+    with pytest.raises(HookInstallError) as exc_info:
+        apply_change(change)
+
+    assert str(exc_info.value) == (
+        f"cannot back up {path} before writing ([Errno 13] Permission denied); it was not changed."
+    )
+    assert writes == []
+    assert path.read_text(encoding="utf-8") == "{}"
+    assert backup.exists() is (failure == "partial-and-cleanup")
+
+
+@pytest.mark.parametrize("prior", [True, False], ids=["update", "create"])
+def test_apply_change_reports_a_config_it_cannot_write(redirect, monkeypatch, prior) -> None:
+    from memtomem_stm.cli import hook_hosts
+
+    path = redirect("claude")
+    if prior:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    change = plan_install("claude", "memtomem-stm hook --host claude")
+    monkeypatch.setattr(hook_hosts, "atomic_write_text", _fail_with_permission_error)
+
+    with pytest.raises(HookInstallError) as exc_info:
+        apply_change(change)
+
+    backup = path.parent / (path.name + ".bak")
+    if prior:
+        assert str(exc_info.value) == (
+            f"cannot write {path} ([Errno 13] Permission denied); it was not changed; "
+            f"the backup at {backup} is a copy of it."
+        )
+        assert path.read_text(encoding="utf-8") == "{}"
+        assert backup.read_text(encoding="utf-8") == "{}"
+    else:
+        assert str(exc_info.value) == (
+            f"cannot write {path} ([Errno 13] Permission denied); it was not changed."
+        )
+        assert not path.exists()
+        assert not backup.exists()
+
+
+@pytest.mark.parametrize("action", ["install", "uninstall"])
+def test_cli_apply_write_failure_exits_cleanly(redirect, monkeypatch, action) -> None:
+    from memtomem_stm.cli import hook_hosts
+
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prior = _plan("install", "claude").new_text if action == "uninstall" else "{}"
+    path.write_text(prior, encoding="utf-8")
+    monkeypatch.setattr(hook_hosts, "atomic_write_text", _fail_with_permission_error)
+
+    result = CliRunner().invoke(cli, ["hook", action, "--host", "claude", "--apply"])
+
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code == 1
+    assert f"cannot write {path}" in result.output
+    assert path.read_text(encoding="utf-8") == prior
