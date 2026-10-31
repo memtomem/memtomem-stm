@@ -1112,7 +1112,7 @@ def _route_failure(res, error: str) -> dict:
 
 
 def test_route_json_without_a_marker_emits_project_not_initialized(runner, sandbox):
-    # A repository root of its own keeps the reported root at cwd under any basetemp.
+    # A repository root of its own keeps the reported root at cwd even below a checkout.
     (sandbox["cwd"] / ".git").mkdir()
     config = sandbox["home"] / "proxy.json"
 
