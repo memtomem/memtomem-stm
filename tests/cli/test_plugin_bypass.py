@@ -19,16 +19,9 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from helpers import (
-    CLAUDE_UNKNOWN_CASES,
-    claude_unknown_worktree,
-    git_worktree,
-    set_home,
-    skip_if_inside_git,
-)
+from helpers import GIT_FILE_LAYOUTS, set_home, skip_if_inside_git
 from memtomem_stm.cli import proxy as proxy_mod
 from memtomem_stm.cli.proxy import cli
-from memtomem_stm.mms import claude_config
 
 # Stands for the directory the probe runs in: the ``probe`` fixture replaces a
 # ``projectPath`` equal to this with that directory, so a record carrying it is
@@ -653,19 +646,6 @@ class TestMcpDisabledServers:
 
         assert self._names(repo / "src") == ["plugin:firebase:emulator"]
 
-    def test_linked_worktree_reads_the_main_checkout_entry(self, probe, home, tmp_path):
-        # Started in <worktree>/src, Claude Code used the main checkout's entry
-        # and created none for the worktree (2026-10-31, Claude Code 2.1.316).
-        skip_if_inside_git(tmp_path.resolve())
-        main = tmp_path / "main"
-        (main / ".git").mkdir(parents=True)
-        git_worktree(main / ".git", tmp_path / "wt", "wt")
-        (tmp_path / "wt" / "src").mkdir()
-        probe["out"] = [FIREBASE_TWO]
-        _write_claude_json(home, _disabled_for(main, ["plugin:firebase:firebase"]))
-
-        assert self._names(tmp_path / "wt" / "src") == ["plugin:firebase:emulator"]
-
     def test_stale_subdirectory_entry_hides_nothing(self, probe, home, tmp_path):
         # Claude Code never reads an entry keyed by a subdirectory of a
         # repository, so a disable left there is stale.
@@ -678,28 +658,19 @@ class TestMcpDisabledServers:
 
         assert self._names(repo / "src") == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
 
-    @pytest.mark.parametrize("case", CLAUDE_UNKNOWN_CASES)
-    def test_a_key_stm_cannot_reproduce_hides_nothing(self, probe, home, tmp_path, case):
+    @pytest.mark.parametrize("layout", sorted(GIT_FILE_LAYOUTS))
+    def test_git_file_or_symlink_hides_nothing(self, probe, home, tmp_path, layout):
+        # No key is given for these layouts, so a disable under the start
+        # directory, its repository root or the main checkout hides nothing.
         skip_if_inside_git(tmp_path.resolve())
-        wt, main = claude_unknown_worktree(tmp_path, case, claude_config._METADATA_LIMIT)
+        start, main = GIT_FILE_LAYOUTS[layout](tmp_path)
+        marked = next(p for p in (start, *start.parents) if os.path.lexists(p / ".git"))
         probe["out"] = [FIREBASE_TWO]
-        _write_claude_json(home, _disabled_under([wt, main], ["plugin:firebase:firebase"]))
+        _write_claude_json(
+            home, _disabled_under([start, marked, main], ["plugin:firebase:firebase"])
+        )
 
-        assert self._names(wt) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
-
-    def test_symlinked_git_marker_hides_nothing(self, probe, home, tmp_path):
-        skip_if_inside_git(tmp_path.resolve())
-        (tmp_path / "real.git").mkdir()
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        try:
-            (repo / ".git").symlink_to(tmp_path / "real.git")
-        except OSError as exc:
-            pytest.skip(f"symlinks unavailable: {exc}")
-        probe["out"] = [FIREBASE_TWO]
-        _write_claude_json(home, _disabled_for(repo, ["plugin:firebase:firebase"]))
-
-        assert self._names(repo) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+        assert self._names(start) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows key form")
     def test_backslash_key_hides_nothing_on_windows(self, probe, home, tmp_path):

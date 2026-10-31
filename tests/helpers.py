@@ -285,33 +285,97 @@ def git_worktree(main_common: Path, wt: Path, name: str, *, backpointer: str | N
     return admin
 
 
-# Each worktree metadata file, and each way it can take a branch of Claude
-# Code's project-key resolution that STM does not reproduce (#1271).
-CLAUDE_UNKNOWN_CASES = [
-    f"{target}:{how}"
-    for target in ("dotgit", "commondir", "gitdir")
-    for how in ("oversize", "not-utf8", "unc", "drive-relative")
-]
+def _symlink(link: Path, target: str | Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
 
 
-def claude_unknown_worktree(base: Path, case: str, limit: int) -> tuple[Path, Path]:
-    """A linked worktree under ``base`` whose metadata takes ``case``.
+def _plain_worktree(base: Path) -> tuple[Path, Path]:
+    (base / "main" / ".git").mkdir(parents=True)
+    git_worktree(base / "main" / ".git", base / "wt", "wt")
+    (base / "wt" / "src").mkdir()
+    return base / "wt" / "src", base / "main"
 
-    ``limit`` is the resolver's metadata size cap. Returns ``(worktree, main)``.
-    """
-    common = base / "main" / ".git"
-    common.mkdir(parents=True)
-    wt = base / "wt"
-    admin = git_worktree(common, wt, "wt")
-    target, how = case.split(":")
-    files = {"dotgit": wt / ".git", "commondir": admin / "commondir", "gitdir": admin / "gitdir"}
-    file = files[target]
-    if how == "oversize":
-        text = file.read_text(encoding="utf-8").strip() + "\n" + "x" * (limit + 1)
-        file.write_text(text, encoding="utf-8")
-    elif how == "not-utf8":
-        file.write_bytes(file.read_bytes().strip() + b"\xff\n")
-    else:
-        value = {"unc": "//server/share/x", "drive-relative": "C:x"}[how]
-        file.write_text(f"gitdir: {value}\n" if target == "dotgit" else f"{value}\n")
-    return wt, base / "main"
+
+def _relative_gitdir(base: Path) -> tuple[Path, Path]:
+    import os
+
+    start, main = _plain_worktree(base)
+    admin = main / ".git" / "worktrees" / "wt"
+    (base / "wt" / ".git").write_text(
+        f"gitdir: {os.path.relpath(admin, base / 'wt')}\n", encoding="utf-8"
+    )
+    return start, main
+
+
+def _foreign_backpointer(base: Path) -> tuple[Path, Path]:
+    (base / "main" / ".git").mkdir(parents=True)
+    git_worktree(base / "main" / ".git", base / "wt", "wt", backpointer=str(base / "x" / ".git"))
+    return base / "wt", base / "main"
+
+
+def _bare_worktree(base: Path) -> tuple[Path, Path]:
+    (base / "bare.git").mkdir()
+    git_worktree(base / "bare.git", base / "wt", "wt")
+    return base / "wt", base / "bare.git"
+
+
+def _submodule(base: Path) -> tuple[Path, Path]:
+    modules = base / "super" / ".git" / "modules" / "m"
+    modules.mkdir(parents=True)
+    (base / "super" / "m").mkdir()
+    (base / "super" / "m" / ".git").write_text(f"gitdir: {modules}\n", encoding="utf-8")
+    return base / "super" / "m", base / "super"
+
+
+def _backpointer_through_symlink(target: str):
+    def build(base: Path) -> tuple[Path, Path]:
+        (base / "main" / ".git").mkdir(parents=True)
+        (base / "other" / "child").mkdir(parents=True)
+        wt = base / "wt"
+        git_worktree(base / "main" / ".git", wt, "wt", backpointer=str(wt / target))
+        if target.startswith("jump"):
+            _symlink(wt / "jump", base / "other" / "child", directory=True)
+        else:
+            _symlink(wt / "link", "/" + str(wt / ".git"))
+        return wt, base / "main"
+
+    return build
+
+
+def _prefixed_dotgit(prefix: str):
+    def build(base: Path) -> tuple[Path, Path]:
+        start, main = _plain_worktree(base)
+        dotgit = base / "wt" / ".git"
+        dotgit.write_text(prefix + dotgit.read_text(encoding="utf-8"), encoding="utf-8")
+        return start, main
+
+    return build
+
+
+def _symlinked_dotgit(base: Path) -> tuple[Path, Path]:
+    (base / "real.git").mkdir()
+    (base / "repo" / "src").mkdir(parents=True)
+    _symlink(base / "repo" / ".git", base / "real.git", directory=True)
+    return base / "repo" / "src", base / "repo"
+
+
+# Layouts whose ``.git`` is a file or a symlink, each with the start directory
+# and the entry a wrong mapping would read (#1271). Claude Code keys most of
+# them by the main checkout after checks STM does not reproduce, and the review
+# rounds of #1288 found three where a port of that mapping picked differently
+# (``backpointer-symlink-*``, ``bom``), so STM gives no key for any of them.
+GIT_FILE_LAYOUTS = {
+    "linked-worktree": _plain_worktree,
+    "relative-gitdir": _relative_gitdir,
+    "foreign-backpointer": _foreign_backpointer,
+    "bare-repo-worktree": _bare_worktree,
+    "submodule": _submodule,
+    "backpointer-symlink-dotdot": _backpointer_through_symlink("jump/../.git"),
+    "backpointer-symlink-unc-target": _backpointer_through_symlink("link"),
+    "bom": _prefixed_dotgit("\ufeff"),
+    "not-a-pointer": _prefixed_dotgit("garbage "),
+    "symlinked-dotgit": _symlinked_dotgit,
+}

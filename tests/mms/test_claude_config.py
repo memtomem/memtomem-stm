@@ -16,8 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import CLAUDE_UNKNOWN_CASES, claude_unknown_worktree, git_worktree, skip_if_inside_git
-from memtomem_stm.mms import claude_config
+from helpers import GIT_FILE_LAYOUTS, skip_if_inside_git
 from memtomem_stm.mms.claude_config import claude_project_key
 
 NFD_NAME = unicodedata.normalize("NFD", "한글repo")
@@ -49,54 +48,14 @@ class TestMeasuredLayouts:
 
         assert claude_project_key(base / "B" / "src") == _key(base / "B")
 
-    def test_linked_worktree_keys_the_main_checkout(self, base):
-        (base / "C" / "main" / ".git").mkdir(parents=True)
-        git_worktree(base / "C" / "main" / ".git", base / "C" / "wt", "wt")
-        (base / "C" / "wt" / "src").mkdir()
+    def test_nearest_git_directory_wins(self, base):
+        (base / "outer" / ".git").mkdir(parents=True)
+        (base / "outer" / "inner" / ".git").mkdir(parents=True)
+        (base / "outer" / "inner" / "src").mkdir()
 
-        assert claude_project_key(base / "C" / "wt" / "src") == _key(base / "C" / "main")
-
-    def test_backpointer_naming_another_path_keys_the_worktree(self, base):
-        (base / "D" / "main" / ".git").mkdir(parents=True)
-        elsewhere = base / "D" / "elsewhere" / ".git"
-        git_worktree(
-            base / "D" / "main" / ".git", base / "D" / "wt", "wt", backpointer=str(elsewhere)
+        assert claude_project_key(base / "outer" / "inner" / "src") == _key(
+            base / "outer" / "inner"
         )
-        (base / "D" / "wt" / "src").mkdir()
-
-        assert claude_project_key(base / "D" / "wt" / "src") == _key(base / "D" / "wt")
-
-    def test_backpointer_is_normalized_before_symlinks_are_followed(self, base):
-        # Claude Code resolves the back-pointer lexically (``..`` first), then
-        # takes its realpath: ``<wt>/jump/../.git`` is ``<wt>/.git`` even when
-        # ``jump`` is a symlink elsewhere.
-        (base / "J" / "main" / ".git").mkdir(parents=True)
-        (base / "J" / "other" / "child").mkdir(parents=True)
-        wt = base / "J" / "wt"
-        git_worktree(
-            base / "J" / "main" / ".git", wt, "wt", backpointer=str(wt / "jump" / ".." / ".git")
-        )
-        try:
-            (wt / "jump").symlink_to(base / "J" / "other" / "child", target_is_directory=True)
-        except OSError as exc:
-            pytest.skip(f"symlinks unavailable: {exc}")
-
-        assert claude_project_key(wt) == _key(base / "J" / "main")
-
-    def test_submodule_style_git_file_keys_its_own_root(self, base):
-        modules = base / "E" / "super" / ".git" / "modules" / "m"
-        modules.mkdir(parents=True)
-        (base / "E" / "m").mkdir()
-        (base / "E" / "m" / ".git").write_text(f"gitdir: {modules}\n", encoding="utf-8")
-
-        assert claude_project_key(base / "E" / "m") == _key(base / "E" / "m")
-
-    def test_worktree_of_a_bare_repository_keys_the_repository_directory(self, base):
-        bare = base / "F" / "bare.git"
-        bare.mkdir(parents=True)
-        git_worktree(bare, base / "F" / "wt", "wt")
-
-        assert claude_project_key(base / "F" / "wt") == _key(bare)
 
     def test_nfd_directory_is_keyed_in_nfc(self, base):
         repo = base / "G" / NFD_NAME
@@ -111,68 +70,15 @@ class TestMeasuredLayouts:
         assert key == _key(base / "G" / NFC_NAME)
         assert key is not None and unicodedata.is_normalized("NFC", key)
 
-    def test_relative_gitdir_keys_the_main_checkout(self, base):
-        (base / "H" / "main" / ".git").mkdir(parents=True)
-        admin = git_worktree(base / "H" / "main" / ".git", base / "H" / "wt", "wt")
-        (base / "H" / "wt" / ".git").write_text(
-            f"gitdir: {os.path.relpath(admin, base / 'H' / 'wt')}\n", encoding="utf-8"
-        )
-        (base / "H" / "wt" / "src").mkdir()
 
-        assert claude_project_key(base / "H" / "wt" / "src") == _key(base / "H" / "main")
+class TestNoKey:
+    @pytest.mark.parametrize("layout", sorted(GIT_FILE_LAYOUTS))
+    def test_git_file_or_symlink_gives_no_key(self, base, layout):
+        start, _main = GIT_FILE_LAYOUTS[layout](base)
 
-    def test_symlinked_git_marker_is_unknown(self, base):
-        # Claude Code keyed this layout by ``I/repo``, after vetting the link
-        # target with checks STM does not reproduce, so STM does not guess.
-        (base / "I" / "real.git").mkdir(parents=True)
-        (base / "I" / "repo" / "src").mkdir(parents=True)
-        try:
-            (base / "I" / "repo" / ".git").symlink_to(base / "I" / "real.git")
-        except OSError as exc:
-            pytest.skip(f"symlinks unavailable: {exc}")
+        assert claude_project_key(start) is None
 
-        assert claude_project_key(base / "I" / "repo" / "src") is None
-
-
-class TestFallbacks:
-    def test_git_file_without_gitdir_line_keys_its_root(self, base):
-        (base / "R").mkdir()
-        (base / "R" / ".git").write_text("not a pointer\n", encoding="utf-8")
-
-        assert claude_project_key(base / "R") == _key(base / "R")
-
-    @pytest.mark.parametrize(
-        ("prefix", "expected"),
-        [("\ufeff", "main"), ("\x1c", "wt")],
-        ids=["bom-trimmed", "info-separator-kept"],
-    )
-    def test_metadata_is_trimmed_like_javascript(self, base, prefix, expected):
-        # Claude Code trims each file with JavaScript's ``trim()``: a leading
-        # BOM goes, a ``\x1c`` stays and the line no longer starts ``gitdir:``.
-        (base / "main" / ".git").mkdir(parents=True)
-        wt = base / "wt"
-        git_worktree(base / "main" / ".git", wt, "wt")
-        (wt / ".git").write_text(
-            prefix + (wt / ".git").read_text(encoding="utf-8"), encoding="utf-8"
-        )
-
-        assert claude_project_key(wt) == _key(base / expected)
-
-    def test_missing_admin_directory_keys_the_worktree(self, base):
-        (base / "W").mkdir()
-        (base / "W" / ".git").write_text(f"gitdir: {base / 'gone'}\n", encoding="utf-8")
-
-        assert claude_project_key(base / "W") == _key(base / "W")
-
-
-class TestUnknown:
-    @pytest.mark.parametrize("case", CLAUDE_UNKNOWN_CASES)
-    def test_metadata_stm_does_not_follow_is_unknown(self, base, case):
-        wt, _main = claude_unknown_worktree(base, case, claude_config._METADATA_LIMIT)
-
-        assert claude_project_key(wt) is None
-
-    def test_unresolvable_cwd_is_unknown(self, base, monkeypatch):
+    def test_unresolvable_cwd_gives_no_key(self, base, monkeypatch):
         def fail(self, strict=False):
             raise OSError("boom")
 

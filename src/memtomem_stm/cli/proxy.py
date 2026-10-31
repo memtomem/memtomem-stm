@@ -4208,8 +4208,8 @@ def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
 
     The key is the one Claude Code uses for ``cwd``
     (:func:`~memtomem_stm.mms.claude_config.claude_project_key`): the
-    repository root, or the main checkout for a linked worktree. A layout
-    whose key STM cannot reproduce reads no disables, and an entry under any
+    repository root. In a linked worktree, a submodule or behind a symlinked
+    ``.git`` there is no key and no disables are read, and an entry under any
     other key is not one Claude Code reads for ``cwd``, so it hides nothing.
     With ``CLAUDE_CONFIG_DIR`` set to a nonempty value, Claude Code reads its
     config elsewhere and ``~/.claude.json`` may hold stale disables, so
