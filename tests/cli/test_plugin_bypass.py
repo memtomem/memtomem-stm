@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -560,9 +561,10 @@ def _write_claude_json(home: Path, data: object) -> None:
 
 
 def _project_key(path: Path) -> str:
-    """How ``/mcp`` spells a project directory as a key: ``/`` separators on
-    Windows too (#1271). Built here, not by the resolver under test."""
-    return path.resolve().as_posix()
+    """How ``/mcp`` spells a project directory as a key: NFC, with ``/``
+    separators on Windows too (#1271). Built here, not by the resolver under
+    test."""
+    return unicodedata.normalize("NFC", path.resolve().as_posix())
 
 
 def _disabled_for(cwd: Path, names: object) -> dict:
@@ -641,6 +643,21 @@ class TestMcpDisabledServers:
         repo = tmp_path / "repo"
         (repo / ".git").mkdir(parents=True)
         (repo / "src").mkdir()
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(repo, ["plugin:firebase:firebase"]))
+
+        assert self._names(repo / "src") == ["plugin:firebase:emulator"]
+
+    def test_nfd_repository_reads_the_nfc_entry(self, probe, home, tmp_path):
+        # /mcp files a directory stored in NFD under its NFC spelling
+        # (2026-10-31, Claude Code 2.1.316).
+        skip_if_inside_git(tmp_path.resolve())
+        name = unicodedata.normalize("NFD", "한글repo")
+        repo = tmp_path / "nfd" / name
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        if os.listdir(tmp_path / "nfd") != [name]:
+            pytest.skip("the filesystem does not keep NFD names")
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(repo, ["plugin:firebase:firebase"]))
 
