@@ -11099,6 +11099,224 @@ def _user_candidate(name: str = "alpha", *, secret: str = "tok_secret", duplicat
     )
 
 
+class TestPruneUnderClaudeConfigDir:
+    """With ``CLAUDE_CONFIG_DIR`` nonempty, discovery still reads
+    ``~/.claude.json`` but ``claude mcp remove -s user|local`` deletes the
+    same name from ``$CLAUDE_CONFIG_DIR/.claude.json`` — measured on Claude
+    Code 2.1.316. So prune would validate and back up one server and delete
+    another. Claude Code global-config rows are manual-only there, on every
+    prune surface; ``.mcp.json`` is unaffected (#1287)."""
+
+    _ENTRY = {"transport": "stdio", "command": "npx"}
+    _HINT = "# Claude Code reads $CLAUDE_CONFIG_DIR/.claude.json while CLAUDE_CONFIG_DIR is set"
+
+    def _candidates(self):
+        return [
+            _cand("u", "Claude Code (user)", entry=self._ENTRY),
+            _cand("l", "Claude Code (project)", entry=self._ENTRY),
+            _cand("p", ".mcp.json (project)", entry=self._ENTRY),
+        ]
+
+    def _seed(self, config: Path, monkeypatch, names=("u", "l", "p")) -> None:
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        servers = {n: {"prefix": n, **self._ENTRY} for n in names}
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": servers}), encoding="utf-8"
+        )
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: self._candidates())
+
+    @pytest.fixture
+    def removals(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, timeout=5, cwd=None):
+            calls.append(list(cmd))
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return calls
+
+    @staticmethod
+    def _removed(calls) -> set[tuple[str, str]]:
+        return {(c[3], c[5]) for c in calls if c[:3] == ["claude", "mcp", "remove"]}
+
+    @staticmethod
+    def _backed_up(home: Path) -> list[str]:
+        if not _backup_log_path(home).exists():
+            return []
+        return [row["name"] for row in _read_backup_log(home)["entries"]]
+
+    def test_prune_leaves_claude_rows_manual(
+        self, runner, config, monkeypatch, removals, _hermetic_home, tmp_path
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+        self._seed(config, monkeypatch)
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["planned"] == [{"name": "p", "source": ".mcp.json (project)"}]
+        assert payload["pruned"] == [{"name": "p", "source": ".mcp.json (project)"}]
+        assert payload["failed"] == []
+        manual = {(row["name"], row["source"]): row["hint"] for row in payload["manual"]}
+        assert set(manual) == {("u", "Claude Code (user)"), ("l", "Claude Code (project)")}
+        assert manual[("u", "Claude Code (user)")] == (
+            f"{self._HINT}, not the ~/.claude.json entry mms matched: compare 'u' there "
+            "before removing it by hand."
+        )
+        assert all("claude mcp remove" not in hint for hint in manual.values())
+        assert self._removed(removals) == {("p", "project")}
+        assert self._backed_up(_hermetic_home) == ["p"]
+
+    def test_prune_preview_marks_claude_rows_manual(
+        self, runner, config, monkeypatch, removals, tmp_path
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+        self._seed(config, monkeypatch)
+
+        result = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        assert any(
+            line.strip().startswith("u ") and line.endswith("Claude Code (user)  (manual)")
+            for line in lines
+        )
+        assert any(
+            line.strip().startswith("l ") and line.endswith("Claude Code (project)  (manual)")
+            for line in lines
+        )
+        assert sum(line.strip().startswith(self._HINT) for line in lines) == 2
+        assert removals == []
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_an_unset_or_empty_dir_still_prunes_claude_rows(
+        self, runner, config, monkeypatch, removals, _hermetic_home, value
+    ):
+        """Positive control: Claude Code falls back to ``~`` for an empty
+        value too, so only a nonempty one moves the active file."""
+        if value is not None:
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", value)
+        self._seed(config, monkeypatch)
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["manual"] == []
+        assert self._removed(removals) == {("u", "user"), ("l", "local"), ("p", "project")}
+        assert sorted(self._backed_up(_hermetic_home)) == ["l", "p", "u"]
+
+    def test_import_prune_leaves_claude_rows_manual(
+        self, runner, config, monkeypatch, removals, _hermetic_home, tmp_path
+    ):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+        self._seed(config, monkeypatch, names=())
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--prune",
+                "--allow-project-configs",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        prune = json.loads(result.stdout)["prune"]
+        assert prune["pruned"] == [{"name": "p", "source": ".mcp.json (project)"}]
+        assert prune["failed"] == []
+        assert {(row["name"], row["source"]) for row in prune["manual"]} == {
+            ("u", "Claude Code (user)"),
+            ("l", "Claude Code (project)"),
+        }
+        assert all(row["hint"].startswith(self._HINT) for row in prune["manual"])
+        assert self._removed(removals) == {("p", "project")}
+        assert self._backed_up(_hermetic_home) == ["p"]
+
+    def test_import_note_does_not_print_a_claude_remove_command(
+        self, runner, config, monkeypatch, removals, tmp_path
+    ):
+        """Without ``--prune`` the dual-registration note lists the removals to
+        make by hand; a ``claude mcp remove`` line there would delete the
+        active file's entry, which mms never read."""
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+        self._seed(config, monkeypatch, names=())
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--allow-project-configs", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        lines = [line.strip() for line in result.output.splitlines()]
+        assert sum(line.startswith(self._HINT) for line in lines) == 2
+        assert "claude mcp remove p -s project" in lines
+        assert not any(
+            line.startswith("claude mcp remove") and " -s project" not in line for line in lines
+        )
+        assert removals == []
+
+    def test_backstop_refuses_before_the_backup_append(
+        self, monkeypatch, removals, _hermetic_home, tmp_path
+    ):
+        """A caller's own allowlist cannot reach the shell-out or the log."""
+        from memtomem_stm.cli.proxy import _prune_imported_candidates
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+        user, local, _project = self._candidates()
+
+        pruned, failed = _prune_imported_candidates(
+            [user, local],
+            pruned_at="2026-11-01T00:00:00Z",
+            allowed_sources={("u", "Claude Code (user)"), ("l", "Claude Code (project)")},
+        )
+
+        assert pruned == []
+        assert [(name, src) for name, src, _ in failed] == [
+            ("u", "Claude Code (user)"),
+            ("l", "Claude Code (project)"),
+        ]
+        assert all("remove 'u' by hand" in err or "remove 'l' by hand" in err for *_, err in failed)
+        assert removals == []
+        assert self._backed_up(_hermetic_home) == []
+
+    @pytest.mark.parametrize("source", ["Claude Code (user)", "Claude Code (project)"])
+    def test_writer_refuses_without_shelling_out(self, monkeypatch, removals, tmp_path, source):
+        from memtomem_stm.cli.proxy import _prune_from_source
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+
+        ok, err = _prune_from_source("u", source)
+
+        assert ok is False
+        assert err == (
+            "Claude Code reads $CLAUDE_CONFIG_DIR/.claude.json while CLAUDE_CONFIG_DIR is set, "
+            "not the ~/.claude.json entry mms matched — remove 'u' by hand"
+        )
+        assert removals == []
+
+    def test_failure_report_prints_the_manual_hint(self, monkeypatch, capsys, tmp_path):
+        from memtomem_stm.cli.proxy import _report_prune_results
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+
+        had_failures = _report_prune_results([], [("u", "Claude Code (user)", "refused")])
+
+        assert had_failures is True
+        err = capsys.readouterr().err.splitlines()
+        heading = err.index("To remove them manually:")
+        assert err[heading + 1].strip().startswith(self._HINT)
+
+
 class TestEnvDivergentPrune:
     """The #983 reproduction, against real client-config files: one client,
     one upstream, no duplicates. Same command line, different ``env`` — a

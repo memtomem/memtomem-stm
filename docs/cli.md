@@ -299,7 +299,12 @@ Cursor entries are discovered and reported but never written: standalone
 `prune` and import-time `--prune` both list them as manual-only rows carrying
 the edit to make — never attempted, never a failure — and `eject` does not
 accept a `cursor-*` target.
-Only the Claude sources have a writer.
+Only the Claude sources have a writer. With `CLAUDE_CONFIG_DIR` nonempty, the
+Claude Code user and project entries are manual-only in the same way:
+discovery reads them from `~/.claude.json`, but `claude mcp remove` acts on
+`$CLAUDE_CONFIG_DIR/.claude.json`, which may hold a different server under the
+same name, so the hint asks you to compare that entry before removing it by
+hand. `.mcp.json` is still pruned.
 
 Bulk validation is atomic by default: if any selected server fails its probe,
 none of the imported servers are written and the command exits 1
@@ -470,7 +475,7 @@ Options:
   --json         Output as JSON for scripting (requires --yes, or --dry-run).
 ```
 
-Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Cursor entries are reported separately as manual-only rather than planned, attempted, or failed — `mms` never writes a Cursor config, so each one carries the manual edit to make. Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
+Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Cursor entries are reported separately as manual-only rather than planned, attempted, or failed — `mms` never writes a Cursor config, so each one carries the manual edit to make. So are Claude Code user and project entries while `CLAUDE_CONFIG_DIR` is nonempty: `claude mcp remove` would act on `$CLAUDE_CONFIG_DIR/.claude.json`, not on the `~/.claude.json` entry `mms` matched and backed up, and a same-named entry there may be a different server. Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
 
 Scope selection is explicit by design: pass `--all` to act on every dual-registered upstream, or pass one or more `NAMES` to limit the action. Either way the run only writes the sources `mms` can write; the rest are listed as `(manual)` with the edit to make. Running `mms prune` with no arguments is a usage error rather than defaulting to "everything" — this is a destructive operation against external config files and the default should be visible.
 
@@ -482,7 +487,7 @@ Your upstream definitions in `stm_proxy.json` are never modified — a prune cha
 
 Before deleting a host entry, every prune path appends the verbatim entry (with its source and timestamp) to `~/.memtomem/pruned_upstreams.json` (mode `0600`) — backup-before-delete, so a crash mid-prune never loses the only copy. The log is append-only and advisory: [`mms eject`](#eject) suggests it when an entry has no recorded origin, but never restores from it without your confirmation.
 
-With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "manual": [{"name", "source", "hint"}], "conflicts": [{"name", "source"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}], "plugin_bypass": [...], "plugin_bypass_disables_unread": null | "no_key" | "config_dir", "codex_extra_servers": [...] | null}` — `plugin_bypass` lists the [plugin servers](#claude-code-plugin-servers) that bypass STM, which prune never touches, with the reason `/mcp` disables were not read beside it (both are also on the `not_dual_registered` failure document); `planned` contains only sources `mms` will attempt to write; `manual` contains unmanaged sources (currently Cursor) with the edit to make; `conflicts` contains sources holding a different server under the same name, which carry no `hint` because there is no edit to recommend. Each actual `failed` row's `hint` is the exact manual removal command. A manual-only run exits 0 with `ok: true` because no planned action failed. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
+With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "manual": [{"name", "source", "hint"}], "conflicts": [{"name", "source"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}], "plugin_bypass": [...], "plugin_bypass_disables_unread": null | "no_key" | "config_dir", "codex_extra_servers": [...] | null}` — `plugin_bypass` lists the [plugin servers](#claude-code-plugin-servers) that bypass STM, which prune never touches, with the reason `/mcp` disables were not read beside it (both are also on the `not_dual_registered` failure document); `planned` contains only sources `mms` will attempt to write; `manual` contains unmanaged sources (currently Cursor), plus Claude Code user and project entries while `CLAUDE_CONFIG_DIR` is nonempty, with the edit to make; `conflicts` contains sources holding a different server under the same name, which carry no `hint` because there is no edit to recommend. Each actual `failed` row's `hint` is the exact manual removal command. A manual-only run exits 0 with `ok: true` because no planned action failed. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
 
 ```bash
 mms prune --all              # remove every writable dual registration (TTY: confirm prompt)
