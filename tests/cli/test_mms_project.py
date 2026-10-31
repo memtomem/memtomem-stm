@@ -19,7 +19,7 @@ from memtomem_stm.cli.mms_project import (
     project_group,
 )
 from memtomem_stm.mms import state
-from helpers import set_home
+from helpers import set_home, skip_if_inside_git
 
 
 @pytest.fixture
@@ -111,6 +111,7 @@ def test_init_rejects_nonexistent_path(runner, sandbox):
 
 def test_show_no_marker_no_git_friendly_text(runner, sandbox):
     """RFC §6.1 — pinned literal text used by `mms project show` UX."""
+    skip_if_inside_git(sandbox["cwd"].resolve())
     res = runner.invoke(project_group, ["show"])
     assert res.exit_code == 0, res.output
     expected = _show_no_marker_no_git_text(sandbox["cwd"].resolve())
@@ -155,6 +156,7 @@ def test_show_json_marker(runner, sandbox):
 
 
 def test_show_json_cwd_fallback(runner, sandbox):
+    skip_if_inside_git(sandbox["cwd"].resolve())
     res = runner.invoke(project_group, ["show", "--json"])
     payload = json.loads(res.output)
     assert payload["source"] == "cwd"
@@ -1110,6 +1112,8 @@ def _route_failure(res, error: str) -> dict:
 
 
 def test_route_json_without_a_marker_emits_project_not_initialized(runner, sandbox):
+    # A repository root of its own keeps the reported root at cwd under any basetemp.
+    (sandbox["cwd"] / ".git").mkdir()
     config = sandbox["home"] / "proxy.json"
 
     res = runner.invoke(project_group, ["route", "--config", str(config), "--json"])
