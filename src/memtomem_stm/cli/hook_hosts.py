@@ -512,9 +512,12 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
     Raises :class:`HookInstallError` when the file exists but does not parse as
     ``fmt`` or is not a top-level table/object — we refuse to overwrite a config
     we cannot understand."""
-    if not path.exists():
-        return None
     try:
+        # Inside the ``try``: on Python 3.12/3.13 ``exists()`` raises
+        # ``PermissionError`` for a file under an unsearchable directory, where
+        # 3.14 returns False and the file reads as absent (#1285).
+        if not path.exists():
+            return None
         raw = path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         # The exception's own text quotes the offending byte; give the offset only.
@@ -529,6 +532,11 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
     except (json.JSONDecodeError, ValueError, tomllib.TOMLDecodeError) as exc:
         raise HookInstallError(
             f"{path} exists but is not valid {fmt.upper()} ({exc}); refusing to "
+            "modify it. Fix or remove the file, then re-run."
+        ) from exc
+    except RecursionError as exc:
+        raise HookInstallError(
+            f"{path} is nested too deeply to parse (RecursionError); refusing to "
             "modify it. Fix or remove the file, then re-run."
         ) from exc
     if not isinstance(data, dict):
@@ -593,6 +601,15 @@ def _render_block(host_tag: str, command: str) -> str:
     return _serialize(spec.fmt, only).rstrip("\n")
 
 
+def _too_deep_to_rewrite(path: Path) -> HookInstallError:
+    """The refusal for a config that parsed but is too deep to copy, merge or
+    re-serialize: ``copy.deepcopy`` recurses in Python and fails first (#1285)."""
+    return HookInstallError(
+        f"{path} is nested too deeply to rewrite (RecursionError); refusing to "
+        "modify it. Fix or remove the file, then re-run."
+    )
+
+
 def plan_install(host_tag: str, command: str) -> HookChange:
     """Plan registering ``command`` as ``host_tag``'s PostToolUse hook.
 
@@ -605,12 +622,16 @@ def plan_install(host_tag: str, command: str) -> HookChange:
     base: dict[str, Any] = current[0] if current else {}
     current_text = current[1] if current else None
 
-    new_data = spec.install_fn(copy.deepcopy(base), command, matcher_for(host_tag))
-    new_text = _serialize(spec.fmt, new_data)
+    try:
+        new_data = spec.install_fn(copy.deepcopy(base), command, matcher_for(host_tag))
+        new_text = _serialize(spec.fmt, new_data)
+        unchanged = new_data == base
+    except RecursionError as exc:
+        raise _too_deep_to_rewrite(path) from exc
 
     if current is None:
         status, changed = "create", True
-    elif new_data == base:
+    elif unchanged:
         status, changed = "already", False
     else:
         status, changed = "update", True
@@ -653,9 +674,12 @@ def plan_uninstall(host_tag: str) -> HookChange:
             notes=(),
         )
     base, current_text = current
-    new_data = spec.uninstall_fn(copy.deepcopy(base))
-    changed = new_data != base
-    new_text = _serialize(spec.fmt, new_data)
+    try:
+        new_data = spec.uninstall_fn(copy.deepcopy(base))
+        changed = new_data != base
+        new_text = _serialize(spec.fmt, new_data)
+    except RecursionError as exc:
+        raise _too_deep_to_rewrite(path) from exc
     return HookChange(
         host_tag=host_tag,
         label=spec.label,
@@ -758,6 +782,19 @@ def apply_change(change: HookChange) -> Path | None:
         mode = 0o600
     backup: Path | None = None
     if change.current_text is not None:
-        backup = _write_backup(path, change.current_text, mode)
-    atomic_write_text(path, change.new_text, mode=mode, durable=True)
+        try:
+            backup = _write_backup(path, change.current_text, mode)
+        except OSError as exc:
+            # Only the config is known untouched: ``_write_backup`` removes a
+            # partial backup, but that removal can fail too (#1285 review).
+            raise HookInstallError(
+                f"cannot back up {path} before writing ({exc}); it was not changed."
+            ) from exc
+    try:
+        atomic_write_text(path, change.new_text, mode=mode, durable=True)
+    except OSError as exc:
+        # ``atomic_write_text`` leaves the target untouched on failure; the
+        # backup, if any, is a verbatim copy of it and stays (#1285).
+        kept = f"; the backup at {backup} is a copy of it" if backup is not None else ""
+        raise HookInstallError(f"cannot write {path} ({exc}); it was not changed{kept}.") from exc
     return backup
