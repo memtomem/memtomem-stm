@@ -13,6 +13,20 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The report of Claude Code plugin servers that bypass STM now leaves out a
+  server disabled in `/mcp` when the command runs from a subdirectory of the
+  repository: the disable is read from the project entry Claude Code uses,
+  keyed by the repository root, instead of the exact directory. A disable left
+  under a subdirectory key, which Claude Code does not read, no longer hides a
+  server. In a linked worktree, a submodule or behind a symlinked `.git`, no
+  disables are read. Discovery and import of project-scope servers still use
+  the directory itself. (#1288, #1271)
+  **Behavior change**: a plugin server hidden only by a disable filed under a
+  subdirectory's own key, or by any disable while the command runs in a linked
+  worktree, a submodule or behind a symlinked `.git`, is listed again. In the
+  first case, disabling it in `/mcp` again files it under the repository root,
+  where it is read; in the others, the report keeps listing it.
+
 - Host discovery ignores JSON decoder recursion failures, and direct host
   restore leaves the file unchanged when JSON cannot be decoded or re-encoded.
   (#1273)
