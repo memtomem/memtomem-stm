@@ -13440,6 +13440,33 @@ class TestEjectCommand:
         assert json.loads((_hermetic_home / ".claude.json").read_text(encoding="utf-8")) == cc
         assert "demo" in self._stm_servers(config)
 
+    def test_force_does_not_add_when_the_config_becomes_unknown_during_the_remove(
+        self, runner, config, tmp_path, fake_claude_host, _hermetic_home, monkeypatch
+    ):
+        """The add is checked too, and the refusal says the pre-remove already
+        happened rather than that nothing changed (#1271)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        cc = {"mcpServers": {"demo": {"command": "other-server"}}}
+        (_hermetic_home / ".claude.json").write_text(json.dumps(cc), encoding="utf-8")
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-user")})
+        remove = proxy_mod._claude_mcp_remove
+
+        def remove_then_change(*args, **kwargs):
+            result = remove(*args, **kwargs)
+            (_hermetic_home / ".claude").mkdir(exist_ok=True)
+            (_hermetic_home / ".claude" / ".config.json").write_text("{}", encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(proxy_mod, "_claude_mcp_remove", remove_then_change)
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--force", *_cfg_args(config)])
+
+        assert result.exit_code != 0, result.output
+        assert "already removed 'demo' from the host and it was not added back" in result.output
+        assert [c["cmd"][2] for c in fake_claude_host["calls"]] == ["remove"]
+        assert "demo" in self._stm_servers(config)
+
     def test_claude_user_restores_into_the_config_dir_file(
         self, runner, config, tmp_path, fake_claude_host, _hermetic_home, monkeypatch
     ):

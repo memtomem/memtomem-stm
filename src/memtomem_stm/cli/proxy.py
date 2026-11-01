@@ -4845,11 +4845,13 @@ def _prune_refusal(spec: _SourceSpec, name: str) -> str | None:
     A source without a writer is refused (#955). A Claude Code global-config
     row is not: discovery read the file and slot Claude Code uses, and
     ``claude mcp remove`` inherits the same environment, so it removes the
-    entry discovery matched and backed up (#1287, #1271) — as long as the
-    file is still the one discovery read. In this process the environment is
-    fixed, so the only way the answer changes is a legacy ``.config.json``
-    appearing, which makes it unknown; the rule is asked again by the
-    backstop before the backup append and by the writer before the shell-out.
+    entry discovery matched and backed up (#1287, #1271). The environment is
+    fixed for this process, so the resolver's answer can change only by
+    becoming unknown (a legacy ``.config.json`` appearing); this rule is asked
+    again by the backstop before the backup append and by the writer before
+    the shell-out, so such a row is refused. It does not pin the file itself:
+    an edit or replacement of the config while prune runs is not detected,
+    as it was not before (#1301).
     """
     if not spec.managed:
         return _unmanaged_prune_refusal(spec, name)
@@ -8432,16 +8434,15 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
         spawn_error = _argv_spawn_error(plan.name, plan.payload)
         if spawn_error is not None:
             return (False, spawn_error)
-        # The pre-check read the file Claude Code used then. In this process
-        # that answer can change only by becoming unknown (a legacy
-        # `.config.json` appearing), and then neither verb would act on the
-        # entry the pre-check compared (#1271).
-        if isinstance(claude_global_config(), ClaudeConfigUnknown):
-            return (
-                False,
-                "STM can no longer tell which file Claude Code reads its config from; "
-                "nothing was changed at the host",
-            )
+        # The pre-check read the file Claude Code used then. The resolver's
+        # answer can only become unknown in this process (a legacy
+        # `.config.json` appearing; the environment is fixed), and then
+        # neither verb would act on the file the pre-check read, so it is
+        # asked again before each one (#1271). This narrows the window, it
+        # does not close it: the file can still be edited or replaced while
+        # a `claude` subprocess runs, which no check here can see (#1301).
+        if _claude_config_unknown_now():
+            return (False, _EJECT_CONFIG_UNKNOWN + "; nothing was changed at the host")
         if plan.overwrite:
             # `claude mcp add-json` has no overwrite flag (same probe lineage
             # as `claude mcp add`, cli/proxy.py:274) — remove-then-add. The
@@ -8450,6 +8451,12 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
             ok, err = _claude_mcp_remove(plan.name, scope, cwd=cwd)
             if not ok:
                 return (False, f"--force pre-remove failed: {err}")
+            if _claude_config_unknown_now():
+                return (
+                    False,
+                    _EJECT_CONFIG_UNKNOWN + f"; the --force pre-remove already removed "
+                    f"'{plan.name}' from the host and it was not added back",
+                )
         return _claude_mcp_add_json(plan.name, plan.payload, scope, cwd=cwd)
     # ``plan.path`` is always set for mcp-json by plan resolution (the
     # preflight rejected pathless targets); mypy can't see that invariant.
@@ -8458,6 +8465,13 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
     # _write_mcp_json_for_stm); the Desktop config carries secrets (0600).
     default_mode = 0o644 if plan.kind == "mcp-json" else 0o600
     return _json_config_set_entry(target, plan.name, plan.payload, default_mode=default_mode)
+
+
+_EJECT_CONFIG_UNKNOWN = "STM can no longer tell which file Claude Code reads its config from"
+
+
+def _claude_config_unknown_now() -> bool:
+    return isinstance(claude_global_config(), ClaudeConfigUnknown)
 
 
 def _eject_verify(plan: _EjectPlan) -> list[str]:
