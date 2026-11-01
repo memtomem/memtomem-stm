@@ -20,7 +20,7 @@ changes inline only. See the deprecation policy in
   names MCP. The license is declared as the SPDX expression `Apache-2.0`
   (PEP 639), the project links gain Documentation and Changelog, and the
   classifiers gain `Environment :: Console`, `Python :: 3 :: Only` and
-  `Typing :: Typed`. PyPI shows it from the next release. (#1304)
+  `Typing :: Typed`. PyPI shows it from the next release. (#1305)
   **Behavior change**: none at runtime. The package metadata states the
   license as `License-Expression: Apache-2.0` instead of the `License` field
   and the `License :: OSI Approved :: Apache Software License` classifier,

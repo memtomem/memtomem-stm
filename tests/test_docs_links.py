@@ -424,19 +424,28 @@ def _pypi_readme_problems(text: str) -> list[str]:
 
     PyPI resolves no relative link or image (it has no repository tree to
     resolve them against) and renders a ``mermaid`` fence as raw source. Same-page
-    ``#anchor`` links work on both.
+    ``#anchor`` links work on both. Raw HTML counts too: the parser hands it back
+    verbatim, so ``href`` and ``src`` are read from it the way :func:`_anchors`
+    reads ``id``, comments removed first since a commented-out tag renders nothing.
     """
     problems: list[str] = []
     for token in _tokens(text):
-        if token.type == "fence" and token.info.strip().split(" ")[0] == "mermaid":
+        if token.type == "fence" and token.info.split()[:1] == ["mermaid"]:
             problems.append("mermaid fence")
-        target = None
+        targets: list[str] = []
         if token.type == "link_open":
-            target = token.attrGet("href")
+            targets.append(str(token.attrGet("href") or ""))
         elif token.type == "image":
-            target = token.attrGet("src")
-        if target is not None and not re.match(r"(https?:|mailto:|#)", str(target)):
-            problems.append(f"relative target: {target}")
+            targets.append(str(token.attrGet("src") or ""))
+        elif token.type in ("html_block", "html_inline"):
+            html = re.sub(r"<!--.*?-->", "", token.content, flags=re.DOTALL)
+            targets.extend(
+                match[1]
+                for match in re.findall(r"\b(?:href|src)\s*=\s*([\"'])(.*?)\1", html, re.IGNORECASE)
+            )
+        for target in targets:
+            if not re.match(r"(https?:|mailto:|#)", target):
+                problems.append(f"relative target: {target}")
     return problems
 
 
@@ -450,6 +459,26 @@ def test_pypi_readme_problems_detects_what_pypi_cannot_render() -> None:
         "relative target: docs/logo.png",
         "mermaid fence",
     ]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ('<a href="LICENSE">License</a>\n', ["relative target: LICENSE"]),
+        ("see <img src='docs/logo.png' alt=\"logo\"> here\n", ["relative target: docs/logo.png"]),
+        (
+            '<p align="center">\n<img SRC="docs/logo.png">\n</p>\n',
+            ["relative target: docs/logo.png"],
+        ),
+        ('<a href="https://example.com">ok</a> <a href="#top">top</a>\n', []),
+        ('<!-- <img src="docs/logo.png"> -->\n', []),
+        ("```mermaid\tcaption\nflowchart TB\n```\n", ["mermaid fence"]),
+        ("```mermaidish\nflowchart TB\n```\n", []),
+        ("```\nplain\n```\n", []),
+    ],
+)
+def test_pypi_readme_problems_reads_raw_html_and_fence_info(body: str, expected: list[str]) -> None:
+    assert _pypi_readme_problems(body) == expected
 
 
 def test_readme_renders_on_pypi() -> None:
