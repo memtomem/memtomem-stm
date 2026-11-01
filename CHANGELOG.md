@@ -9,7 +9,49 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.4] — 2026-11-01
+
+### Upgrade notes
+
+- **Under an absolute `CLAUDE_CONFIG_DIR`, discovery, `mms import`, `mms
+  host`, `prune` and `eject` use `$CLAUDE_CONFIG_DIR/.claude.json`** instead
+  of `~/.claude.json`, so they list the Claude Code user and project servers
+  Claude Code uses, and `eject` restores entries there where 0.7.3 refused.
+  (#1271, #1287)
+- **When STM cannot tell which file Claude Code reads its config from, it
+  reads no Claude Code user or project servers,** and `eject` to a Claude
+  Code user or project target refuses. `init`, `add --from-clients` and
+  `prune` print a note saying so, `mms host` reports `not_inspected`, and
+  `mms import` prints no note. `<cwd>/.mcp.json` is still read and ejected
+  to. This covers a `CLAUDE_CONFIG_DIR` that is relative, empty or has a `.`
+  or `..` component, a set `CLAUDE_CODE_CUSTOM_OAUTH_URL`, a `HOME`
+  (`USERPROFILE` on Windows) that is unset or fails the same test as
+  `CLAUDE_CONFIG_DIR`, and any legacy `.config.json`
+  in Claude Code's config directory, or one STM cannot check. That includes
+  an empty `~/.claude/.config.json` beside `~/.claude.json`, where Claude
+  Code reads `~/.claude.json` and 0.7.3 read it too. Remove an empty legacy
+  file you do not use. (#1271)
+- **The Claude Code project entry is the repository root's.** From a
+  subdirectory STM reads the root's entry instead of the subdirectory's, and
+  in a linked worktree, a submodule or behind a symlinked `.git` it reads
+  none. `eject` of a Claude Code project server recorded from such a
+  directory refuses, even with `--force`; restore it manually from
+  `upstream_servers.<name>.origin.original`. A server `mms import` recorded
+  from a subdirectory's own entry, and found in no other host config, shows
+  as `removed_at_host` when `mms host status` runs from that subdirectory,
+  and `mms host sync --apply` removes it from the registry once confirmed.
+  Review the sync plan before confirming. (#1271)
+- **A standalone `mms prune` whose plan is entirely manual-only prints the
+  rows and exits 0** instead of asking to confirm, or exiting 1 without a
+  TTY. `--json` still requires `--yes` or `--dry-run`. (#1287)
+- **`mms host sync --apply` keeps registry entries whose Claude Code config
+  was not read,** reporting them as `not_inspected` instead of removing them.
+  `host status|scan|sync --json` gain `not_inspected` fields. (#1271)
+- **The Claude Code plugin-server note and `doctor`'s `plugin_bypass`
+  warning can end with a sentence saying `/mcp` disables were not read,**
+  and the `--json` documents of `init`, `add --from-clients` and `prune`
+  gain `plugin_bypass_disables_unread` (`"no_key"`, `"no_config"` or
+  `null`). (#1289, #1294)
 
 ### Added
 
@@ -21,6 +63,8 @@ changes inline only. See the deprecation policy in
   reason. `null` records no reason, not a completed check. The rows keep
   their five keys.
   (#1294)
+  **Behavior change**: those `--json` documents gain the
+  `plugin_bypass_disables_unread` key.
 
 ### Fixed
 
@@ -31,30 +75,44 @@ changes inline only. See the deprecation policy in
   cannot tell which file Claude Code reads its config from — so a listed
   server may be one you already disabled. The `plugin_bypass` JSON rows are
   unchanged. (#1289, #1271)
+  **Behavior change**: in those cases the note and the `doctor` warning text
+  gain that sentence.
 - STM reads Claude Code's config file and project entry the way Claude Code
   does. Discovery, `mms import`, `mms host status|scan|sync`, `prune`, `eject`
   and the `/mcp` disable check read `$CLAUDE_CONFIG_DIR/.claude.json` when
   `CLAUDE_CONFIG_DIR` is an absolute path (before, the disable check read
-  nothing there and the rest read `~/.claude.json`), and the project entry Claude Code uses for the current directory: the
-  repository root from a subdirectory (they read the subdirectory's own entry,
-  which Claude Code does not use). With `CLAUDE_CONFIG_DIR` nonempty,
+  nothing there, `eject` refused, and the rest read `~/.claude.json`), and
+  the project entry Claude Code uses for the current directory: the
+  repository root from a subdirectory (discovery, import, host and prune
+  read the subdirectory's own entry, which Claude Code does not use; the
+  disable check already used the root's). With `CLAUDE_CONFIG_DIR` nonempty,
   `mms prune` and `--prune` matched and backed up the `~/.claude.json` entry
   while `claude mcp remove -s user|local` deleted the same name from
   `$CLAUDE_CONFIG_DIR/.claude.json`, and from a subdirectory a stale entry
   could be matched while the repository root's was removed; both now act on
   one entry. (#1271, #1287)
-  **Behavior change**: under an absolute `CLAUDE_CONFIG_DIR`, `prune` removes
-  Claude Code user and project entries again and `eject` restores them (it
-  refused before). When STM cannot tell which file Claude Code reads — a
-  relative, empty or `..`-containing `CLAUDE_CONFIG_DIR`, a set
-  `CLAUDE_CODE_CUSTOM_OAUTH_URL`, or a legacy `.config.json` in Claude Code's
-  config directory — it reads no Claude Code servers and says so (`Note:
-  Claude Code user and project servers were not read: …`), `eject` to a
-  Claude Code target refuses, and the disable reason is `"no_config"`. In a
-  linked worktree, a submodule or behind a symlinked `.git` the project entry
-  is not read. A standalone `mms prune` whose plan is entirely manual-only
-  (Cursor rows) prints the rows and exits 0 instead of asking to confirm, or
-  exiting 1 without a TTY; `--json` still requires `--yes` or `--dry-run`.
+  **Behavior change**: under an absolute `CLAUDE_CONFIG_DIR`, these commands
+  list and act on the Claude Code user and project servers in
+  `$CLAUDE_CONFIG_DIR/.claude.json`, not those in `~/.claude.json`, and
+  `eject` restores Claude Code user and project entries (0.7.3 refused).
+  When STM cannot tell which file Claude Code reads — a `CLAUDE_CONFIG_DIR`
+  that is relative, empty or has a `.` or `..` component, a set
+  `CLAUDE_CODE_CUSTOM_OAUTH_URL`, a `HOME` that is unset or fails the same
+  test, or any legacy
+  `.config.json` in Claude Code's config directory, even an empty one beside
+  `~/.claude.json`, or one STM cannot check — it reads no Claude Code user or
+  project servers (`init`, `add --from-clients` and `prune` print `Note:
+  Claude Code user and project servers were not read: …`), and `eject` to
+  a Claude Code user or project target refuses;
+  `<cwd>/.mcp.json` is unaffected. From a subdirectory the repository root's
+  project entry is read instead of the subdirectory's; in a linked worktree,
+  a submodule or behind a symlinked `.git` no project entry is read, and
+  `eject` of a project server recorded there refuses, even with `--force`.
+  A server imported from a subdirectory's own entry and in no other host
+  config becomes `removed_at_host` in `mms host status` run from there. A
+  standalone `mms prune` whose plan is entirely manual-only (Cursor rows)
+  prints the rows and exits 0 instead of asking to confirm, or exiting 1
+  without a TTY; `--json` still requires `--yes` or `--dry-run`.
 - `mms host sync --apply` no longer deletes registry entries whose Claude
   Code host config was not read: STM could not tell which config file or
   project entry is in use, or that file or `<cwd>/.mcp.json` is not a
