@@ -14,6 +14,8 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback_store import FeedbackStore
 from helpers import set_home
 
+_EXEC_SEARCH_KEYS = ("PATH", "NoDefaultCurrentDirectoryInExePath")
+
 
 @pytest.fixture(autouse=True)
 def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
@@ -42,13 +44,27 @@ def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
         # This is another home root. Tests that exercise custom Claude config
         # behavior set their own value after isolation.
         patch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        # Renames Claude Code's config file, so STM reads none of it (#1271).
+        patch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
         # MonkeyPatch restores deletions in reverse. Delete backwards so STM
         # keys regain their original order: case-equivalent names are resolved
         # last-one-wins by settings on POSIX.
         for name in reversed(list(os.environ)):
             if name.lower().startswith("memtomem_stm_"):
                 patch.delenv(name, raising=False)
-        yield
+        # Every CLI invocation and ``server.main`` rewrite these in this process
+        # (``harden_exec_search``). Under a simulated ``win32`` on POSIX the
+        # rewrite empties PATH, and an empty PATH would break every later
+        # test that runs a program by name, so put them back after each test.
+        saved = {k: os.environ.get(k) for k in _EXEC_SEARCH_KEYS}
+        try:
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 @pytest.fixture

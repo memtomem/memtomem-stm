@@ -3,9 +3,9 @@
 **Official website & docs: [https://memtomem.com](https://memtomem.com)**
 
 [![PyPI](https://img.shields.io/pypi/v/memtomem-stm)](https://pypi.org/project/memtomem-stm/)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-green)](https://python.org)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![CLA](https://img.shields.io/badge/CLA-required-green)](CLA.md)
+[![Python versions](https://img.shields.io/pypi/pyversions/memtomem-stm)](https://pypi.org/project/memtomem-stm/)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/memtomem/memtomem-stm/blob/main/LICENSE)
+[![CLA](https://img.shields.io/badge/CLA-required-green)](https://github.com/memtomem/memtomem-stm/blob/main/CLA.md)
 
 > 🧪 **Beta** — the core proxy path (compression, caching, surfacing) is ready for everyday use. APIs and defaults may still change between 0.x minor releases, always with an Upgrade notes entry, and a few features are marked [experimental](https://github.com/memtomem/memtomem-stm/blob/main/README.md#feature-maturity). Feedback and issue reports are especially welcome: [Issues](https://github.com/memtomem/memtomem-stm/issues) · [Discussions](https://github.com/memtomem/memtomem-stm/discussions).
 
@@ -25,22 +25,18 @@ It sits between your AI agent and its upstream MCP servers, compressing tool res
 - **Carries context across sessions** — surfaces prior decisions from memtomem LTM automatically, so the agent picks up where it left off rather than re-discovering what it already knew.
 - **Drops in front of any MCP server** — adds compression, caching, and observability as a proxy layer, without changes to upstream code.
 
-```mermaid
-flowchart TB
-    Agent["Agent<br/>(Claude Code, Cursor, …)"]
-    subgraph STM["memtomem-stm (STM)"]
-        Pipe["CLEAN → COMPRESS → SURFACE"]
-    end
-    LTM[("memtomem LTM<br/>(MCP server)")]
-    FS["filesystem<br/>MCP server"]
-    GH["github<br/>MCP server"]
-    Other["…any MCP server"]
-
-    Agent -->|MCP| STM
-    STM <-->|MCP: stdio / SSE / HTTP| FS
-    STM <-->|MCP| GH
-    STM <-->|MCP| Other
-    STM <-.->|surfacing<br/>via MCP| LTM
+```text
+                   Agent (Claude Code, Cursor, ...)
+                                   │ MCP
+                                   ▼
+  ┌────────────────────── memtomem-stm (STM) ──────────────────────┐
+  │                   CLEAN → COMPRESS → SURFACE                   │
+  └───────┬───────────────┬───────────────┬───────────────┬────────┘
+          │               │               │               ┊ surfacing via MCP
+          ▼               ▼               ▼               ▼
+     filesystem        github        ...any MCP     memtomem LTM
+     MCP server      MCP server        server       (MCP server)
+    └───────── MCP: stdio / SSE / HTTP ─────────┘
 ```
 
 ## Installation
@@ -284,4 +280,4 @@ tests must pass.
 
 ## License
 
-[Apache License 2.0](LICENSE). Contributions are accepted under the terms of the [Contributor License Agreement](CLA.md).
+[Apache License 2.0](https://github.com/memtomem/memtomem-stm/blob/main/LICENSE). Contributions are accepted under the terms of the [Contributor License Agreement](https://github.com/memtomem/memtomem-stm/blob/main/CLA.md).

@@ -3312,3 +3312,53 @@ def test_daemon_docs_state_the_admission_and_pre_auth_budgets() -> None:
         )
     )
     assert f"more than {pre_auth} simultaneous connections" in hooks
+
+
+def test_plugin_servers_section_says_when_mcp_disables_were_not_read() -> None:
+    """#1289: the note says when ``/mcp`` disables were not read; docs quote it.
+
+    The header is read from the code, so rewording either side fails here, and
+    the JSON limits are pinned to the paragraph that makes the claim.
+    """
+    from memtomem_stm.cli import proxy
+
+    section = _heading_section(_read("docs/cli.md"), "Claude Code plugin servers", "docs/cli.md")
+    paragraph = _paragraph(section, "disabledMcpServers", "docs/cli.md")
+    for needed in (
+        f'"{proxy._DISABLES_UNREAD_HEADER}"',
+        "`doctor` appends the reason to its warning",
+        "`init --json` prints no note",
+    ):
+        if needed not in paragraph:
+            pytest.fail(f"docs/cli.md plugin-servers paragraph lost {needed!r}")
+
+
+def test_plugin_bypass_json_reason_key_is_documented() -> None:
+    """#1294: the JSON key and every reason it can hold are named in docs/cli.md.
+
+    The key and the reasons are read from the code, so a renamed key, a new
+    reason or a reworded value fails here, in the plugin-servers paragraph and
+    in both shape listings that name ``plugin_bypass``.
+    """
+    from memtomem_stm.cli import proxy
+
+    keys = list(proxy._plugin_bypass_json([]))
+    assert keys[0] == "plugin_bypass" and len(keys) == 2
+    key = keys[1]
+    reasons = list(proxy._DISABLES_UNREAD_CAVEAT)
+    docs = _read("docs/cli.md")
+    section = _heading_section(docs, "Claude Code plugin servers", "docs/cli.md")
+    paragraph = " ".join(_paragraph(section, "disabledMcpServers", "docs/cli.md").split())
+    for needed in (
+        f"`{key}`",
+        *(f'`"{reason}"`' for reason in reasons),
+        "`null` means STM recorded no reason, not that the disables were checked",
+        f"carry neither `plugin_bypass` nor `{key}`",
+    ):
+        if needed not in paragraph:
+            pytest.fail(f"docs/cli.md plugin-servers paragraph lost {needed!r}")
+    shape = f'"{key}": null | ' + " | ".join(f'"{reason}"' for reason in reasons)
+    for heading in ("`add`", "`prune`"):
+        listing = " ".join(_heading_section(docs, heading, "docs/cli.md").split())
+        if shape not in listing:
+            pytest.fail(f"docs/cli.md {heading} JSON shape lost {shape!r}")

@@ -8,6 +8,7 @@ import pytest
 
 from memtomem_stm.mms import state
 from memtomem_stm.mms.detect import Project, Source, detect_project
+from helpers import skip_if_inside_git
 
 
 def _write_marker(root: Path, name: str = "proj", enabled: list[str] | None = None) -> Path:
@@ -61,6 +62,7 @@ def test_git_fallback_when_no_marker(tmp_path):
 
 
 def test_cwd_fallback_when_no_marker_no_git(tmp_path):
+    skip_if_inside_git(tmp_path.resolve())
     p = detect_project(tmp_path)
     assert p.source is Source.CWD
     assert p.root == tmp_path.resolve()
@@ -146,6 +148,7 @@ def test_cwd_is_root_filesystem_falls_back_to_cwd(monkeypatch, tmp_path):
     # Use tmp_path (no marker, no git) to simulate. We don't actually walk
     # to the real `/` — pathlib stops at root naturally.
     # The contract: even if walk reaches root, no exception.
+    skip_if_inside_git(tmp_path.resolve())
     p = detect_project(tmp_path)
     assert p.source is Source.CWD
 

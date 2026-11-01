@@ -13,13 +13,14 @@ import json
 import os
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
 
-from helpers import set_home
+from helpers import GIT_FILE_LAYOUTS, set_home, skip_if_inside_git
 from memtomem_stm.cli import proxy as proxy_mod
 from memtomem_stm.cli.proxy import cli
 
@@ -547,6 +548,23 @@ class TestEchoPluginBypass:
         assert expected != "claude plugin disable evil;rm -rf ~&x@m"
 
 
+_UNREAD_HEADER = proxy_mod._DISABLES_UNREAD_HEADER
+
+
+def _says(reason: str, text: str) -> bool:
+    """Whether ``text`` gives ``reason`` for unread disables; the note wraps it."""
+    return " ".join(proxy_mod._DISABLES_UNREAD_CAVEAT[reason].split()) in " ".join(text.split())
+
+
+def test_unread_reason_is_not_part_of_a_rows_identity():
+    plain = proxy_mod._PluginBypass("p@m", "s", "stdio", "user")
+    marked = proxy_mod._PluginBypass("p@m", "s", "stdio", "user", "no_key")
+
+    assert plain == marked
+    assert hash(plain) == hash(marked)
+    assert marked.as_json() == plain.as_json()
+
+
 # Firebase with a second server, so a disable can be shown to drop exactly one.
 FIREBASE_TWO = {
     **FIREBASE,
@@ -559,8 +577,19 @@ def _write_claude_json(home: Path, data: object) -> None:
     (home / ".claude.json").write_text(text, encoding="utf-8")
 
 
+def _project_key(path: Path) -> str:
+    """How ``/mcp`` spells a project directory as a key: NFC, with ``/``
+    separators on Windows too (#1271). Built here, not by the resolver under
+    test."""
+    return unicodedata.normalize("NFC", path.resolve().as_posix())
+
+
 def _disabled_for(cwd: Path, names: object) -> dict:
-    return {"projects": {str(cwd.resolve()): {"disabledMcpServers": names}}}
+    return {"projects": {_project_key(cwd): {"disabledMcpServers": names}}}
+
+
+def _disabled_under(paths: list[Path], names: list[str]) -> dict:
+    return {"projects": {_project_key(p): {"disabledMcpServers": names} for p in paths}}
 
 
 class TestMcpDisabledServers:
@@ -577,7 +606,17 @@ class TestMcpDisabledServers:
     def _names(self, cwd: Path) -> list[str]:
         return [row.runtime_name for row in proxy_mod._plugin_bypass_servers(cwd)]
 
+    @staticmethod
+    def _note(cwd: Path, capsys) -> str:
+        """The note the commands print for ``cwd`` (#1289)."""
+        capsys.readouterr()
+        proxy_mod._echo_plugin_bypass(proxy_mod._plugin_bypass_servers(cwd), err=False)
+        return capsys.readouterr().out
+
     def test_disabled_server_is_dropped_and_its_sibling_kept(self, probe, home, tmp_path):
+        # A repository root of its own, so a `.git` file above tmp_path (a
+        # basetemp inside a linked worktree) cannot take the key away (#1295).
+        (tmp_path / ".git").mkdir()
         # The string `/mcp` wrote for a disabled firebase server (2026-10-30,
         # Claude Code 2.1.314); `claude plugin list --json` was unchanged.
         probe["out"] = [FIREBASE_TWO]
@@ -586,6 +625,7 @@ class TestMcpDisabledServers:
         assert self._names(tmp_path) == ["plugin:firebase:emulator"]
 
     def test_without_a_disable_both_are_reported(self, probe, home, tmp_path):
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, []))
 
@@ -593,8 +633,9 @@ class TestMcpDisabledServers:
 
     def test_another_projects_disable_does_not_apply(self, probe, home, tmp_path):
         probe["out"] = [FIREBASE_TWO]
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         other = tmp_path / "other"
-        other.mkdir()
+        (other / ".git").mkdir(parents=True)  # a project of its own, not a stale subdirectory
         _write_claude_json(home, _disabled_for(other, ["plugin:firebase:firebase"]))
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
@@ -602,7 +643,7 @@ class TestMcpDisabledServers:
     def test_symlinked_cwd_reads_the_resolved_key(self, probe, home, tmp_path):
         probe["out"] = [FIREBASE_TWO]
         real = tmp_path / "real"
-        real.mkdir()
+        (real / ".git").mkdir(parents=True)  # pins the key at the resolved directory
         link = tmp_path / "link"
         link.symlink_to(real, target_is_directory=True)
         _write_claude_json(home, _disabled_for(real, ["plugin:firebase:firebase"]))
@@ -610,21 +651,159 @@ class TestMcpDisabledServers:
         assert self._names(link) == ["plugin:firebase:emulator"]
 
     def test_bare_server_key_does_not_disable(self, probe, home, tmp_path):
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, ["firebase", "PLUGIN:FIREBASE:FIREBASE"]))
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
 
-    def test_claude_config_dir_reads_no_disables(self, probe, home, tmp_path, monkeypatch):
-        # Claude Code reads its config from the override, so a disable left in
-        # ~/.claude.json may be stale: it must not hide a running server.
+    def test_absolute_claude_config_dir_reads_its_own_file(
+        self, probe, home, tmp_path, monkeypatch
+    ):
+        # Claude Code reads $CLAUDE_CONFIG_DIR/.claude.json (#1271): a disable
+        # there applies, and one left in ~/.claude.json is stale.
+        (tmp_path / ".git").mkdir()  # pins the key, as above
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:emulator"]))
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        _write_claude_json(cfg, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator"]
+
+    @pytest.mark.parametrize("value", ["", "relative/cfg"])
+    def test_unknown_config_reads_no_disables(self, probe, home, tmp_path, monkeypatch, value):
+        # Empty makes Claude Code read ./.config.json, relative resolves
+        # against its own cwd: STM cannot tell which file is in use, so a
+        # disable in ~/.claude.json must not hide a running server.
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", value)
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
 
+    def test_unknown_config_says_disables_were_not_read(
+        self, probe, home, tmp_path, monkeypatch, capsys
+    ):
+        probe["out"] = [FIREBASE_TWO]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+
+        note = self._note(tmp_path, capsys)
+
+        assert note.count(_UNREAD_HEADER) == 1
+        assert _says("no_config", note)
+        assert not _says("no_key", note)
+
+    def test_directory_outside_a_repository_says_nothing(self, probe, home, tmp_path, capsys):
+        # Outside any repository the key is the directory itself.
+        skip_if_inside_git(tmp_path.resolve())
+        probe["out"] = [FIREBASE_TWO]
+
+        note = self._note(tmp_path, capsys)
+
+        assert "plugin:firebase:firebase" in note
+        assert _UNREAD_HEADER not in note
+
+    def test_repository_root_says_nothing(self, probe, home, tmp_path, capsys):
+        skip_if_inside_git(tmp_path.resolve())
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        probe["out"] = [FIREBASE_TWO]
+
+        note = self._note(repo, capsys)
+
+        assert "plugin:firebase:firebase" in note
+        assert _UNREAD_HEADER not in note
+
+    def test_unresolvable_key_says_disables_were_not_read(
+        self, probe, home, tmp_path, monkeypatch, capsys
+    ):
+        # claude_project_key also gives no key when cwd cannot be resolved;
+        # patching Path.resolve instead would stop discovery before the read.
+        skip_if_inside_git(tmp_path.resolve())
+        (tmp_path / ".git").mkdir()
+        _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
+        monkeypatch.setattr(proxy_mod, "claude_project_key", lambda _cwd: None)
+        probe["out"] = [FIREBASE_TWO]
+
+        note = self._note(tmp_path, capsys)
+
+        assert "plugin:firebase:firebase" in note
+        assert _says("no_key", note)
+
+    def test_subdirectory_reads_the_repository_root_entry(self, probe, home, tmp_path):
+        # Started in <repo>/src, /mcp filed the disable under <repo> (2026-10-31,
+        # Claude Code 2.1.316).
+        skip_if_inside_git(tmp_path.resolve())
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(repo, ["plugin:firebase:firebase"]))
+
+        assert self._names(repo / "src") == ["plugin:firebase:emulator"]
+
+    def test_nfd_repository_reads_the_nfc_entry(self, probe, home, tmp_path):
+        # /mcp files a directory stored in NFD under its NFC spelling
+        # (2026-10-31, Claude Code 2.1.316).
+        skip_if_inside_git(tmp_path.resolve())
+        name = unicodedata.normalize("NFD", "한글repo")
+        repo = tmp_path / "nfd" / name
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        if os.listdir(tmp_path / "nfd") != [name]:
+            pytest.skip("the filesystem does not keep NFD names")
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(repo, ["plugin:firebase:firebase"]))
+
+        assert self._names(repo / "src") == ["plugin:firebase:emulator"]
+
+    def test_stale_subdirectory_entry_hides_nothing(self, probe, home, tmp_path):
+        # Claude Code never reads an entry keyed by a subdirectory of a
+        # repository, so a disable left there is stale.
+        skip_if_inside_git(tmp_path.resolve())
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(repo / "src", ["plugin:firebase:firebase"]))
+
+        assert self._names(repo / "src") == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+
+    @pytest.mark.parametrize("layout", sorted(GIT_FILE_LAYOUTS))
+    def test_git_file_or_symlink_hides_nothing(self, probe, home, tmp_path, layout, capsys):
+        # No key is given for these layouts, so a disable under the start
+        # directory, its repository root or the main checkout hides nothing,
+        # and the note says the disables were not read (#1289).
+        skip_if_inside_git(tmp_path.resolve())
+        start, main = GIT_FILE_LAYOUTS[layout](tmp_path)
+        marked = next(p for p in (start, *start.parents) if os.path.lexists(p / ".git"))
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(
+            home, _disabled_under([start, marked, main], ["plugin:firebase:firebase"])
+        )
+
+        assert self._names(start) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+        note = self._note(start, capsys)
+        assert note.count(_UNREAD_HEADER) == 1
+        assert _says("no_key", note)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows key form")
+    def test_backslash_key_hides_nothing_on_windows(self, probe, home, tmp_path, capsys):
+        (tmp_path / ".git").mkdir()  # pins the key, as above
+        probe["out"] = [FIREBASE_TWO]
+        key = str(tmp_path.resolve())
+        _write_claude_json(
+            home, {"projects": {key: {"disabledMcpServers": ["plugin:firebase:firebase"]}}}
+        )
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+        assert _UNREAD_HEADER not in self._note(tmp_path, capsys)  # the key was resolved
+
     def test_non_string_members_are_ignored_not_fatal(self, probe, home, tmp_path):
+        (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase", None, 3]))
 
@@ -644,16 +823,21 @@ class TestMcpDisabledServers:
         ],
         ids=["missing", "invalid", "root-list", "projects-list", "entry-list", "names-str", "deep"],
     )
-    def test_unreadable_disable_data_hides_nothing(self, probe, home, tmp_path, content):
+    def test_unreadable_disable_data_hides_nothing(self, probe, home, tmp_path, content, capsys):
+        # A repository root of its own, so a `.git` file above tmp_path (a
+        # basetemp inside a linked worktree) cannot change the key.
+        (tmp_path / ".git").mkdir()
         probe["out"] = [FIREBASE_TWO]
         if content is not None:
             if isinstance(content, dict):
                 content = json.dumps(content).replace(
-                    '"__cwd__"', json.dumps(str(tmp_path.resolve()))
+                    '"__cwd__"', json.dumps(_project_key(tmp_path))
                 )
             _write_claude_json(home, content)
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+        # The file was consulted; only an unread entry gets the caveat.
+        assert _UNREAD_HEADER not in self._note(tmp_path, capsys)
 
 
 @pytest.fixture
@@ -674,17 +858,20 @@ def _config(home: Path, servers: dict | None = None) -> Path:
     return path
 
 
+REGISTRY_COMMANDS = [
+    ["import", "--from", "claude-code", "--apply"],
+    ["host", "status", "--json"],
+    ["host", "sync", "--json"],
+    ["host", "scan", "--from", "claude-code", "--json"],
+]
+
+_ROW_KEYS = {"plugin_id", "server", "runtime_name", "transport", "scope"}
+
+
 class TestCommandsReport:
-    @pytest.mark.parametrize(
-        "argv",
-        [
-            ["import", "--from", "claude-code", "--apply"],
-            ["host", "status", "--json"],
-            ["host", "sync", "--json"],
-            ["host", "scan", "--from", "claude-code", "--json"],
-        ],
-    )
+    @pytest.mark.parametrize("argv", REGISTRY_COMMANDS)
     def test_registry_commands_report_plugins_without_importing(self, sandbox, probe, argv):
+        (sandbox["cwd"] / ".git").mkdir()  # pins the key: no caveat wherever tmp lives
         probe["out"] = [_leaky_plugin()]
         result = CliRunner().invoke(cli, argv)
         assert result.exit_code == 0, result.output
@@ -692,9 +879,58 @@ class TestCommandsReport:
             json.loads(result.stdout)
         assert "plugin:leaky:http-srv" in result.stderr
         assert "bypass STM" in result.stderr
+        assert _UNREAD_HEADER not in result.output
         for canary in CANARIES:
             assert canary not in result.output
         assert not (sandbox["home"] / ".mms/registry.toml").exists()
+
+    @pytest.mark.parametrize("argv", REGISTRY_COMMANDS)
+    def test_registry_commands_say_disables_were_not_read(self, sandbox, probe, monkeypatch, argv):
+        probe["out"] = [_leaky_plugin()]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+
+        result = CliRunner().invoke(cli, argv)
+
+        assert result.exit_code == 0, result.output
+        if "--json" in argv:
+            assert _UNREAD_HEADER not in result.stdout
+        assert "plugin:leaky:http-srv" in result.stderr
+        assert result.stderr.count(_UNREAD_HEADER) == 1
+        assert _says("no_config", result.stderr)
+
+    @pytest.mark.parametrize("unread", [None, "no_config", "no_key"])
+    @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+    def test_doctor_says_when_disables_were_not_read(
+        self, sandbox, probe, monkeypatch, as_json, unread
+    ):
+        (sandbox["cwd"] / ".git").mkdir()  # pins the key: no caveat wherever tmp lives
+        probe["out"] = [FIREBASE]
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
+        if unread == "no_config":
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+        elif unread == "no_key":
+            monkeypatch.setattr(proxy_mod, "claude_project_key", lambda _cwd: None)
+        config = _config(sandbox["home"])
+
+        result = CliRunner().invoke(
+            cli, ["doctor", "--config", str(config), *(["--json"] if as_json else [])]
+        )
+
+        assert result.exit_code == 0, result.output
+        if as_json:
+            row = next(c for c in json.loads(result.stdout)["checks"] if c["id"] == "plugin_bypass")
+            assert row["status"] == "WARN"
+            detail = row["detail"]
+        else:
+            assert "1 Claude Code plugin MCP server(s) bypass STM" in result.stdout
+            detail = result.stdout
+        assert "plugin:firebase:firebase" in detail
+        if unread is None:
+            assert "`/mcp` disables not read" not in detail
+        else:
+            caveat = proxy_mod._DISABLES_UNREAD_CAVEAT[unread]
+            assert detail.count("`/mcp` disables not read") == 1
+            assert f"`/mcp` disables not read: {caveat}" in detail
 
     @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
     def test_doctor_warns_without_leaking_or_writing(self, sandbox, probe, monkeypatch, as_json):
@@ -787,6 +1023,7 @@ class TestCommandsReport:
             assert canary not in result.output
 
     def test_add_from_clients_json_omits_a_server_disabled_in_mcp(self, sandbox, probe):
+        (sandbox["cwd"] / ".git").mkdir()  # pins the key: no caveat wherever tmp lives
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(
             sandbox["home"], _disabled_for(sandbox["cwd"], ["plugin:firebase:firebase"])
@@ -803,9 +1040,34 @@ class TestCommandsReport:
             "plugin:firebase:emulator"
         ]
 
+    @pytest.mark.parametrize(
+        "argv",
+        [["add", "--from-clients", "--all", "--json"], ["prune", "--all", "--json"]],
+        ids=["add", "prune"],
+    )
+    def test_json_rows_keep_their_shape_when_disables_were_not_read(
+        self, sandbox, probe, monkeypatch, argv
+    ):
+        probe["out"] = [FIREBASE_TWO]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+        config = _config(sandbox["home"])
+
+        result = CliRunner().invoke(cli, [*argv, "--config", str(config)])
+
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.stdout)["plugin_bypass"]
+        assert [row["runtime_name"] for row in rows] == [
+            "plugin:firebase:emulator",
+            "plugin:firebase:firebase",
+        ]
+        assert all(set(row) == _ROW_KEYS for row in rows)
+        assert _UNREAD_HEADER not in result.stdout
+        assert _says("no_config", result.stderr)
+
     def test_prune_without_upstreams_survives_a_deeply_nested_claude_json(self, sandbox, probe):
         # prune returns before discovery when nothing is configured, so the
         # disable read is the only parse of ~/.claude.json on this path.
+        (sandbox["cwd"] / ".git").mkdir()  # pins the key, so that parse is reached
         probe["out"] = [FIREBASE]
         _write_claude_json(sandbox["home"], '{"projects": ' + "[" * 100_000 + "]" * 100_000 + "}")
         config = _config(sandbox["home"])
@@ -817,11 +1079,14 @@ class TestCommandsReport:
         assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
             "plugin:firebase:firebase"
         ]
+        assert document["plugin_bypass_disables_unread"] is None  # the file was read
 
     @pytest.mark.skipif(sys.platform == "win32", reason="the project match is off on Windows")
     def test_add_from_clients_json_omits_an_install_from_another_project(self, sandbox, probe):
+        # Both roots known, so the install is told apart from this project.
+        (sandbox["cwd"] / ".git").mkdir()
         elsewhere = sandbox["home"] / "elsewhere"
-        elsewhere.mkdir()
+        (elsewhere / ".git").mkdir(parents=True)
         probe["out"] = [{**FIREBASE, "projectPath": str(elsewhere)}]
         config = _config(sandbox["home"])
 
@@ -897,6 +1162,46 @@ class TestCommandsReport:
         assert result.exit_code == 0, result.output
         assert "plugin:firebase:firebase (stdio, local)" in result.stdout
         assert result.stdout.index("bypass STM") < result.stdout.index("Server name")
+
+    def test_init_text_says_disables_were_not_read(self, sandbox, probe, monkeypatch):
+        probe["out"] = [FIREBASE]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+        config = sandbox["home"] / "new.json"
+
+        result = CliRunner().invoke(
+            cli,
+            ["init", "--no-validate", "--client", "skip", "--config", str(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout.count(_UNREAD_HEADER) == 1
+        assert _says("no_config", result.stdout)
+        assert result.stdout.index(_UNREAD_HEADER) < result.stdout.index("Server name")
+
+    def test_init_json_keeps_the_row_shape_and_prints_no_note(self, sandbox, probe, monkeypatch):
+        # init --json withholds the whole note, so the caveat is not shown either.
+        probe["out"] = [FIREBASE]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+        config = sandbox["home"] / "new.json"
+
+        result = CliRunner().invoke(
+            cli,
+            ["init", "--no-validate", "--client", "skip", "--lang", "en", "--json"]
+            + ["--config", str(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.stdout)["plugin_bypass"]
+        assert [row["runtime_name"] for row in rows] == ["plugin:firebase:firebase"]
+        assert all(set(row) == _ROW_KEYS for row in rows)
+        assert _UNREAD_HEADER not in result.output
+        assert "bypass STM" not in result.output
+        # The config gap has no JSON field, so init --json still says it, on
+        # stderr (#1271).
+        assert "Claude Code user and project servers were not read" in result.stderr
+        assert "were not read" not in result.stdout
 
     def test_init_json_carries_the_rows_on_success(self, sandbox, probe):
         probe["out"] = [FIREBASE]
@@ -1016,6 +1321,7 @@ class TestCommandsReport:
         document = json.loads(result.stdout)
         assert document["action"] == "register"
         assert "plugin_bypass" not in document
+        assert "plugin_bypass_disables_unread" not in document
         assert probe["calls"] == []
 
     def test_init_lock_failure_is_the_shared_envelope_without_the_key(
@@ -1040,4 +1346,169 @@ class TestCommandsReport:
         document = json.loads(result.stdout)
         assert document["error"] == "config_lock_unavailable"
         assert "plugin_bypass" not in document
+        assert "plugin_bypass_disables_unread" not in document
         assert probe["calls"] == []
+
+
+_INIT_ARGV = ["init", "--no-validate", "--client", "skip", "--lang", "en", "--json"]
+_INIT_ANSWERS = "filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n"
+_FS = {"fs": {"prefix": "fs", "transport": "stdio", "command": "npx"}}
+
+
+def _write_denied(*args, **kwargs):
+    raise PermissionError(13, "Permission denied")
+
+
+# Every JSON document that carries ``plugin_bypass``: (argv, stdin, exit code,
+# ``error``, upstreams in the config or None for a fresh init path,
+# write failure). The reason must ride on each one (#1294).
+_BYPASS_DOCUMENTS = {
+    "add": (["add", "--from-clients", "--all", "--json"], None, 0, None, {}, False),
+    "add-unknown-server": (
+        ["add", "--from-clients", "--select", "firebase", "--json"],
+        None,
+        1,
+        "unknown_server",
+        {},
+        False,
+    ),
+    "prune": (["prune", "--all", "--json"], None, 0, None, _FS, False),
+    "prune-no-upstreams": (["prune", "--all", "--json"], None, 0, None, {}, False),
+    "prune-not-dual-registered": (
+        ["prune", "firebase", "--json"],
+        None,
+        1,
+        "not_dual_registered",
+        _FS,
+        False,
+    ),
+    "init": (_INIT_ARGV, _INIT_ANSWERS, 0, None, None, False),
+    "init-prompt-eof": (_INIT_ARGV, "", 1, "setup_failed", None, False),
+    "init-write-failure": (_INIT_ARGV, _INIT_ANSWERS, 1, "config_write_failed", None, True),
+}
+
+
+class TestDisablesUnreadInJson:
+    """The JSON documents say why ``/mcp`` disables were not read (#1294).
+
+    The reason is an envelope key beside ``plugin_bypass``, so the rows keep
+    their five documented keys.
+    """
+
+    @staticmethod
+    def _document(sandbox, monkeypatch, surface: str) -> dict:
+        argv, answers, exit_code, error, upstreams, write_fails = _BYPASS_DOCUMENTS[surface]
+        if upstreams is None:
+            config = sandbox["home"] / "new.json"
+        else:
+            config = _config(sandbox["home"], upstreams)
+        if write_fails:
+            monkeypatch.setattr(proxy_mod, "atomic_write_text", _write_denied)
+        result = CliRunner().invoke(cli, [*argv, "--config", str(config)], input=answers)
+        assert result.exit_code == exit_code, result.output
+        document = json.loads(result.stdout)
+        assert document.get("error") == error
+        return document
+
+    @pytest.mark.parametrize("surface", sorted(_BYPASS_DOCUMENTS))
+    def test_no_config_reason_rides_beside_the_rows(self, sandbox, probe, monkeypatch, surface):
+        (sandbox["cwd"] / ".git").mkdir()  # only an unknown config can give a reason
+        probe["out"] = [FIREBASE]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+
+        document = self._document(sandbox, monkeypatch, surface)
+
+        assert document["plugin_bypass_disables_unread"] == "no_config"
+        assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
+            "plugin:firebase:firebase"
+        ]
+        assert all(set(row) == _ROW_KEYS for row in document["plugin_bypass"])
+        keys = list(document)
+        assert keys.index("plugin_bypass_disables_unread") == keys.index("plugin_bypass") + 1
+
+    @pytest.mark.parametrize("surface", sorted(_BYPASS_DOCUMENTS))
+    def test_read_disables_give_null(self, sandbox, probe, monkeypatch, surface):
+        (sandbox["cwd"] / ".git").mkdir()
+        probe["out"] = [FIREBASE]
+
+        document = self._document(sandbox, monkeypatch, surface)
+
+        assert document["plugin_bypass_disables_unread"] is None
+        assert len(document["plugin_bypass"]) == 1
+
+    @pytest.mark.parametrize("layout", ["linked-worktree", "symlinked-dotgit"])
+    @pytest.mark.parametrize("surface", ["add", "init"])
+    def test_no_key_reason(self, sandbox, probe, monkeypatch, tmp_path, layout, surface):
+        skip_if_inside_git(tmp_path.resolve())
+        (tmp_path / "layout").mkdir()
+        start, _main = GIT_FILE_LAYOUTS[layout](tmp_path / "layout")
+        monkeypatch.chdir(start)
+        probe["out"] = [FIREBASE]
+
+        document = self._document(sandbox, monkeypatch, surface)
+
+        assert document["plugin_bypass_disables_unread"] == "no_key"
+        assert len(document["plugin_bypass"]) == 1
+
+    @pytest.mark.parametrize("surface", ["add", "prune", "init"])
+    def test_no_rows_give_null_even_when_disables_were_not_read(
+        self, sandbox, probe, monkeypatch, surface
+    ):
+        probe["out"] = []
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+
+        document = self._document(sandbox, monkeypatch, surface)
+
+        assert document["plugin_bypass"] == []
+        assert document["plugin_bypass_disables_unread"] is None
+
+    @pytest.mark.parametrize("content", ["{not json", '{"projects": []}'], ids=["invalid", "list"])
+    def test_unreadable_disable_data_is_null_not_a_reason(
+        self, sandbox, probe, monkeypatch, content
+    ):
+        # Consulted but unreadable: no caveat, and no claim it was checked.
+        (sandbox["cwd"] / ".git").mkdir()
+        _write_claude_json(sandbox["home"], content)
+        probe["out"] = [FIREBASE_TWO]
+
+        document = self._document(sandbox, monkeypatch, "add")
+
+        assert len(document["plugin_bypass"]) == 2
+        assert document["plugin_bypass_disables_unread"] is None
+
+    def test_init_reason_does_not_leak_into_the_next_document(self, sandbox, probe, monkeypatch):
+        # One process, as the reset at the decorator's entry has to hold it.
+        from memtomem_stm.mms import state
+
+        probe["out"] = [FIREBASE]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
+        runner = CliRunner()
+
+        def init(*argv: str, config: Path, answers: str | None = None) -> dict:
+            result = runner.invoke(cli, [*argv, "--config", str(config)], input=answers)
+            return json.loads(result.stdout)
+
+        first = init(*_INIT_ARGV, config=sandbox["home"] / "a.json", answers=_INIT_ANSWERS)
+        assert first["plugin_bypass_disables_unread"] == "no_config"
+
+        demo = init(*_INIT_ARGV, "--demo", config=sandbox["home"] / "b.json")
+        assert demo["plugin_bypass"] is None
+        assert demo["plugin_bypass_disables_unread"] is None
+
+        refused = init("init", "--json", config=sandbox["home"] / "a.json")
+        assert refused["ok"] is False
+        assert refused["plugin_bypass"] is None
+        assert refused["plugin_bypass_disables_unread"] is None
+
+        register = init("register", "--mcp", "json", "--json", config=sandbox["home"] / "a.json")
+        assert "plugin_bypass_disables_unread" not in register
+
+        with monkeypatch.context() as m:
+
+            def denied(path):
+                raise IsADirectoryError(21, "Is a directory", str(path))
+
+            m.setattr(state, "open_lock_fd", denied)
+            locked = init("init", "--json", config=sandbox["home"] / "c.json")
+        assert locked["error"] == "config_lock_unavailable"
+        assert "plugin_bypass_disables_unread" not in locked

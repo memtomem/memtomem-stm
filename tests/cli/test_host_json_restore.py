@@ -5,7 +5,7 @@ import json
 import pytest
 from click.testing import CliRunner
 
-from helpers import set_home
+from helpers import claude_key, set_home
 
 from memtomem_stm.cli import proxy
 
@@ -38,6 +38,9 @@ def test_eject_refuses_unreadable_target_before_any_write(
     tmp_path, monkeypatch, kind, failure, force
 ):
     set_home(monkeypatch, tmp_path)
+    # tmp_path is its own repository, so the project entry Claude Code uses
+    # for it is tmp_path wherever the temp dir lives (#1271).
+    (tmp_path / ".git").mkdir()
     target = tmp_path / (".mcp.json" if kind == "mcp-json" else ".claude.json")
     monkeypatch.setattr(proxy, "_desktop_config_path", lambda: target)
     raw = {
@@ -48,7 +51,7 @@ def test_eject_refuses_unreadable_target_before_any_write(
         "servers": b'{"mcpServers": []}',
     }[failure]
     if kind == "claude-project" and failure == "servers":
-        raw = json.dumps({"projects": {str(tmp_path.resolve()): {"mcpServers": []}}}).encode()
+        raw = json.dumps({"projects": {claude_key(tmp_path): {"mcpServers": []}}}).encode()
     target.write_bytes(raw)
     config = tmp_path / "stm.json"
     config.write_text(
@@ -114,20 +117,35 @@ def test_writer_refuses_invalid_servers_map_without_clobbering(tmp_path, servers
     assert target.read_bytes() == before
 
 
+def _relative_config_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "private-canary/claude")
+
+
+def _custom_oauth(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", "https://private-canary.invalid/oauth")
+
+
+def _legacy_config(monkeypatch, tmp_path):
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".config.json").write_text('{"private-canary": 1}')
+
+
+@pytest.mark.parametrize("unknown", [_relative_config_dir, _custom_oauth, _legacy_config])
 @pytest.mark.parametrize("kind", ["claude-user", "claude-project"])
 @pytest.mark.parametrize("force", [False, True])
-def test_eject_refuses_unsupported_claude_config_dir_before_host_access(
-    tmp_path, monkeypatch, kind, force
+def test_eject_refuses_an_unknown_claude_config_before_host_access(
+    tmp_path, monkeypatch, kind, force, unknown
 ):
+    """When STM cannot tell which file Claude Code reads (#1271), eject reads
+    and writes nothing at the host, not even the default ``~/.claude.json``."""
     set_home(monkeypatch, tmp_path)
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "private-canary"))
+    unknown(monkeypatch, tmp_path)
     config = tmp_path / "stm.json"
     config.write_text(json.dumps({"upstream_servers": {"demo": {"command": "x"}}}))
     before = config.read_bytes()
 
-    # Both the stale default config and the unknown active layout must stay untouched.
     def unexpected(*args, **kwargs):
-        pytest.fail("custom Claude config must be rejected before host reads or writes")
+        pytest.fail("an unknown Claude config must be rejected before host reads or writes")
 
     monkeypatch.setattr(proxy, "_read_eject_host_json", unexpected)
     monkeypatch.setattr(proxy, "_run_claude_mcp", unexpected)
@@ -137,7 +155,7 @@ def test_eject_refuses_unsupported_claude_config_dir_before_host_access(
         args.append("--force")
     result = CliRunner().invoke(proxy.cli, args)
     assert result.exit_code == 1, result.output
-    assert "unsupported with CLAUDE_CONFIG_DIR set" in result.output
+    assert "cannot tell which file Claude Code reads its config from" in result.output
     assert "private-canary" not in result.output
     assert config.read_bytes() == before
 
@@ -183,13 +201,15 @@ def test_restore_handles_real_config_that_may_exceed_encoder_depth(tmp_path):
 @pytest.mark.parametrize("shape", ["projects", "project", "servers", "entry"])
 def test_strict_layout_error_identifies_target_file(tmp_path, monkeypatch, shape):
     set_home(monkeypatch, tmp_path)
+    (tmp_path / ".git").mkdir()  # tmp_path keys its own project entry (#1271)
     path = tmp_path / ".claude.json"
     project = str(tmp_path.resolve())
+    key = claude_key(tmp_path)
     content = {
         "projects": {"projects": []},
-        "project": {"projects": {project: []}},
-        "servers": {"projects": {project: {"mcpServers": []}}},
-        "entry": {"projects": {project: {"mcpServers": {"demo": "private-canary"}}}},
+        "project": {"projects": {key: []}},
+        "servers": {"projects": {key: {"mcpServers": []}}},
+        "entry": {"projects": {key: {"mcpServers": {"demo": "private-canary"}}}},
     }[shape]
     path.write_text(json.dumps(content))
     with pytest.raises(proxy._HostConfigReadError) as exc:

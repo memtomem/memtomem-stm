@@ -38,6 +38,19 @@ def set_home(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     monkeypatch.setenv("USERPROFILE", str(path))
 
 
+def claude_key(path: Path) -> str:
+    """How Claude Code spells ``path`` as a ``projects`` key: resolved, NFC,
+    ``/``-separated on Windows too (#1271).
+
+    Built here for fixtures and expectations, not by the resolver under test.
+    A subprocess cwd or a recorded execution dir stays native; only the key
+    takes this form.
+    """
+    import unicodedata
+
+    return unicodedata.normalize("NFC", path.resolve().as_posix())
+
+
 def fake_tool_result(text: str, *, is_error: bool = False) -> SimpleNamespace:
     """The upstream ``CallToolResult`` shape the manager reads.
 
@@ -259,3 +272,123 @@ def held_empty_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
             proc.wait()
         if proc.stdout is not None:
             proc.stdout.close()
+
+
+def skip_if_inside_git(root: Path) -> None:
+    """Skip when ``root`` sits in a git checkout: its ``.git`` would change every key."""
+    import os
+
+    if any(os.path.lexists(p / ".git") for p in (root, *root.parents)):
+        pytest.skip("the temporary directory sits inside a git repository")
+
+
+def git_worktree(main_common: Path, wt: Path, name: str, *, backpointer: str | None = None) -> Path:
+    """Lay out a linked worktree the way git does, without running git.
+
+    Writes the worktree's ``.git`` file, and ``commondir`` plus the back-pointer
+    ``gitdir`` in its admin directory under ``main_common/worktrees/<name>``,
+    which it returns.
+    """
+    admin = main_common / "worktrees" / name
+    admin.mkdir(parents=True)
+    (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    (admin / "gitdir").write_text(f"{backpointer or wt / '.git'}\n", encoding="utf-8")
+    wt.mkdir(parents=True, exist_ok=True)
+    (wt / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    return admin
+
+
+def _symlink(link: Path, target: str | Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+
+def _plain_worktree(base: Path) -> tuple[Path, Path]:
+    (base / "main" / ".git").mkdir(parents=True)
+    git_worktree(base / "main" / ".git", base / "wt", "wt")
+    (base / "wt" / "src").mkdir()
+    return base / "wt" / "src", base / "main"
+
+
+def _relative_gitdir(base: Path) -> tuple[Path, Path]:
+    import os
+
+    start, main = _plain_worktree(base)
+    admin = main / ".git" / "worktrees" / "wt"
+    (base / "wt" / ".git").write_text(
+        f"gitdir: {os.path.relpath(admin, base / 'wt')}\n", encoding="utf-8"
+    )
+    return start, main
+
+
+def _foreign_backpointer(base: Path) -> tuple[Path, Path]:
+    (base / "main" / ".git").mkdir(parents=True)
+    git_worktree(base / "main" / ".git", base / "wt", "wt", backpointer=str(base / "x" / ".git"))
+    return base / "wt", base / "main"
+
+
+def _bare_worktree(base: Path) -> tuple[Path, Path]:
+    (base / "bare.git").mkdir()
+    git_worktree(base / "bare.git", base / "wt", "wt")
+    return base / "wt", base / "bare.git"
+
+
+def _submodule(base: Path) -> tuple[Path, Path]:
+    modules = base / "super" / ".git" / "modules" / "m"
+    modules.mkdir(parents=True)
+    (base / "super" / "m").mkdir()
+    (base / "super" / "m" / ".git").write_text(f"gitdir: {modules}\n", encoding="utf-8")
+    return base / "super" / "m", base / "super"
+
+
+def _backpointer_through_symlink(target: str):
+    def build(base: Path) -> tuple[Path, Path]:
+        (base / "main" / ".git").mkdir(parents=True)
+        (base / "other" / "child").mkdir(parents=True)
+        wt = base / "wt"
+        git_worktree(base / "main" / ".git", wt, "wt", backpointer=str(wt / target))
+        if target.startswith("jump"):
+            _symlink(wt / "jump", base / "other" / "child", directory=True)
+        else:
+            _symlink(wt / "link", "/" + str(wt / ".git"))
+        return wt, base / "main"
+
+    return build
+
+
+def _prefixed_dotgit(prefix: str):
+    def build(base: Path) -> tuple[Path, Path]:
+        start, main = _plain_worktree(base)
+        dotgit = base / "wt" / ".git"
+        dotgit.write_text(prefix + dotgit.read_text(encoding="utf-8"), encoding="utf-8")
+        return start, main
+
+    return build
+
+
+def _symlinked_dotgit(base: Path) -> tuple[Path, Path]:
+    (base / "real.git").mkdir()
+    (base / "repo" / "src").mkdir(parents=True)
+    _symlink(base / "repo" / ".git", base / "real.git", directory=True)
+    return base / "repo" / "src", base / "repo"
+
+
+# Layouts whose ``.git`` is a file or a symlink, each with the start directory
+# and the entry a wrong mapping would read (#1271). Claude Code keys most of
+# them by the main checkout after checks STM does not reproduce, and the review
+# rounds of #1288 found three where a port of that mapping picked differently
+# (``backpointer-symlink-*``, ``bom``), so STM gives no key for any of them.
+GIT_FILE_LAYOUTS = {
+    "linked-worktree": _plain_worktree,
+    "relative-gitdir": _relative_gitdir,
+    "foreign-backpointer": _foreign_backpointer,
+    "bare-repo-worktree": _bare_worktree,
+    "submodule": _submodule,
+    "backpointer-symlink-dotdot": _backpointer_through_symlink("jump/../.git"),
+    "backpointer-symlink-unc-target": _backpointer_through_symlink("link"),
+    "bom": _prefixed_dotgit("\ufeff"),
+    "not-a-pointer": _prefixed_dotgit("garbage "),
+    "symlinked-dotgit": _symlinked_dotgit,
+}

@@ -3133,6 +3133,11 @@ if _should_advertise_obs_tools():
 
 def main() -> None:
     """Run the STM MCP server."""
+    # Also reached without the CLI group (direct callers), and it starts the
+    # LTM server and upstreams by bare name in the client's project directory.
+    from memtomem_stm.utils.exec_env import harden_exec_search
+
+    harden_exec_search()
     # STMConfig folds MEMTOMEM_STM_LOG_LEVEL and MEMTOMEM_STM_LOG_FILE into
     # one env surface (#612). A bad env value used to fall back to WARNING
     # silently here while the lifespan's own STMConfig() raised the same

@@ -35,6 +35,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from memtomem_stm.mms.claude_config import (
+    CLAUDE_CONFIG_UNKNOWN_REASONS,
+    claude_project_key,
+    read_claude_global_config,
+)
 from memtomem_stm.mms.secrets import Classification, classify_env
 
 if TYPE_CHECKING:
@@ -279,11 +284,55 @@ def _mcp_servers(config: dict[str, Any]) -> dict[str, Any]:
     return servers if isinstance(servers, dict) else {}
 
 
-def scan_claude_code(cwd: Path) -> list[ImportCandidate]:
-    """Scan ``~/.claude.json`` (user + per-project) plus ``<cwd>/.mcp.json``."""
-    candidates: list[ImportCandidate] = []
+# Why a source was not inspected, keyed by the code a scanner records in its
+# ``gaps`` sink (#1271). A source in ``gaps`` was skipped, not found empty, so
+# nothing may read its missing entries as removed at the host.
+SOURCE_GAP_REASONS: dict[str, str] = {
+    **CLAUDE_CONFIG_UNKNOWN_REASONS,
+    "no_key": (
+        "STM cannot tell which project entry Claude Code uses here "
+        "(e.g. a linked worktree, a submodule or a symlinked .git)"
+    ),
+    "mcp_json_unreadable": ".mcp.json in this directory could not be read as a JSON object",
+}
 
-    user_config = _read_json_safely(Path("~/.claude.json").expanduser())
+
+def _read_json_or_gap(path: Path) -> tuple[dict[str, Any] | None, bool]:
+    """``(data, unread)``: a missing file is ``(None, False)``, inspected and empty.
+
+    Anything else that yields no object — an I/O or decode error, invalid
+    JSON, a non-object top level — is ``(None, True)``: not inspected.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, False
+    except (OSError, ValueError):
+        return None, True
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None, True
+    return (data, False) if isinstance(data, dict) else (None, True)
+
+
+def scan_claude_code(cwd: Path, gaps: dict[str, str] | None = None) -> list[ImportCandidate]:
+    """Scan Claude Code's global config (user + project slot) plus ``<cwd>/.mcp.json``.
+
+    The global config is the file Claude Code reads and the project slot the
+    key it uses for ``cwd`` (#1271). A source that cannot be inspected — the
+    file cannot be placed or read, the slot cannot be named, ``.mcp.json``
+    exists but is unreadable — is recorded in ``gaps`` as
+    ``{source_label: reason}`` (a key of :data:`SOURCE_GAP_REASONS`).
+    """
+    candidates: list[ImportCandidate] = []
+    sink: dict[str, str] = gaps if gaps is not None else {}
+
+    claude_read = read_claude_global_config()
+    user_config = claude_read.data
+    if claude_read.unread is not None:
+        sink["Claude Code (user)"] = claude_read.unread
+        sink["Claude Code (project)"] = claude_read.unread
     if user_config:
         for name, raw in _mcp_servers(user_config).items():
             if not isinstance(raw, dict):
@@ -292,10 +341,14 @@ def scan_claude_code(cwd: Path) -> list[ImportCandidate]:
             if cand:
                 candidates.append(cand)
 
-        # Per-project entries live under .projects.<absolute-cwd>.mcpServers.
+        # Per-project entries live under .projects.<key>.mcpServers, the key
+        # being the repository root from a subdirectory.
         projects = user_config.get("projects") or {}
-        if isinstance(projects, dict):
-            project_entry = projects.get(str(cwd)) or projects.get(str(cwd.resolve())) or {}
+        key = claude_project_key(cwd)
+        if key is None:
+            sink["Claude Code (project)"] = "no_key"
+        elif isinstance(projects, dict):
+            project_entry = projects.get(key) or {}
             if isinstance(project_entry, dict):
                 for name, raw in _mcp_servers(project_entry).items():
                     if not isinstance(raw, dict):
@@ -304,7 +357,9 @@ def scan_claude_code(cwd: Path) -> list[ImportCandidate]:
                     if cand:
                         candidates.append(cand)
 
-    project_mcp = _read_json_safely(cwd / ".mcp.json")
+    project_mcp, mcp_unread = _read_json_or_gap(cwd / ".mcp.json")
+    if mcp_unread:
+        sink[".mcp.json (project)"] = "mcp_json_unreadable"
     if project_mcp:
         for name, raw in _mcp_servers(project_mcp).items():
             if not isinstance(raw, dict):
@@ -426,3 +481,25 @@ def discover(host: HostId | str, cwd: Path) -> list[ImportCandidate]:
     if scanner is None:
         raise ValueError(f"Unknown host '{host}'. Valid: {', '.join(ALL_HOSTS)}, all")
     return scanner(cwd)
+
+
+def discover_with_gaps(
+    host: HostId | str, cwd: Path
+) -> tuple[list[ImportCandidate], dict[str, str]]:
+    """:func:`discover`, plus ``{source_label: reason}`` for sources not inspected.
+
+    Only the Claude Code scanner reports gaps so far (#1271); the others
+    still read an unreadable file as an empty one.
+    """
+    hosts = list(ALL_HOSTS) if host == "all" else [host]
+    gaps: dict[str, str] = {}
+    out: list[ImportCandidate] = []
+    for h in hosts:
+        scanner = _HOST_SCANNERS.get(h)
+        if scanner is None:
+            raise ValueError(f"Unknown host '{host}'. Valid: {', '.join(ALL_HOSTS)}, all")
+        if scanner is scan_claude_code:
+            out.extend(scan_claude_code(cwd, gaps))
+        else:
+            out.extend(scanner(cwd))
+    return out, gaps

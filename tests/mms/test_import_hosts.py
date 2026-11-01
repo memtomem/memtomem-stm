@@ -10,7 +10,7 @@ import pytest
 from memtomem_stm.mms import import_hosts as ih
 from memtomem_stm.mms.secrets import Kind
 from memtomem_stm.mms.state import RegistryServer
-from helpers import set_home
+from helpers import claude_key, set_home
 
 
 # ---------------------------------------------------------------------------
@@ -208,10 +208,10 @@ class TestScanClaudeCode:
 
     def test_per_project_scope(self, sandbox_home, tmp_path):
         cwd = tmp_path / "proj"
-        cwd.mkdir()
+        (cwd / ".git").mkdir(parents=True)  # its own key wherever tmp lives (#1271)
         cfg = {
             "projects": {
-                str(cwd): {
+                claude_key(cwd): {
                     "mcpServers": {
                         "playwright": {"command": "npx", "args": ["-y", "@mcp/pw"]},
                     }
@@ -264,6 +264,95 @@ class TestScanClaudeCode:
 
     def test_missing_file_returns_empty(self, sandbox_home, tmp_path):
         assert ih.scan_claude_code(tmp_path) == []
+
+    def test_missing_file_is_not_a_gap(self, sandbox_home, tmp_path):
+        (tmp_path / ".git").mkdir()
+        gaps: dict[str, str] = {}
+
+        assert ih.scan_claude_code(tmp_path, gaps) == []
+        assert gaps == {}
+
+    def test_subdirectory_reads_the_repository_slot(self, sandbox_home, tmp_path):
+        """Measured on 2.1.316: from ``<repo>/src`` the entry is under
+        ``projects["<repo>"]``; a ``<repo>/src`` key is one Claude Code
+        neither reads nor writes (#1271)."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        cfg = {
+            "projects": {
+                claude_key(repo): {"mcpServers": {"root": {"command": "npx"}}},
+                claude_key(repo / "src"): {"mcpServers": {"stale": {"command": "npx"}}},
+            }
+        }
+        (sandbox_home / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+        assert [c.name for c in ih.scan_claude_code(repo / "src")] == ["root"]
+
+    def test_absolute_config_dir_is_read(self, sandbox_home, tmp_path, monkeypatch):
+        cfg_dir = tmp_path / "cfg"
+        cfg_dir.mkdir()
+        (cfg_dir / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"active": {"command": "npx"}}}), encoding="utf-8"
+        )
+        (sandbox_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"stale": {"command": "npx"}}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
+
+        assert [c.name for c in ih.scan_claude_code(tmp_path)] == ["active"]
+
+    def test_unknown_config_is_a_gap_for_both_claude_sources(
+        self, sandbox_home, tmp_path, monkeypatch
+    ):
+        (sandbox_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"stale": {"command": "npx"}}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative")
+        gaps: dict[str, str] = {}
+
+        assert ih.scan_claude_code(tmp_path, gaps) == []
+        assert gaps == {"Claude Code (user)": "config_dir", "Claude Code (project)": "config_dir"}
+
+    def test_unreadable_config_is_a_gap(self, sandbox_home, tmp_path):
+        (sandbox_home / ".claude.json").write_text("{not json", encoding="utf-8")
+        gaps: dict[str, str] = {}
+
+        ih.scan_claude_code(tmp_path, gaps)
+
+        assert gaps == {"Claude Code (user)": "unreadable", "Claude Code (project)": "unreadable"}
+
+    def test_no_key_is_a_gap_for_the_project_source_only(self, sandbox_home, tmp_path):
+        cwd = tmp_path / "wt"
+        cwd.mkdir()
+        (cwd / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        (sandbox_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"u": {"command": "npx"}}}), encoding="utf-8"
+        )
+        gaps: dict[str, str] = {}
+
+        assert [c.name for c in ih.scan_claude_code(cwd, gaps)] == ["u"]
+        assert gaps == {"Claude Code (project)": "no_key"}
+
+    @pytest.mark.parametrize("raw", [b"{not json", b"[]", b"\xff"])
+    def test_unreadable_mcp_json_is_a_gap(self, sandbox_home, tmp_path, raw):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".mcp.json").write_bytes(raw)
+        gaps: dict[str, str] = {}
+
+        ih.scan_claude_code(tmp_path, gaps)
+
+        assert gaps == {".mcp.json (project)": "mcp_json_unreadable"}
+
+    def test_discover_with_gaps_collects_them(self, sandbox_home, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (sandbox_home / ".claude.json").write_text("{not json", encoding="utf-8")
+
+        _cands, gaps = ih.discover_with_gaps("all", tmp_path)
+
+        assert gaps == {"Claude Code (user)": "unreadable", "Claude Code (project)": "unreadable"}
+        with pytest.raises(ValueError):
+            ih.discover_with_gaps("vim", tmp_path)
 
 
 class TestScanCursor:
@@ -465,8 +554,8 @@ class TestNonDictMcpServers:
     @BAD_VALUES
     def test_claude_code_project_scope_returns_empty(self, sandbox_home, tmp_path, bad):
         cwd = tmp_path / "proj"
-        cwd.mkdir()
-        cfg = {"projects": {str(cwd): {"mcpServers": bad}}}
+        (cwd / ".git").mkdir(parents=True)  # its own key wherever tmp lives (#1271)
+        cfg = {"projects": {claude_key(cwd): {"mcpServers": bad}}}
         (sandbox_home / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
         assert ih.scan_claude_code(cwd) == []
 
