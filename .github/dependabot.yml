@@ -16,6 +16,17 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Keep declared requirements where they are: a release the requirement
+    # already admits only moves uv.lock. With the default ("auto"), the uv
+    # updater raised each requirement it touched to the newest release
+    # (#1304), so runtime floors in the published wheel would follow every
+    # routine refresh. A release outside a requirement (an `mcp` 3.x past
+    # `<3`, a new `pip-audit` past its `==` pin) still changes it and arrives
+    # as a PR; "lockfile-only" would drop that update without a PR. This
+    # setting also governs security updates: a fix the requirement already
+    # admits moves uv.lock only, so the published runtime floor still needs
+    # review and a manual raise (#737).
+    versioning-strategy: "increase-if-necessary"
     groups:
       python-minor-patch:
         update-types: ["minor", "patch"]
