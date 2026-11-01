@@ -9,7 +9,17 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.5] — 2026-11-01
+
+### Upgrade notes
+
+- **Nothing changes at runtime.** The wheel's metadata states the license as
+  `License-Expression: Apache-2.0`; 0.7.4 used the `License` field and the
+  `License :: OSI Approved :: Apache Software License` classifier, which
+  0.7.5 no longer carries. A license scanner that reads only those two finds
+  no license. Building from the sdist needs `hatchling>=1.27`, which build
+  isolation installs on its own; a build with `--no-build-isolation`, as
+  distribution packagers run, must provide it. (#1305)
 
 ### Changed
 
@@ -20,7 +30,7 @@ changes inline only. See the deprecation policy in
   names MCP. The license is declared as the SPDX expression `Apache-2.0`
   (PEP 639), the project links gain Documentation and Changelog, and the
   classifiers gain `Environment :: Console`, `Python :: 3 :: Only` and
-  `Typing :: Typed`. PyPI shows it from the next release. (#1305)
+  `Typing :: Typed`. PyPI shows it from this release. (#1305)
   **Behavior change**: none at runtime. The package metadata states the
   license as `License-Expression: Apache-2.0` instead of the `License` field
   and the `License :: OSI Approved :: Apache Software License` classifier,
