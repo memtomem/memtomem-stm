@@ -55,7 +55,13 @@ from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import has_lone_surrogate, unencodable_field
 from memtomem_stm.cli._write_lock import ConfigWriteError, with_config_write_lock
 from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
-from memtomem_stm.mms.claude_config import claude_project_key
+from memtomem_stm.mms.claude_config import (
+    CLAUDE_CONFIG_UNKNOWN_REASONS,
+    ClaudeConfigUnknown,
+    claude_global_config,
+    claude_project_key,
+    read_claude_global_config,
+)
 from memtomem_stm.mms.import_hosts import (
     _DANGEROUS_ENV_KEYS,
     _desktop_config_path,
@@ -3432,20 +3438,34 @@ _UNMANAGED_SOURCE_FILES: dict[str, str] = {
     "cursor-project": ".cursor/mcp.json in this checkout",
 }
 _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
-# The sources Claude Code keeps in its global config file. Discovery reads them
-# from ``~/.claude.json``; Claude Code reads ``$CLAUDE_CONFIG_DIR/.claude.json``
-# instead when that variable is nonempty, and so does every ``claude mcp``
-# call, so there the entry STM matched is not the one Claude acts on (#1287).
+# The sources Claude Code keeps in its global config file, which
+# ``claude_global_config`` locates the way Claude Code does (#1271).
 _CLAUDE_GLOBAL_CONFIG_KINDS = frozenset({"claude-user", "claude-project"})
 
 
-def _claude_config_dir_set() -> bool:
-    """Whether Claude Code reads its config from ``CLAUDE_CONFIG_DIR``.
+def _claude_config_gap_note(cwd: Path) -> str | None:
+    """What discovery skipped in Claude Code's config for ``cwd``, and why (#1271).
 
-    Nonempty only, the way Claude Code resolves it
-    (``CLAUDE_CONFIG_DIR || homedir()``).
+    The whole file when STM cannot place or read it; the project entry alone
+    when the file has projects but STM cannot tell which one Claude Code uses
+    for ``cwd``. ``None`` when nothing was skipped — including a readable file
+    with no projects, where no entry could hold a server whatever the key.
     """
-    return bool(os.environ.get("CLAUDE_CONFIG_DIR"))
+    claude_read = read_claude_global_config()
+    if claude_read.unread is not None:
+        reason = CLAUDE_CONFIG_UNKNOWN_REASONS[claude_read.unread]
+        return f"Claude Code user and project servers were not read: {reason}."
+    projects = claude_read.data.get("projects") if claude_read.data else None
+    if isinstance(projects, dict) and projects and claude_project_key(cwd) is None:
+        return f"Claude Code project servers were not read: {_DISABLES_UNREAD_CAVEAT['no_key']}."
+    return None
+
+
+def _echo_claude_config_gap(cwd: Path, *, err: bool) -> None:
+    """Say what discovery skipped in Claude Code's config, if anything."""
+    note = _claude_config_gap_note(cwd)
+    if note is not None:
+        click.echo(f"{_warn('Note:')} {note}", err=err)
 
 
 def _prune_targets(
@@ -3950,10 +3970,14 @@ def _discover_candidates(cwd: Path) -> list[_DiscoveredCandidate]:
             )
         )
 
-    # 2. Claude Code ~/.claude.json user-scope + per-project entries.
-    claude_json = Path("~/.claude.json").expanduser()
-    cc = _read_json_safely(claude_json)
-    if cc:
+    # 2. Claude Code's global config (``~/.claude.json`` unless relocated):
+    #    user scope, plus the ``projects`` slot Claude Code uses for cwd. A
+    #    file STM cannot place is skipped, never guessed (#1271); callers say
+    #    so through ``_echo_claude_config_gap``.
+    claude_read = read_claude_global_config()
+    cc = claude_read.data
+    claude_json = claude_read.path
+    if cc and claude_json is not None:
         if isinstance(cc.get("mcpServers"), dict):
             sources.append(
                 _DiscoveredSource(
@@ -3965,17 +3989,21 @@ def _discover_candidates(cwd: Path) -> list[_DiscoveredCandidate]:
                 )
             )
         projects = cc.get("projects")
-        if isinstance(projects, dict):
-            # Match on resolved cwd so we don't duplicate entries across sibling projects.
-            resolved_cwd = str(cwd.resolve())
-            proj_entry = projects.get(resolved_cwd)
+        # The slot is the key Claude Code uses for cwd — the repository root
+        # from a subdirectory — while ``src_path`` stays cwd itself: Claude
+        # Code launches a local-scope server from the session's start
+        # directory, so that is the checkout identity reads, and ``claude mcp
+        # remove -s local`` run from it picks this same slot (#1271).
+        key = claude_project_key(cwd)
+        if key is not None and isinstance(projects, dict):
+            proj_entry = projects.get(key)
             if isinstance(proj_entry, dict) and isinstance(proj_entry.get("mcpServers"), dict):
                 sources.append(
                     _DiscoveredSource(
                         spec=_SOURCE_BY_LABEL["Claude Code (project)"],
-                        src_path=resolved_cwd,
+                        src_path=str(cwd.resolve()),
                         path=_canonical_path(claude_json),
-                        slot=("projects", resolved_cwd, "mcpServers"),
+                        slot=("projects", key, "mcpServers"),
                         servers=proj_entry["mcpServers"],
                     )
                 )
@@ -4238,12 +4266,12 @@ _DISABLES_UNREAD_CAVEAT = {
         "STM cannot tell which project entry Claude Code uses here "
         "(e.g. a linked worktree, a submodule or a symlinked `.git`)"
     ),
-    "config_dir": "STM does not read `/mcp` state when CLAUDE_CONFIG_DIR is nonempty",
+    "no_config": "STM cannot tell which file Claude Code reads its config from",
 }
 
 
 def _claude_disabled_mcp_servers(cwd: Path) -> tuple[frozenset[str], str | None]:
-    """Names disabled for ``cwd`` in ``/mcp``, from ``~/.claude.json`` (#1268).
+    """Names disabled for ``cwd`` in ``/mcp``, from Claude Code's global config (#1268).
 
     ``/mcp`` records a disabled plugin server under
     ``projects[<key>].disabledMcpServers`` as the name it shows,
@@ -4261,18 +4289,19 @@ def _claude_disabled_mcp_servers(cwd: Path) -> tuple[frozenset[str], str | None]
     ``cwd`` at all, why (a key into ``_DISABLES_UNREAD_CAVEAT``) so the caller
     can say so next to the report (#1289): ``"no_key"`` when there is no key
     (a linked worktree, a submodule, a symlinked ``.git``, or a ``cwd`` that
-    cannot be resolved), ``"config_dir"`` when ``CLAUDE_CONFIG_DIR`` is
-    nonempty, so Claude Code reads its config elsewhere and ``~/.claude.json``
-    may hold stale disables. Either way no names are returned. When the file
-    is consulted, anything unreadable in it yields no names and no reason, so
-    it never hides a server.
+    cannot be resolved), ``"no_config"`` when STM cannot tell which file
+    Claude Code reads its config from
+    (:func:`~memtomem_stm.mms.claude_config.claude_global_config`, #1271).
+    Either way no names are returned. When the file is consulted, anything
+    unreadable in it yields no names and no reason, so it never hides a server.
     """
-    if _claude_config_dir_set():
-        return frozenset(), "config_dir"
+    claude_read = read_claude_global_config()
+    if claude_read.unread is not None and claude_read.unread != "unreadable":
+        return frozenset(), "no_config"
     key = claude_project_key(cwd)
     if key is None:
         return frozenset(), "no_key"
-    cc = _read_json_safely(Path("~/.claude.json").expanduser())
+    cc = claude_read.data
     projects = cc.get("projects") if cc else None
     entry = projects.get(key) if isinstance(projects, dict) else None
     disabled = entry.get("disabledMcpServers") if isinstance(entry, dict) else None
@@ -4595,8 +4624,8 @@ def _source_removal_hint(name: str, source: str) -> str:
     STM never edits source client configs itself — the hint is copy-paste
     only. Scope-label mapping comes from ``_SOURCE_SPECS`` and matches the
     ``claude mcp remove -s`` flag: ``Claude Code (project)`` is the
-    per-project entry in ``~/.claude.json``, which the Claude Code CLI calls
-    ``local``.
+    per-project entry in Claude Code's global config, which the Claude Code
+    CLI calls ``local``.
 
     The two ``#`` branches are prose, not commands, so ``_shell_join`` never
     sees them — their config-derived values are display-escaped by ``_disp``
@@ -4608,14 +4637,6 @@ def _source_removal_hint(name: str, source: str) -> str:
         # Both values are untrusted here: reaching this branch means ``source``
         # was not one of the known labels either.
         return f"# Remove '{_disp(name)}' from {_disp(source)}."
-    if spec.kind in _CLAUDE_GLOBAL_CONFIG_KINDS and _claude_config_dir_set():
-        # `claude mcp remove` would act on the active file, which mms never
-        # read: a same-named entry there may be another server (#1287).
-        return (
-            "# Claude Code reads $CLAUDE_CONFIG_DIR/.claude.json while CLAUDE_CONFIG_DIR is "
-            f"set, not the ~/.claude.json entry mms matched: compare '{_disp(name)}' there "
-            "before removing it by hand."
-        )
     if spec.claude_scope is not None:
         return _shell_join(["claude", "mcp", "remove", name, "-s", spec.claude_scope])
     if not spec.managed:
@@ -4813,19 +4834,13 @@ def _prune_refusal(spec: _SourceSpec, name: str) -> str | None:
 
     The one rule every prune reader asks — the plan split, the backstop and
     the writer — so a row is never planned by one and refused by another.
-    A source without a writer is refused (#955), and so is a Claude Code
-    global-config source while ``CLAUDE_CONFIG_DIR`` is nonempty: discovery
-    validated and backed up the ``~/.claude.json`` entry, but ``claude mcp
-    remove`` deletes the same name from the active file, which may hold a
-    different server (#1287).
+    A source without a writer is refused (#955). A Claude Code global-config
+    row is not: discovery read the file and slot Claude Code uses, and
+    ``claude mcp remove`` inherits the same environment, so it removes the
+    entry discovery matched and backed up (#1287, #1271).
     """
     if not spec.managed:
         return _unmanaged_prune_refusal(spec, name)
-    if spec.kind in _CLAUDE_GLOBAL_CONFIG_KINDS and _claude_config_dir_set():
-        return (
-            "Claude Code reads $CLAUDE_CONFIG_DIR/.claude.json while CLAUDE_CONFIG_DIR is set, "
-            f"not the ~/.claude.json entry mms matched — remove '{name}' by hand"
-        )
     return None
 
 
@@ -4852,10 +4867,7 @@ def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
         # Ordered ahead of ``claude_scope`` so this guard and its caller's copy
         # (``_prune_imported_candidates``) agree on precedence: a future
         # unmanaged spec that also carries a scope must not shell out here
-        # while the caller reports it as untouched (#955 review). Under a
-        # nonempty CLAUDE_CONFIG_DIR the shell-out targets a file discovery
-        # never read, so a Claude Code global-config row is refused the same
-        # way (#1287).
+        # while the caller reports it as untouched (#955 review).
         return (False, refusal)
     if spec.claude_scope is not None:
         return _claude_mcp_remove(name, spec.claude_scope)
@@ -5000,6 +5012,23 @@ def _prune_imported_candidates(
     return pruned, failed
 
 
+def _same_source_slot(row: dict[str, Any], ref: dict[str, Any] | None) -> bool:
+    """Whether provenance ``row`` names the host entry ``ref`` addresses."""
+    if ref is None or row.get("kind") != ref.get("kind"):
+        return False
+    row_path, ref_path = row.get("path"), ref.get("path")
+    if row_path == ref_path:
+        return True
+    if ref.get("kind") != "claude-project":
+        return False
+    if not isinstance(row_path, str) or not isinstance(ref_path, str):
+        return False
+    if not (Path(row_path).is_absolute() and Path(ref_path).is_absolute()):
+        return False
+    row_key = claude_project_key(Path(row_path))
+    return row_key is not None and row_key == claude_project_key(Path(ref_path))
+
+
 def _mark_pruned_sources(
     servers: dict[str, Any],
     candidates: list[_DiscoveredCandidate],
@@ -5015,6 +5044,11 @@ def _mark_pruned_sources(
     sources, so only rows whose writer succeeded flip; a failed duplicate
     keeps ``pruned: false`` and stays visible to ``mms eject`` (PR3).
     Returns ``True`` when anything changed so the caller knows to save.
+
+    A ``claude-project`` row records the directory the server runs in, and
+    several directories share one ``projects`` slot (a repository and its
+    subdirectories). The prune removed the entry from that slot, so a row
+    recorded from any directory of it is matched by the slot key (#1271).
     """
     refs: dict[tuple[str, str], dict[str, Any]] = {}
     for cand in candidates:
@@ -5032,7 +5066,7 @@ def _mark_pruned_sources(
         for row in (origin.get("source"), *(origin.get("duplicates") or [])):
             if not isinstance(row, dict):
                 continue
-            if row.get("kind") != ref.get("kind") or row.get("path") != ref.get("path"):
+            if not _same_source_slot(row, ref):
                 continue
             if not row.get("pruned"):
                 row["pruned"] = True
@@ -5693,6 +5727,7 @@ def _add_from_clients(
 
     discovery_cwd = Path.cwd()
     all_candidates = _discover_candidates(discovery_cwd)
+    _echo_claude_config_gap(discovery_cwd, err=as_json)
     plugin_bypass = _plugin_bypass_servers(discovery_cwd)
     _echo_plugin_bypass(plugin_bypass, err=as_json)
     from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
@@ -6270,6 +6305,9 @@ def init(
     if not demo:
         plugin_bypass = _plugin_bypass_servers(Path.cwd())
         _SETUP_PLUGIN_BYPASS.set(_plugin_bypass_json(plugin_bypass))
+        # Unlike the plugin rows, this has no JSON field: under --json it is
+        # the only record that discovery skipped Claude Code's config.
+        _echo_claude_config_gap(Path.cwd(), err=json_mode)
         if not json_mode:
             _echo_plugin_bypass(plugin_bypass, err=False)
         from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
@@ -7517,6 +7555,7 @@ def prune(
         }
 
     data = _load(resolved, json_action="prune" if as_json else None)
+    _echo_claude_config_gap(Path.cwd(), err=as_json)
     plugin_bypass = _plugin_bypass_servers(Path.cwd())
     _echo_plugin_bypass(plugin_bypass, err=as_json)
     from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
@@ -7615,8 +7654,7 @@ def prune(
         # Nothing here is this run's to write, so there is no consent to ask
         # for: a prompt (or a "pass --yes" exit without a TTY) would gate an
         # action the run cannot take, which the import path already skips
-        # (#955). A nonempty CLAUDE_CONFIG_DIR makes this the common case
-        # for Claude Code rows (#1287). ``--json`` keeps its own contract.
+        # (#955). ``--json`` keeps its own contract.
         click.echo("")
         click.echo(
             f"{_ok('Nothing to remove automatically:')} remove the (manual) rows by hand. "
@@ -7784,8 +7822,9 @@ def _eject_host_config_path(kind: str, path: str | None) -> Path | None:
         return Path(path) if path else None
     if kind == "claude-desktop":
         return _desktop_config_path()
-    if kind in {"claude-user", "claude-project"}:
-        return Path("~/.claude.json").expanduser()
+    if kind in _CLAUDE_GLOBAL_CONFIG_KINDS:
+        resolved = claude_global_config()
+        return None if isinstance(resolved, ClaudeConfigUnknown) else resolved
     return None
 
 
@@ -7799,12 +7838,30 @@ def _read_host_servers(
     the host config directly rather than parsing ``claude mcp get`` output — the latter has no
     machine-readable contract, and a parse drift could false-pass the
     verify or leak secret values through diagnostics.
+
+    A Claude Code target is read from the file and ``projects`` slot Claude
+    Code uses (#1271): the slot is derived from the recorded project directory,
+    which is also the cwd ``claude mcp add -s local`` runs in, so the write and
+    this read meet in one slot. When STM cannot tell either, strict refuses
+    before anything is removed or added.
     """
-    if kind in _CLAUDE_GLOBAL_CONFIG_KINDS and _claude_config_dir_set():
+    if kind in _CLAUDE_GLOBAL_CONFIG_KINDS:
+        resolved = claude_global_config()
+        if isinstance(resolved, ClaudeConfigUnknown):
+            if strict:
+                raise _HostConfigReadError(
+                    "STM cannot tell which file Claude Code reads its config from ("
+                    f"{CLAUDE_CONFIG_UNKNOWN_REASONS[resolved.reason]}); "
+                    "restore the registration manually in the active Claude configuration"
+                )
+            return None
+    slot_key = claude_project_key(Path(path)) if kind == "claude-project" and path else None
+    if kind == "claude-project" and slot_key is None:
         if strict:
             raise _HostConfigReadError(
-                "automatic eject to Claude Code is unsupported with CLAUDE_CONFIG_DIR set; "
-                "restore the registration manually in the active Claude configuration"
+                f"STM cannot tell which project entry Claude Code uses for {path} "
+                "(e.g. a linked worktree, a submodule or a symlinked .git); "
+                "restore the registration manually"
             )
         return None
     config_path = _eject_host_config_path(kind, path)
@@ -7818,15 +7875,15 @@ def _read_host_servers(
             raise _HostConfigReadError(
                 f"target config {config_path}: projects is not an object; fix it before ejecting"
             )
-        candidate = projects.get(path) if isinstance(projects, dict) else None
+        candidate = projects.get(slot_key) if isinstance(projects, dict) else None
         if (
             strict
             and isinstance(projects, dict)
-            and path in projects
+            and slot_key in projects
             and not isinstance(candidate, dict)
         ):
             raise _HostConfigReadError(
-                f"target config {config_path}: project {path} is not an object; "
+                f"target config {config_path}: project {slot_key} is not an object; "
                 "fix it before ejecting"
             )
         data = candidate if isinstance(candidate, dict) else None

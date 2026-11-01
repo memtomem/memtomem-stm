@@ -39,6 +39,12 @@ The four buckets:
      v2 binary — comparing them silently would always read as
      ``changed``, which is worse than asking for a re-stamp.
 
+A fifth state, ``not_inspected`` (#1271), splits off what used to read as
+``removed_at_host``: the entry's baseline source is one the scan skipped —
+STM could not tell which Claude Code config or project entry is in use, or
+the file was unreadable — so a missing candidate says nothing about the host.
+Rows carry a ``reason``; sync never removes them.
+
 When candidates with the same name appear in multiple host configs,
 the comparison candidate is chosen by ``baseline.source_label`` match
 first, falling back to first-seen across :data:`ALL_HOSTS`. This keeps
@@ -47,9 +53,9 @@ into a second host — the import-time host stays the comparison axis.
 
 PR6 added ``mms host sync`` as the write-back counterpart to status's
 read-only inspection. Sync's JSON shape (``mode``/``aborted``/``plan``
-/``summary``) is its own contract independent of status's locked-in
-4-key shape — bucket vocabulary is shared, but the surface that emits
-it is not.
+/``summary``) is its own contract independent of status's summary
+shape (5 keys since ``not_inspected``) — bucket vocabulary is shared, but
+the surface that emits it is not.
 """
 
 from __future__ import annotations
@@ -70,7 +76,8 @@ from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
 from memtomem_stm.mms.import_hosts import (
     ALL_HOSTS,
     ImportCandidate,
-    discover,
+    SOURCE_GAP_REASONS,
+    discover_with_gaps,
     project_local_gate_message,
 )
 
@@ -223,14 +230,23 @@ def _classify(
     registry: state.RegistryConfig,
     import_state: state.ImportState,
     candidates: list[ImportCandidate],
+    gaps: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Bucket every registry entry into one of four states.
+    """Bucket every registry entry into one of five states.
 
     Returns a list of dicts (one per registry entry) with keys
     ``name``, ``state``, ``source_label``, ``baseline_hash``,
     ``current_hash``, ``last_imported``. Order matches
     ``registry.servers`` insertion order (registry.toml file order).
+
+    ``gaps`` maps source labels the scan could not inspect to a reason
+    (:func:`~memtomem_stm.mms.import_hosts.discover_with_gaps`). A baselined
+    entry no scanner returned whose baseline source is one of them is
+    ``not_inspected`` — with a ``reason`` key — not ``removed_at_host``:
+    its host config was skipped, not found without it, so nothing may
+    remove it on that evidence (#1271).
     """
+    gaps = gaps or {}
     cand_by_name = _select_candidate_by_name(candidates, import_state)
     rows: list[dict] = []
     for name in registry.servers:
@@ -258,6 +274,19 @@ def _classify(
                     "baseline_hash": baseline.drift_hash if baseline else None,
                     "current_hash": current_hash,
                     "last_imported": baseline.last_imported if baseline else None,
+                }
+            )
+            continue
+        if cand is None and baseline.source_label in gaps:
+            rows.append(
+                {
+                    "name": name,
+                    "state": "not_inspected",
+                    "source_label": baseline.source_label,
+                    "baseline_hash": baseline.drift_hash,
+                    "current_hash": None,
+                    "last_imported": baseline.last_imported,
+                    "reason": gaps[baseline.source_label],
                 }
             )
             continue
@@ -324,7 +353,11 @@ def _render_text(rows: list[dict]) -> None:
     ``removed_at_host`` (15) fits with one char of padding past the
     longest state name.
     """
-    main_rows = [r for r in rows if r["state"] in ("unchanged", "changed", "removed_at_host")]
+    main_rows = [
+        r
+        for r in rows
+        if r["state"] in ("unchanged", "changed", "removed_at_host", "not_inspected")
+    ]
     n_unchanged = sum(1 for r in main_rows if r["state"] == "unchanged")
     n_changed = sum(1 for r in main_rows if r["state"] == "changed")
     n_removed = sum(1 for r in rows if r["state"] == "removed_at_host")
@@ -351,15 +384,29 @@ def _render_text(rows: list[dict]) -> None:
                 n=n_no_baseline, ies_or_y=_ies_or_y(n_no_baseline)
             )
         )
+    _render_not_inspected_footer(rows)
+
+
+def _render_not_inspected_footer(rows: list[dict], indent: str = " ") -> None:
+    """One line per skip reason: those entries were kept, and why (#1271)."""
+    by_reason: dict[str, int] = {}
+    for row in rows:
+        if row["state"] == "not_inspected":
+            by_reason[row["reason"]] = by_reason.get(row["reason"], 0) + 1
+    for reason, n in by_reason.items():
+        click.echo(
+            f"{indent}{n} entr{_ies_or_y(n)} not inspected (kept): {SOURCE_GAP_REASONS[reason]}"
+        )
 
 
 def _render_json(rows: list[dict]) -> None:
-    """JSON renderer. Includes every state; summary always carries 4 keys."""
+    """JSON renderer. Includes every state; summary always carries 5 keys."""
     summary = {
         "unchanged": sum(1 for r in rows if r["state"] == "unchanged"),
         "changed": sum(1 for r in rows if r["state"] == "changed"),
         "removed_at_host": sum(1 for r in rows if r["state"] == "removed_at_host"),
         "no_baseline": sum(1 for r in rows if r["state"] == "no_baseline"),
+        "not_inspected": sum(1 for r in rows if r["state"] == "not_inspected"),
     }
     payload = {"entries": rows, "summary": summary}
     click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
@@ -399,6 +446,7 @@ def status_cmd(json_output: bool) -> None:
                             "changed": 0,
                             "removed_at_host": 0,
                             "no_baseline": 0,
+                            "not_inspected": 0,
                         },
                     },
                     indent=2,
@@ -408,8 +456,8 @@ def status_cmd(json_output: bool) -> None:
         click.echo(_NO_REGISTRY_MSG, nl=False)
         return
 
-    candidates = discover("all", Path.cwd().resolve())
-    rows = _classify(registry, import_state, candidates)
+    candidates, gaps = discover_with_gaps("all", Path.cwd().resolve())
+    rows = _classify(registry, import_state, candidates, gaps)
     if json_output:
         _render_json(rows)
     else:
@@ -442,7 +490,7 @@ def _scan_rows(
     ]
 
 
-def _render_scan_text(rows: list[dict], from_host: str) -> None:
+def _render_scan_text(rows: list[dict], from_host: str, gaps: dict[str, str]) -> None:
     """Default human-readable scan renderer.
 
     Empty case: scoped one-liner — ``across host configs`` when no
@@ -467,6 +515,7 @@ def _render_scan_text(rows: list[dict], from_host: str) -> None:
     if not rows:
         scope = "across host configs" if from_host == "all" else f"in {from_host}"
         click.echo(f"No MCP entries discovered {scope}.\n", nl=False)
+        _render_scan_gaps(gaps)
         return
     click.echo(f" {'NAME':<20} {'HOST':<22} IN_REGISTRY")
     for row in rows:
@@ -483,9 +532,19 @@ def _render_scan_text(rows: list[dict], from_host: str) -> None:
         f" {n_total} {entries_word} across {n_hosts} {hosts_word} "
         f"({n_in_reg} in registry, {n_new} new at host)"
     )
+    _render_scan_gaps(gaps)
 
 
-def _render_scan_json(rows: list[dict]) -> None:
+def _render_scan_gaps(gaps: dict[str, str]) -> None:
+    for label, reason in gaps.items():
+        click.echo(f" {_disp(label)} not inspected: {SOURCE_GAP_REASONS[reason]}")
+
+
+def _gap_rows(gaps: dict[str, str]) -> list[dict[str, str]]:
+    return [{"source": label, "reason": reason} for label, reason in gaps.items()]
+
+
+def _render_scan_json(rows: list[dict], gaps: dict[str, str]) -> None:
     """JSON scan renderer. Always emits 3-key summary (zero counts explicit)."""
     n_total = len(rows)
     n_in_reg = sum(1 for r in rows if r["in_registry"])
@@ -499,6 +558,8 @@ def _render_scan_json(rows: list[dict]) -> None:
             # not at host vs at host, not in registry).
             "new_at_host": n_total - n_in_reg,
         },
+        # Sources the scan skipped (#1271): their entries are unknown, not absent.
+        "not_inspected": _gap_rows(gaps),
     }
     click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
 
@@ -539,12 +600,12 @@ def scan_cmd(from_host: str, json_output: bool) -> None:
 
     registry = state.load_registry()
     report_host_bypass(Path.cwd().resolve(), from_host.lower())
-    candidates = discover(from_host, Path.cwd().resolve())
+    candidates, gaps = discover_with_gaps(from_host, Path.cwd().resolve())
     rows = _scan_rows(candidates, registry)
     if json_output:
-        _render_scan_json(rows)
+        _render_scan_json(rows, gaps)
     else:
-        _render_scan_text(rows, from_host)
+        _render_scan_text(rows, from_host, gaps)
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +628,7 @@ def _empty_sync_payload() -> dict:
         "skipped_changed": [],
         "orphan_no_baseline": [],
         "conflicts": [],
+        "not_inspected": [],
     }
 
 
@@ -581,6 +643,7 @@ def _empty_sync_summary() -> dict:
         "restamped": 0,
         "unchanged": 0,
         "conflicts": 0,
+        "not_inspected": 0,
     }
 
 
@@ -1001,16 +1064,19 @@ def sync_cmd(
     registry = state.load_registry()
     import_state = state.load_import_state()
     report_host_bypass(cwd)
-    candidates = discover("all", cwd)
+    candidates, gaps = discover_with_gaps("all", cwd)
 
     # Two orthogonal classifiers (see Action-bucket matrix in the plan).
     new, conflicts, _idempotent = _classify_against_registry(candidates, registry)
-    classified = _classify(registry, import_state, candidates)
+    classified = _classify(registry, import_state, candidates, gaps)
     cand_by_name = _select_candidate_by_name(candidates, import_state)
 
     removed_at_host_rows = [r for r in classified if r["state"] == "removed_at_host"]
     changed_rows_classified = [r for r in classified if r["state"] == "changed"]
     no_baseline_rows = [r for r in classified if r["state"] == "no_baseline"]
+    # Never mutated: their host config was skipped, so a missing candidate
+    # says nothing about the host (#1271).
+    not_inspected_rows = [r for r in classified if r["state"] == "not_inspected"]
     n_unchanged = sum(1 for r in classified if r["state"] == "unchanged")
 
     no_baseline_with_cand = [r for r in no_baseline_rows if cand_by_name.get(r["name"]) is not None]
@@ -1096,6 +1162,12 @@ def sync_cmd(
             {"name": cand.name, "host": cand.source_label, "reason": reason}
             for cand, reason in conflicts
         ],
+        # Registry entries whose baseline source the scan could not inspect:
+        # kept as they are, never in ``remove`` (#1271).
+        "not_inspected": [
+            {"name": r["name"], "source_label": r["source_label"], "reason": r["reason"]}
+            for r in not_inspected_rows
+        ],
     }
     # ``restamped`` always present (default 0); incremented only on
     # ``--apply --force`` over baseline-source-matched entries.
@@ -1109,6 +1181,7 @@ def sync_cmd(
         "restamped": len(restamp_eligible_rows) if force else 0,
         "unchanged": n_unchanged,
         "conflicts": len(plan_payload["conflicts"]),
+        "not_inspected": len(plan_payload["not_inspected"]),
     }
 
     # In-process row enrichment for the diff renderer (Lock-down 2).
@@ -1139,6 +1212,7 @@ def sync_cmd(
                 force_active=force,
             )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
+            _render_not_inspected_footer(not_inspected_rows, indent="  ")
         return
 
     # ----- --apply -----
@@ -1220,6 +1294,7 @@ def sync_cmd(
                 apply_outcome="no_op",
             )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
+            _render_not_inspected_footer(not_inspected_rows, indent="  ")
         return
 
     # Step 1: registry write (ADD inserts + REMOVE deletes + RESTAMP
@@ -1305,3 +1380,4 @@ def sync_cmd(
             apply_outcome="mutated",
         )
         _render_orphan_no_baseline_footer(len(no_baseline_orphans))
+        _render_not_inspected_footer(not_inspected_rows, indent="  ")

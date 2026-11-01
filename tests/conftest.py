@@ -44,6 +44,8 @@ def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
         # This is another home root. Tests that exercise custom Claude config
         # behavior set their own value after isolation.
         patch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        # Renames Claude Code's config file, so STM reads none of it (#1271).
+        patch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
         # MonkeyPatch restores deletions in reverse. Delete backwards so STM
         # keys regain their original order: case-equivalent names are resolved
         # last-one-wins by settings on POSIX.

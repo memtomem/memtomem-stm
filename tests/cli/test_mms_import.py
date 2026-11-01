@@ -517,6 +517,7 @@ class TestProjectConfigGate:
         # ``.projects.<cwd>`` lives in the user's home ~/.claude.json — a repo
         # checkout cannot ship it, so it is NOT gated.
         cwd = sandbox["cwd"].resolve()
+        (cwd / ".git").mkdir()  # cwd keys its own project entry (#1271)
         cfg = {"projects": {str(cwd): {"mcpServers": {"homeproj": {"command": "echo"}}}}}
         (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
         res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])

@@ -15,7 +15,7 @@ changes inline only. See the deprecation policy in
 
 - The `--json` documents of `init`, `add --from-clients` and `prune` carry
   why `/mcp` disables were not read next to `plugin_bypass`, as
-  `plugin_bypass_disables_unread` (`"no_key"`, `"config_dir"` or `null`), so
+  `plugin_bypass_disables_unread` (`"no_key"`, `"no_config"` or `null`), so
   a consumer can tell that a listed server may be one already disabled.
   `init --json` prints no note, so this key is the only place it gives the
   reason. `null` records no reason, not a completed check. The rows keep
@@ -27,22 +27,44 @@ changes inline only. See the deprecation policy in
 - The Claude Code plugin-server note (`init`, `add --from-clients`, `prune`,
   `import`, `host status|scan|sync`) and `doctor`'s `plugin_bypass` warning now
   say when STM did not read `/mcp` disables for the current directory — in a
-  linked worktree, a submodule or behind a symlinked `.git`, or with
-  `CLAUDE_CONFIG_DIR` nonempty — so a listed server may be one you already
-  disabled. The `plugin_bypass` JSON rows are unchanged. (#1289)
-- With `CLAUDE_CONFIG_DIR` nonempty, `mms prune` and `--prune` no longer
-  delete a different server from the active Claude Code config. Discovery
-  matched and backed up the entry in `~/.claude.json`, but
-  `claude mcp remove -s user|local` acts on `$CLAUDE_CONFIG_DIR/.claude.json`,
-  so a same-named entry there was removed without a backup. (#1287, #1300)
-  **Behavior change**: with a nonempty `CLAUDE_CONFIG_DIR`, Claude Code user
-  and project entries are manual-only rows (`manual` in `--json`), as Cursor
-  entries are, and their hint says to compare the entry in the active config
-  before removing it by hand instead of printing a `claude mcp remove`
-  command. `.mcp.json` entries are still pruned. A standalone `mms prune`
-  whose plan is entirely manual-only (these rows, or Cursor ones) now prints
-  the rows and exits 0 instead of asking to confirm, or exiting 1 without a
-  TTY; `--json` still requires `--yes` or `--dry-run`.
+  linked worktree, a submodule or behind a symlinked `.git`, or when STM
+  cannot tell which file Claude Code reads its config from — so a listed
+  server may be one you already disabled. The `plugin_bypass` JSON rows are
+  unchanged. (#1289, #1271)
+- STM reads Claude Code's config file and project entry the way Claude Code
+  does. Discovery, `mms import`, `mms host status|scan|sync`, `prune`, `eject`
+  and the `/mcp` disable check read `$CLAUDE_CONFIG_DIR/.claude.json` when
+  `CLAUDE_CONFIG_DIR` is an absolute path (before, the disable check read
+  nothing there and the rest read `~/.claude.json`), and the project entry Claude Code uses for the current directory: the
+  repository root from a subdirectory (they read the subdirectory's own entry,
+  which Claude Code does not use). With `CLAUDE_CONFIG_DIR` nonempty,
+  `mms prune` and `--prune` matched and backed up the `~/.claude.json` entry
+  while `claude mcp remove -s user|local` deleted the same name from
+  `$CLAUDE_CONFIG_DIR/.claude.json`, and from a subdirectory a stale entry
+  could be matched while the repository root's was removed; both now act on
+  one entry. (#1271, #1287)
+  **Behavior change**: under an absolute `CLAUDE_CONFIG_DIR`, `prune` removes
+  Claude Code user and project entries again and `eject` restores them (it
+  refused before). When STM cannot tell which file Claude Code reads — a
+  relative, empty or `..`-containing `CLAUDE_CONFIG_DIR`, a set
+  `CLAUDE_CODE_CUSTOM_OAUTH_URL`, or a legacy `.config.json` in Claude Code's
+  config directory — it reads no Claude Code servers and says so (`Note:
+  Claude Code user and project servers were not read: …`), `eject` to a
+  Claude Code target refuses, and the disable reason is `"no_config"`. In a
+  linked worktree, a submodule or behind a symlinked `.git` the project entry
+  is not read. A standalone `mms prune` whose plan is entirely manual-only
+  (Cursor rows) prints the rows and exits 0 instead of asking to confirm, or
+  exiting 1 without a TTY; `--json` still requires `--yes` or `--dry-run`.
+- `mms host sync --apply` no longer deletes registry entries whose Claude
+  Code host config was not read: STM could not tell which config file or
+  project entry is in use, or that file or `<cwd>/.mcp.json` is not a
+  readable JSON object. Those entries are `not_inspected` instead of
+  `removed_at_host`, and are kept. (#1271)
+  **Behavior change**: `host status --json` rows can carry the state
+  `not_inspected` with a `reason`, and its `summary` gains `not_inspected`;
+  `host scan --json` gains a top-level `not_inspected` list of skipped
+  sources; `host sync --json` gains `plan.not_inspected` and
+  `summary.not_inspected`.
 
 ## [0.7.3] — 2026-10-31
 

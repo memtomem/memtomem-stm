@@ -405,6 +405,7 @@ class TestEdges:
                 "changed": 0,
                 "removed_at_host": 0,
                 "no_baseline": 0,
+                "not_inspected": 0,
             },
         }
 
@@ -453,18 +454,20 @@ class TestJsonShape:
         assert res.exit_code == 0, res.output
         payload = json.loads(res.output)
 
-        # Summary always carries the four keys, all integers.
+        # Summary always carries the five keys, all integers.
         assert set(payload["summary"].keys()) == {
             "unchanged",
             "changed",
             "removed_at_host",
             "no_baseline",
+            "not_inspected",
         }
         assert payload["summary"] == {
             "unchanged": 1,
             "changed": 1,
             "removed_at_host": 1,
             "no_baseline": 1,
+            "not_inspected": 0,
         }
 
         # entries[] includes all four states.
@@ -710,6 +713,7 @@ class TestScan:
         assert payload == {
             "entries": [],
             "summary": {"total": 0, "in_registry": 0, "new_at_host": 0},
+            "not_inspected": [],
         }
 
     def test_scan_empty_filtered_host_message_scoped(self, runner, sandbox):
@@ -729,6 +733,7 @@ class TestScan:
         assert json.loads(json_res.output) == {
             "entries": [],
             "summary": {"total": 0, "in_registry": 0, "new_at_host": 0},
+            "not_inspected": [],
         }
 
     def test_scan_from_filter_case_insensitive(self, runner, sandbox):
@@ -918,6 +923,7 @@ class TestSyncPlan:
             "restamped": 0,
             "unchanged": 1,
             "conflicts": 0,
+            "not_inspected": 0,
         }
 
     def test_plan_add_redacts_secrets_by_default(self, runner, sandbox):
@@ -1381,6 +1387,7 @@ class TestSyncJsonShape:
         "skipped_changed",
         "orphan_no_baseline",
         "conflicts",
+        "not_inspected",
     }
     _SUMMARY_KEYS = {
         "added",
@@ -1392,6 +1399,7 @@ class TestSyncJsonShape:
         "restamped",
         "unchanged",
         "conflicts",
+        "not_inspected",
     }
 
     def test_json_shape_plan_mode_all_keys_present(self, runner, sandbox):
@@ -2270,3 +2278,167 @@ class TestRestampDiffEscapesEveryDisplayedField:
 
         assert "\x1b" not in out and "\r" not in out
         assert "\\u001B" in out and "\\u000D" in out
+
+
+# ---------------------------------------------------------------------------
+# Sources the scan could not inspect (#1271)
+# ---------------------------------------------------------------------------
+
+
+def _import_project_scope(runner, sandbox, mcps: dict) -> Path:
+    """Baseline ``mcps`` as Claude Code project-scope entries of a repo at cwd.
+
+    cwd gets a ``.git`` directory so its key is cwd itself whatever sits
+    above the temp dir; the entries live in that slot of ``~/.claude.json``.
+    """
+    cwd = sandbox["cwd"]
+    (cwd / ".git").mkdir(exist_ok=True)
+    key = str(cwd.resolve())
+    cfg = {"projects": {key: {"mcpServers": mcps}}}
+    (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
+    _apply_claude_code(runner)
+    return cwd
+
+
+class TestNotInspected:
+    """A baselined entry whose host config was skipped is kept, never removed.
+
+    Each case first makes the old code's verdict ``removed_at_host`` possible:
+    the entry is gone from ``~/.claude.json`` (the file the old scanner read
+    unconditionally), and only the new scanner knows that file is not the one
+    in use, or was not read.
+    """
+
+    def _assert_kept(self, runner, name: str, reason: str) -> None:
+        res = _sync(runner, "--apply", "--yes", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["plan"]["remove"] == []
+        assert payload["summary"]["removed"] == 0
+        assert payload["summary"]["not_inspected"] == 1
+        [row] = payload["plan"]["not_inspected"]
+        assert row["name"] == name
+        assert row["reason"] == reason
+        assert name in state.load_registry().servers
+        assert name in state.load_import_state().entries
+
+    def test_legacy_config_keeps_the_entry(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"kept": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+        (sandbox["home"] / ".claude").mkdir()
+        (sandbox["home"] / ".claude" / ".config.json").write_text("{}", encoding="utf-8")
+
+        self._assert_kept(runner, "kept", "legacy_config")
+
+    def test_unreadable_config_keeps_the_entry(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"kept": {"command": "npx"}})
+        _apply_claude_code(runner)
+        (sandbox["home"] / ".claude.json").write_text("{not json", encoding="utf-8")
+
+        self._assert_kept(runner, "kept", "unreadable")
+
+    def test_relative_claude_config_dir_keeps_the_entry(self, runner, sandbox, monkeypatch):
+        _seed_claude_code(sandbox, {"kept": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/claude")
+
+        self._assert_kept(runner, "kept", "config_dir")
+
+    def test_unreadable_mcp_json_keeps_the_entry(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"kept": {"command": "npx"}})
+        res = runner.invoke(
+            import_command, ["--from", "claude-code", "--apply", "--allow-project-configs"]
+        )
+        assert res.exit_code == 0, res.output
+        (sandbox["cwd"] / ".mcp.json").write_text("[]", encoding="utf-8")
+
+        self._assert_kept(runner, "kept", "mcp_json_unreadable")
+
+    def test_unknown_project_key_keeps_project_entries_only(self, runner, sandbox):
+        cwd = _import_project_scope(runner, sandbox, {"proj-srv": {"command": "npx"}})
+        cfg = json.loads((sandbox["home"] / ".claude.json").read_text(encoding="utf-8"))
+        cfg["mcpServers"] = {}
+        (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
+        # A `.git` file (a linked worktree's) leaves the slot unknown.
+        (cwd / ".git").rmdir()
+        (cwd / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+
+        self._assert_kept(runner, "proj-srv", "no_key")
+
+    def test_a_readable_config_without_the_entry_still_removes_it(self, runner, sandbox):
+        """Control: the new state does not swallow a real removal."""
+        _seed_claude_code(sandbox, {"gone": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+
+        res = _sync(runner, "--apply", "--yes", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert [r["name"] for r in payload["plan"]["remove"]] == ["gone"]
+        assert payload["plan"]["not_inspected"] == []
+        assert "gone" not in state.load_registry().servers
+
+    def test_status_reports_the_state_and_reason(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"kept": {"command": "npx"}})
+        _apply_claude_code(runner)
+        (sandbox["home"] / ".claude.json").write_text("{not json", encoding="utf-8")
+
+        res = _status(runner, "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        [row] = payload["entries"]
+        assert (row["state"], row["reason"]) == ("not_inspected", "unreadable")
+        assert payload["summary"]["not_inspected"] == 1
+        assert payload["summary"]["removed_at_host"] == 0
+
+        text = _status(runner)
+        assert text.exit_code == 0, text.output
+        assert "not_inspected" in text.output
+        assert "1 entry not inspected (kept): Claude Code's config file could not" in text.output
+
+    def test_scan_lists_skipped_sources(self, runner, sandbox):
+        (sandbox["home"] / ".claude.json").write_text("{not json", encoding="utf-8")
+
+        res = _scan(runner, "--json")
+        assert res.exit_code == 0, res.output
+        gaps = {row["source"]: row["reason"] for row in json.loads(res.output)["not_inspected"]}
+        assert gaps == {"Claude Code (user)": "unreadable", "Claude Code (project)": "unreadable"}
+
+        text = _scan(runner)
+        assert "Claude Code (user) not inspected:" in text.output
+
+
+class TestClaudeConfigLocation:
+    """The scanner reads the file and slot Claude Code 2.1.316 uses (#1271)."""
+
+    def test_absolute_claude_config_dir_is_read(self, runner, sandbox, monkeypatch):
+        cfg_dir = sandbox["home"] / "cfg"
+        cfg_dir.mkdir()
+        (cfg_dir / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"active": {"command": "npx"}}}), encoding="utf-8"
+        )
+        _seed_claude_code(sandbox, {"stale": {"command": "npx"}})
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
+
+        res = _scan(runner, "--json")
+        assert res.exit_code == 0, res.output
+        assert [r["name"] for r in json.loads(res.output)["entries"]] == ["active"]
+
+    def test_subdirectory_reads_the_repository_slot(self, runner, sandbox, monkeypatch):
+        repo = sandbox["cwd"]
+        (repo / ".git").mkdir()
+        (repo / "src").mkdir()
+        cfg = {
+            "projects": {
+                str(repo.resolve()): {"mcpServers": {"root-slot": {"command": "npx"}}},
+                str((repo / "src").resolve()): {"mcpServers": {"stale-sub": {"command": "x"}}},
+            }
+        }
+        (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
+        monkeypatch.chdir(repo / "src")
+
+        res = _scan(runner, "--json")
+        assert res.exit_code == 0, res.output
+        assert [r["name"] for r in json.loads(res.output)["entries"]] == ["root-slot"]

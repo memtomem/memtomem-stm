@@ -657,40 +657,44 @@ class TestMcpDisabledServers:
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
 
-    def test_claude_config_dir_reads_no_disables(self, probe, home, tmp_path, monkeypatch):
-        # Claude Code reads its config from the override, so a disable left in
-        # ~/.claude.json may be stale: it must not hide a running server.
+    def test_absolute_claude_config_dir_reads_its_own_file(
+        self, probe, home, tmp_path, monkeypatch
+    ):
+        # Claude Code reads $CLAUDE_CONFIG_DIR/.claude.json (#1271): a disable
+        # there applies, and one left in ~/.claude.json is stale.
+        (tmp_path / ".git").mkdir()  # pins the key, as above
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:emulator"]))
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        _write_claude_json(cfg, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator"]
+
+    @pytest.mark.parametrize("value", ["", "relative/cfg"])
+    def test_unknown_config_reads_no_disables(self, probe, home, tmp_path, monkeypatch, value):
+        # Empty makes Claude Code read ./.config.json, relative resolves
+        # against its own cwd: STM cannot tell which file is in use, so a
+        # disable in ~/.claude.json must not hide a running server.
         (tmp_path / ".git").mkdir()  # pins the key, as above
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", value)
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
 
-    def test_claude_config_dir_says_disables_were_not_read(
+    def test_unknown_config_says_disables_were_not_read(
         self, probe, home, tmp_path, monkeypatch, capsys
     ):
         probe["out"] = [FIREBASE_TWO]
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
 
         note = self._note(tmp_path, capsys)
 
         assert note.count(_UNREAD_HEADER) == 1
-        assert _says("config_dir", note)
+        assert _says("no_config", note)
         assert not _says("no_key", note)
-
-    def test_empty_claude_config_dir_reads_disables_and_says_nothing(
-        self, probe, home, tmp_path, monkeypatch, capsys
-    ):
-        (tmp_path / ".git").mkdir()  # pins the key, as above
-        probe["out"] = [FIREBASE_TWO]
-        _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
-
-        assert self._names(tmp_path) == ["plugin:firebase:emulator"]
-        note = self._note(tmp_path, capsys)
-        assert "plugin:firebase:emulator" in note
-        assert _UNREAD_HEADER not in note
 
     def test_directory_outside_a_repository_says_nothing(self, probe, home, tmp_path, capsys):
         # Outside any repository the key is the directory itself.
@@ -883,7 +887,7 @@ class TestCommandsReport:
     @pytest.mark.parametrize("argv", REGISTRY_COMMANDS)
     def test_registry_commands_say_disables_were_not_read(self, sandbox, probe, monkeypatch, argv):
         probe["out"] = [_leaky_plugin()]
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
 
         result = CliRunner().invoke(cli, argv)
 
@@ -892,9 +896,9 @@ class TestCommandsReport:
             assert _UNREAD_HEADER not in result.stdout
         assert "plugin:leaky:http-srv" in result.stderr
         assert result.stderr.count(_UNREAD_HEADER) == 1
-        assert _says("config_dir", result.stderr)
+        assert _says("no_config", result.stderr)
 
-    @pytest.mark.parametrize("unread", [None, "config_dir", "no_key"])
+    @pytest.mark.parametrize("unread", [None, "no_config", "no_key"])
     @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
     def test_doctor_says_when_disables_were_not_read(
         self, sandbox, probe, monkeypatch, as_json, unread
@@ -902,8 +906,8 @@ class TestCommandsReport:
         (sandbox["cwd"] / ".git").mkdir()  # pins the key: no caveat wherever tmp lives
         probe["out"] = [FIREBASE]
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
-        if unread == "config_dir":
-            monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        if unread == "no_config":
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
         elif unread == "no_key":
             monkeypatch.setattr(proxy_mod, "claude_project_key", lambda _cwd: None)
         config = _config(sandbox["home"])
@@ -1045,7 +1049,7 @@ class TestCommandsReport:
         self, sandbox, probe, monkeypatch, argv
     ):
         probe["out"] = [FIREBASE_TWO]
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
         config = _config(sandbox["home"])
 
         result = CliRunner().invoke(cli, [*argv, "--config", str(config)])
@@ -1058,7 +1062,7 @@ class TestCommandsReport:
         ]
         assert all(set(row) == _ROW_KEYS for row in rows)
         assert _UNREAD_HEADER not in result.stdout
-        assert _says("config_dir", result.stderr)
+        assert _says("no_config", result.stderr)
 
     def test_prune_without_upstreams_survives_a_deeply_nested_claude_json(self, sandbox, probe):
         # prune returns before discovery when nothing is configured, so the
@@ -1161,7 +1165,7 @@ class TestCommandsReport:
 
     def test_init_text_says_disables_were_not_read(self, sandbox, probe, monkeypatch):
         probe["out"] = [FIREBASE]
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
         config = sandbox["home"] / "new.json"
 
         result = CliRunner().invoke(
@@ -1172,13 +1176,13 @@ class TestCommandsReport:
 
         assert result.exit_code == 0, result.output
         assert result.stdout.count(_UNREAD_HEADER) == 1
-        assert _says("config_dir", result.stdout)
+        assert _says("no_config", result.stdout)
         assert result.stdout.index(_UNREAD_HEADER) < result.stdout.index("Server name")
 
     def test_init_json_keeps_the_row_shape_and_prints_no_note(self, sandbox, probe, monkeypatch):
         # init --json withholds the whole note, so the caveat is not shown either.
         probe["out"] = [FIREBASE]
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
         config = sandbox["home"] / "new.json"
 
         result = CliRunner().invoke(
@@ -1194,6 +1198,10 @@ class TestCommandsReport:
         assert all(set(row) == _ROW_KEYS for row in rows)
         assert _UNREAD_HEADER not in result.output
         assert "bypass STM" not in result.output
+        # The config gap has no JSON field, so init --json still says it, on
+        # stderr (#1271).
+        assert "Claude Code user and project servers were not read" in result.stderr
+        assert "were not read" not in result.stdout
 
     def test_init_json_carries_the_rows_on_success(self, sandbox, probe):
         probe["out"] = [FIREBASE]
@@ -1403,14 +1411,14 @@ class TestDisablesUnreadInJson:
         return document
 
     @pytest.mark.parametrize("surface", sorted(_BYPASS_DOCUMENTS))
-    def test_config_dir_reason_rides_beside_the_rows(self, sandbox, probe, monkeypatch, surface):
-        (sandbox["cwd"] / ".git").mkdir()  # only CLAUDE_CONFIG_DIR can give a reason
+    def test_no_config_reason_rides_beside_the_rows(self, sandbox, probe, monkeypatch, surface):
+        (sandbox["cwd"] / ".git").mkdir()  # only an unknown config can give a reason
         probe["out"] = [FIREBASE]
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
 
         document = self._document(sandbox, monkeypatch, surface)
 
-        assert document["plugin_bypass_disables_unread"] == "config_dir"
+        assert document["plugin_bypass_disables_unread"] == "no_config"
         assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
             "plugin:firebase:firebase"
         ]
@@ -1447,7 +1455,7 @@ class TestDisablesUnreadInJson:
         self, sandbox, probe, monkeypatch, surface
     ):
         probe["out"] = []
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
 
         document = self._document(sandbox, monkeypatch, surface)
 
@@ -1473,7 +1481,7 @@ class TestDisablesUnreadInJson:
         from memtomem_stm.mms import state
 
         probe["out"] = [FIREBASE]
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sandbox["home"] / "cfg"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/cfg")
         runner = CliRunner()
 
         def init(*argv: str, config: Path, answers: str | None = None) -> dict:
@@ -1481,7 +1489,7 @@ class TestDisablesUnreadInJson:
             return json.loads(result.stdout)
 
         first = init(*_INIT_ARGV, config=sandbox["home"] / "a.json", answers=_INIT_ANSWERS)
-        assert first["plugin_bypass_disables_unread"] == "config_dir"
+        assert first["plugin_bypass_disables_unread"] == "no_config"
 
         demo = init(*_INIT_ARGV, "--demo", config=sandbox["home"] / "b.json")
         assert demo["plugin_bypass"] is None
