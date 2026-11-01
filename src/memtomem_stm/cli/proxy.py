@@ -3432,6 +3432,20 @@ _UNMANAGED_SOURCE_FILES: dict[str, str] = {
     "cursor-project": ".cursor/mcp.json in this checkout",
 }
 _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
+# The sources Claude Code keeps in its global config file. Discovery reads them
+# from ``~/.claude.json``; Claude Code reads ``$CLAUDE_CONFIG_DIR/.claude.json``
+# instead when that variable is nonempty, and so does every ``claude mcp``
+# call, so there the entry STM matched is not the one Claude acts on (#1287).
+_CLAUDE_GLOBAL_CONFIG_KINDS = frozenset({"claude-user", "claude-project"})
+
+
+def _claude_config_dir_set() -> bool:
+    """Whether Claude Code reads its config from ``CLAUDE_CONFIG_DIR``.
+
+    Nonempty only, the way Claude Code resolves it
+    (``CLAUDE_CONFIG_DIR || homedir()``).
+    """
+    return bool(os.environ.get("CLAUDE_CONFIG_DIR"))
 
 
 def _prune_targets(
@@ -3454,7 +3468,7 @@ def _prune_targets(
                 continue
             seen.add(key)
             row = {"name": cand.name, "source": registration.source}
-            if registration.spec.managed:
+            if _prune_refusal(registration.spec, cand.name) is None:
                 writable.append(row)
             else:
                 manual.append(row)
@@ -4253,7 +4267,7 @@ def _claude_disabled_mcp_servers(cwd: Path) -> tuple[frozenset[str], str | None]
     is consulted, anything unreadable in it yields no names and no reason, so
     it never hides a server.
     """
-    if os.environ.get("CLAUDE_CONFIG_DIR"):
+    if _claude_config_dir_set():
         return frozenset(), "config_dir"
     key = claude_project_key(cwd)
     if key is None:
@@ -4594,6 +4608,14 @@ def _source_removal_hint(name: str, source: str) -> str:
         # Both values are untrusted here: reaching this branch means ``source``
         # was not one of the known labels either.
         return f"# Remove '{_disp(name)}' from {_disp(source)}."
+    if spec.kind in _CLAUDE_GLOBAL_CONFIG_KINDS and _claude_config_dir_set():
+        # `claude mcp remove` would act on the active file, which mms never
+        # read: a same-named entry there may be another server (#1287).
+        return (
+            "# Claude Code reads $CLAUDE_CONFIG_DIR/.claude.json while CLAUDE_CONFIG_DIR is "
+            f"set, not the ~/.claude.json entry mms matched: compare '{_disp(name)}' there "
+            "before removing it by hand."
+        )
     if spec.claude_scope is not None:
         return _shell_join(["claude", "mcp", "remove", name, "-s", spec.claude_scope])
     if not spec.managed:
@@ -4786,6 +4808,27 @@ def _unmanaged_prune_refusal(spec: _SourceSpec, name: str) -> str:
     return f"{spec.label} entries are not pruned by mms — remove '{name}' by hand"
 
 
+def _prune_refusal(spec: _SourceSpec, name: str) -> str | None:
+    """Why ``spec`` is not pruned automatically, or ``None`` when it is.
+
+    The one rule every prune reader asks — the plan split, the backstop and
+    the writer — so a row is never planned by one and refused by another.
+    A source without a writer is refused (#955), and so is a Claude Code
+    global-config source while ``CLAUDE_CONFIG_DIR`` is nonempty: discovery
+    validated and backed up the ``~/.claude.json`` entry, but ``claude mcp
+    remove`` deletes the same name from the active file, which may hold a
+    different server (#1287).
+    """
+    if not spec.managed:
+        return _unmanaged_prune_refusal(spec, name)
+    if spec.kind in _CLAUDE_GLOBAL_CONFIG_KINDS and _claude_config_dir_set():
+        return (
+            "Claude Code reads $CLAUDE_CONFIG_DIR/.claude.json while CLAUDE_CONFIG_DIR is set, "
+            f"not the ~/.claude.json entry mms matched — remove '{name}' by hand"
+        )
+    return None
+
+
 def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
     """Dispatch the prune action per source label used by ``_discover_candidates``.
 
@@ -4797,7 +4840,8 @@ def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
     spec = _SOURCE_BY_LABEL.get(source)
     if spec is None:
         return (False, f"unknown source label: {source}")
-    if not spec.managed:
+    refusal = _prune_refusal(spec, name)
+    if refusal is not None:
         # Refused, not guessed: neither the shell-out below nor the one
         # direct-edit writer (Claude Desktop's) targets this source's file, so
         # dispatching would delete the entry from a file the operator never
@@ -4808,8 +4852,11 @@ def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
         # Ordered ahead of ``claude_scope`` so this guard and its caller's copy
         # (``_prune_imported_candidates``) agree on precedence: a future
         # unmanaged spec that also carries a scope must not shell out here
-        # while the caller reports it as untouched (#955 review).
-        return (False, _unmanaged_prune_refusal(spec, name))
+        # while the caller reports it as untouched (#955 review). Under a
+        # nonempty CLAUDE_CONFIG_DIR the shell-out targets a file discovery
+        # never read, so a Claude Code global-config row is refused the same
+        # way (#1287).
+        return (False, refusal)
     if spec.claude_scope is not None:
         return _claude_mcp_remove(name, spec.claude_scope)
     return _desktop_json_remove_entry(name)
@@ -4925,23 +4972,19 @@ def _prune_imported_candidates(
             src = registration.source
             if (cand.name, src) not in allowed_sources:
                 continue
-            if not registration.spec.managed:
-                # Backstop for a caller that put an unmanaged row in its own
-                # allowlist. Refuses BEFORE the backup append (#955): the log
+            refusal = _prune_refusal(registration.spec, cand.name)
+            if refusal is not None:
+                # Backstop for a caller that put a refused row (unmanaged, or
+                # a Claude Code global-config row under CLAUDE_CONFIG_DIR) in
+                # its own allowlist. Refuses BEFORE the backup append (#955): the log
                 # is append-only and its newest row for a name is what the
                 # eject retry hint reads, so a row written for a prune that
                 # then refuses would shadow an older real backup and point the
                 # operator at a `--to` target eject does not accept. The
                 # message is rendered here rather than fetched from the writer
                 # — calling a writer for its error string is how the two
-                # copies of the ``managed`` rule drift apart.
-                failed.append(
-                    (
-                        cand.name,
-                        src,
-                        _unmanaged_prune_refusal(registration.spec, cand.name),
-                    )
-                )
+                # copies of the rule drift apart.
+                failed.append((cand.name, src, refusal))
                 continue
             ok, err = _append_pruned_backup(
                 cand.name, registration.source_ref, registration.raw, pruned_at
@@ -5144,7 +5187,7 @@ def _report_prune_results(
             # arbitrary text from a subprocess, not a value from our config.
             click.echo(f"  {_disp(name)} ({src}): {_disp(err)}", err=True)
         click.echo("", err=True)
-        click.echo("Run the following to remove them manually:", err=True)
+        click.echo("To remove them manually:", err=True)
         for name, src, _ in failed:
             click.echo(f"  {_source_removal_hint(name, src)}", err=True)
     return bool(failed)
@@ -7568,6 +7611,19 @@ def prune(
         click.echo(f"{_ok('Dry run:')} no writes performed.")
         return
 
+    if not planned and not as_json:
+        # Nothing here is this run's to write, so there is no consent to ask
+        # for: a prompt (or a "pass --yes" exit without a TTY) would gate an
+        # action the run cannot take, which the import path already skips
+        # (#955). A nonempty CLAUDE_CONFIG_DIR makes this the common case
+        # for Claude Code rows (#1287). ``--json`` keeps its own contract.
+        click.echo("")
+        click.echo(
+            f"{_ok('Nothing to remove automatically:')} remove the (manual) rows by hand. "
+            "No changes made."
+        )
+        return
+
     if assume_yes:
         proceed = True
     elif as_json:
@@ -7744,7 +7800,7 @@ def _read_host_servers(
     machine-readable contract, and a parse drift could false-pass the
     verify or leak secret values through diagnostics.
     """
-    if kind in {"claude-user", "claude-project"} and os.environ.get("CLAUDE_CONFIG_DIR"):
+    if kind in _CLAUDE_GLOBAL_CONFIG_KINDS and _claude_config_dir_set():
         if strict:
             raise _HostConfigReadError(
                 "automatic eject to Claude Code is unsupported with CLAUDE_CONFIG_DIR set; "

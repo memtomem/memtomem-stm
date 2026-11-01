@@ -30,6 +30,19 @@ changes inline only. See the deprecation policy in
   linked worktree, a submodule or behind a symlinked `.git`, or with
   `CLAUDE_CONFIG_DIR` nonempty — so a listed server may be one you already
   disabled. The `plugin_bypass` JSON rows are unchanged. (#1289)
+- With `CLAUDE_CONFIG_DIR` nonempty, `mms prune` and `--prune` no longer
+  delete a different server from the active Claude Code config. Discovery
+  matched and backed up the entry in `~/.claude.json`, but
+  `claude mcp remove -s user|local` acts on `$CLAUDE_CONFIG_DIR/.claude.json`,
+  so a same-named entry there was removed without a backup. (#1287, #1300)
+  **Behavior change**: with a nonempty `CLAUDE_CONFIG_DIR`, Claude Code user
+  and project entries are manual-only rows (`manual` in `--json`), as Cursor
+  entries are, and their hint says to compare the entry in the active config
+  before removing it by hand instead of printing a `claude mcp remove`
+  command. `.mcp.json` entries are still pruned. A standalone `mms prune`
+  whose plan is entirely manual-only (these rows, or Cursor ones) now prints
+  the rows and exits 0 instead of asking to confirm, or exiting 1 without a
+  TTY; `--json` still requires `--yes` or `--dry-run`.
 
 ## [0.7.3] — 2026-10-31
 
