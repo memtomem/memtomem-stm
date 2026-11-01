@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -416,3 +418,96 @@ def test_public_markdown_has_no_duplicate_generated_anchors() -> None:
             seen.add(slug)
     if failures:
         pytest.fail("Duplicate public documentation heading slugs:\n" + "\n".join(failures))
+
+
+class _HtmlTargets(HTMLParser):
+    """The ``href`` and ``src`` values of the tags in a raw HTML fragment.
+
+    The stdlib parser rather than a regex: it reads unquoted values, values
+    spanning lines and exact attribute names (so ``data-src``, or ``href=`` text
+    inside another attribute's value, is not a target), and skips comments.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.targets: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.targets.extend(value for name, value in attrs if name in ("href", "src") and value)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+
+def _pypi_readme_problems(text: str) -> list[str]:
+    """What in ``text`` PyPI's renderer cannot show the way GitHub does.
+
+    PyPI resolves no relative link or image (it has no repository tree to
+    resolve them against) and renders a ``mermaid`` fence as raw source. Same-page
+    ``#anchor`` links work on both. Raw HTML counts too: the Markdown parser hands
+    it back verbatim, and :class:`_HtmlTargets` reads its ``href`` and ``src``.
+    """
+    problems: list[str] = []
+    for token in _tokens(text):
+        if token.type == "fence" and token.info.split()[:1] == ["mermaid"]:
+            problems.append("mermaid fence")
+        targets: list[str] = []
+        if token.type == "link_open":
+            targets.append(str(token.attrGet("href") or ""))
+        elif token.type == "image":
+            targets.append(str(token.attrGet("src") or ""))
+        elif token.type in ("html_block", "html_inline"):
+            parser = _HtmlTargets()
+            parser.feed(token.content)
+            parser.close()
+            targets.extend(parser.targets)
+        for target in (raw.strip() for raw in targets):
+            if not re.match(r"(https?:|mailto:|#)", target):
+                problems.append(f"relative target: {target}")
+    return problems
+
+
+def test_pypi_readme_problems_detects_what_pypi_cannot_render() -> None:
+    sample = (
+        "[license](LICENSE) ![logo](docs/logo.png) [ok](https://example.com) "
+        "[here](#install)\n\n```mermaid\nflowchart TB\n```\n"
+    )
+    assert _pypi_readme_problems(sample) == [
+        "relative target: LICENSE",
+        "relative target: docs/logo.png",
+        "mermaid fence",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ('<a href="LICENSE">License</a>\n', ["relative target: LICENSE"]),
+        ("see <img src='docs/logo.png' alt=\"logo\"> here\n", ["relative target: docs/logo.png"]),
+        (
+            '<p align="center">\n<img SRC="docs/logo.png">\n</p>\n',
+            ["relative target: docs/logo.png"],
+        ),
+        ("<a href=LICENSE>License</a>\n", ["relative target: LICENSE"]),
+        ("<img src=docs/logo.png>\n", ["relative target: docs/logo.png"]),
+        ('<a href="\nLICENSE">License</a>\n', ["relative target: LICENSE"]),
+        ('<a href="https://example.com">ok</a> <a href="#top">top</a>\n', []),
+        ('<a title=\'example href="LICENSE"\' href="https://example.com">ok</a>\n', []),
+        ('<img data-src="docs/logo.png" src="https://example.com/logo.png">\n', []),
+        ('<!-- <img src="docs/logo.png"> -->\n', []),
+        ("```mermaid\tcaption\nflowchart TB\n```\n", ["mermaid fence"]),
+        ("```mermaidish\nflowchart TB\n```\n", []),
+        ("```\nplain\n```\n", []),
+    ],
+)
+def test_pypi_readme_problems_reads_raw_html_and_fence_info(body: str, expected: list[str]) -> None:
+    assert _pypi_readme_problems(body) == expected
+
+
+def test_readme_renders_on_pypi() -> None:
+    """README.md is the PyPI long description, so it must render there too."""
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        readme = tomllib.load(handle)["project"]["readme"]
+    assert readme == "README.md"
+    problems = _pypi_readme_problems((REPO_ROOT / readme).read_text(encoding="utf-8"))
+    assert problems == [], "README.md has content PyPI cannot render:\n" + "\n".join(problems)
