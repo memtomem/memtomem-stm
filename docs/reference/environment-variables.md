@@ -271,7 +271,8 @@ provider, host, or standard SDK. They do not change `STMConfig` completeness.
 | `OPENAI_API_KEY` | Fallback credential for OpenAI compression or embedding relevance scoring. |
 | `ANTHROPIC_API_KEY` | Fallback credential for Anthropic compression. |
 | `CODEX_HOME` | Codex user config discovery root; defaults to `~/.codex`. |
-| `CLAUDE_CONFIG_DIR` | Claude hook config discovery root. |
+| `CLAUDE_CONFIG_DIR` | Claude hook config discovery root, and the directory of the Claude Code config (`.claude.json`) that MCP discovery, `prune` and `eject` read when it is an absolute path; see [Which Claude Code config STM reads](../cli.md#which-claude-code-config-stm-reads). |
+| `CLAUDE_CODE_CUSTOM_OAUTH_URL` | When set, Claude Code reads a differently named config file, so STM reads no Claude Code MCP servers or `/mcp` disables. |
 | `KIMI_CODE_HOME` | Kimi Code hook config discovery root. |
 | `APPDATA` | Native Windows Claude Desktop config discovery root. |
 | `OTEL_SERVICE_NAME` | Standard OpenTelemetry service name; STM supplies its configured/default name only when this is absent. |
