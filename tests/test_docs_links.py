@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -416,3 +417,45 @@ def test_public_markdown_has_no_duplicate_generated_anchors() -> None:
             seen.add(slug)
     if failures:
         pytest.fail("Duplicate public documentation heading slugs:\n" + "\n".join(failures))
+
+
+def _pypi_readme_problems(text: str) -> list[str]:
+    """What in ``text`` PyPI's renderer cannot show the way GitHub does.
+
+    PyPI resolves no relative link or image (it has no repository tree to
+    resolve them against) and renders a ``mermaid`` fence as raw source. Same-page
+    ``#anchor`` links work on both.
+    """
+    problems: list[str] = []
+    for token in _tokens(text):
+        if token.type == "fence" and token.info.strip().split(" ")[0] == "mermaid":
+            problems.append("mermaid fence")
+        target = None
+        if token.type == "link_open":
+            target = token.attrGet("href")
+        elif token.type == "image":
+            target = token.attrGet("src")
+        if target is not None and not re.match(r"(https?:|mailto:|#)", str(target)):
+            problems.append(f"relative target: {target}")
+    return problems
+
+
+def test_pypi_readme_problems_detects_what_pypi_cannot_render() -> None:
+    sample = (
+        "[license](LICENSE) ![logo](docs/logo.png) [ok](https://example.com) "
+        "[here](#install)\n\n```mermaid\nflowchart TB\n```\n"
+    )
+    assert _pypi_readme_problems(sample) == [
+        "relative target: LICENSE",
+        "relative target: docs/logo.png",
+        "mermaid fence",
+    ]
+
+
+def test_readme_renders_on_pypi() -> None:
+    """README.md is the PyPI long description, so it must render there too."""
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        readme = tomllib.load(handle)["project"]["readme"]
+    assert readme == "README.md"
+    problems = _pypi_readme_problems((REPO_ROOT / readme).read_text(encoding="utf-8"))
+    assert problems == [], "README.md has content PyPI cannot render:\n" + "\n".join(problems)

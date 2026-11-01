@@ -9,6 +9,23 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Changed
+
+- The PyPI project page renders the whole README and carries fuller
+  metadata. The architecture diagram is plain text instead of a Mermaid
+  block that PyPI showed as source, the license and CLA links are absolute,
+  the Python badge reads the supported versions from PyPI, and the summary
+  names MCP. The license is declared as the SPDX expression `Apache-2.0`
+  (PEP 639), the project links gain Documentation and Changelog, and the
+  classifiers gain `Environment :: Console`, `Python :: 3 :: Only` and
+  `Typing :: Typed`. PyPI shows it from the next release. (#1304)
+  **Behavior change**: none at runtime. The package metadata states the
+  license as `License-Expression: Apache-2.0` instead of the `License` field
+  and the `License :: OSI Approved :: Apache Software License` classifier,
+  which license scanners that read only those two no longer find.
+
 ## [0.7.4] — 2026-11-01
 
 ### Upgrade notes
