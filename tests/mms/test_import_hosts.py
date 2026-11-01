@@ -10,7 +10,7 @@ import pytest
 from memtomem_stm.mms import import_hosts as ih
 from memtomem_stm.mms.secrets import Kind
 from memtomem_stm.mms.state import RegistryServer
-from helpers import set_home
+from helpers import claude_key, set_home
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +211,7 @@ class TestScanClaudeCode:
         (cwd / ".git").mkdir(parents=True)  # its own key wherever tmp lives (#1271)
         cfg = {
             "projects": {
-                str(cwd): {
+                claude_key(cwd): {
                     "mcpServers": {
                         "playwright": {"command": "npx", "args": ["-y", "@mcp/pw"]},
                     }
@@ -281,8 +281,8 @@ class TestScanClaudeCode:
         (repo / "src").mkdir()
         cfg = {
             "projects": {
-                str(repo.resolve()): {"mcpServers": {"root": {"command": "npx"}}},
-                str((repo / "src").resolve()): {"mcpServers": {"stale": {"command": "npx"}}},
+                claude_key(repo): {"mcpServers": {"root": {"command": "npx"}}},
+                claude_key(repo / "src"): {"mcpServers": {"stale": {"command": "npx"}}},
             }
         }
         (sandbox_home / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
@@ -555,7 +555,7 @@ class TestNonDictMcpServers:
     def test_claude_code_project_scope_returns_empty(self, sandbox_home, tmp_path, bad):
         cwd = tmp_path / "proj"
         (cwd / ".git").mkdir(parents=True)  # its own key wherever tmp lives (#1271)
-        cfg = {"projects": {str(cwd): {"mcpServers": bad}}}
+        cfg = {"projects": {claude_key(cwd): {"mcpServers": bad}}}
         (sandbox_home / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
         assert ih.scan_claude_code(cwd) == []
 

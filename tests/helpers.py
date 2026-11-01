@@ -38,6 +38,19 @@ def set_home(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     monkeypatch.setenv("USERPROFILE", str(path))
 
 
+def claude_key(path: Path) -> str:
+    """How Claude Code spells ``path`` as a ``projects`` key: resolved, NFC,
+    ``/``-separated on Windows too (#1271).
+
+    Built here for fixtures and expectations, not by the resolver under test.
+    A subprocess cwd or a recorded execution dir stays native; only the key
+    takes this form.
+    """
+    import unicodedata
+
+    return unicodedata.normalize("NFC", path.resolve().as_posix())
+
+
 def fake_tool_result(text: str, *, is_error: bool = False) -> SimpleNamespace:
     """The upstream ``CallToolResult`` shape the manager reads.
 

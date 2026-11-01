@@ -4637,6 +4637,14 @@ def _source_removal_hint(name: str, source: str) -> str:
         # Both values are untrusted here: reaching this branch means ``source``
         # was not one of the known labels either.
         return f"# Remove '{_disp(name)}' from {_disp(source)}."
+    if spec.kind in _CLAUDE_GLOBAL_CONFIG_KINDS and isinstance(
+        claude_global_config(), ClaudeConfigUnknown
+    ):
+        # `claude mcp remove` would act on a file STM cannot name (#1271).
+        return (
+            "# STM cannot tell which file Claude Code reads its config from: "
+            f"remove '{_disp(name)}' from the active one by hand."
+        )
     if spec.claude_scope is not None:
         return _shell_join(["claude", "mcp", "remove", name, "-s", spec.claude_scope])
     if not spec.managed:
@@ -4837,10 +4845,21 @@ def _prune_refusal(spec: _SourceSpec, name: str) -> str | None:
     A source without a writer is refused (#955). A Claude Code global-config
     row is not: discovery read the file and slot Claude Code uses, and
     ``claude mcp remove`` inherits the same environment, so it removes the
-    entry discovery matched and backed up (#1287, #1271).
+    entry discovery matched and backed up (#1287, #1271) — as long as the
+    file is still the one discovery read. In this process the environment is
+    fixed, so the only way the answer changes is a legacy ``.config.json``
+    appearing, which makes it unknown; the rule is asked again by the
+    backstop before the backup append and by the writer before the shell-out.
     """
     if not spec.managed:
         return _unmanaged_prune_refusal(spec, name)
+    if spec.kind in _CLAUDE_GLOBAL_CONFIG_KINDS and isinstance(
+        claude_global_config(), ClaudeConfigUnknown
+    ):
+        return (
+            "STM cannot tell which file Claude Code reads its config from — "
+            f"remove '{name}' by hand"
+        )
     return None
 
 
@@ -8413,6 +8432,16 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
         spawn_error = _argv_spawn_error(plan.name, plan.payload)
         if spawn_error is not None:
             return (False, spawn_error)
+        # The pre-check read the file Claude Code used then. In this process
+        # that answer can change only by becoming unknown (a legacy
+        # `.config.json` appearing), and then neither verb would act on the
+        # entry the pre-check compared (#1271).
+        if isinstance(claude_global_config(), ClaudeConfigUnknown):
+            return (
+                False,
+                "STM can no longer tell which file Claude Code reads its config from; "
+                "nothing was changed at the host",
+            )
         if plan.overwrite:
             # `claude mcp add-json` has no overwrite flag (same probe lineage
             # as `claude mcp add`, cli/proxy.py:274) — remove-then-add. The

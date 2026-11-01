@@ -5,7 +5,7 @@ import json
 import pytest
 from click.testing import CliRunner
 
-from helpers import set_home
+from helpers import claude_key, set_home
 
 from memtomem_stm.cli import proxy
 
@@ -51,7 +51,7 @@ def test_eject_refuses_unreadable_target_before_any_write(
         "servers": b'{"mcpServers": []}',
     }[failure]
     if kind == "claude-project" and failure == "servers":
-        raw = json.dumps({"projects": {str(tmp_path.resolve()): {"mcpServers": []}}}).encode()
+        raw = json.dumps({"projects": {claude_key(tmp_path): {"mcpServers": []}}}).encode()
     target.write_bytes(raw)
     config = tmp_path / "stm.json"
     config.write_text(
@@ -204,11 +204,12 @@ def test_strict_layout_error_identifies_target_file(tmp_path, monkeypatch, shape
     (tmp_path / ".git").mkdir()  # tmp_path keys its own project entry (#1271)
     path = tmp_path / ".claude.json"
     project = str(tmp_path.resolve())
+    key = claude_key(tmp_path)
     content = {
         "projects": {"projects": []},
-        "project": {"projects": {project: []}},
-        "servers": {"projects": {project: {"mcpServers": []}}},
-        "entry": {"projects": {project: {"mcpServers": {"demo": "private-canary"}}}},
+        "project": {"projects": {key: []}},
+        "servers": {"projects": {key: {"mcpServers": []}}},
+        "entry": {"projects": {key: {"mcpServers": {"demo": "private-canary"}}}},
     }[shape]
     path.write_text(json.dumps(content))
     with pytest.raises(proxy._HostConfigReadError) as exc:

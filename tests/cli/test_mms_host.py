@@ -20,7 +20,7 @@ from memtomem_stm.cli.mms_host import host_group
 from memtomem_stm.cli.mms_import import import_command
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
-from helpers import set_home
+from helpers import claude_key, set_home
 
 
 @pytest.fixture
@@ -2293,7 +2293,7 @@ def _import_project_scope(runner, sandbox, mcps: dict) -> Path:
     """
     cwd = sandbox["cwd"]
     (cwd / ".git").mkdir(exist_ok=True)
-    key = str(cwd.resolve())
+    key = claude_key(cwd)
     cfg = {"projects": {key: {"mcpServers": mcps}}}
     (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
     _apply_claude_code(runner)
@@ -2432,8 +2432,8 @@ class TestClaudeConfigLocation:
         (repo / "src").mkdir()
         cfg = {
             "projects": {
-                str(repo.resolve()): {"mcpServers": {"root-slot": {"command": "npx"}}},
-                str((repo / "src").resolve()): {"mcpServers": {"stale-sub": {"command": "x"}}},
+                claude_key(repo): {"mcpServers": {"root-slot": {"command": "npx"}}},
+                claude_key(repo / "src"): {"mcpServers": {"stale-sub": {"command": "x"}}},
             }
         }
         (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")

@@ -15,7 +15,7 @@ from memtomem_stm.cli.mms_import import import_command
 from memtomem_stm.mms import drift, state
 from memtomem_stm.mms.drift import compute_drift_hash
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
-from helpers import set_home
+from helpers import claude_key, set_home
 
 
 @pytest.fixture
@@ -518,7 +518,7 @@ class TestProjectConfigGate:
         # checkout cannot ship it, so it is NOT gated.
         cwd = sandbox["cwd"].resolve()
         (cwd / ".git").mkdir()  # cwd keys its own project entry (#1271)
-        cfg = {"projects": {str(cwd): {"mcpServers": {"homeproj": {"command": "echo"}}}}}
+        cfg = {"projects": {claude_key(cwd): {"mcpServers": {"homeproj": {"command": "echo"}}}}}
         (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
         res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
         assert res.exit_code == 0, res.output

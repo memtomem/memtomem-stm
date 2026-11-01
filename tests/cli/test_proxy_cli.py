@@ -32,7 +32,7 @@ from click.testing import CliRunner
 from memtomem_stm.cli.proxy import cli
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
 from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
-from helpers import set_home
+from helpers import claude_key, set_home
 
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "_fake_memtomem_server.py"
 
@@ -4176,7 +4176,7 @@ class TestInitDiscoverySources:
             json.dumps(
                 {
                     "projects": {
-                        str(cwd.resolve()): {
+                        claude_key(cwd): {
                             "mcpServers": {"proj-tool": {"command": "node", "args": ["a.js"]}}
                         }
                     }
@@ -8015,7 +8015,7 @@ class TestCheckoutScopedIdentity:
             (checkout / ".cursor" / "mcp.json").write_text(json.dumps(entry), encoding="utf-8")
         elif kind == "claude-project":
             (home / ".claude.json").write_text(
-                json.dumps({"projects": {str(checkout.resolve()): entry}}),
+                json.dumps({"projects": {claude_key(checkout): entry}}),
                 encoding="utf-8",
             )
         else:  # pragma: no cover - guards a typo in the parametrization
@@ -11273,7 +11273,7 @@ class TestPruneUnderClaudeConfigDir:
         repo = tmp_path / "repo"
         (repo / ".git").mkdir(parents=True)
         (repo / "src").mkdir()
-        root_key, sub_key = str(repo.resolve()), str((repo / "src").resolve())
+        root_key, sub_key = claude_key(repo), claude_key(repo / "src")
         cc = {
             "projects": {
                 sub_key: {"mcpServers": {"l": {"command": "npx", "args": ["stale"]}}},
@@ -11311,7 +11311,7 @@ class TestPruneUnderClaudeConfigDir:
         repo = tmp_path / "repo"
         (repo / ".git").mkdir(parents=True)
         (repo / "src").mkdir()
-        cc = {"projects": {str(repo.resolve()): {"mcpServers": {"l": {"command": "npx"}}}}}
+        cc = {"projects": {claude_key(repo): {"mcpServers": {"l": {"command": "npx"}}}}}
         (_hermetic_home / ".claude.json").write_text(json.dumps(cc), encoding="utf-8")
         config.write_text(
             json.dumps(
@@ -11356,6 +11356,39 @@ class TestPruneUnderClaudeConfigDir:
             "relative, or contains '.' or '..'." in result.output
         )
         assert removals == []
+
+    @pytest.mark.parametrize("after", ["_discover_candidates", "_prune_targets"])
+    def test_a_config_that_becomes_unknown_mid_run_is_not_pruned(
+        self, runner, config, monkeypatch, removals, _hermetic_home, after
+    ):
+        """A legacy ``.config.json`` appearing after discovery, or after the
+        plan split, means ``claude mcp remove`` may act on another file: no
+        backup row, no shell-out (#1271). The first is caught by the plan
+        split, the second by the backstop before the backup append."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"u": dict(self._ENTRY)}}), encoding="utf-8"
+        )
+        self._seed(config, monkeypatch, names=("u",), stub=False)
+        original = getattr(proxy_mod, after)
+
+        def run_then_change(*args, **kwargs):
+            result = original(*args, **kwargs)
+            (_hermetic_home / ".claude").mkdir(exist_ok=True)
+            (_hermetic_home / ".claude" / ".config.json").write_text("{}", encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(proxy_mod, after, run_then_change)
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+
+        payload = json.loads(result.stdout)
+        refused = payload["manual"] if after == "_discover_candidates" else payload["failed"]
+        assert [row["name"] for row in refused] == ["u"]
+        assert payload["pruned"] == []
+        assert removals == []
+        assert self._backed_up(_hermetic_home) == []
 
     @pytest.mark.parametrize("has_projects", [True, False])
     def test_an_unknown_project_slot_says_so_when_projects_exist(
@@ -12813,8 +12846,8 @@ class TestEjectCommand:
         re-read. Both are stated here, not derived from STM's resolver:
         ``config`` is the file (default the hermetic ``~/.claude.json``) and
         ``slot`` maps the subprocess cwd to the key Claude Code 2.1.316 writes
-        (default: the cwd with symlinks resolved, as measured outside a
-        repository; tests inside a repository set it). ``strip_keys``
+        (default: the cwd resolved, in the key form Claude Code writes, as
+        measured outside a repository; tests inside a repository set it). ``strip_keys``
         simulates the CLI's schema-strip of unknown fields (probed on 2.1.173);
         ``write=False`` simulates a clean exit that wrote nowhere we can see
         (wrong project slot).
@@ -12828,7 +12861,7 @@ class TestEjectCommand:
             "strip_keys": [],
             "write": True,
             "config": _hermetic_home / ".claude.json",
-            "slot": lambda cwd: os.path.realpath(cwd),
+            "slot": lambda cwd: claude_key(Path(cwd)),
         }
 
         def fake_run(cmd, timeout=5, cwd=None):
@@ -13311,7 +13344,7 @@ class TestEjectCommand:
         repo = tmp_path / "repo"
         (repo / ".git").mkdir(parents=True)
         (repo / "src").mkdir()
-        root_key = str(repo.resolve())
+        root_key = claude_key(repo)
         fake_claude_host["slot"] = lambda _cwd: root_key
         recorded = str((repo / "src").resolve())
         self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=recorded)})
@@ -13328,13 +13361,38 @@ class TestEjectCommand:
     def test_subdirectory_record_sees_a_clobber_in_the_repository_slot(
         self, runner, config, tmp_path, fake_claude_host, _hermetic_home
     ):
-        """No-clobber reads the root slot too: a different same-named server
-        there is refused, and a stale ``projects[<repo>/src]`` decoy is not
-        mistaken for the target."""
+        """No-clobber reads the root slot: a different same-named server there
+        is refused before any host call. Only the root slot holds one, so a
+        pre-check reading ``projects[<repo>/src]`` would find nothing and
+        proceed."""
         repo = tmp_path / "repo"
         (repo / ".git").mkdir(parents=True)
         (repo / "src").mkdir()
-        root_key, sub_key = str(repo.resolve()), str((repo / "src").resolve())
+        root_key = claude_key(repo)
+        fake_claude_host["slot"] = lambda _cwd: root_key
+        cc = {"projects": {root_key: {"mcpServers": {"demo": {"command": "other-server"}}}}}
+        (_hermetic_home / ".claude.json").write_text(json.dumps(cc), encoding="utf-8")
+        recorded = str((repo / "src").resolve())
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=recorded)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code != 0, result.output
+        assert "--force" in result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+        after = json.loads((_hermetic_home / ".claude.json").read_text(encoding="utf-8"))
+        assert after == cc
+
+    def test_force_from_a_subdirectory_replaces_the_root_slot_only(
+        self, runner, config, tmp_path, fake_claude_host, _hermetic_home
+    ):
+        """``--force`` removes and re-adds in the root slot; a stale
+        ``projects[<repo>/src]`` entry under the same name is untouched."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        root_key, sub_key = claude_key(repo), claude_key(repo / "src")
         fake_claude_host["slot"] = lambda _cwd: root_key
         cc = {
             "projects": {
@@ -13343,13 +13401,8 @@ class TestEjectCommand:
             }
         }
         (_hermetic_home / ".claude.json").write_text(json.dumps(cc), encoding="utf-8")
-        self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=sub_key)})
-
-        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
-
-        assert result.exit_code != 0, result.output
-        assert fake_claude_host["calls"] == []
-        assert "demo" in self._stm_servers(config)
+        recorded = str((repo / "src").resolve())
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=recorded)})
 
         forced = runner.invoke(cli, ["eject", "demo", "--yes", "--force", *_cfg_args(config)])
 
@@ -13357,6 +13410,35 @@ class TestEjectCommand:
         after = json.loads((_hermetic_home / ".claude.json").read_text(encoding="utf-8"))
         assert after["projects"][root_key]["mcpServers"]["demo"]["command"] == "npx"
         assert after["projects"][sub_key]["mcpServers"]["demo"] == {"command": "stale-decoy"}
+
+    def test_force_refuses_when_the_config_becomes_unknown_after_the_check(
+        self, runner, config, tmp_path, fake_claude_host, _hermetic_home, monkeypatch
+    ):
+        """A legacy ``.config.json`` appearing between the no-clobber check and
+        the pre-remove makes Claude Code act on another file: nothing at the
+        host may be removed (#1271)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        cc = {"mcpServers": {"demo": {"command": "other-server"}}}
+        (_hermetic_home / ".claude.json").write_text(json.dumps(cc), encoding="utf-8")
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-user")})
+        checked = proxy_mod._host_existing_entry
+
+        def check_then_change(*args, **kwargs):
+            entry = checked(*args, **kwargs)
+            (_hermetic_home / ".claude").mkdir(exist_ok=True)
+            (_hermetic_home / ".claude" / ".config.json").write_text("{}", encoding="utf-8")
+            return entry
+
+        monkeypatch.setattr(proxy_mod, "_host_existing_entry", check_then_change)
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--force", *_cfg_args(config)])
+
+        assert result.exit_code != 0, result.output
+        assert "can no longer tell which file Claude Code reads" in result.output
+        assert fake_claude_host["calls"] == []
+        assert json.loads((_hermetic_home / ".claude.json").read_text(encoding="utf-8")) == cc
+        assert "demo" in self._stm_servers(config)
 
     def test_claude_user_restores_into_the_config_dir_file(
         self, runner, config, tmp_path, fake_claude_host, _hermetic_home, monkeypatch
@@ -13407,7 +13489,7 @@ class TestEjectCommand:
         recorded = str(proj)
         cc = {
             "projects": {
-                recorded: {"mcpServers": {"demo": {"command": "other-server"}}},
+                claude_key(proj): {"mcpServers": {"demo": {"command": "other-server"}}},
             }
         }
         (_hermetic_home / ".claude.json").write_text(json.dumps(cc), encoding="utf-8")
