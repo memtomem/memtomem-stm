@@ -197,15 +197,18 @@ class TestGlobalConfigUnknown:
         assert claude_global_config() == _unknown("config_dir")
 
     def test_dot_dot_through_a_symlink_names_another_file(self, home, tmp_path, monkeypatch):
-        """Why ``..`` is refused: Node joins ``/a/link/..`` to ``/a``, the OS
-        resolves it through the link to ``/b``, and both files exist."""
+        """Why ``..`` is refused: Node joins ``/a/link/..`` to ``/a``, while
+        macOS and Linux resolve it through the link to ``/b``, and both files
+        exist. Windows collapses ``..`` lexically too, so the two agree there
+        and only the refusal is asserted."""
         (tmp_path / "a").mkdir()
         (tmp_path / "b" / "child").mkdir(parents=True)
         (tmp_path / "a" / "link").symlink_to(tmp_path / "b" / "child")
         (tmp_path / "a" / ".claude.json").write_text("A")
         (tmp_path / "b" / ".claude.json").write_text("B")
         value = str(tmp_path / "a") + "/link/.."
-        assert (Path(value) / ".claude.json").read_text() == "B"  # what Python reads
+        if sys.platform != "win32":
+            assert (Path(value) / ".claude.json").read_text() == "B"  # what Python reads
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", value)
 
         assert claude_global_config() == _unknown("config_dir")

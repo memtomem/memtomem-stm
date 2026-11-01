@@ -101,9 +101,10 @@ _SEPARATORS = re.compile(r"[\\/]" if sys.platform == "win32" else "/")
 def _joinable_dir(value: str | None) -> bool:
     """Whether ``value`` joins to the same file in Node and in Python.
 
-    Node's ``path.join`` collapses ``.`` and ``..`` lexically, while the OS
-    resolves a ``..`` that Python leaves in place physically, through any
-    symlink before it, so the two can name different files. A relative value
+    Node's ``path.join`` collapses ``.`` and ``..`` lexically, while macOS and
+    Linux resolve a ``..`` that Python leaves in place physically, through any
+    symlink before it, so the two can name different files (Windows collapses
+    it lexically as Node does; refusing it there too costs nothing). A relative value
     is resolved against Claude Code's own working directory, which STM does
     not know — and so, on Windows, is one rooted on the current drive
     (``\\cfg``) or relative to a drive's cwd (``C:cfg``): ``Path.is_absolute``
