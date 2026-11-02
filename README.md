@@ -25,19 +25,9 @@ It sits between your AI agent and its upstream MCP servers, compressing tool res
 - **Carries context across sessions** — surfaces prior decisions from memtomem LTM automatically, so the agent picks up where it left off rather than re-discovering what it already knew.
 - **Drops in front of any MCP server** — adds compression, caching, and observability as a proxy layer, without changes to upstream code.
 
-```text
-                   Agent (Claude Code, Cursor, ...)
-                                   │ MCP
-                                   ▼
-  ┌────────────────────── memtomem-stm (STM) ──────────────────────┐
-  │                   CLEAN → COMPRESS → SURFACE                   │
-  └───────┬───────────────┬───────────────┬───────────────┬────────┘
-          │               │               │               ┊ surfacing via MCP
-          ▼               ▼               ▼               ▼
-     filesystem        github        ...any MCP     memtomem LTM
-     MCP server      MCP server        server       (MCP server)
-    └───────── MCP: stdio / SSE / HTTP ─────────┘
-```
+<p align="center">
+  <img src="https://raw.githubusercontent.com/memtomem/memtomem-stm/main/docs/assets/architecture.svg" width="480" alt="Your agent, such as Claude Code, Cursor, or Claude Desktop, talks MCP to memtomem-stm, which passes tool responses through CLEAN, COMPRESS, then SURFACE. STM forwards tool calls over MCP (stdio, SSE, or HTTP) to upstream servers such as filesystem, github, or any other MCP server. When a memtomem LTM server is configured, SURFACE reads relevant memories from it, also over MCP.">
+</p>
 
 ## Installation
 
