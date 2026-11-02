@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sys
 import tomllib
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote
@@ -439,6 +440,20 @@ class _HtmlTargets(HTMLParser):
         self.handle_starttag(tag, attrs)
 
 
+def _render_targets(token: Token) -> list[str]:
+    """The link and image targets ``token`` renders, Markdown or raw HTML."""
+    if token.type == "link_open":
+        return [str(token.attrGet("href") or "")]
+    if token.type == "image":
+        return [str(token.attrGet("src") or "")]
+    if token.type in ("html_block", "html_inline"):
+        parser = _HtmlTargets()
+        parser.feed(token.content)
+        parser.close()
+        return parser.targets
+    return []
+
+
 def _pypi_readme_problems(text: str) -> list[str]:
     """What in ``text`` PyPI's renderer cannot show the way GitHub does.
 
@@ -451,17 +466,7 @@ def _pypi_readme_problems(text: str) -> list[str]:
     for token in _tokens(text):
         if token.type == "fence" and token.info.split()[:1] == ["mermaid"]:
             problems.append("mermaid fence")
-        targets: list[str] = []
-        if token.type == "link_open":
-            targets.append(str(token.attrGet("href") or ""))
-        elif token.type == "image":
-            targets.append(str(token.attrGet("src") or ""))
-        elif token.type in ("html_block", "html_inline"):
-            parser = _HtmlTargets()
-            parser.feed(token.content)
-            parser.close()
-            targets.extend(parser.targets)
-        for target in (raw.strip() for raw in targets):
+        for target in (raw.strip() for raw in _render_targets(token)):
             if not re.match(r"(https?:|mailto:|#)", target):
                 problems.append(f"relative target: {target}")
     return problems
@@ -511,3 +516,97 @@ def test_readme_renders_on_pypi() -> None:
     assert readme == "README.md"
     problems = _pypi_readme_problems((REPO_ROOT / readme).read_text(encoding="utf-8"))
     assert problems == [], "README.md has content PyPI cannot render:\n" + "\n".join(problems)
+
+
+_RAW_MAIN = "https://raw.githubusercontent.com/memtomem/memtomem-stm/main/"
+_ARCHITECTURE_SVG = "docs/assets/architecture.svg"
+_PIPELINE = ("CLEAN", "COMPRESS", "SURFACE")
+_SVG = "{http://www.w3.org/2000/svg}"
+
+
+class _HtmlImages(HTMLParser):
+    """The attributes of each ``<img>`` in a raw HTML fragment, by exact name."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.images: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "img":
+            self.images.append({name: value or "" for name, value in attrs})
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+
+def _readme() -> str:
+    return (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def _in_order(text: str, words: tuple[str, ...]) -> bool:
+    """Each of ``words`` is in ``text``, and their first mentions come in this order.
+
+    First mentions, not a subsequence: prose that names a stage again later
+    ("the SURFACE stage reads ...") would otherwise complete a reordered list.
+    """
+    firsts = [re.search(rf"\b{word}\b", text) for word in words]
+    if any(match is None for match in firsts):
+        return False
+    starts = [match.start() for match in firsts if match is not None]
+    return starts == sorted(starts)
+
+
+def test_readme_raw_main_targets_exist() -> None:
+    """A README target on raw.githubusercontent ``main`` names a file in this tree.
+
+    PyPI needs absolute URLs, so the README reaches its own images through
+    ``raw.githubusercontent.com``. The relative-link checker never sees those,
+    and a renamed or missing file would show as a broken image only after merge.
+    """
+    targets = [
+        target.strip()
+        for token in _tokens(_readme())
+        for target in _render_targets(token)
+        if target.strip().startswith(_RAW_MAIN)
+    ]
+    assert _RAW_MAIN + _ARCHITECTURE_SVG in targets
+    missing = [
+        target
+        for target in targets
+        if not (REPO_ROOT / unquote(target[len(_RAW_MAIN) :].split("#")[0].split("?")[0])).is_file()
+    ]
+    assert missing == [], "README points at files missing from main's tree:\n" + "\n".join(missing)
+
+
+def test_readme_architecture_diagram_shows_the_pipeline_in_order() -> None:
+    """The picture, its description and the README alt text all read CLEAN → COMPRESS → SURFACE.
+
+    The stage boxes are read left to right by their ``x`` coordinate, which is
+    the order a reader sees them in, not the order they appear in the file.
+    """
+    images: list[dict[str, str]] = []
+    for token in _tokens(_readme()):
+        if token.type in ("html_block", "html_inline"):
+            parser = _HtmlImages()
+            parser.feed(token.content)
+            parser.close()
+            images.extend(parser.images)
+    diagrams = [image for image in images if image.get("src") == _RAW_MAIN + _ARCHITECTURE_SVG]
+    assert len(diagrams) == 1
+    assert _in_order(diagrams[0].get("alt", ""), _PIPELINE)
+
+    svg = ET.parse(REPO_ROOT / _ARCHITECTURE_SVG).getroot()
+    title = svg.find(f"{_SVG}title")
+    desc = svg.find(f"{_SVG}desc")
+    assert title is not None and (title.text or "").strip()
+    assert desc is not None and _in_order(desc.text or "", _PIPELINE)
+
+    stages = [
+        ("".join(element.itertext()).strip(), element.get("x", ""))
+        for element in svg.iter(f"{_SVG}text")
+        if "".join(element.itertext()).strip() in _PIPELINE
+    ]
+    assert sorted(label for label, _ in stages) == sorted(_PIPELINE)
+    x = {label: float(value) for label, value in stages if re.fullmatch(r"\d+(\.\d+)?", value)}
+    assert len(x) == len(_PIPELINE), f"each stage needs a numeric x: {stages}"
+    assert x["CLEAN"] < x["COMPRESS"] < x["SURFACE"]

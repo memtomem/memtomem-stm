@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 462" width="480" height="462" role="img" aria-labelledby="title desc">
+  <title id="title">memtomem-stm architecture</title>
+  <desc id="desc">Your agent, such as Claude Code, Cursor, or Claude Desktop, talks MCP to memtomem-stm. STM passes tool responses through three stages in order: CLEAN, COMPRESS, then SURFACE. It forwards tool calls over MCP, by stdio, SSE, or HTTP, to upstream servers such as filesystem, github, or any other MCP server. When a memtomem LTM server is configured, the SURFACE stage reads relevant memories from it, also over MCP; without one, STM still proxies, compresses, and caches.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .box { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+    .group { fill: none; stroke: #d0d7de; stroke-width: 1.5; }
+    .stm { fill: #ddf4ff; stroke: #54aeff; stroke-width: 1.5; }
+    .stage { fill: #ffffff; stroke: #54aeff; stroke-width: 1.5; }
+    .ltm { fill: #f6f8fa; stroke: #59636e; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .title { fill: #1f2328; font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .name { fill: #1f2328; font: 600 15px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .cmd { fill: #0550ae; font: 600 14px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .server { fill: #1f2328; font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .note { fill: #59636e; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .arrow { fill: none; stroke: #59636e; stroke-width: 1.5; }
+    .dashed { stroke-dasharray: 5 4; }
+    .head { fill: #59636e; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .box, .ltm { fill: #161b22; stroke: #3d444d; }
+      .ltm { stroke: #9198a1; }
+      .group { stroke: #3d444d; }
+      .stm { fill: #0c2d6b; stroke: #1f6feb; }
+      .stage { fill: #0d1117; stroke: #1f6feb; }
+      .title, .name, .server { fill: #f0f6fc; }
+      .cmd { fill: #79c0ff; }
+      .note { fill: #9198a1; }
+      .arrow { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="480" height="462" rx="12"/>
+
+  <!-- Agent -->
+  <rect class="box" x="20" y="16" width="440" height="60" rx="8"/>
+  <text class="title" x="240" y="42" text-anchor="middle">Your agent</text>
+  <text class="note" x="240" y="62" text-anchor="middle">Claude Code · Cursor · Claude Desktop · any MCP client</text>
+
+  <path class="arrow" d="M 240 76 V 118" marker-end="url(#head)"/>
+  <text class="note" x="252" y="102">MCP</text>
+
+  <!-- STM and its pipeline -->
+  <rect class="stm" x="20" y="120" width="440" height="104" rx="8"/>
+  <text class="name" x="240" y="146" text-anchor="middle">memtomem-stm</text>
+  <rect class="stage" x="36" y="162" width="116" height="36" rx="6"/>
+  <text class="cmd" x="94" y="185" text-anchor="middle">CLEAN</text>
+  <path class="arrow" d="M 154 180 H 180" marker-end="url(#head)"/>
+  <rect class="stage" x="182" y="162" width="116" height="36" rx="6"/>
+  <text class="cmd" x="240" y="185" text-anchor="middle">COMPRESS</text>
+  <path class="arrow" d="M 300 180 H 326" marker-end="url(#head)"/>
+  <rect class="stage" x="328" y="162" width="116" height="36" rx="6"/>
+  <text class="cmd" x="386" y="185" text-anchor="middle">SURFACE</text>
+
+  <!-- Upstream MCP servers -->
+  <path class="arrow" d="M 160 224 V 270" marker-end="url(#head)"/>
+  <text class="note" x="172" y="252">MCP: stdio / SSE / HTTP</text>
+  <rect class="group" x="20" y="272" width="280" height="174" rx="10"/>
+  <text class="note" x="160" y="294" text-anchor="middle">Upstream MCP servers</text>
+  <rect class="box" x="36" y="306" width="248" height="36" rx="6"/>
+  <text class="server" x="160" y="329" text-anchor="middle">filesystem</text>
+  <rect class="box" x="36" y="350" width="248" height="36" rx="6"/>
+  <text class="server" x="160" y="373" text-anchor="middle">github</text>
+  <rect class="box" x="36" y="394" width="248" height="36" rx="6"/>
+  <text class="server" x="160" y="417" text-anchor="middle">any MCP server</text>
+
+  <!-- Optional LTM -->
+  <path class="arrow dashed" d="M 390 224 V 286" marker-end="url(#head)"/>
+  <text class="note" x="400" y="248">surfacing</text>
+  <text class="note" x="400" y="265">via MCP</text>
+  <path class="ltm" d="M 320 300 A 70 10 0 0 1 460 300 V 372 A 70 10 0 0 1 320 372 Z"/>
+  <path class="ltm" d="M 320 300 A 70 10 0 0 0 460 300"/>
+  <text class="title" x="390" y="336" text-anchor="middle">memtomem LTM</text>
+  <text class="note" x="390" y="356" text-anchor="middle">MCP server</text>
+  <text class="note" x="390" y="404" text-anchor="middle">optional</text>
+</svg>

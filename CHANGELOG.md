@@ -9,6 +9,18 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Changed
+
+- The README architecture diagram is an SVG image
+  (`docs/assets/architecture.svg`) instead of a plain-text drawing, so it
+  scales to phone width instead of scrolling sideways, and it carries a
+  light and a dark palette chosen by `prefers-color-scheme`. The image is
+  referenced by its
+  `raw.githubusercontent.com` URL on `main`, since PyPI cannot resolve a
+  relative path; its alt text describes the same flow.
+
 ## [0.7.5] — 2026-11-01
 
 ### Upgrade notes
