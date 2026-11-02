@@ -17,9 +17,9 @@ changes inline only. See the deprecation policy in
   (`docs/assets/architecture.svg`) instead of a plain-text drawing, so it
   scales to phone width instead of scrolling sideways, and it carries a
   light and a dark palette chosen by `prefers-color-scheme`. The image is
-  referenced by its
-  `raw.githubusercontent.com` URL on `main`, since PyPI cannot resolve a
-  relative path; its alt text describes the same flow.
+  referenced by its `raw.githubusercontent.com` URL on `main`, since PyPI
+  cannot resolve a relative path; its alt text describes the same flow.
+  (#1308)
 
 ## [0.7.5] — 2026-11-01
 
