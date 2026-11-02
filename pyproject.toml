@@ -1,6 +1,6 @@
 [project]
 name = "memtomem-stm"
-version = "0.7.5"
+version = "0.7.6"
 description = "MCP proxy for AI agents: compresses and caches tool responses, and surfaces relevant memories from memtomem LTM"
 authors = [
     {name = "DAPADA Inc.", email = "contact@dapada.co.kr"},

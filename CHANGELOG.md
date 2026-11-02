@@ -9,7 +9,7 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.6] — 2026-11-02
 
 ### Changed
 
