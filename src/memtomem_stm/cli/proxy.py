@@ -2500,7 +2500,11 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         click.echo("* host original pruned — `mms eject NAME` restores it (see `mms eject -h`).")
 
 
-def _render_compression_block(summary: dict[str, Any]) -> None:
+def _render_compression_block(
+    summary: dict[str, Any],
+    by_source: dict[str, dict[str, Any]] | None = None,
+    max_history: int | None = None,
+) -> None:
     click.echo(_hdr("Proxy / Compression"))
     click.echo("=" * 30)
     if not summary.get("available") or not summary.get("total_calls"):
@@ -2520,8 +2524,32 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
         )
     click.echo(f"  calls: {summary['total_calls']}  (errors: {summary['error_count']})")
     click.echo(f"  chars: {orig:,} -> {comp:,}  (saved {summary['saved_chars']:,}, {ratio:.1f}%)")
+    # A blended ratio is dominated by whichever source records the most text,
+    # so with more than one source present each gets its own line (the hook
+    # records native tool output, compressed only when hook compression runs).
+    present = {src: s for src, s in (by_source or {}).items() if s.get("total_calls")}
+    if len(present) > 1:
+        for src, s in present.items():
+            src_orig = int(s["total_original_chars"])
+            # Structured deliveries are sized separately (line above), so a
+            # source with no text chars has no ratio rather than a 0% one.
+            saved = f"saved {float(s['saved_ratio']) * 100:.1f}%" if src_orig else "no text ratio"
+            line = (
+                f"    {src:<5} calls: {s['total_calls']}  chars: {src_orig:,} -> "
+                f"{int(s['total_compressed_chars']):,}  ({saved})"
+            )
+            src_structured = int((s.get("structured_delivery") or {}).get("calls") or 0)
+            if src_structured:
+                line += f"  [{src_structured} structured, separate accounting]"
+            click.echo(line)
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
-    click.echo("  Read volume: stm_admin(action=progressive_stats); telemetry may be incomplete.")
+    if max_history is not None:
+        click.echo(
+            f"  Window: retained rows only; this config caps each source at {max_history:,} rows\n"
+            "    (proxy.metrics.max_history). The oldest are trimmed in batches, so a source\n"
+            "    can briefly exceed it; `mms hook` takes its cap only from\n"
+            "    MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY."
+        )
     unknown = summary.get("unclassified_mcp_calls", 0)
     if unknown:
         click.echo(
@@ -2546,6 +2574,50 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
                 f"{row['calls']:>6} {row['original_chars']:>10,} "
                 f"{row['compressed_chars']:>10,} {saved_pct:>6.1f}%"
             )
+
+
+def _render_progressive_block(
+    summary: dict[str, Any], *, collecting: bool, retention_days: int
+) -> None:
+    """Progressive-delivery volume from :func:`read_progressive_summary`."""
+    click.echo(_hdr("Progressive delivery"))
+    click.echo("=" * 30)
+    if summary.get("error"):
+        click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
+        return
+    if not collecting:
+        click.echo("  Collection disabled (proxy.progressive_reads.enabled = false).")
+    if not summary.get("available") or not summary.get("total_responses"):
+        click.echo("  No progressive responses recorded yet.")
+        return
+    produced = int(summary["produced_chars"])
+    delivered = int(summary["delivered_chars"])
+    pct = float(summary["delivered_ratio"]) * 100
+    click.echo(
+        f"  responses: {summary['total_responses']}  "
+        f"(with follow-up reads: {summary['follow_up_responses']}; "
+        f"reads recorded: {summary['total_reads']})"
+    )
+    click.echo(f"  chars: {produced:,} produced -> {delivered:,} delivered ({pct:.1f}%)")
+    click.echo(
+        "  Delivered counts every recorded read, so rereads count again.\n"
+        "  It measures payload sent to the agent, not tokens."
+    )
+    if summary.get("unclassified_reads"):
+        click.echo(
+            f"  {summary['unclassified_reads']} reads predate initial/follow-up "
+            "classification; they are included in both totals."
+        )
+    oldest = summary.get("oldest_at")
+    if oldest is not None:
+        since = datetime.fromtimestamp(float(oldest), tz=UTC).strftime("%Y-%m-%d")
+        window = (
+            f"rows older than {retention_days} days are purged when the server\n"
+            "    starts with collection enabled (proxy.progressive_reads.retention_days)"
+            if retention_days > 0
+            else "no age purge\n    (proxy.progressive_reads.retention_days = 0)"
+        )
+        click.echo(f"  Window: since {since} UTC; {window}.")
 
 
 def _opportunity_lines(summary: dict[str, Any]) -> list[str]:
@@ -2657,7 +2729,9 @@ def stats(
     """Show proxy compression and surfacing stats from the persistent stores.
 
     Reads ``proxy_metrics.db`` and ``stm_feedback.db`` read-only (it never
-    creates or migrates them) and reports all-time totals. The live MCP server
+    creates or migrates them) and reports totals over the rows still retained
+    (``proxy.metrics.max_history`` per source, ``retention_days`` for
+    progressive reads and surfacing), not all-time totals. The live MCP server
     keeps additional in-memory counters that a separate CLI process cannot see,
     so the numbers here reflect only what has been written to disk. An explicit
     ``--config`` also steers the STMConfig-backed feedback-DB location (#839).
@@ -2666,6 +2740,7 @@ def stats(
     from memtomem_stm.config import STMConfig, stm_config_for_cli
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
     from memtomem_stm.proxy.metrics_store import read_compression_summary
+    from memtomem_stm.proxy.progressive_reads_store import read_progressive_summary
     from memtomem_stm.surfacing.feedback_store import read_surfacing_summary
 
     # Refuse before the stores are touched or anything is printed. The summary
@@ -2717,14 +2792,27 @@ def stats(
         config_status = "missing"
         proxy_cfg = stm_config.proxy if stm_config is not None else ProxyConfig()
     else:
-        # Parse/validation error — fall back to defaults purely to locate the
-        # DB paths to probe, but flag the config as invalid.
+        # Parse/validation error: the server then keeps the config pydantic-
+        # settings built from the environment (server.app_lifespan's no-swap
+        # branch), so locate the DBs from that same config — a defaults-only
+        # fallback would read a different DB whenever an env var moves one.
         config_status = "invalid"
-        proxy_cfg = ProxyConfig()
+        proxy_cfg = stm_config.proxy if stm_config is not None else ProxyConfig()
 
     compression = read_compression_summary(
         proxy_cfg.metrics.db_path, tool=tool_filter, source=source_filter
     )
+    # ``--source`` scopes the compression rows only; unset, report each source
+    # beside the aggregate so one high-volume source cannot hide another's ratio.
+    compression_by_source = (
+        {
+            src: read_compression_summary(proxy_cfg.metrics.db_path, tool=tool_filter, source=src)
+            for src in ("mcp", "hook")
+        }
+        if source_filter is None
+        else None
+    )
+    progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
     # These numbers come only from the on-disk stores; the live MCP server
@@ -2750,6 +2838,8 @@ def stats(
                     "source_filter": source_filter,
                     "data_source": data_source,
                     "compression": compression,
+                    "compression_by_source": compression_by_source,
+                    "progressive": progressive,
                     "surfacing": surfacing,
                 },
                 indent=2,
@@ -2767,7 +2857,15 @@ def stats(
         click.echo(f"Source : {source_filter}")
     click.echo(f"Data   : {data_source}")
     click.echo("")
-    _render_compression_block(compression)
+    _render_compression_block(
+        compression, compression_by_source, max_history=proxy_cfg.metrics.max_history
+    )
+    click.echo("")
+    _render_progressive_block(
+        progressive,
+        collecting=proxy_cfg.progressive_reads.enabled,
+        retention_days=proxy_cfg.progressive_reads.retention_days,
+    )
     click.echo("")
     _render_surfacing_block(surfacing)
 

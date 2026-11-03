@@ -9,6 +9,29 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Changed
+
+- `mms stats` no longer hides one source's savings behind another's volume.
+  When rows from both proxied MCP tools and `mms hook` are present, each
+  source gets its own line and ratio under the aggregate, which keeps its
+  shape and meaning. A new **Progressive delivery** section reads the
+  progressive-reads table read-only and reports chars produced against chars
+  delivered to the agent (every recorded read counts, so rereads can push the
+  ratio above 100%) and the oldest retained row; it replaces the pointer to
+  `stm_admin(action=progressive_stats)`. `--tool` filters it; `--source` still
+  scopes only the compression rows. The text and `docs/cli.md` no longer say
+  "all-time totals": a window line names `proxy.metrics.max_history` (per
+  source) and `proxy.progressive_reads.retention_days`. `--json` adds
+  `compression_by_source` (`null` when `--source` is given) and `progressive`;
+  existing keys keep their names and meanings.
+- **Behavior change**: with an invalid proxy config file, `mms stats` now
+  reads the environment-derived config the server keeps in that case instead
+  of built-in defaults. A DB moved by an environment variable is the one it
+  reads, and the `Enabled` / `Servers` lines (`enabled` / `servers` in
+  `--json`) report the environment's values.
+
 ## [0.7.6] — 2026-11-02
 
 ### Changed
