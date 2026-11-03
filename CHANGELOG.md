@@ -39,6 +39,16 @@ changes inline only. See the deprecation policy in
   servers) when the runtime configuration keeps the server from starting —
   for example `MEMTOMEM_STM_PROXY=[]`. Its closing line now says to fix the
   runtime configuration named in the warning above. `--json` is unchanged.
+- `stm_admin(action="proxy_stats")` prints its latency percentiles. The row
+  read a key the tracker does not publish, so it never appeared. The figures
+  are the clean, compress and surface timers of each successful live call,
+  summed: surfacing's LTM lookup is in them and the upstream tool fetch is
+  not, so they are not tool latency. (#1315)
+  **Behavior change**: once a successful live call has been recorded, the
+  output gains a `Stage latency:   p50=… p95=… p99=… ms` row and a line under
+  it saying what the figures cover; after more than 10,000 live calls that
+  line also names the window (`; last 10000 calls`). `TokenTracker.get_summary()`
+  gains `latency_samples`, the number of calls the percentiles cover.
 
 - `mms health` probes the configured upstreams with environment overrides
   applied: the config file overlaid with `MEMTOMEM_STM_PROXY` /
