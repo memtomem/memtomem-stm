@@ -2327,6 +2327,11 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
     display_count = effective_count if effective_count is not None else len(servers)
     if runtime.file_fallback and config_error:
         click.echo("Run `mms config validate` to fix the proxy file.")
+    elif runtime.startup_error:
+        # The warning above already names what is invalid. Neither adding an
+        # upstream nor probing the listed ones helps while startup fails, and
+        # `mms config validate` lints the file only (no env overlay).
+        click.echo("Fix the runtime configuration named in the warning above first.")
     elif display_count:
         click.echo("Run `mms list` for per-server detail; `mms health` to probe connectivity.")
     else:
