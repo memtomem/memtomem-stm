@@ -2327,6 +2327,11 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
     display_count = effective_count if effective_count is not None else len(servers)
     if runtime.file_fallback and config_error:
         click.echo("Run `mms config validate` to fix the proxy file.")
+    elif runtime.startup_error:
+        # The warning above already names what is invalid. Neither adding an
+        # upstream nor probing the listed ones helps while startup fails, and
+        # `mms config validate` lints the file only (no env overlay).
+        click.echo("Fix the runtime configuration named in the warning above first.")
     elif display_count:
         click.echo("Run `mms list` for per-server detail; `mms health` to probe connectivity.")
     else:
@@ -9919,6 +9924,69 @@ def _silenced_mcp_sdk_logs() -> Iterator[None]:
         sdk_logger.setLevel(prior)
 
 
+@dataclass(frozen=True)
+class _EffectiveUpstreams:
+    """The upstream map ``doctor`` and ``health`` check, and how it was chosen."""
+
+    servers: dict[str, dict[str, Any]]
+    # The env-overlaid document and its typed model, when they validated.
+    data: dict[str, Any]
+    config: ProxyConfig | None
+    # Set when the env-overlaid snapshot of ``file_data`` fails validation.
+    snapshot_error: str | None = None
+
+
+def _effective_upstreams(
+    file_data: dict[str, Any], runtime: _RuntimeProxyRead
+) -> _EffectiveUpstreams:
+    """Pick the upstreams the server-shaped diagnostics read (#831).
+
+    ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__*`` can add or override upstreams,
+    so the map is ``file_data`` overlaid with the proxy env fragment. The
+    overlay is re-validated here because ``file_data`` was read before
+    ``runtime`` was: a file edited in between can pass the runtime read and
+    fail as this snapshot, and the snapshot is what gets checked. When the
+    runtime read reports an error, or the snapshot fails, there is no effective
+    snapshot to trust and the raw file map is used.
+    """
+    effective_data: dict[str, Any] = {}
+    effective_config: ProxyConfig | None = None
+    snapshot_error: str | None = None
+    if runtime.error is None:
+        from pydantic import ValidationError
+
+        from memtomem_stm.proxy.config import (
+            ProxyConfig,
+            _deep_merge,
+            collect_proxy_env_overrides,
+            validation_error_summary,
+        )
+
+        # One merged dict for the model and for callers' predicates: they must
+        # judge the same document, or a check could report a value the model
+        # never saw.
+        merged = _deep_merge(file_data, collect_proxy_env_overrides().fragment)
+        try:
+            effective_config = ProxyConfig.model_validate(merged)
+        except ValidationError as exc:
+            snapshot_error = (
+                f"{exc.error_count()} validation error(s): {validation_error_summary(exc)}"
+            )
+        else:
+            effective_data = merged
+    raw: Any = (
+        effective_data.get("upstream_servers", {})
+        if effective_config is not None
+        else file_data.get("upstream_servers", {})
+    )
+    servers = (
+        {name: cfg for name, cfg in raw.items() if isinstance(cfg, dict)}
+        if isinstance(raw, dict)
+        else {}
+    )
+    return _EffectiveUpstreams(servers, effective_data, effective_config, snapshot_error)
+
+
 async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, StagedProbeResult]:
     """Probe all servers in parallel, returning per-server staged results."""
 
@@ -10005,14 +10073,17 @@ def health(
     from memtomem_stm.server import _hidden_obs_tools_hint
 
     data = _load(path, json_action="health" if as_json else None)
-    servers: dict[str, Any] = data.get("upstream_servers", {})
     explicit_config = _explicit_config_path(config_path)
     surfacing_status = _surfacing_bootstrap_status(float(timeout), config_path=explicit_config)
     # Same startup-aware read as ``status`` / ``list``: a rejected whole
     # proxy env block counts as invalid, and the error names locations and
     # error types only, never input values.
     runtime = _runtime_proxy_read(path, config_path)
-    config_error = runtime.error
+    effective = _effective_upstreams(data, runtime)
+    # A snapshot that fails after a valid runtime read means the file changed
+    # between the two reads; report it as the invalid file it now is.
+    config_error = runtime.error or effective.snapshot_error
+    servers = effective.servers
     logging_status = _logging_destination_status(explicit_config)
     obs_tools_hint = _hidden_obs_tools_hint()
 
@@ -10795,8 +10866,16 @@ def doctor(
             # transport/prefix/probe checks operate on the raw dicts and stay
             # meaningful.
             runtime = _runtime_proxy_read(path, config_path)
-            effective_config: Any | None = None
-            effective_data: dict[str, Any] = {}
+            # Every server-shaped check below reads the EFFECTIVE map, not the
+            # file's: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__* can add or
+            # override upstreams, and those are the ones the server would
+            # serve — reporting "no upstream servers configured" over an
+            # env-supplied one is the same doctor-disagrees-with-runtime defect
+            # as #831 itself. `health` picks its probe set the same way.
+            effective = _effective_upstreams(data, runtime)
+            effective_config = effective.config
+            effective_data = effective.data
+            servers = effective.servers
             if runtime.error:
                 # A startup-rejected environment leaves the file itself
                 # valid, so `config validate` would pass; point at the
@@ -10813,58 +10892,19 @@ def doctor(
                     f"{_runtime_config_warning(runtime)}: {runtime.error}",
                     schema_next,
                 )
-            else:
-                # Build the same env-overlaid typed snapshot the running
-                # server consumes. Provider diagnostics must reflect env >
-                # file precedence and model defaults, not the raw JSON alone.
-                from pydantic import ValidationError
-
-                from memtomem_stm.proxy.config import (
-                    ProxyConfig,
-                    _deep_merge,
-                    collect_proxy_env_overrides,
-                    validation_error_summary,
+            elif effective.snapshot_error:
+                # `data` was read before the runtime read, so a file edited in
+                # between can validate there and fail here. Judge the snapshot
+                # the later checks actually use.
+                check(
+                    "config_schema",
+                    "config schema",
+                    "FAIL",
+                    f"{_CONFIG_INVALID_WARNING}: {effective.snapshot_error}",
+                    f"mms config validate {cfg_arg}",
                 )
-
-                # One merged dict for both the model and the inert-state
-                # predicate below: they must judge the same document, or
-                # doctor could report an `enabled` the model never saw.
-                effective_data = _deep_merge(data, collect_proxy_env_overrides().fragment)
-                try:
-                    effective_config = ProxyConfig.model_validate(effective_data)
-                except ValidationError as exc:
-                    # `data` was read before the runtime read, so a file
-                    # edited in between can validate there and fail here.
-                    # Judge the snapshot the later checks actually use.
-                    effective_data = {}
-                    check(
-                        "config_schema",
-                        "config schema",
-                        "FAIL",
-                        f"{_CONFIG_INVALID_WARNING}: {exc.error_count()} validation error(s): "
-                        f"{validation_error_summary(exc)}",
-                        f"mms config validate {cfg_arg}",
-                    )
-                else:
-                    check("config_schema", "config schema", "PASS", "valid")
-
-            # Every server-shaped check below reads the EFFECTIVE map, not the
-            # file's: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__* can add or
-            # override upstreams, and those are the ones the server would
-            # serve — reporting "no upstream servers configured" over an
-            # env-supplied one is the same doctor-disagrees-with-runtime defect
-            # as #831 itself. Only a schema-invalid config falls back to the
-            # raw file, since there is no effective snapshot to trust.
-            raw_servers = (
-                effective_data.get("upstream_servers", {})
-                if effective_config is not None
-                else data.get("upstream_servers", {})
-            )
-            servers = (
-                {n: c for n, c in raw_servers.items() if isinstance(c, dict)}
-                if isinstance(raw_servers, dict)
-                else {}
-            )
+            else:
+                check("config_schema", "config schema", "PASS", "valid")
 
             # 4. proxy enabled — upstream tools are only registered inside the
             # `config.proxy.enabled` gate, so a disabled proxy probes green per

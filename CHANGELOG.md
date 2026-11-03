@@ -32,6 +32,33 @@ changes inline only. See the deprecation policy in
   reads, and the `Enabled` / `Servers` lines (`enabled` / `servers` in
   `--json`) report the environment's values.
 
+### Fixed
+
+- `mms status` no longer ends with "Run `mms add` (or `mms init`) to register
+  an upstream." (empty file) or "Run `mms list` … `mms health` …" (file with
+  servers) when the runtime configuration keeps the server from starting —
+  for example `MEMTOMEM_STM_PROXY=[]`. Its closing line now says to fix the
+  runtime configuration named in the warning above. `--json` is unchanged.
+
+- `mms health` probes the configured upstreams with environment overrides
+  applied: the config file overlaid with `MEMTOMEM_STM_PROXY` /
+  `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS…` settings, the same map `mms doctor`
+  checks since #831 (the two now share one helper). It read the file alone,
+  so an env-only upstream was never probed (an otherwise empty file printed
+  "No upstream servers configured."), and an env-overridden field such as
+  `command` was probed with the file's value. When the runtime configuration
+  or that overlaid snapshot fails validation, it still probes the file's
+  servers; when the file health read first no longer validates once
+  overlaid (for example, it was edited before the runtime read), that is now
+  reported invalid, as doctor already did. Probing does not depend on
+  `enabled`.
+  **Behavior change**: `mms health --json` `servers` now includes env-only
+  upstreams, and each probe uses the env-overridden entry; `config_valid` /
+  `config_error` also reflect that overlaid snapshot. A non-object server
+  entry in the file (`"upstream_servers": {"bad": 7}`) is skipped instead of
+  crashing health with an `AttributeError` (exit 1 → exit 0, reported as an
+  invalid config).
+
 ## [0.7.6] — 2026-11-02
 
 ### Changed

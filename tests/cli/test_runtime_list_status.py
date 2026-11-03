@@ -396,6 +396,29 @@ def test_invalid_file_with_no_effective_servers_points_to_file_repair(tmp_path):
     assert "No upstream servers configured." not in listed.stdout
 
 
+@pytest.mark.parametrize("file_servers", [{}, {"s": {"prefix": "s", "command": "echo"}}])
+def test_status_points_to_runtime_repair_when_startup_is_invalid(
+    tmp_path, monkeypatch, file_servers
+):
+    """A startup failure is fixed in the environment, not by the file's servers.
+
+    With an empty file, status used to suggest `mms add`; with servers in the
+    file it suggested `mms list` / `mms health`. Neither helps while the server
+    cannot start, and `mms config validate` lints the file only.
+    """
+    path = tmp_path / "proxy.json"
+    path.write_text(json.dumps({"upstream_servers": file_servers}))
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY", "[]")
+    status = CliRunner().invoke(cli, ["status", "--config", str(path)])
+    assert status.exit_code == 0, status.output
+    assert "server cannot start" in status.stdout
+    last = status.stdout.rstrip().splitlines()[-1]
+    assert last == "Fix the runtime configuration named in the warning above first."
+    assert "Run `mms add`" not in status.stdout
+    assert "Run `mms list`" not in status.stdout
+    assert "Run `mms config validate`" not in status.stdout
+
+
 def test_status_labels_nonboolean_file_enabled_when_startup_is_invalid(tmp_path, monkeypatch):
     path = tmp_path / "proxy.json"
     path.write_text('{"enabled": "nope", "upstream_servers": {}}')
