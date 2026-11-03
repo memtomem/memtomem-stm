@@ -48,10 +48,16 @@ changes inline only. See the deprecation policy in
   "No upstream servers configured."), and an env-overridden field such as
   `command` was probed with the file's value. When the runtime configuration
   or that overlaid snapshot fails validation, it still probes the file's
-  servers; a file edited between health's two reads is now reported invalid,
-  as doctor already did. Probing does not depend on `enabled`.
+  servers; when the file health read first no longer validates once
+  overlaid (for example, it was edited before the runtime read), that is now
+  reported invalid, as doctor already did. Probing does not depend on
+  `enabled`.
   **Behavior change**: `mms health --json` `servers` now includes env-only
-  upstreams, and each probe uses the env-overridden entry.
+  upstreams, and each probe uses the env-overridden entry; `config_valid` /
+  `config_error` also reflect that overlaid snapshot. A non-object server
+  entry in the file (`"upstream_servers": {"bad": 7}`) is skipped instead of
+  crashing health with an `AttributeError` (exit 1 → exit 0, reported as an
+  invalid config).
 
 ## [0.7.6] — 2026-11-02
 
