@@ -15320,6 +15320,76 @@ class TestHealth:
         finally:
             locked.chmod(0o700)
 
+    @staticmethod
+    def _record_probed(monkeypatch) -> list[dict]:
+        """Stub the probe and record which config each server was probed with."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        probed: list[dict] = []
+
+        async def fake_probe(cfg, timeout):
+            probed.append(cfg)
+            return StagedProbeResult(stage=ProbeStage.CONFIGURED, error="stub")
+
+        monkeypatch.setattr(proxy_mod, "_probe_one", fake_probe)
+        return probed
+
+    def test_health_probes_env_only_upstream(self, runner, config, monkeypatch):
+        """An upstream defined only in the environment is one the running server
+        serves, so health probes it — the rule doctor has applied since #831.
+        Health used to read the file map alone and print "No upstream servers
+        configured." here."""
+        probed = self._record_probed(monkeypatch)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+            json.dumps({"envsrv": {"prefix": "envsrv", "command": "env-cmd"}}),
+        )
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert set(json.loads(result.output)["servers"]) == {"envsrv"}
+        assert [cfg["command"] for cfg in probed] == ["env-cmd"]
+
+        text = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert text.exit_code == 0, text.output
+        assert "No upstream servers configured" not in text.output
+        assert "envsrv" in text.output
+
+    def test_health_probes_env_override_of_file_upstream(self, runner, config, monkeypatch):
+        """An env override of one field changes what the server would run, so
+        the probe gets the merged entry, not the file's."""
+        probed = self._record_probed(monkeypatch)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__fs__COMMAND", "env-cmd")
+        config.write_text(
+            json.dumps({"upstream_servers": {"fs": {"prefix": "fs", "command": "file-cmd"}}}),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert set(json.loads(result.output)["servers"]) == {"fs"}
+        assert [(cfg["prefix"], cfg["command"]) for cfg in probed] == [("fs", "env-cmd")]
+
+    def test_health_probes_file_map_when_runtime_config_is_invalid(
+        self, runner, config, monkeypatch
+    ):
+        """With a startup-invalid environment there is no effective snapshot to
+        trust, so health keeps probing the file's servers, as doctor does."""
+        probed = self._record_probed(monkeypatch)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", "[]")
+        config.write_text(
+            json.dumps({"upstream_servers": {"fs": {"prefix": "fs", "command": "file-cmd"}}}),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["config_valid"] is False
+        assert set(data["servers"]) == {"fs"}
+        assert [cfg["command"] for cfg in probed] == ["file-cmd"]
+
     def test_health_json_no_servers(self, runner, config, monkeypatch):
         monkeypatch.delenv("MEMTOMEM_STM_LOG_FILE", raising=False)
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")

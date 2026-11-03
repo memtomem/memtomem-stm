@@ -9924,6 +9924,28 @@ def _silenced_mcp_sdk_logs() -> Iterator[None]:
         sdk_logger.setLevel(prior)
 
 
+def _health_probe_servers(
+    data: dict[str, Any], runtime: _RuntimeProxyRead
+) -> dict[str, dict[str, Any]]:
+    """The upstreams ``health`` probes: the ones a running server would serve.
+
+    ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__*`` can add or override upstreams,
+    so the map is the file overlaid with the proxy env fragment — the rule
+    ``doctor`` applies to its server checks (#831). Only when the runtime read
+    reports an error is there no effective snapshot to trust, and the raw file
+    map is probed instead, again as ``doctor`` does.
+    """
+    raw: Any = data.get("upstream_servers", {})
+    if runtime.error is None:
+        from memtomem_stm.proxy.config import _deep_merge, collect_proxy_env_overrides
+
+        merged = _deep_merge(data, collect_proxy_env_overrides().fragment)
+        raw = merged.get("upstream_servers", {})
+    if not isinstance(raw, dict):
+        return {}
+    return {name: cfg for name, cfg in raw.items() if isinstance(cfg, dict)}
+
+
 async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, StagedProbeResult]:
     """Probe all servers in parallel, returning per-server staged results."""
 
@@ -10010,7 +10032,6 @@ def health(
     from memtomem_stm.server import _hidden_obs_tools_hint
 
     data = _load(path, json_action="health" if as_json else None)
-    servers: dict[str, Any] = data.get("upstream_servers", {})
     explicit_config = _explicit_config_path(config_path)
     surfacing_status = _surfacing_bootstrap_status(float(timeout), config_path=explicit_config)
     # Same startup-aware read as ``status`` / ``list``: a rejected whole
@@ -10018,6 +10039,7 @@ def health(
     # error types only, never input values.
     runtime = _runtime_proxy_read(path, config_path)
     config_error = runtime.error
+    servers = _health_probe_servers(data, runtime)
     logging_status = _logging_destination_status(explicit_config)
     obs_tools_hint = _hidden_obs_tools_hint()
 
