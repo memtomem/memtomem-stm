@@ -1477,7 +1477,7 @@ sequenceDiagram
     STM-->>Agent: ack (auto-tuner notes positive sample)
     Note over Agent,STM: if stm_admin is advertised
     Agent->>STM: stm_admin(action="proxy_stats")
-    STM-->>Agent: token savings · cache hit ratio · latency p50/p95/p99
+    STM-->>Agent: token savings · cache hit ratio · stage latency p50/p95/p99
 ```
 
 ## Logging
