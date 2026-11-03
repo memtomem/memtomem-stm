@@ -40,13 +40,16 @@ changes inline only. See the deprecation policy in
   for example `MEMTOMEM_STM_PROXY=[]`. Its closing line now says to fix the
   runtime configuration named in the warning above. `--json` is unchanged.
 
-- `mms health` probes the upstreams a running server would serve: the config
-  file overlaid with `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS…` environment
-  overrides, the rule `mms doctor` has used since #831. It read the file
-  alone, so an env-only upstream was never probed (an otherwise empty file
-  printed "No upstream servers configured."), and an env-overridden field
-  such as `command` was probed with the file's value. With a runtime
-  configuration that fails validation it still probes the file's servers.
+- `mms health` probes the configured upstreams with environment overrides
+  applied: the config file overlaid with `MEMTOMEM_STM_PROXY` /
+  `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS…` settings, the same map `mms doctor`
+  checks since #831 (the two now share one helper). It read the file alone,
+  so an env-only upstream was never probed (an otherwise empty file printed
+  "No upstream servers configured."), and an env-overridden field such as
+  `command` was probed with the file's value. When the runtime configuration
+  or that overlaid snapshot fails validation, it still probes the file's
+  servers; a file edited between health's two reads is now reported invalid,
+  as doctor already did. Probing does not depend on `enabled`.
   **Behavior change**: `mms health --json` `servers` now includes env-only
   upstreams, and each probe uses the env-overridden entry.
 

@@ -15344,7 +15344,7 @@ class TestHealth:
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
             json.dumps({"envsrv": {"prefix": "envsrv", "command": "env-cmd"}}),
         )
-        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
 
         result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
@@ -15389,6 +15389,39 @@ class TestHealth:
         assert data["config_valid"] is False
         assert set(data["servers"]) == {"fs"}
         assert [cfg["command"] for cfg in probed] == ["file-cmd"]
+
+    def test_health_rechecks_the_snapshot_it_probes(self, runner, config, monkeypatch):
+        """Health reads the file before the runtime read. A file edited in between
+        can pass the runtime read and fail as the snapshot health probes; that
+        snapshot must be reported invalid and the file's servers probed, the way
+        doctor handles the same race."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        probed = self._record_probed(monkeypatch)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__a__COMMAND", "env-cmd")
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "a": {"prefix": "dup", "command": "file-cmd"},
+                        "b": {"prefix": "dup", "command": "file-cmd"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            proxy_mod,
+            "_runtime_proxy_read",
+            lambda *_args, **_kwargs: proxy_mod._RuntimeProxyRead(None, None, frozenset()),
+        )
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["config_valid"] is False
+        assert data["config_error"] == "1 validation error(s): value_error"
+        assert sorted(cfg["command"] for cfg in probed) == ["file-cmd", "file-cmd"]
 
     def test_health_json_no_servers(self, runner, config, monkeypatch):
         monkeypatch.delenv("MEMTOMEM_STM_LOG_FILE", raising=False)
