@@ -11,8 +11,8 @@ Thank you for your interest in contributing to memtomem-stm!
 2. Comment on the issue to claim it. You don't need to be assigned: the
    comment is the claim. If someone has already claimed it, pick another one.
 3. Set up with [Development Setup](#development-setup). While you work,
-   running only the test file the issue names is enough; before you open the
-   pull request, run the checks in
+   running only the focused test command the issue names is enough; before
+   you open the pull request, run the checks in
    [Pull Request Guidelines](#pull-request-guidelines).
 4. Open the pull request. On your first one the CLA bot asks you to sign,
    once per account (see
