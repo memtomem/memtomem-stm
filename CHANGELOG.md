@@ -32,6 +32,14 @@ changes inline only. See the deprecation policy in
   reads, and the `Enabled` / `Servers` lines (`enabled` / `servers` in
   `--json`) report the environment's values.
 
+### Fixed
+
+- `mms status` no longer ends with "Run `mms add` (or `mms init`) to register
+  an upstream." (empty file) or "Run `mms list` … `mms health` …" (file with
+  servers) when the runtime configuration keeps the server from starting —
+  for example `MEMTOMEM_STM_PROXY=[]`. Its closing line now says to fix the
+  runtime configuration named in the warning above. `--json` is unchanged.
+
 ## [0.7.6] — 2026-11-02
 
 ### Changed
