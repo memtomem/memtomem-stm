@@ -260,8 +260,11 @@ async def test_run_hook_allowlist_env_accepts_legacy_native_names(monkeypatch: p
     engine = _engine_with_results([_FakeResult(_FakeChunk(content="hit"), 0.9)])
     # Read (canonical read) is not in the Bash-only allowlist → rejected.
     assert await run_surfacing_hook(_canonical(_READ_PAYLOAD), engine=engine) == {}
-    # Bash (legacy native → canonical shell) is accepted.
-    out = await run_surfacing_hook(_canonical(_bash_payload({"stdout": _LONG})), engine=engine)
+    # Bash (legacy native → canonical shell) is accepted. A description gives
+    # the native-tool extractor a query: ``seq 1 4000`` alone is one token.
+    payload = _bash_payload({"stdout": _LONG})
+    payload["tool_input"] = {**payload["tool_input"], "description": "Print the load test numbers"}
+    out = await run_surfacing_hook(_canonical(payload), engine=engine)
     assert "hit" in out["hookSpecificOutput"]["additionalContext"]
 
 
