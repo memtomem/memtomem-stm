@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from pathlib import PurePosixPath
 from typing import Any
 
 from memtomem_stm.proxy.privacy import contains_sensitive_content
@@ -324,6 +325,14 @@ class ContextExtractor:
         ``memtomem stm surfacing context extractor``.
         """
         p = path.strip().replace("\\", "/")
+        if not broad and p:
+            # The narrow rule matches exact components, so a path argument is
+            # read in canonical form first: ``/tmp//claude-501/x`` and
+            # ``/private/tmp/./claude-501/x`` are the scratchpad too.
+            # ``PurePosixPath`` collapses repeated separators and ``.``
+            # segments but leaves ``..`` alone, since resolving it lexically
+            # can name a different file under a symlink.
+            p = str(PurePosixPath(p))
         if cls._is_scratch_path(p, cwd, broad=broad):
             return []
         relative = False

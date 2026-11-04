@@ -499,6 +499,25 @@ class TestTempRepositoryFromAnotherCwd:
         assert _builtin("Grep", {"path": path, "pattern": "jwt_handler"}) is None
 
     @pytest.mark.parametrize(
+        "path",
+        [
+            "/tmp//claude-501/session/scratchpad/notes.md",
+            "/private/tmp/./claude-501/session/scratchpad/notes.md",
+            "/tmp/claude-501//",
+        ],
+    )
+    def test_equivalent_spellings_of_the_claude_root_stay_scratchpads(self, path: str) -> None:
+        assert _builtin("Grep", {"path": path, "pattern": "jwt_handler"}) is None
+
+    @pytest.mark.parametrize(
+        "path", ["/tmp/claude-501/../repo/notes.md", "$TMPDIR/../review/notes.md"]
+    )
+    def test_dot_dot_is_not_resolved(self, path: str) -> None:
+        # Lexical ``..`` resolution can name another file under a symlink, so
+        # a path that starts in a scratchpad stays one.
+        assert _builtin("Read", {"file_path": path}) is None
+
+    @pytest.mark.parametrize(
         ("path", "cwd"),
         [("/Users/u//tmp/auth/jwt.py", "/repo"), ("/repo//tmp/auth/jwt.py", "/repo")],
     )
