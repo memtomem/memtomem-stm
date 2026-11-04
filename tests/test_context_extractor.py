@@ -542,7 +542,8 @@ class TestTempRepositoryFromAnotherCwd:
 
 class TestMacTempDirSpellings:
     """#1334: macOS ``$TMPDIR`` is a scratchpad in both spellings (``/var`` is a
-    symlink to ``/private/var``), including the directory itself."""
+    symlink to ``/private/var``). A path argument includes the directory itself;
+    a shell command matches descendants only."""
 
     _CWD = "/Users/u/repo"
 
@@ -562,11 +563,24 @@ class TestMacTempDirSpellings:
         "command",
         [
             "ls /private/var/folders/4n/mt3k/T/pytest-of-u/pytest-365/",
-            "ls /private/var/folders/",
+            "ls /var/folders/4n/mt3k/T/pytest-of-u/pytest-365/",
         ],
     )
     def test_command_segment_is_skipped(self, command: str) -> None:
         assert _builtin("Bash", {"command": command}, cwd=self._CWD) is None
+
+    @pytest.mark.parametrize(
+        ("command", "query"),
+        [
+            # The path token stops at ``+``/``:``; the rest is not the temp dir.
+            ("cat /private/var/folders+archive/auth/jwt_handler.py", "private var folders"),
+            ("cat /private/var/folders:archive/auth/jwt_handler.py", "private var folders"),
+            # A bare root in a command is not matched (same as before #1334).
+            ("ls /private/var/folders/", "private var folders"),
+        ],
+    )
+    def test_command_root_token_is_not_a_scratchpad(self, command: str, query: str) -> None:
+        assert _builtin("Bash", {"command": command}, cwd=self._CWD) == query
 
     def test_checkout_used_as_cwd_is_still_tokenized(self) -> None:
         root = "/private/var/folders/4n/mt3k/T/pytest-of-u/pytest-1/repo"
