@@ -13,6 +13,9 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `mms import --help` shows preview, apply and verification examples, with
+  the registry destination and project-config acknowledgement explained. (#1332)
+
 - `mms stats --all-time` reports compression totals that survive the
   per-source `proxy.metrics.max_history` trim. A database trigger folds every
   row deleted from `proxy_metrics` into a never-pruned `proxy_metrics_daily`
