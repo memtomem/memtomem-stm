@@ -2327,6 +2327,11 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
     display_count = effective_count if effective_count is not None else len(servers)
     if runtime.file_fallback and config_error:
         click.echo("Run `mms config validate` to fix the proxy file.")
+    elif runtime.startup_error:
+        # The warning above already names what is invalid. Neither adding an
+        # upstream nor probing the listed ones helps while startup fails, and
+        # `mms config validate` lints the file only (no env overlay).
+        click.echo("Fix the runtime configuration named in the warning above first.")
     elif display_count:
         click.echo("Run `mms list` for per-server detail; `mms health` to probe connectivity.")
     else:
@@ -2502,9 +2507,67 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         click.echo("* host original pruned — `mms eject NAME` restores it (see `mms eject -h`).")
 
 
-def _render_compression_block(summary: dict[str, Any]) -> None:
-    click.echo(_hdr("Proxy / Compression"))
+def _utc_text(epoch: float, fmt: str) -> str:
+    """Format a stored epoch, which SQLite may date outside Python's range.
+
+    ``date()`` accepts year 0, which ``datetime`` refuses, and a platform may
+    refuse negative epochs; the raw value is printed instead of crashing a
+    read-only report.
+    """
+    try:
+        return datetime.fromtimestamp(epoch, tz=UTC).strftime(fmt)
+    except (ValueError, OverflowError, OSError):
+        return f"epoch {epoch!r}"
+
+
+def _all_time_coverage_lines(rollup: dict[str, Any]) -> list[str]:
+    """Coverage lines for a :func:`read_compression_all_time` ``rollup`` dict."""
+    lines: list[str] = []
+    earliest = rollup.get("earliest_created_at")
+    if earliest is not None:
+        since = _utc_text(float(earliest), "%Y-%m-%d")
+        lines.append(
+            f"  Window: all time — retained rows plus the daily rollup, since {since} UTC."
+        )
+    else:
+        lines.append("  Window: all time — retained rows plus the daily rollup.")
+    incomplete = rollup.get("incomplete_before")
+    if incomplete is not None:
+        lost = rollup.get("lost_before_install")
+        lost_text = f"{lost:,} rows were" if isinstance(lost, int) else "rows were"
+        lines.append(
+            f"  Incomplete before {_utc_text(float(incomplete), '%Y-%m-%d %H:%M')} UTC: "
+            f"{lost_text} trimmed\n"
+            "    before the rollup was installed, so rows created before then may be missing."
+        )
+    undated = rollup.get("unknown_date_calls") or 0
+    if undated:
+        lines.append(
+            f"  {undated} counted rows had no convertible timestamp; their dates are unknown."
+        )
+    return lines
+
+
+def _render_compression_block(
+    summary: dict[str, Any],
+    by_source: dict[str, dict[str, Any]] | None = None,
+    max_history: int | None = None,
+) -> None:
+    raw_rollup = summary.get("rollup")
+    rollup: dict[str, Any] | None = raw_rollup if isinstance(raw_rollup, dict) else None
+    click.echo(_hdr("Proxy / Compression" if rollup is None else "Proxy / Compression (all time)"))
     click.echo("=" * 30)
+    if rollup is not None and summary.get("error"):
+        click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
+        return
+    if rollup is not None and not rollup.get("installed"):
+        click.echo(
+            "  All-time totals unavailable: this metrics DB has no daily rollup yet.\n"
+            "    It is installed the next time this STM version opens the DB (the MCP\n"
+            "    server, `mms tune` or `mms hook`); rows trimmed before then are not\n"
+            "    recoverable. Without --all-time this command reports the retained rows."
+        )
+        return
     if not summary.get("available") or not summary.get("total_calls"):
         click.echo("  No proxy metrics recorded yet.")
         return
@@ -2522,8 +2585,35 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
         )
     click.echo(f"  calls: {summary['total_calls']}  (errors: {summary['error_count']})")
     click.echo(f"  chars: {orig:,} -> {comp:,}  (saved {summary['saved_chars']:,}, {ratio:.1f}%)")
+    # A blended ratio is dominated by whichever source records the most text,
+    # so with more than one source present each gets its own line (the hook
+    # records native tool output, compressed only when hook compression runs).
+    present = {src: s for src, s in (by_source or {}).items() if s.get("total_calls")}
+    if len(present) > 1:
+        for src, s in present.items():
+            src_orig = int(s["total_original_chars"])
+            # Structured deliveries are sized separately (line above), so a
+            # source with no text chars has no ratio rather than a 0% one.
+            saved = f"saved {float(s['saved_ratio']) * 100:.1f}%" if src_orig else "no text ratio"
+            line = (
+                f"    {src:<5} calls: {s['total_calls']}  chars: {src_orig:,} -> "
+                f"{int(s['total_compressed_chars']):,}  ({saved})"
+            )
+            src_structured = int((s.get("structured_delivery") or {}).get("calls") or 0)
+            if src_structured:
+                line += f"  [{src_structured} structured, separate accounting]"
+            click.echo(line)
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
-    click.echo("  Read volume: stm_admin(action=progressive_stats); telemetry may be incomplete.")
+    if rollup is not None:
+        for line in _all_time_coverage_lines(rollup):
+            click.echo(line)
+    elif max_history is not None:
+        click.echo(
+            f"  Window: retained rows only; this config caps each source at {max_history:,} rows\n"
+            "    (proxy.metrics.max_history). The oldest are trimmed in batches, so a source\n"
+            "    can briefly exceed it; `mms hook` takes its cap only from\n"
+            "    MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY."
+        )
     unknown = summary.get("unclassified_mcp_calls", 0)
     if unknown:
         click.echo(
@@ -2548,6 +2638,50 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
                 f"{row['calls']:>6} {row['original_chars']:>10,} "
                 f"{row['compressed_chars']:>10,} {saved_pct:>6.1f}%"
             )
+
+
+def _render_progressive_block(
+    summary: dict[str, Any], *, collecting: bool, retention_days: int
+) -> None:
+    """Progressive-delivery volume from :func:`read_progressive_summary`."""
+    click.echo(_hdr("Progressive delivery"))
+    click.echo("=" * 30)
+    if summary.get("error"):
+        click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
+        return
+    if not collecting:
+        click.echo("  Collection disabled (proxy.progressive_reads.enabled = false).")
+    if not summary.get("available") or not summary.get("total_responses"):
+        click.echo("  No progressive responses recorded yet.")
+        return
+    produced = int(summary["produced_chars"])
+    delivered = int(summary["delivered_chars"])
+    pct = float(summary["delivered_ratio"]) * 100
+    click.echo(
+        f"  responses: {summary['total_responses']}  "
+        f"(with follow-up reads: {summary['follow_up_responses']}; "
+        f"reads recorded: {summary['total_reads']})"
+    )
+    click.echo(f"  chars: {produced:,} produced -> {delivered:,} delivered ({pct:.1f}%)")
+    click.echo(
+        "  Delivered counts every recorded read, so rereads count again.\n"
+        "  It measures payload sent to the agent, not tokens."
+    )
+    if summary.get("unclassified_reads"):
+        click.echo(
+            f"  {summary['unclassified_reads']} reads predate initial/follow-up "
+            "classification; they are included in both totals."
+        )
+    oldest = summary.get("oldest_at")
+    if oldest is not None:
+        since = datetime.fromtimestamp(float(oldest), tz=UTC).strftime("%Y-%m-%d")
+        window = (
+            f"rows older than {retention_days} days are purged when the server\n"
+            "    starts with collection enabled (proxy.progressive_reads.retention_days)"
+            if retention_days > 0
+            else "no age purge\n    (proxy.progressive_reads.retention_days = 0)"
+        )
+        click.echo(f"  Window: since {since} UTC; {window}.")
 
 
 def _opportunity_lines(summary: dict[str, Any]) -> list[str]:
@@ -2648,18 +2782,30 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     help="Filter compression rows by provenance: 'mcp' (proxied upstream tools) "
     "or 'hook' (native built-in tools recorded by 'mms hook').",
 )
+@click.option(
+    "--all-time",
+    "all_time",
+    is_flag=True,
+    help="Report compression over all rows ever recorded since the daily rollup was "
+    "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def stats(
     config_path: str | None,
     *,
     tool_filter: str | None = None,
     source_filter: str | None = None,
+    all_time: bool = False,
     as_json: bool = False,
 ) -> None:
     """Show proxy compression and surfacing stats from the persistent stores.
 
     Reads ``proxy_metrics.db`` and ``stm_feedback.db`` read-only (it never
-    creates or migrates them) and reports all-time totals. The live MCP server
+    creates or migrates them) and reports totals over the rows still retained
+    (``proxy.metrics.max_history`` per source, ``retention_days`` for
+    progressive reads and surfacing), not all-time totals. ``--all-time`` switches
+    the compression section alone to the never-pruned daily rollup plus retained
+    rows (#1316); progressive and surfacing stay retained-window. The live MCP server
     keeps additional in-memory counters that a separate CLI process cannot see,
     so the numbers here reflect only what has been written to disk. An explicit
     ``--config`` also steers the STMConfig-backed feedback-DB location (#839).
@@ -2667,7 +2813,11 @@ def stats(
     config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.config import STMConfig, stm_config_for_cli
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
-    from memtomem_stm.proxy.metrics_store import read_compression_summary
+    from memtomem_stm.proxy.metrics_store import (
+        read_compression_all_time,
+        read_compression_summary,
+    )
+    from memtomem_stm.proxy.progressive_reads_store import read_progressive_summary
     from memtomem_stm.surfacing.feedback_store import read_surfacing_summary
 
     # Refuse before the stores are touched or anything is printed. The summary
@@ -2719,14 +2869,28 @@ def stats(
         config_status = "missing"
         proxy_cfg = stm_config.proxy if stm_config is not None else ProxyConfig()
     else:
-        # Parse/validation error — fall back to defaults purely to locate the
-        # DB paths to probe, but flag the config as invalid.
+        # Parse/validation error: the server then keeps the config pydantic-
+        # settings built from the environment (server.app_lifespan's no-swap
+        # branch), so locate the DBs from that same config — a defaults-only
+        # fallback would read a different DB whenever an env var moves one.
         config_status = "invalid"
-        proxy_cfg = ProxyConfig()
+        proxy_cfg = stm_config.proxy if stm_config is not None else ProxyConfig()
 
-    compression = read_compression_summary(
+    read_compression = read_compression_all_time if all_time else read_compression_summary
+    compression = read_compression(
         proxy_cfg.metrics.db_path, tool=tool_filter, source=source_filter
     )
+    # ``--source`` scopes the compression rows only; unset, report each source
+    # beside the aggregate so one high-volume source cannot hide another's ratio.
+    compression_by_source = (
+        {
+            src: read_compression(proxy_cfg.metrics.db_path, tool=tool_filter, source=src)
+            for src in ("mcp", "hook")
+        }
+        if source_filter is None
+        else None
+    )
+    progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
     # These numbers come only from the on-disk stores; the live MCP server
@@ -2751,7 +2915,10 @@ def stats(
                     "tool_filter": tool_filter,
                     "source_filter": source_filter,
                     "data_source": data_source,
+                    "compression_scope": "all_time" if all_time else "retained",
                     "compression": compression,
+                    "compression_by_source": compression_by_source,
+                    "progressive": progressive,
                     "surfacing": surfacing,
                 },
                 indent=2,
@@ -2769,7 +2936,15 @@ def stats(
         click.echo(f"Source : {source_filter}")
     click.echo(f"Data   : {data_source}")
     click.echo("")
-    _render_compression_block(compression)
+    _render_compression_block(
+        compression, compression_by_source, max_history=proxy_cfg.metrics.max_history
+    )
+    click.echo("")
+    _render_progressive_block(
+        progressive,
+        collecting=proxy_cfg.progressive_reads.enabled,
+        retention_days=proxy_cfg.progressive_reads.retention_days,
+    )
     click.echo("")
     _render_surfacing_block(surfacing)
 
@@ -9823,6 +9998,69 @@ def _silenced_mcp_sdk_logs() -> Iterator[None]:
         sdk_logger.setLevel(prior)
 
 
+@dataclass(frozen=True)
+class _EffectiveUpstreams:
+    """The upstream map ``doctor`` and ``health`` check, and how it was chosen."""
+
+    servers: dict[str, dict[str, Any]]
+    # The env-overlaid document and its typed model, when they validated.
+    data: dict[str, Any]
+    config: ProxyConfig | None
+    # Set when the env-overlaid snapshot of ``file_data`` fails validation.
+    snapshot_error: str | None = None
+
+
+def _effective_upstreams(
+    file_data: dict[str, Any], runtime: _RuntimeProxyRead
+) -> _EffectiveUpstreams:
+    """Pick the upstreams the server-shaped diagnostics read (#831).
+
+    ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__*`` can add or override upstreams,
+    so the map is ``file_data`` overlaid with the proxy env fragment. The
+    overlay is re-validated here because ``file_data`` was read before
+    ``runtime`` was: a file edited in between can pass the runtime read and
+    fail as this snapshot, and the snapshot is what gets checked. When the
+    runtime read reports an error, or the snapshot fails, there is no effective
+    snapshot to trust and the raw file map is used.
+    """
+    effective_data: dict[str, Any] = {}
+    effective_config: ProxyConfig | None = None
+    snapshot_error: str | None = None
+    if runtime.error is None:
+        from pydantic import ValidationError
+
+        from memtomem_stm.proxy.config import (
+            ProxyConfig,
+            _deep_merge,
+            collect_proxy_env_overrides,
+            validation_error_summary,
+        )
+
+        # One merged dict for the model and for callers' predicates: they must
+        # judge the same document, or a check could report a value the model
+        # never saw.
+        merged = _deep_merge(file_data, collect_proxy_env_overrides().fragment)
+        try:
+            effective_config = ProxyConfig.model_validate(merged)
+        except ValidationError as exc:
+            snapshot_error = (
+                f"{exc.error_count()} validation error(s): {validation_error_summary(exc)}"
+            )
+        else:
+            effective_data = merged
+    raw: Any = (
+        effective_data.get("upstream_servers", {})
+        if effective_config is not None
+        else file_data.get("upstream_servers", {})
+    )
+    servers = (
+        {name: cfg for name, cfg in raw.items() if isinstance(cfg, dict)}
+        if isinstance(raw, dict)
+        else {}
+    )
+    return _EffectiveUpstreams(servers, effective_data, effective_config, snapshot_error)
+
+
 async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, StagedProbeResult]:
     """Probe all servers in parallel, returning per-server staged results."""
 
@@ -9909,14 +10147,17 @@ def health(
     from memtomem_stm.server import _hidden_obs_tools_hint
 
     data = _load(path, json_action="health" if as_json else None)
-    servers: dict[str, Any] = data.get("upstream_servers", {})
     explicit_config = _explicit_config_path(config_path)
     surfacing_status = _surfacing_bootstrap_status(float(timeout), config_path=explicit_config)
     # Same startup-aware read as ``status`` / ``list``: a rejected whole
     # proxy env block counts as invalid, and the error names locations and
     # error types only, never input values.
     runtime = _runtime_proxy_read(path, config_path)
-    config_error = runtime.error
+    effective = _effective_upstreams(data, runtime)
+    # A snapshot that fails after a valid runtime read means the file changed
+    # between the two reads; report it as the invalid file it now is.
+    config_error = runtime.error or effective.snapshot_error
+    servers = effective.servers
     logging_status = _logging_destination_status(explicit_config)
     obs_tools_hint = _hidden_obs_tools_hint()
 
@@ -10699,8 +10940,16 @@ def doctor(
             # transport/prefix/probe checks operate on the raw dicts and stay
             # meaningful.
             runtime = _runtime_proxy_read(path, config_path)
-            effective_config: Any | None = None
-            effective_data: dict[str, Any] = {}
+            # Every server-shaped check below reads the EFFECTIVE map, not the
+            # file's: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__* can add or
+            # override upstreams, and those are the ones the server would
+            # serve — reporting "no upstream servers configured" over an
+            # env-supplied one is the same doctor-disagrees-with-runtime defect
+            # as #831 itself. `health` picks its probe set the same way.
+            effective = _effective_upstreams(data, runtime)
+            effective_config = effective.config
+            effective_data = effective.data
+            servers = effective.servers
             if runtime.error:
                 # A startup-rejected environment leaves the file itself
                 # valid, so `config validate` would pass; point at the
@@ -10717,58 +10966,19 @@ def doctor(
                     f"{_runtime_config_warning(runtime)}: {runtime.error}",
                     schema_next,
                 )
-            else:
-                # Build the same env-overlaid typed snapshot the running
-                # server consumes. Provider diagnostics must reflect env >
-                # file precedence and model defaults, not the raw JSON alone.
-                from pydantic import ValidationError
-
-                from memtomem_stm.proxy.config import (
-                    ProxyConfig,
-                    _deep_merge,
-                    collect_proxy_env_overrides,
-                    validation_error_summary,
+            elif effective.snapshot_error:
+                # `data` was read before the runtime read, so a file edited in
+                # between can validate there and fail here. Judge the snapshot
+                # the later checks actually use.
+                check(
+                    "config_schema",
+                    "config schema",
+                    "FAIL",
+                    f"{_CONFIG_INVALID_WARNING}: {effective.snapshot_error}",
+                    f"mms config validate {cfg_arg}",
                 )
-
-                # One merged dict for both the model and the inert-state
-                # predicate below: they must judge the same document, or
-                # doctor could report an `enabled` the model never saw.
-                effective_data = _deep_merge(data, collect_proxy_env_overrides().fragment)
-                try:
-                    effective_config = ProxyConfig.model_validate(effective_data)
-                except ValidationError as exc:
-                    # `data` was read before the runtime read, so a file
-                    # edited in between can validate there and fail here.
-                    # Judge the snapshot the later checks actually use.
-                    effective_data = {}
-                    check(
-                        "config_schema",
-                        "config schema",
-                        "FAIL",
-                        f"{_CONFIG_INVALID_WARNING}: {exc.error_count()} validation error(s): "
-                        f"{validation_error_summary(exc)}",
-                        f"mms config validate {cfg_arg}",
-                    )
-                else:
-                    check("config_schema", "config schema", "PASS", "valid")
-
-            # Every server-shaped check below reads the EFFECTIVE map, not the
-            # file's: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__* can add or
-            # override upstreams, and those are the ones the server would
-            # serve — reporting "no upstream servers configured" over an
-            # env-supplied one is the same doctor-disagrees-with-runtime defect
-            # as #831 itself. Only a schema-invalid config falls back to the
-            # raw file, since there is no effective snapshot to trust.
-            raw_servers = (
-                effective_data.get("upstream_servers", {})
-                if effective_config is not None
-                else data.get("upstream_servers", {})
-            )
-            servers = (
-                {n: c for n, c in raw_servers.items() if isinstance(c, dict)}
-                if isinstance(raw_servers, dict)
-                else {}
-            )
+            else:
+                check("config_schema", "config schema", "PASS", "valid")
 
             # 4. proxy enabled — upstream tools are only registered inside the
             # `config.proxy.enabled` gate, so a disabled proxy probes green per

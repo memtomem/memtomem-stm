@@ -2,6 +2,29 @@
 
 Thank you for your interest in contributing to memtomem-stm!
 
+## Your first contribution
+
+1. Pick an issue labelled
+   [`good first issue`](https://github.com/memtomem/memtomem-stm/labels/good%20first%20issue).
+   Each one names the files to change, what to test, and the test file to run.
+   These issues touch at most three files and change no public API.
+2. Comment on the issue to claim it. You don't need to be assigned: the
+   comment is the claim. If someone has already claimed it, pick another one.
+3. Set up with [Development Setup](#development-setup). While you work,
+   running only the focused test command the issue names is enough; before
+   you open the pull request, run the checks in
+   [Pull Request Guidelines](#pull-request-guidelines).
+4. Open the pull request. On your first one the CLA bot asks you to sign,
+   once per account (see
+   [Contributor License Agreement](#contributor-license-agreement-cla)).
+   Until you have had a commit or pull request merged into this repository,
+   GitHub also holds each CI run on your pull requests until a maintainer
+   approves it. That hold is GitHub's rule for first-time contributors, not
+   a review verdict.
+5. After your first pull request, issues labelled
+   [`help wanted`](https://github.com/memtomem/memtomem-stm/labels/help%20wanted)
+   are the next step: they are larger or need more context.
+
 ## Development Setup
 
 Python 3.12 and 3.13 are supported runtimes. Python 3.14 is experimental;
