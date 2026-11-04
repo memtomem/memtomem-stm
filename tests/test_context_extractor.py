@@ -393,7 +393,13 @@ class TestBuiltinReviewRegressions:
         )
 
     def test_scratchpad_path_with_spaces_is_dropped(self) -> None:
-        assert _builtin("Read", {"file_path": "/tmp/my scratchpad/review log.txt"}) is None
+        path = "/private/tmp/claude-501/-Users-u/my scratchpad/review log.txt"
+        assert _builtin("Read", {"file_path": path}) is None
+
+    def test_temp_path_with_spaces_outside_the_claude_root_is_tokenized(self) -> None:
+        # Only Claude Code's temp root is a scratchpad for a path argument (#1324).
+        q = _builtin("Read", {"file_path": "/tmp/my scratchpad/review log.txt"})
+        assert q == "my scratchpad review log"
 
     def test_path_with_spaces_is_tokenized(self) -> None:
         q = _builtin("Read", {"file_path": "/Users/u/My Docs/design notes.md"})
@@ -425,7 +431,7 @@ class TestBuiltinRound2Regressions:
         "name", ["1234567890abcdef1234567890.json", "550e8400-e29b-41d4-a716-446655440000.json"]
     )
     def test_identifier_file_stems_are_dropped(self, name: str) -> None:
-        assert ContextExtractor._builtin_path_tokens(f"/repo/auth/{name}", None) == [
+        assert ContextExtractor._builtin_path_tokens(f"/repo/auth/{name}", None, broad=False) == [
             "repo",
             "auth",
         ]
@@ -449,6 +455,58 @@ class TestRepositoryUnderTmp:
         assert _builtin("Bash", {"command": cmd, "description": "Read log"}, cwd=self._ROOT) is None
 
 
+class TestTempRepositoryFromAnotherCwd:
+    """#1324: a path argument under ``/tmp/<dir>/`` is a repository, not a
+    scratchpad, even when the call's ``cwd`` is elsewhere. Shell commands keep
+    the broad rule."""
+
+    def test_release_worktree_read(self) -> None:
+        q = _builtin("Read", {"file_path": "/private/tmp/memtomem-release/CHANGELOG.md"})
+        assert q == "memtomem release CHANGELOG"
+
+    def test_nested_package_read(self) -> None:
+        path = "/private/tmp/memtomem-lcmm/packages/langchain-memtomem/README.md"
+        assert _builtin("Read", {"file_path": path}) == "memtomem lcmm langchain memtomem README"
+
+    def test_repository_named_like_claude_is_not_the_claude_root(self) -> None:
+        q = _builtin("Read", {"file_path": "/tmp/claude-tools/src/auth/jwt_handler.py"})
+        assert q == "claude tools auth jwt handler"
+
+    def test_grep_path_under_a_temp_repository(self) -> None:
+        q = _builtin("Grep", {"path": "/private/tmp/demo-repo/src", "pattern": "jwt_handler"})
+        assert q == "demo repo jwt handler"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/private/tmp/claude-501/-Users-u/ee4d5107-06b0-44f4-b580-9e98d18804c4/notes.md",
+            "/tmp/claude-1000/-home-u-repo/ee4d5107-06b0-44f4-b580-9e98d18804c4/notes.md",
+            "/var/folders/4n/mt3k/T/pytest-of-u/pytest-1/repo/notes.md",
+            "$TMPDIR/review/notes.md",
+            "${TMPDIR}/review/notes.md",
+        ],
+    )
+    def test_claude_root_and_tmpdir_reads_stay_scratchpads(self, path: str) -> None:
+        assert _builtin("Read", {"file_path": path}) is None
+
+    @pytest.mark.parametrize(
+        "path",
+        ["/tmp/claude-501", "/tmp/claude-501/", "\\tmp\\claude-501", "/private/tmp/claude-0"],
+    )
+    def test_claude_root_itself_is_a_scratchpad(self, path: str) -> None:
+        # A Grep/Glob ``path`` is often the directory itself; its ``claude``
+        # token would otherwise lift a two-token pattern over the floor.
+        assert _builtin("Grep", {"path": path, "pattern": "jwt_handler"}) is None
+
+    def test_command_naming_a_temp_repository_is_still_skipped(self) -> None:
+        cmd = "cat /private/tmp/memtomem-release/CHANGELOG.md"
+        assert _builtin("Bash", {"command": cmd, "description": "Read the changelog"}) is None
+
+    def test_other_segments_of_that_command_still_contribute(self) -> None:
+        cmd = "cat /tmp/repo/CHANGELOG.md; cat src/auth/jwt_handler.py"
+        assert _builtin("Bash", {"command": cmd}) == "auth jwt handler"
+
+
 class TestBuiltinPaths:
     def test_read_relative_to_cwd(self) -> None:
         q = _builtin(
@@ -462,7 +520,9 @@ class TestBuiltinPaths:
 
     def test_uuid_and_hex_segments_dropped(self) -> None:
         tokens = ContextExtractor._builtin_path_tokens(
-            "/data/ee4d5107-06b0-44f4-b580-9e98d18804c4/deadbeef/runs/summary.json", None
+            "/data/ee4d5107-06b0-44f4-b580-9e98d18804c4/deadbeef/runs/summary.json",
+            None,
+            broad=False,
         )
         assert tokens == ["data", "runs", "summary"]
 

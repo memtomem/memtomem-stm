@@ -36,7 +36,17 @@ _MAX_COMMAND_CHARS = 1000
 _PATH_STOP_TOKENS = frozenset({"src", "lib", "tests", "test", "packages", "pkg"})
 _HEX8_RE = re.compile(r"^[0-9a-f]{8}$", re.I)
 _HOME_PREFIX_RE = re.compile(r"^(?:~/|/Users/[^/]+/|/home/[^/]+/)")
+# Two scratchpad rules. Shell commands use the broad one: a command naming any
+# temp path is mostly a throwaway probe (``/tmp/rv1/x.py``), and the replay
+# measured ``/tmp`` commands as low-yield. A path *argument* (Read, Grep, Glob)
+# under a non-Claude ``/tmp/<dir>/`` was, in a month of transcripts, a
+# repository worktree or clone, so path arguments use the narrow rule: only Claude Code's own temp
+# root, which it names ``claude-<uid>`` under the OS temp dir, plus the
+# per-user ``$TMPDIR`` (``/var/folders/…`` on macOS).
 _SCRATCH_PREFIXES = ("/private/tmp/", "/tmp/", "/var/folders/", "$TMPDIR", "${TMPDIR}")
+_ARG_SCRATCH_PREFIXES = ("/var/folders/", "$TMPDIR", "${TMPDIR}")
+_CLAUDE_TEMP_ROOT_RE = re.compile(r"^/(?:private/)?tmp/claude-[0-9]+(?:/|$)")
+_TEMP_ROOT_RE = re.compile(r"^/(?:private/)?tmp/")
 _SEGMENT_SPLIT_RE = re.compile(r"\n|;|&&|\|\||\|")
 _LEADING_ASSIGNMENTS_RE = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
 _INLINE_PYTHON_RE = re.compile(r"^\s*(?:uv\s+run\s+)?python[0-9.]*\s+(?:-c\b|-(?:\s|$))")
@@ -203,7 +213,7 @@ class ContextExtractor:
             if key in _PATH_KEYS and isinstance(value, str):
                 # Every path argument, with or without a slash or a space:
                 # the tokenizer is also where scratchpad paths are dropped.
-                parts.extend(self._builtin_path_tokens(value, cwd))
+                parts.extend(self._builtin_path_tokens(value, cwd, broad=False))
                 continue
             if isinstance(value, str) and len(value) > 2 and not self._is_identifier(value):
                 if key in _PATTERN_KEYS:
@@ -255,7 +265,10 @@ class ContextExtractor:
             # inside a flag (``--file=/tmp/patterns.txt``) or a redirection
             # (``</tmp/build.log``, ``> /tmp/out.txt``) — before either is
             # dropped below. This matches the replay's class definition.
-            if any(cls._is_scratch_path(m.group(0), cwd) for m in _PATH_TOKEN_RE.finditer(segment)):
+            if any(
+                cls._is_scratch_path(m.group(0), cwd, broad=True)
+                for m in _PATH_TOKEN_RE.finditer(segment)
+            ):
                 continue
             segment = _REDIRECT_RE.sub(" ", _FD_DUP_RE.sub(" ", segment))
             seg_tokens: list[str] = []
@@ -268,7 +281,7 @@ class ContextExtractor:
                 match = _PATH_TOKEN_RE.search(bare)
                 path = match.group(0) if match else (bare if _BARE_FILE_RE.match(bare) else None)
                 if path is not None:
-                    seg_tokens.extend(cls._builtin_path_tokens(path, cwd))
+                    seg_tokens.extend(cls._builtin_path_tokens(path, cwd, broad=True))
                 elif _WORD_RE.match(bare) and bare.lower() not in _SHELL_NOISE_WORDS:
                     seg_tokens.append(bare)
             contributed = True
@@ -276,11 +289,19 @@ class ContextExtractor:
         return tokens if contributed else None
 
     @staticmethod
-    def _is_scratch_path(path: str, cwd: str | None) -> bool:
+    def _is_scratch_path(path: str, cwd: str | None, *, broad: bool) -> bool:
         """A temp-directory path, unless it lies inside the call's ``cwd``:
-        a repository checked out under ``/tmp`` is the work, not a scratchpad."""
+        a repository checked out under ``/tmp`` is the work, not a scratchpad.
+
+        ``broad`` (shell commands) counts every temp root; otherwise (path
+        arguments) only Claude Code's temp root and ``$TMPDIR`` count, so a
+        repository under ``/tmp`` read from another ``cwd`` still yields a query.
+        """
         p = path.replace("\\", "/")
-        if not p.startswith(_SCRATCH_PREFIXES):
+        if broad:
+            if not p.startswith(_SCRATCH_PREFIXES):
+                return False
+        elif not (p.startswith(_ARG_SCRATCH_PREFIXES) or _CLAUDE_TEMP_ROOT_RE.match(p)):
             return False
         if cwd:
             root = cwd.replace("\\", "/").rstrip("/")
@@ -289,17 +310,19 @@ class ContextExtractor:
         return True
 
     @classmethod
-    def _builtin_path_tokens(cls, path: str, cwd: str | None) -> list[str]:
+    def _builtin_path_tokens(cls, path: str, cwd: str | None, *, broad: bool) -> list[str]:
         """Tokens of a path seen in a native-tool call, in path order.
 
-        Relative to ``cwd`` when under it; otherwise without a home prefix.
+        ``broad`` selects the scratchpad rule (see :meth:`_is_scratch_path`).
+        Relative to ``cwd`` when under it; otherwise without a home or temp-root
+        (``/tmp/``, ``/private/tmp/``) prefix.
         Scratchpad paths, ``$VAR`` / ``~`` segments, id-like segments (uuid,
         long hex, 8-hex), a small structural stop-list and the file extension
         carry no topic and are dropped: ``src/memtomem_stm/surfacing/context_extractor.py`` becomes
         ``memtomem stm surfacing context extractor``.
         """
         p = path.strip().replace("\\", "/")
-        if cls._is_scratch_path(p, cwd):
+        if cls._is_scratch_path(p, cwd, broad=broad):
             return []
         if cwd:
             root = cwd.replace("\\", "/").rstrip("/")
@@ -307,7 +330,7 @@ class ContextExtractor:
                 p = ""
             elif p.startswith(root + "/"):
                 p = p[len(root) + 1 :]
-        p = _HOME_PREFIX_RE.sub("", p)
+        p = _TEMP_ROOT_RE.sub("", _HOME_PREFIX_RE.sub("", p))
         segments = [s for s in p.split("/") if s]
         tokens: list[str] = []
         for i, seg in enumerate(segments):
