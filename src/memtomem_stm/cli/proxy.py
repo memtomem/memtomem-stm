@@ -2505,13 +2505,67 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         click.echo("* host original pruned — `mms eject NAME` restores it (see `mms eject -h`).")
 
 
+def _utc_text(epoch: float, fmt: str) -> str:
+    """Format a stored epoch, which SQLite may date outside Python's range.
+
+    ``date()`` accepts year 0, which ``datetime`` refuses, and a platform may
+    refuse negative epochs; the raw value is printed instead of crashing a
+    read-only report.
+    """
+    try:
+        return datetime.fromtimestamp(epoch, tz=UTC).strftime(fmt)
+    except (ValueError, OverflowError, OSError):
+        return f"epoch {epoch!r}"
+
+
+def _all_time_coverage_lines(rollup: dict[str, Any]) -> list[str]:
+    """Coverage lines for a :func:`read_compression_all_time` ``rollup`` dict."""
+    lines: list[str] = []
+    earliest = rollup.get("earliest_created_at")
+    if earliest is not None:
+        since = _utc_text(float(earliest), "%Y-%m-%d")
+        lines.append(
+            f"  Window: all time — retained rows plus the daily rollup, since {since} UTC."
+        )
+    else:
+        lines.append("  Window: all time — retained rows plus the daily rollup.")
+    incomplete = rollup.get("incomplete_before")
+    if incomplete is not None:
+        lost = rollup.get("lost_before_install")
+        lost_text = f"{lost:,} rows were" if isinstance(lost, int) else "rows were"
+        lines.append(
+            f"  Incomplete before {_utc_text(float(incomplete), '%Y-%m-%d %H:%M')} UTC: "
+            f"{lost_text} trimmed\n"
+            "    before the rollup was installed, so rows created before then may be missing."
+        )
+    undated = rollup.get("unknown_date_calls") or 0
+    if undated:
+        lines.append(
+            f"  {undated} counted rows had no convertible timestamp; their dates are unknown."
+        )
+    return lines
+
+
 def _render_compression_block(
     summary: dict[str, Any],
     by_source: dict[str, dict[str, Any]] | None = None,
     max_history: int | None = None,
 ) -> None:
-    click.echo(_hdr("Proxy / Compression"))
+    raw_rollup = summary.get("rollup")
+    rollup: dict[str, Any] | None = raw_rollup if isinstance(raw_rollup, dict) else None
+    click.echo(_hdr("Proxy / Compression" if rollup is None else "Proxy / Compression (all time)"))
     click.echo("=" * 30)
+    if rollup is not None and summary.get("error"):
+        click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
+        return
+    if rollup is not None and not rollup.get("installed"):
+        click.echo(
+            "  All-time totals unavailable: this metrics DB has no daily rollup yet.\n"
+            "    It is installed the next time this STM version opens the DB (the MCP\n"
+            "    server, `mms tune` or `mms hook`); rows trimmed before then are not\n"
+            "    recoverable. Without --all-time this command reports the retained rows."
+        )
+        return
     if not summary.get("available") or not summary.get("total_calls"):
         click.echo("  No proxy metrics recorded yet.")
         return
@@ -2548,7 +2602,10 @@ def _render_compression_block(
                 line += f"  [{src_structured} structured, separate accounting]"
             click.echo(line)
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
-    if max_history is not None:
+    if rollup is not None:
+        for line in _all_time_coverage_lines(rollup):
+            click.echo(line)
+    elif max_history is not None:
         click.echo(
             f"  Window: retained rows only; this config caps each source at {max_history:,} rows\n"
             "    (proxy.metrics.max_history). The oldest are trimmed in batches, so a source\n"
@@ -2723,12 +2780,20 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     help="Filter compression rows by provenance: 'mcp' (proxied upstream tools) "
     "or 'hook' (native built-in tools recorded by 'mms hook').",
 )
+@click.option(
+    "--all-time",
+    "all_time",
+    is_flag=True,
+    help="Report compression over all rows ever recorded since the daily rollup was "
+    "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def stats(
     config_path: str | None,
     *,
     tool_filter: str | None = None,
     source_filter: str | None = None,
+    all_time: bool = False,
     as_json: bool = False,
 ) -> None:
     """Show proxy compression and surfacing stats from the persistent stores.
@@ -2736,7 +2801,9 @@ def stats(
     Reads ``proxy_metrics.db`` and ``stm_feedback.db`` read-only (it never
     creates or migrates them) and reports totals over the rows still retained
     (``proxy.metrics.max_history`` per source, ``retention_days`` for
-    progressive reads and surfacing), not all-time totals. The live MCP server
+    progressive reads and surfacing), not all-time totals. ``--all-time`` switches
+    the compression section alone to the never-pruned daily rollup plus retained
+    rows (#1316); progressive and surfacing stay retained-window. The live MCP server
     keeps additional in-memory counters that a separate CLI process cannot see,
     so the numbers here reflect only what has been written to disk. An explicit
     ``--config`` also steers the STMConfig-backed feedback-DB location (#839).
@@ -2744,7 +2811,10 @@ def stats(
     config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.config import STMConfig, stm_config_for_cli
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
-    from memtomem_stm.proxy.metrics_store import read_compression_summary
+    from memtomem_stm.proxy.metrics_store import (
+        read_compression_all_time,
+        read_compression_summary,
+    )
     from memtomem_stm.proxy.progressive_reads_store import read_progressive_summary
     from memtomem_stm.surfacing.feedback_store import read_surfacing_summary
 
@@ -2804,14 +2874,15 @@ def stats(
         config_status = "invalid"
         proxy_cfg = stm_config.proxy if stm_config is not None else ProxyConfig()
 
-    compression = read_compression_summary(
+    read_compression = read_compression_all_time if all_time else read_compression_summary
+    compression = read_compression(
         proxy_cfg.metrics.db_path, tool=tool_filter, source=source_filter
     )
     # ``--source`` scopes the compression rows only; unset, report each source
     # beside the aggregate so one high-volume source cannot hide another's ratio.
     compression_by_source = (
         {
-            src: read_compression_summary(proxy_cfg.metrics.db_path, tool=tool_filter, source=src)
+            src: read_compression(proxy_cfg.metrics.db_path, tool=tool_filter, source=src)
             for src in ("mcp", "hook")
         }
         if source_filter is None
@@ -2842,6 +2913,7 @@ def stats(
                     "tool_filter": tool_filter,
                     "source_filter": source_filter,
                     "data_source": data_source,
+                    "compression_scope": "all_time" if all_time else "retained",
                     "compression": compression,
                     "compression_by_source": compression_by_source,
                     "progressive": progressive,

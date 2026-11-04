@@ -661,3 +661,157 @@ class TestReadProgressiveSummary:
 
         assert summary["available"] is True
         assert summary["delivered_ratio"] == 0.0
+
+
+class TestMmsStatsAllTime:
+    """``--all-time`` swaps the compression section to the daily rollup (#1316)."""
+
+    @staticmethod
+    def _seed_trimmed(home: Path) -> Path:
+        db = home / ".memtomem" / "proxy_metrics.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        store = MetricsStore(db, max_history=1)
+        store.initialize()
+        try:
+            for comp in (400, 600, 500):
+                store.record(
+                    CallMetrics(
+                        server="c7", tool="query-docs", original_chars=1000, compressed_chars=comp
+                    )
+                )
+        finally:
+            store.close()
+        return db
+
+    def test_human_output_counts_trimmed_rows(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed_trimmed(tmp_path)
+
+        retained = runner.invoke(cli, ["stats"])
+        assert retained.exit_code == 0, retained.output
+        assert "calls: 1 " in retained.output, "positive control: the cap trimmed"
+
+        result = runner.invoke(cli, ["stats", "--all-time"])
+        assert result.exit_code == 0, result.output
+        assert "Proxy / Compression (all time)" in result.output
+        assert "calls: 3 " in result.output
+        assert "chars: 3,000 -> 1,500" in result.output
+        assert "Window: all time" in result.output
+        assert "retained rows only" not in result.output
+        # Fresh DB: nothing was trimmed before the rollup existed.
+        assert "Incomplete before" not in result.output
+
+    def test_json_names_the_scope_and_coverage(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed_trimmed(tmp_path)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+        assert data["compression_scope"] == "all_time"
+        assert data["compression"]["total_calls"] == 3
+        rollup = data["compression"]["rollup"]
+        assert rollup["installed"] is True
+        assert rollup["lost_before_install"] == 0
+        assert rollup["incomplete_before"] is None
+        assert data["compression_by_source"]["mcp"]["total_calls"] == 3
+
+        plain = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert plain["compression_scope"] == "retained"
+        assert "rollup" not in plain["compression"]
+
+    def test_pre_rollup_db_says_unavailable_and_stays_untouched(
+        self, runner, tmp_path, monkeypatch
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        raw = sqlite3.connect(str(db))
+        raw.execute("DROP TRIGGER proxy_metrics_rollup_on_delete_v1")
+        raw.execute("DROP TABLE proxy_metrics_daily")
+        raw.commit()
+        raw.close()
+
+        result = runner.invoke(cli, ["stats", "--all-time"])
+
+        assert result.exit_code == 0, result.output
+        assert "All-time totals unavailable" in result.output
+        assert "calls:" not in result.output.split("Progressive delivery")[0]
+        raw = sqlite3.connect(str(db))
+        tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master")}
+        raw.close()
+        assert "proxy_metrics_daily" not in tables
+
+    def test_incomplete_coverage_line(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._seed_trimmed(tmp_path)
+        raw = sqlite3.connect(str(db))
+        raw.execute(
+            "UPDATE metrics_meta SET value = '7' WHERE key = 'rollup_rows_lost_before_install'"
+        )
+        raw.execute(
+            "UPDATE metrics_meta SET value = '4102444800.0' WHERE key = 'rollup_installed_at'"
+        )
+        raw.commit()
+        raw.close()
+
+        result = runner.invoke(cli, ["stats", "--all-time"])
+
+        assert result.exit_code == 0, result.output
+        assert "Incomplete before 2100-01-01 00:00 UTC: 7 rows were trimmed" in result.output
+
+    def test_coverage_outside_pythons_date_range_renders(self, runner, tmp_path, monkeypatch):
+        """SQLite dates year 0, which ``datetime`` refuses; the report must not
+        crash, whether the row is retained or already rolled up."""
+        set_home(monkeypatch, tmp_path)
+        db = self._seed_trimmed(tmp_path)
+        raw = sqlite3.connect(str(db))
+        raw.execute("UPDATE proxy_metrics SET created_at = -62167219200")
+        raw.commit()
+        raw.close()
+        retained = runner.invoke(cli, ["stats", "--all-time"])
+        assert retained.exit_code == 0, retained.output
+        assert "since epoch -62167219200.0 UTC" in retained.output
+
+        raw = sqlite3.connect(str(db))
+        raw.execute("DELETE FROM proxy_metrics")
+        raw.commit()
+        raw.close()
+        rolled = runner.invoke(cli, ["stats", "--all-time"])
+        assert rolled.exit_code == 0, rolled.output
+        assert "since epoch -62167219200.0 UTC" in rolled.output
+
+    def test_non_finite_sizes_render_in_both_output_modes(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._seed_trimmed(tmp_path)
+        store = MetricsStore(db, max_history=1)
+        store.initialize()
+        try:
+            store.record(
+                CallMetrics(
+                    server="c7",
+                    tool="query-docs",
+                    original_chars=float("inf"),
+                    compressed_chars=float("-inf"),
+                )
+            )
+            store.record(
+                CallMetrics(
+                    server="builtin",
+                    tool="Bash",
+                    original_chars=10,
+                    compressed_chars=10,
+                    source="hook",
+                )
+            )
+        finally:
+            store.close()
+
+        human = runner.invoke(cli, ["stats", "--all-time"])
+        assert human.exit_code == 0, human.output
+        assert "mcp   calls: 4  chars: 3,000 -> 1,500" in human.output
+
+        def _reject(token: str) -> None:
+            raise AssertionError(f"non-standard JSON number {token}")
+
+        data = json.loads(
+            runner.invoke(cli, ["stats", "--json", "--all-time"]).output, parse_constant=_reject
+        )
+        assert data["compression"]["total_original_chars"] == 3010
