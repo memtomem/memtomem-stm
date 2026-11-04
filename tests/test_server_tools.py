@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -302,6 +303,125 @@ class TestProxyStats:
         result = await stm_proxy_stats(ctx=ctx)
         assert "Cache entries:" not in result
         assert "Cache hit rate:" in result
+
+
+def _stage_latency_rows(text: str) -> list[tuple[float, float, float]]:
+    return [
+        (float(m[1]), float(m[2]), float(m[3]))
+        for m in re.finditer(
+            r"^Stage latency:\s+p50=(\S+)\s+p95=(\S+)\s+p99=(\S+) ms$", text, re.MULTILINE
+        )
+    ]
+
+
+def _timed_call(clean: float, compress: float, surface: float):
+    from memtomem_stm.proxy.metrics import CallMetrics
+
+    return CallMetrics(
+        server="s",
+        tool="t",
+        original_chars=10,
+        compressed_chars=5,
+        clean_ms=clean,
+        compress_ms=compress,
+        surface_ms=surface,
+    )
+
+
+class TestProxyStatsStageLatency:
+    """#1315: the latency row read a key the tracker never published, so it
+    never rendered. It reports the summed clean/compress/surface timers."""
+
+    async def test_renders_total_stage_percentiles(self):
+        tracker = TokenTracker()
+        tracker.record(_timed_call(1, 10, 100))
+        tracker.record(_timed_call(3, 30, 300))
+        result = await stm_proxy_stats(ctx=_make_ctx(tracker=tracker))
+
+        # Per-call totals are 111 and 333; no single stage gives these values.
+        assert _stage_latency_rows(result) == [(222.0, 321.9, 330.78)]
+        t = tracker.get_summary()["latency_percentiles"]["total_ms"]
+        assert _stage_latency_rows(result) == [(t["p50"], t["p95"], t["p99"])]
+        lines = result.splitlines()
+        row = next(i for i, line in enumerate(lines) if line.startswith("Stage latency:"))
+        assert lines[row + 1] == (
+            "  (clean+compress+surface per live call, LTM lookup included; upstream fetch excluded)"
+        )
+
+    async def test_percentiles_are_of_the_per_call_sum(self):
+        """Each call spends 100 ms in a different stage, so every per-call
+        total is 100. Adding up the per-stage percentiles instead would give
+        p95/p99 = 190/198 — the proportional timings above cannot tell the two
+        apart."""
+        tracker = TokenTracker()
+        tracker.record(_timed_call(100, 0, 0))
+        tracker.record(_timed_call(0, 100, 0))
+        result = await stm_proxy_stats(ctx=_make_ctx(tracker=tracker))
+        assert _stage_latency_rows(result) == [(100.0, 100.0, 100.0)]
+
+    async def test_all_zero_live_call_still_renders(self):
+        """The non-text/empty passthrough path records a live call with every
+        stage at 0 ms; that is a measurement, not an empty window."""
+        from memtomem_stm.proxy.metrics import CallMetrics
+
+        tracker = TokenTracker()
+        tracker.record(CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0))
+        result = await stm_proxy_stats(ctx=_make_ctx(tracker=tracker))
+        assert _stage_latency_rows(result) == [(0.0, 0.0, 0.0)]
+
+    async def test_absent_without_live_calls(self):
+        from memtomem_stm.proxy.metrics import CallMetrics, ErrorCategory
+
+        empty = TokenTracker()
+        hits_only = TokenTracker()
+        hits_only.record_cache_hit(chars=5)
+        errors_only = TokenTracker()
+        errors_only.record_error(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.TRANSPORT,
+            )
+        )
+        for tracker in (empty, hits_only, errors_only):
+            result = await stm_proxy_stats(ctx=_make_ctx(tracker=tracker))
+            assert "Stage latency" not in result
+            assert "upstream fetch excluded" not in result
+
+    async def test_names_the_window_once_calls_exceed_it(self, monkeypatch):
+        import memtomem_stm.proxy.metrics as metrics_mod
+
+        monkeypatch.setattr(metrics_mod, "LATENCY_WINDOW", 3)
+
+        from memtomem_stm.proxy.metrics import CallMetrics
+
+        # Cache hits and failed calls are invocations but never enter the
+        # window, so they must not make a full window read as overflowed.
+        at_capacity = TokenTracker()
+        for _ in range(3):
+            at_capacity.record(_timed_call(0, 0, 1))
+        at_capacity.record_cache_hit(chars=5)
+        at_capacity.record_error(
+            CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0, is_error=True)
+        )
+        assert at_capacity.get_summary()["latency_samples"] == 3
+        result = await stm_proxy_stats(ctx=_make_ctx(tracker=at_capacity))
+        assert _stage_latency_rows(result) == [(1.0, 1.0, 1.0)]
+        assert "last 3 calls" not in result
+        assert "upstream fetch excluded)" in result
+
+        # The 1000 ms outlier is the oldest sample, so the fourth call evicts
+        # it; were it kept, p95/p99 would not be 1.0.
+        rolled = TokenTracker()
+        rolled.record(_timed_call(0, 0, 1000))
+        for _ in range(3):
+            rolled.record(_timed_call(0, 0, 1))
+        result = await stm_proxy_stats(ctx=_make_ctx(tracker=rolled))
+        assert _stage_latency_rows(result) == [(1.0, 1.0, 1.0)]
+        assert "upstream fetch excluded; last 3 calls)" in result
 
 
 # ── stm_proxy_select_chunks ──────────────────────────────────────────────

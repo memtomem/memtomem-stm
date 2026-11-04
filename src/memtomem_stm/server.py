@@ -1260,11 +1260,22 @@ async def stm_proxy_stats(
         for cat, count in sorted(errors_by_cat.items()):
             lines.append(f"  {cat}: {count}")
 
-    # Latency percentiles
-    latency = summary.get("latency_percentiles", {})
-    if latency.get("total"):
-        t = latency["total"]
-        lines.append(f"\nLatency (ms):    p50={t['p50']}  p95={t['p95']}  p99={t['p99']}")
+    # Stage latency percentiles. ``total_ms`` is the sum of the recorded clean,
+    # compress and surface timers, which all start after the upstream response
+    # has arrived — so it is not tool latency, but surfacing's LTM round-trip is
+    # in it. Gated on the sample count: an empty window still reports a truthy
+    # all-zero dict, and a live call can legitimately record zero on every stage.
+    latency_samples = summary.get("latency_samples", 0)
+    if latency_samples > 0:
+        t = summary["latency_percentiles"]["total_ms"]
+        window = (
+            f"; last {latency_samples} calls" if summary["total_calls"] > latency_samples else ""
+        )
+        lines.append(f"\nStage latency:   p50={t['p50']}  p95={t['p95']}  p99={t['p99']} ms")
+        lines.append(
+            "  (clean+compress+surface per live call, LTM lookup included;"
+            f" upstream fetch excluded{window})"
+        )
 
     # RPS
     rps = summary.get("current_rps", 0)
