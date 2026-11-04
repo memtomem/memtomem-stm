@@ -104,7 +104,7 @@ changes inline only. See the deprecation policy in
   replaced the working directory with the driveless `\dir` instead of keeping
   its drive. macOS / Linux extract the same rows as before. On Windows with
   Python 3.13+, drive-qualified, UNC, driveless and relative paths are judged
-  as before; only malformed spellings such as `/:/` can differ. (#1337)
+  as before; only malformed spellings such as `/:/` can differ. (#1339, #1337)
   **Behavior change**: none external — the script ships only in the
   repository, and its extracted rows change only on Windows.
 
