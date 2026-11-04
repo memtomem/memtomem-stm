@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import functools
 import hashlib
 import logging
@@ -12,7 +13,7 @@ import time
 import uuid
 from concurrent.futures import Future
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from memtomem_stm.observability.tracing import traced
@@ -41,8 +42,10 @@ from memtomem_stm.surfacing.mcp_client import (
     render_score_scale,
     LtmCapabilities,
     LtmTransportError,
+    RemoteContextInfo,
     SearchOutcome,
 )
+from memtomem_stm.surfacing.project_scope import INACTIVE, ProjectScope, ProjectScopeCache
 from memtomem_stm.surfacing.observability import (
     _NOOP_OBSERVABILITY,
     Outcome,
@@ -452,6 +455,8 @@ class SurfacingEngine:
 
             self._auto_tuner = AutoTuner(config, feedback_tracker.store)
         self._extractor = ContextExtractor()
+        # cwd → repository namespace include-list for native-tool hook calls.
+        self._project_scopes = ProjectScopeCache()
         self._gate = RelevanceGate(config, observability=observability)
         self._formatter = SurfacingFormatter(config)
         self._cache = SurfacingCache(ttl=config.cache_ttl_seconds)
@@ -1777,7 +1782,7 @@ class SurfacingEngine:
             return response_text
 
         query = self._extractor.extract_query(
-            server, tool, arguments, self._config, context_query=context_query
+            server, tool, arguments, self._config, context_query=context_query, cwd=host.cwd
         )
         if query is None:
             self._skip(scope, tool, "no_query")
@@ -1808,6 +1813,10 @@ class SurfacingEngine:
             return response_text
 
         try:
+            # Inside the ``try`` on purpose: resolution awaits an executor, and
+            # a cancellation or failure there must unwind through the same
+            # handlers and the rate-claim release below as any other pre-work.
+            project_scope = await self._project_scope_for(tool, host)
             return await self._do_surface(
                 server,
                 tool,
@@ -1818,6 +1827,7 @@ class SurfacingEngine:
                 deadline_monotonic=deadline_monotonic,
                 scope=scope,
                 host=host,
+                project_scope=project_scope,
             )
         except asyncio.TimeoutError:
             self._outcome(scope, tool, "error_timeout")
@@ -1861,6 +1871,49 @@ class SurfacingEngine:
             # why the marker sits where the spending starts.
             if not scope.ltm_attempted:
                 self._gate.release_claim(rate_claim)
+
+    def _pinned_namespace(self, tool: str) -> str | None:
+        tool_cfg = self._config.context_tools.get(tool)
+        if tool_cfg and tool_cfg.namespace:
+            return tool_cfg.namespace
+        return self._config.default_namespace
+
+    async def _project_scope_for(self, tool: str, host: _HostCall) -> ProjectScope:
+        """The repository scope for a hook call, or :data:`INACTIVE`.
+
+        Spawns nothing unless the call carries ``cwd``, scoping is enabled and
+        no namespace is pinned for the tool.
+        """
+        if (
+            host.cwd is None
+            or not self._config.project_scope_from_cwd
+            or self._pinned_namespace(tool) is not None
+        ):
+            return INACTIVE
+        return await self._project_scopes.get(host.cwd)
+
+    def _excluded(self, namespace: object) -> bool:
+        if not isinstance(namespace, str):
+            return False
+        return any(
+            fnmatch.fnmatchcase(namespace, pattern) for pattern in self._config.exclude_namespaces
+        )
+
+    def _namespace_excluded(self, result: Any) -> bool:
+        meta = getattr(getattr(result, "chunk", None), "metadata", None)
+        return self._excluded(getattr(meta, "namespace", None))
+
+    def _drop_excluded_neighbours(self, result: Any) -> None:
+        """Remove excluded context-window neighbours; the formatter renders
+        them next to the hit, so they would otherwise inject the namespace
+        the hit itself was allowed past."""
+        ctx = getattr(result, "context", None)
+        if not isinstance(ctx, RemoteContextInfo):
+            return
+        before = tuple(c for c in ctx.window_before if not self._excluded(c.namespace))
+        after = tuple(c for c in ctx.window_after if not self._excluded(c.namespace))
+        if len(before) != len(ctx.window_before) or len(after) != len(ctx.window_after):
+            result.context = replace(ctx, window_before=before, window_after=after)
 
     async def handle_feedback(
         self,
@@ -2383,6 +2436,7 @@ class SurfacingEngine:
         deadline_monotonic: float | None = None,
         scope: _TimerScope,
         host: _HostCall = _NO_HOST_CALL,
+        project_scope: ProjectScope = INACTIVE,
     ) -> str:
         """Cache lookup, per-key stampede lock, then the timed LTM window.
 
@@ -2424,7 +2478,9 @@ class SurfacingEngine:
         after the gate and query extraction: whatever pre-work the engine does
         on its own account debits its own time, not the LTM's record.
         """
-        cache_key = framed_digest((server, tool, query))
+        # The scope is part of the key: the same query from two repositories
+        # searches different namespaces and must not share a cached answer.
+        cache_key = framed_digest((server, tool, query, project_scope.key))
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._observability.record_cache("hit")
@@ -2482,6 +2538,7 @@ class SurfacingEngine:
                     trace_id=trace_id,
                     scope=scope,
                     host=host,
+                    project_scope=project_scope,
                 ),
                 effective_timeout,
                 scope,
@@ -2499,6 +2556,7 @@ class SurfacingEngine:
         trace_id: str | None = None,
         scope: _TimerScope,
         host: _HostCall = _NO_HOST_CALL,
+        project_scope: ProjectScope = INACTIVE,
     ) -> str:
         """Admission for the one path that starts LTM work, then the work.
 
@@ -2549,6 +2607,7 @@ class SurfacingEngine:
             trace_id=trace_id,
             scope=scope,
             host=host,
+            project_scope=project_scope,
         )
 
     async def _do_surface_miss_admitted(
@@ -2563,6 +2622,7 @@ class SurfacingEngine:
         trace_id: str | None = None,
         scope: _TimerScope,
         host: _HostCall = _NO_HOST_CALL,
+        project_scope: ProjectScope = INACTIVE,
     ) -> str:
         # Past admission, this call takes the LTM path on every branch below
         # — compose or legacy search — so its rate-limit slot is spent whatever
@@ -2579,11 +2639,12 @@ class SurfacingEngine:
             if tool_cfg and tool_cfg.max_results
             else self._config.effective_max_results()
         )
-        namespace = (
-            tool_cfg.namespace
-            if tool_cfg and tool_cfg.namespace
-            else self._config.default_namespace
-        )
+        # A pinned namespace always wins; otherwise a hook call's repository
+        # scope is sent as an exact-name include-list (Core applies it to
+        # context-window neighbours too); otherwise search is unscoped.
+        namespace: str | list[str] | None = self._pinned_namespace(tool)
+        if namespace is None and project_scope.active:
+            namespace = list(project_scope.namespaces)
 
         # Ask a capable core to compose Pinned Context + retrieval under one
         # budget. Capability absence alone falls back to legacy mem_search;
@@ -2829,6 +2890,13 @@ class SurfacingEngine:
                 )
         else:
             scored = [r for r in retrieved_results if r.score >= min_score]
+        if self._config.exclude_namespaces:
+            # After the scale/auto-tune bookkeeping above, which should keep
+            # seeing the batch the LTM returned; before anything is claimed,
+            # cached or injected. Pinned results are not in ``scored``.
+            scored = [r for r in scored if not self._namespace_excluded(r)]
+            for r in scored:
+                self._drop_excluded_neighbours(r)
         demoted_ids = self._feedback_demoted_ids([str(r.chunk.id) for r in scored])
         if demoted_ids:
             logger.debug(

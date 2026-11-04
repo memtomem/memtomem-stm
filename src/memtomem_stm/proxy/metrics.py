@@ -25,6 +25,10 @@ MAX_TRACKED_KEYS = 10_000
 # short enough that no single row can blow up the DB.
 MAX_ERROR_MESSAGE_CHARS = 500
 
+# Per-stage latency samples kept for the p50/p95/p99 in ``get_summary()``: a
+# rolling window of the most recent successful live calls, not lifetime.
+LATENCY_WINDOW = 10_000
+
 # ``compression_strategy`` of a response whose annotated text blocks were kept
 # apart instead of compressed (#1112): no compressor ran, so the base is
 # ``none``, and the suffix names why. The tuner drops these rows by this exact
@@ -349,11 +353,10 @@ class TokenTracker:
         self._total_hint_events = 0
         self._last_hint_count = 0
         # Per-call latencies for percentile computation (bounded rolling window)
-        _LATENCY_WINDOW = 10000
-        self._clean_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
-        self._compress_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
-        self._surface_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
-        self._total_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
+        self._clean_latencies: deque[float] = deque(maxlen=LATENCY_WINDOW)
+        self._compress_latencies: deque[float] = deque(maxlen=LATENCY_WINDOW)
+        self._surface_latencies: deque[float] = deque(maxlen=LATENCY_WINDOW)
+        self._total_latencies: deque[float] = deque(maxlen=LATENCY_WINDOW)
 
     @property
     def metrics_store(self) -> MetricsStore | None:
@@ -539,6 +542,9 @@ class TokenTracker:
                 "surface_ms": self._percentiles(self._surface_latencies),
                 "total_ms": self._percentiles(self._total_latencies),
             },
+            # How many calls the percentiles above cover: an empty window
+            # reports all-zero percentiles, so readers gate on this count.
+            "latency_samples": len(self._total_latencies),
             "current_rps": self._rps_tracker.rps(),
             "total_errors": self._total_errors,
             "errors_by_category": dict(self._errors_by_category),

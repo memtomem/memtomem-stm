@@ -1528,9 +1528,7 @@ class TestLedgerRpcMark:
         from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
         from memtomem_stm.surfacing.observability import attribute_call
 
-        adapter = McpClientSearchAdapter(
-            SurfacingConfig(result_format="structured", rerank=False)
-        )
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured", rerank=False))
         session = AsyncMock()
         version = MagicMock()
         version_text = MagicMock()
@@ -1576,9 +1574,7 @@ class TestLedgerRpcMark:
         session.call_tool = AsyncMock(return_value=self._hit())
 
         with attribute_call() as bookkeeping:
-            await adapter._rpc(
-                session, 1, "mem_do", {"action": "increment_access", "params": {}}
-            )
+            await adapter._rpc(session, 1, "mem_do", {"action": "increment_access", "params": {}})
         assert bookkeeping.retrieval_attempted is False
 
         with attribute_call() as composed:
@@ -1791,7 +1787,7 @@ class TestCancelledCallReleasesRateSlot:
             config=_make_config(max_surfacings_per_minute=1),
             mcp_adapter=adapter,
         )
-        cache_key = framed_digest(("gh", "read_file", self.QUERY))
+        cache_key = framed_digest(("gh", "read_file", self.QUERY, ""))
 
         async with engine._key_locks.hold(cache_key):
             task = asyncio.create_task(
@@ -1825,7 +1821,7 @@ class TestCancelledCallReleasesRateSlot:
             config=_make_config(max_surfacings_per_minute=1),
             mcp_adapter=adapter,
         )
-        cache_key = framed_digest(("gh", "read_file", self.QUERY))
+        cache_key = framed_digest(("gh", "read_file", self.QUERY, ""))
 
         async with engine._key_locks.hold(cache_key):
             task = asyncio.create_task(
@@ -1900,7 +1896,7 @@ class TestSurfacingCacheStampede:
         # Symptom 3: cache entry reflects the populated result, not the
         # poisoned empty list. A subsequent call for the same query must
         # still hit the memory, not bypass surfacing on an empty-hit.
-        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"], ""))
         cached = engine._cache.get(cache_key)
         assert cached, (
             "Cache poisoned with empty list — stampede's losing writer "
@@ -2006,7 +2002,7 @@ class TestSurfacingCacheStampede:
                 f"B's cached result (got {adapter.search.call_count} searches)"
             )
             cached = engine._cache.get(
-                framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+                framed_digest(("gh", "read_file", VALID_ARGS["_context_query"], ""))
             )
             assert cached and any(r.chunk.id == "mem-shared" for r in cached), (
                 "Cache entry missing or poisoned — the second searcher's empty "
@@ -2060,7 +2056,7 @@ class TestKeyLockWaitIsNotAnLtmTimeout:
             observability=obs,
         )
         charges = self._count_breaker_charges(engine)
-        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"], ""))
 
         async def hold_the_key(hold_for: float) -> None:
             async with engine._key_locks.hold(cache_key):
@@ -2075,9 +2071,7 @@ class TestKeyLockWaitIsNotAnLtmTimeout:
         out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         await holder
 
-        assert "shared result" in out, (
-            "the queued call was aborted before it ever reached the LTM"
-        )
+        assert "shared result" in out, "the queued call was aborted before it ever reached the LTM"
         assert adapter.search.call_count == 1
         outcomes = obs.snapshot()["outcomes"].get("read_file", {})
         assert "error_timeout" not in outcomes, (
@@ -2093,9 +2087,7 @@ class TestKeyLockWaitIsNotAnLtmTimeout:
         chunk = FakeChunk(id="mem-shared", content="shared result")
         results = [FakeSearchResult(chunk=chunk, score=0.5)]
         adapter = _make_mcp_adapter()
-        adapter.search = AsyncMock(
-            side_effect=AssertionError("a cache hit must not reach the LTM")
-        )
+        adapter.search = AsyncMock(side_effect=AssertionError("a cache hit must not reach the LTM"))
         obs = SurfacingObservability()
         engine = SurfacingEngine(
             config=_make_config(timeout_seconds=5.0),
@@ -2103,7 +2095,7 @@ class TestKeyLockWaitIsNotAnLtmTimeout:
             observability=obs,
         )
         charges = self._count_breaker_charges(engine)
-        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"], ""))
 
         async def hold_then_populate() -> None:
             async with engine._key_locks.hold(cache_key):
@@ -2152,7 +2144,7 @@ class TestKeyLockWaitIsNotAnLtmTimeout:
             observability=obs,
         )
         charges = self._count_breaker_charges(engine)
-        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"], ""))
 
         async def hold_the_key() -> None:
             # Released without populating the cache, so the re-check misses.
@@ -2175,7 +2167,6 @@ class TestKeyLockWaitIsNotAnLtmTimeout:
         assert out == LONG_RESPONSE
         assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
         assert charges[0] == 1
-
 
 
 class TestRelevanceGateConcurrency:
@@ -4212,9 +4203,10 @@ class TestScoreScaleDiagnostic:
         # row is shared with peer processes, so persistence cannot be latched
         # to the once-per-episode WARNING (#944).
         await engine.drain_store_writes()
-        assert tracker.record_diagnostic.call_args_list == [
-            call("gh", "read_file", "score_ceiling_below_min", at=ANY)
-        ] * 2
+        assert (
+            tracker.record_diagnostic.call_args_list
+            == [call("gh", "read_file", "score_ceiling_below_min", at=ANY)] * 2
+        )
 
     async def test_empty_recovery_and_threshold_change_reset_episode(self, caplog):
         tracker = MagicMock()
@@ -4401,9 +4393,10 @@ class TestReportedScoreScale:
         # WARNS once, PERSISTS twice: the durable row is shared, so each
         # mismatched observation must reopen it (#944).
         await engine.drain_store_writes()
-        assert tracker.record_diagnostic.call_args_list == [
-            call("gh", "read_file", "score_scale_mismatch", at=ANY)
-        ] * 2
+        assert (
+            tracker.record_diagnostic.call_args_list
+            == [call("gh", "read_file", "score_scale_mismatch", at=ANY)] * 2
+        )
         # The named scale supersedes streak evidence entirely.
         assert ("gh", "read_file") not in engine._score_scale_streaks
 
@@ -4718,6 +4711,7 @@ class TestScoreScaleMapsAreBounded:
         self._drive(engine, named_low)
         self._assert_capped(engine._score_scale_mismatch_active)
 
+
 class TestScaleGatedMinScore:
     """Scale gate (``scale_gated_min_score``, the #1781-adoption follow-up):
     a core-named non-RRF scale suspends the RRF-calibrated global/auto-tuned
@@ -4817,9 +4811,7 @@ class TestScaleGatedMinScore:
                 chunk=FakeChunk(content="foreign scale"), score=0.001, score_scale="bm25"
             )
         ]
-        engine = self._engine(
-            results, tracker=tracker, min_score=0.02, scale_gated_min_score=False
-        )
+        engine = self._engine(results, tracker=tracker, min_score=0.02, scale_gated_min_score=False)
         out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert out == LONG_RESPONSE
         await engine.drain_store_writes()
@@ -4855,7 +4847,10 @@ class TestScaleGatedMinScore:
         engine = self._engine(results, tracker=tracker, min_score=0.02)
         for i in range(5):
             out = await engine.surface(
-                "gh", "read_file", {"_context_query": f"unrecognized scale query {i}"}, LONG_RESPONSE
+                "gh",
+                "read_file",
+                {"_context_query": f"unrecognized scale query {i}"},
+                LONG_RESPONSE,
             )
             assert out == LONG_RESPONSE
         await engine.drain_store_writes()
@@ -4911,9 +4906,10 @@ class TestScaleGatedMinScore:
         engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
         engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
         await engine.drain_store_writes()
-        assert tracker.record_diagnostic_recoveries.call_args_list == [
-            call("gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY)
-        ] * 2
+        assert (
+            tracker.record_diagnostic_recoveries.call_args_list
+            == [call("gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY)] * 2
+        )
         assert ("gh", "read_file") not in engine._score_scale_mismatch_active
         assert ("gh", "read_file") not in engine._score_scale_streaks
 
@@ -4993,9 +4989,7 @@ class TestScaleGatedMinScore:
 
     async def test_snapshot_reports_gate_disabled(self):
         results = [
-            FakeSearchResult(
-                chunk=FakeChunk(content="gate off"), score=0.5, score_scale="rerank"
-            )
+            FakeSearchResult(chunk=FakeChunk(content="gate off"), score=0.5, score_scale="rerank")
         ]
         engine = self._engine(results, min_score=0.02, scale_gated_min_score=False)
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
@@ -5811,3 +5805,291 @@ class TestCacheHitFloorMatchesMiss:
             assert label(miss) == label(hit) == "weak"
         finally:
             tracker.close()
+
+
+# ── Repository scope and namespace exclusion for hook calls ─────────────────
+
+
+class _StubScopes:
+    """Stands in for ``ProjectScopeCache``: fixed answers, records each cwd asked."""
+
+    def __init__(self, answers: dict[str, Any] | None = None, *, wait: asyncio.Event | None = None):
+        self.answers = answers or {}
+        self.asked: list[str] = []
+        self.wait = wait
+
+    async def get(self, cwd: str):
+        from memtomem_stm.surfacing.project_scope import INACTIVE
+
+        self.asked.append(cwd)
+        if self.wait is not None:
+            await self.wait.wait()
+        return self.answers.get(cwd, INACTIVE)
+
+
+def _scope(*namespaces: str):
+    from memtomem_stm.surfacing.project_scope import ProjectScope
+
+    return ProjectScope(namespaces=tuple(sorted(namespaces)))
+
+
+_REPO_SCOPE = ("claude:-r", "default", "shared:r")
+_READ_ARGS = {"file_path": "/r/src/auth/jwt_handler.py"}
+
+
+def _ns_result(content: str, namespace: str, score: float = 0.5) -> FakeSearchResult:
+    return FakeSearchResult(
+        chunk=FakeChunk(content=content, metadata=FakeChunkMeta(namespace=namespace)), score=score
+    )
+
+
+class TestRepositoryScope:
+    async def test_hook_call_sends_the_include_list_to_search(self):
+        root = "/Users/u/Work/repo"
+        adapter = _make_mcp_adapter([_ns_result("scoped memory", "claude:-r")])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        engine._project_scopes = _StubScopes({root: _scope(*_REPO_SCOPE)})
+
+        out = await engine.surface(
+            "builtin",
+            "Read",
+            {"file_path": f"{root}/src/auth/jwt_handler.py"},
+            LONG_RESPONSE,
+            cwd=root,
+        )
+
+        assert "scoped memory" in out
+        kwargs = adapter.search.await_args.kwargs
+        assert kwargs["namespace"] == sorted(_REPO_SCOPE)
+        # The extractor saw the cwd too: without it the query would keep
+        # ``Work repo`` from the absolute path.
+        assert kwargs["query"] == "auth jwt handler"
+
+    async def test_hook_call_sends_the_include_list_to_compose(self):
+        adapter = _make_compose_adapter([_remote_result("composed memory", 0.5)])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        engine._project_scopes = _StubScopes({"/r": _scope(*_REPO_SCOPE)})
+
+        await engine.surface("builtin", "Read", _READ_ARGS, LONG_RESPONSE, cwd="/r")
+
+        assert adapter.context_compose.await_args.kwargs["namespace"] == sorted(_REPO_SCOPE)
+
+    async def test_no_cwd_means_no_resolution_and_unscoped_search(self):
+        adapter = _make_mcp_adapter([_ns_result("m", "default")])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        stub = engine._project_scopes = _StubScopes()
+
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert stub.asked == []
+        assert adapter.search.await_args.kwargs["namespace"] is None
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"default_namespace": "pinned"},
+            {"context_tools": {"Read": {"namespace": "pinned"}}},
+        ],
+    )
+    async def test_a_pinned_namespace_wins_and_nothing_is_resolved(self, overrides):
+        adapter = _make_mcp_adapter([_ns_result("m", "pinned")])
+        engine = SurfacingEngine(config=_make_config(**overrides), mcp_adapter=adapter)
+        stub = engine._project_scopes = _StubScopes({"/r": _scope(*_REPO_SCOPE)})
+
+        await engine.surface("builtin", "Read", _READ_ARGS, LONG_RESPONSE, cwd="/r")
+
+        assert stub.asked == []
+        assert adapter.search.await_args.kwargs["namespace"] == "pinned"
+
+    async def test_scoping_can_be_switched_off(self):
+        adapter = _make_mcp_adapter([_ns_result("m", "default")])
+        engine = SurfacingEngine(
+            config=_make_config(project_scope_from_cwd=False), mcp_adapter=adapter
+        )
+        stub = engine._project_scopes = _StubScopes({"/r": _scope(*_REPO_SCOPE)})
+
+        await engine.surface("builtin", "Read", _READ_ARGS, LONG_RESPONSE, cwd="/r")
+
+        assert stub.asked == []
+        assert adapter.search.await_args.kwargs["namespace"] is None
+
+    async def test_two_repositories_do_not_share_a_cached_answer(self):
+        adapter = _make_mcp_adapter([_ns_result("m", "default")])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        engine._project_scopes = _StubScopes(
+            {"/r": _scope("claude:-r", "default"), "/s": _scope("claude:-s", "default")}
+        )
+        args = {"file_path": "src/auth/jwt_handler.py"}
+
+        await engine.surface("builtin", "Read", args, LONG_RESPONSE, cwd="/r")
+        await engine.surface("builtin", "Read", args, LONG_RESPONSE, cwd="/r")
+        assert adapter.search.await_count == 1  # positive control: same repo hits the cache
+        await engine.surface("builtin", "Read", args, LONG_RESPONSE, cwd="/s")
+        assert adapter.search.await_count == 2
+
+    async def test_cancel_during_resolution_gives_the_rate_slot_back(self):
+        adapter = _make_mcp_adapter([_ns_result("m", "default")])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        never = asyncio.Event()
+        stub = engine._project_scopes = _StubScopes(wait=never)
+        task = asyncio.create_task(
+            engine.surface("builtin", "Read", _READ_ARGS, LONG_RESPONSE, cwd="/r")
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if stub.asked:
+                break
+        assert stub.asked == ["/r"]
+        assert len(engine._gate._surfacing_timestamps) == 1  # the slot was claimed
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert list(engine._gate._surfacing_timestamps) == []
+        adapter.search.assert_not_awaited()
+
+    @pytest.mark.skipif(__import__("shutil").which("git") is None, reason="git not installed")
+    async def test_real_resolution_from_a_git_repository(self, tmp_path):
+        import os
+        import subprocess
+
+        from memtomem_stm.surfacing.project_scope import ProjectScopeCache, slugify
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
+        root = str(repo.resolve())
+        home = tmp_path / "claude-home"
+        (home / "projects" / slugify(root)).mkdir(parents=True)
+        adapter = _make_mcp_adapter([_ns_result("m", f"claude:{slugify(root)}")])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        engine._project_scopes = ProjectScopeCache(claude_config_dir=home)
+
+        await engine.surface(
+            "builtin",
+            "Read",
+            {"file_path": f"{root}/src/auth/jwt_handler.py"},
+            LONG_RESPONSE,
+            cwd=root,
+        )
+
+        assert adapter.search.await_args.kwargs["namespace"] == sorted(
+            [f"claude:{slugify(root)}", "default", "shared:repo"]
+        )
+
+
+class TestNamespaceExclusion:
+    async def test_excluded_namespaces_are_dropped_on_a_proxied_call(self):
+        adapter = _make_mcp_adapter(
+            [
+                _ns_result("old plan", "claude-plans", 0.9),
+                _ns_result("codex index", "codex", 0.8),
+                _ns_result("kept memory", "default", 0.5),
+            ]
+        )
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "kept memory" in out
+        assert "old plan" not in out and "codex index" not in out
+
+    async def test_patterns_are_fnmatch_and_can_be_cleared(self):
+        results = [
+            _ns_result("archived", "archive:2025", 0.9),
+            _ns_result("old plan", "claude-plans"),
+        ]
+        engine = SurfacingEngine(
+            config=_make_config(exclude_namespaces=["archive:*"]),
+            mcp_adapter=_make_mcp_adapter(results),
+        )
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "archived" not in out and "old plan" in out
+
+    async def test_pinned_context_is_never_excluded(self):
+        from memtomem_stm.surfacing.mcp_client import RemoteSearchResult
+
+        pinned = RemoteSearchResult(
+            "operator pin", 1.0, source="pin.md", namespace="codex", pinned=True
+        )
+        adapter = _make_compose_adapter([_remote_result("retrieved", 0.5)], pinned=[pinned])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "operator pin" in out
+
+    async def test_a_batch_emptied_by_exclusion_keeps_the_score_label(self):
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([_ns_result("old plan", "claude-plans", 0.9)]),
+            observability=obs,
+        )
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"no_results_score": 1}
+
+
+class TestExcludedNeighbours:
+    async def test_an_excluded_context_window_neighbour_is_not_injected(self):
+        from memtomem_stm.surfacing.mcp_client import (
+            RemoteContextChunk,
+            RemoteContextInfo,
+            RemoteSearchResult,
+        )
+
+        hit = RemoteSearchResult(
+            "allowed hit body",
+            0.5,
+            source="a.md",
+            namespace="default",
+            context=RemoteContextInfo(
+                window_before=(RemoteContextChunk("n1", "codex neighbour text", "c.md", "codex"),),
+                window_after=(
+                    RemoteContextChunk("n2", "default neighbour text", "a.md", "default"),
+                ),
+            ),
+        )
+        adapter = _make_compose_adapter([hit])
+        engine = SurfacingEngine(config=_make_config(context_window_size=1), mcp_adapter=adapter)
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "allowed hit body" in out
+        assert "default neighbour text" in out  # positive control: neighbours do render
+        assert "codex neighbour text" not in out
+
+
+class TestBuiltinQueryPrivacy:
+    _SECRET = "curl 'https://api.example.invalid/?api_key=demo_secret_value'"
+
+    async def test_secret_bearing_bash_command_leaves_as_a_digest(self):
+        sent = []
+        for args in (
+            {"command": self._SECRET, "description": "Probe the API"},
+            {"description": "Probe the API", "command": self._SECRET},
+        ):
+            adapter = _make_mcp_adapter([_ns_result("m", "default")])
+            engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+            await engine.surface("builtin", "Bash", args, LONG_RESPONSE)
+            sent.append(adapter.search.await_args.kwargs["query"])
+
+        assert sent[0].startswith("sha256:")
+        assert "demo_secret_value" not in sent[0]
+        assert sent[0] == sent[1]
+
+    async def test_secret_bearing_argv_command_leaves_as_a_digest(self):
+        adapter = _make_mcp_adapter([_ns_result("m", "default")])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        argv = ["curl", "-H", "api_key: demo_secret_value", "https://api.example.invalid/status"]
+
+        await engine.surface("builtin", "shell", {"command": argv}, LONG_RESPONSE)
+
+        query = adapter.search.await_args.kwargs["query"]
+        assert query.startswith("sha256:")
+        assert "demo_secret_value" not in query

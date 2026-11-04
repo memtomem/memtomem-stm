@@ -9,6 +9,89 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Added
+
+- `mms stats --all-time` reports compression totals that survive the
+  per-source `proxy.metrics.max_history` trim. A database trigger folds every
+  row deleted from `proxy_metrics` into a never-pruned `proxy_metrics_daily`
+  table (UTC day × source × server × tool, with the same accounting classes
+  the retained summary distinguishes), and all-time totals are those rows
+  plus the retained ones. Rows trimmed by an older STM version sharing the
+  file are counted too, since the trigger lives in the database. The rollup
+  is installed on the first open by this version; rows trimmed before then
+  are not recoverable, and the output says from when the totals may be
+  incomplete and how many rows were already lost. Progressive-read and cache
+  counters are not covered yet (#1316). To reset the history, delete the rows
+  of `proxy_metrics` and then of `proxy_metrics_daily`; do not drop
+  `proxy_metrics_daily` while its trigger exists.
+
+### Changed
+
+- `mms stats` no longer hides one source's savings behind another's volume.
+  When rows from both proxied MCP tools and `mms hook` are present, each
+  source gets its own line and ratio under the aggregate, which keeps its
+  shape and meaning. A new **Progressive delivery** section reads the
+  progressive-reads table read-only and reports chars produced against chars
+  delivered to the agent (every recorded read counts, so rereads can push the
+  ratio above 100%) and the oldest retained row; it replaces the pointer to
+  `stm_admin(action=progressive_stats)`. `--tool` filters it; `--source` still
+  scopes only the compression rows. The text and `docs/cli.md` no longer say
+  "all-time totals": a window line names `proxy.metrics.max_history` (per
+  source) and `proxy.progressive_reads.retention_days`. `--json` adds
+  `compression_by_source` (`null` when `--source` is given) and `progressive`;
+  existing keys keep their names and meanings.
+- **Behavior change**: with an invalid proxy config file, `mms stats` now
+  reads the environment-derived config the server keeps in that case instead
+  of built-in defaults. A DB moved by an environment variable is the one it
+  reads, and the `Enabled` / `Servers` lines (`enabled` / `servers` in
+  `--json`) report the environment's values.
+- `mms list` now ends its empty-state message with "Run `mms add` (or
+  `mms init`) to register an upstream.", the hint `mms status` prints,
+  when the runtime configuration is valid. It stays silent when the file
+  fails validation or the proxy environment is invalid, since adding an
+  upstream is not the fix there. **Behavior change**: the human-readable
+  `mms list` output gains one line when no upstream servers are configured;
+  `--json`, `mms prune` and `mms health` are unchanged. (#1318, #1313)
+
+### Fixed
+
+- `mms status` no longer ends with "Run `mms add` (or `mms init`) to register
+  an upstream." (empty file) or "Run `mms list` … `mms health` …" (file with
+  servers) when the runtime configuration keeps the server from starting —
+  for example `MEMTOMEM_STM_PROXY=[]`. Its closing line now says to fix the
+  runtime configuration named in the warning above. `--json` is unchanged.
+- `stm_admin(action="proxy_stats")` prints its latency percentiles. The row
+  read a key the tracker does not publish, so it never appeared. The figures
+  are the clean, compress and surface timers of each successful live call,
+  summed: surfacing's LTM lookup is in them and the upstream tool fetch is
+  not, so they are not tool latency. (#1323, #1315)
+  **Behavior change**: once a successful live call has been recorded, the
+  output gains a `Stage latency:   p50=… p95=… p99=… ms` row and a line under
+  it saying what the figures cover; after more than 10,000 live calls that
+  line also names the window (`; last 10000 calls`). `TokenTracker.get_summary()`
+  gains `latency_samples`, the number of calls the percentiles cover.
+
+- `mms health` probes the configured upstreams with environment overrides
+  applied: the config file overlaid with `MEMTOMEM_STM_PROXY` /
+  `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS…` settings, the same map `mms doctor`
+  checks since #831 (the two now share one helper). It read the file alone,
+  so an env-only upstream was never probed (an otherwise empty file printed
+  "No upstream servers configured."), and an env-overridden field such as
+  `command` was probed with the file's value. When the runtime configuration
+  or that overlaid snapshot fails validation, it still probes the file's
+  servers; when the file health read first no longer validates once
+  overlaid (for example, it was edited before the runtime read), that is now
+  reported invalid, as doctor already did. Probing does not depend on
+  `enabled`.
+  **Behavior change**: `mms health --json` `servers` now includes env-only
+  upstreams, and each probe uses the env-overridden entry; `config_valid` /
+  `config_error` also reflect that overlaid snapshot. A non-object server
+  entry in the file (`"upstream_servers": {"bad": 7}`) is skipped instead of
+  crashing health with an `AttributeError` (exit 1 → exit 0, reported as an
+  invalid config).
+
 ## [0.7.6] — 2026-11-02
 
 ### Changed

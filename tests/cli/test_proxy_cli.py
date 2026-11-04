@@ -981,7 +981,21 @@ class TestConfigLoad:
         result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "No upstream servers configured" in result.output
+        assert "mms add" in result.output
         assert "Config not found" not in result.output
+
+    def test_list_empty_config_hint_withheld_on_invalid_proxy_env(
+        self, runner, config, monkeypatch
+    ):
+        """An invalid ``MEMTOMEM_STM_PROXY`` leaves the runtime configuration
+        invalid, so registering an upstream is not the fix and ``list`` must
+        not suggest it."""
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", "[]")
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "No upstream servers configured" in result.output
+        assert "mms add" not in result.output
 
     def test_list_json_missing_config(self, runner, config):
         """``list --json`` already returned ``config_not_found`` since #220;
@@ -1009,6 +1023,7 @@ class TestConfigLoad:
         assert "fails validation" in result.output
         assert "falls back to env/defaults" in result.output
         assert "No upstream servers configured" in result.output
+        assert "mms add" not in result.output
 
     def test_list_stays_silent_when_env_overrides_fix_the_file(self, runner, config, monkeypatch):
         """The warning claims what a *running server* does, so it has to be
@@ -1024,6 +1039,7 @@ class TestConfigLoad:
         result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "fails validation" not in result.output
+        assert "mms add" in result.output
 
         # Positive control: the same file without the override still warns,
         # so the assertion above is about the overlay and not about the
@@ -15319,6 +15335,109 @@ class TestHealth:
             assert json.loads(json_result.output)["logging"]["writable"] is False
         finally:
             locked.chmod(0o700)
+
+    @staticmethod
+    def _record_probed(monkeypatch) -> list[dict]:
+        """Stub the probe and record which config each server was probed with."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        probed: list[dict] = []
+
+        async def fake_probe(cfg, timeout):
+            probed.append(cfg)
+            return StagedProbeResult(stage=ProbeStage.CONFIGURED, error="stub")
+
+        monkeypatch.setattr(proxy_mod, "_probe_one", fake_probe)
+        return probed
+
+    def test_health_probes_env_only_upstream(self, runner, config, monkeypatch):
+        """An upstream defined only in the environment is one the running server
+        serves, so health probes it — the rule doctor has applied since #831.
+        Health used to read the file map alone and print "No upstream servers
+        configured." here."""
+        probed = self._record_probed(monkeypatch)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+            json.dumps({"envsrv": {"prefix": "envsrv", "command": "env-cmd"}}),
+        )
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert set(json.loads(result.output)["servers"]) == {"envsrv"}
+        assert [cfg["command"] for cfg in probed] == ["env-cmd"]
+
+        text = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert text.exit_code == 0, text.output
+        assert "No upstream servers configured" not in text.output
+        assert "envsrv" in text.output
+
+    def test_health_probes_env_override_of_file_upstream(self, runner, config, monkeypatch):
+        """An env override of one field changes what the server would run, so
+        the probe gets the merged entry, not the file's."""
+        probed = self._record_probed(monkeypatch)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__fs__COMMAND", "env-cmd")
+        config.write_text(
+            json.dumps({"upstream_servers": {"fs": {"prefix": "fs", "command": "file-cmd"}}}),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert set(json.loads(result.output)["servers"]) == {"fs"}
+        assert [(cfg["prefix"], cfg["command"]) for cfg in probed] == [("fs", "env-cmd")]
+
+    def test_health_probes_file_map_when_runtime_config_is_invalid(
+        self, runner, config, monkeypatch
+    ):
+        """With a startup-invalid environment there is no effective snapshot to
+        trust, so health keeps probing the file's servers, as doctor does."""
+        probed = self._record_probed(monkeypatch)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", "[]")
+        config.write_text(
+            json.dumps({"upstream_servers": {"fs": {"prefix": "fs", "command": "file-cmd"}}}),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["config_valid"] is False
+        assert set(data["servers"]) == {"fs"}
+        assert [cfg["command"] for cfg in probed] == ["file-cmd"]
+
+    def test_health_rechecks_the_snapshot_it_probes(self, runner, config, monkeypatch):
+        """Health reads the file before the runtime read. A file edited in between
+        can pass the runtime read and fail as the snapshot health probes; that
+        snapshot must be reported invalid and the file's servers probed, the way
+        doctor handles the same race."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        probed = self._record_probed(monkeypatch)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__a__COMMAND", "env-cmd")
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "a": {"prefix": "dup", "command": "file-cmd"},
+                        "b": {"prefix": "dup", "command": "file-cmd"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            proxy_mod,
+            "_runtime_proxy_read",
+            lambda *_args, **_kwargs: proxy_mod._RuntimeProxyRead(None, None, frozenset()),
+        )
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["config_valid"] is False
+        assert data["config_error"] == "1 validation error(s): value_error"
+        assert sorted(cfg["command"] for cfg in probed) == ["file-cmd", "file-cmd"]
 
     def test_health_json_no_servers(self, runner, config, monkeypatch):
         monkeypatch.delenv("MEMTOMEM_STM_LOG_FILE", raising=False)

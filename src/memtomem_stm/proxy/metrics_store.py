@@ -6,6 +6,7 @@ import logging
 import sqlite3
 import threading
 import time
+from collections.abc import Collection
 from pathlib import Path
 
 from memtomem_stm.proxy.metrics import (
@@ -149,21 +150,223 @@ _SCHEMA_FINGERPRINT_KEY = "schema_fingerprint"
 # would stamp "current" over a schema it never changed. Those need a real
 # migration step first — a pre-existing limit of this store, not one the
 # fingerprint introduces.
-_SCHEMA_EPOCH = 1
+_SCHEMA_EPOCH = 2
+
+# ── Daily rollup (#1316) ────────────────────────────────────────────────────
+#
+# ``proxy_metrics`` is bounded (``max_history`` per source), so "all time" has
+# to live somewhere trimming never reaches. ``proxy_metrics_daily`` holds the
+# rows that have LEFT the raw table: an AFTER DELETE trigger folds each deleted
+# row into its ``(UTC day, source, server, tool)`` bucket, and an all-time
+# total is the daily buckets plus the rows still retained. Rolling up on delete
+# rather than on insert is what makes this exact:
+#
+# - each row is either still retained or was deleted exactly once, and the
+#   trigger runs inside the deleting statement, so there is no watermark, no
+#   backfill and nothing to double count;
+# - the trigger lives in the database file, so a DELETE issued by an older STM
+#   build — which knows nothing about this table — still feeds it. Mixed
+#   versions writing one file are the normal state (each MCP client spawns its
+#   own proxy), and an insert-side counter would miss every row they write.
+#
+# Contract: ANY delete from ``proxy_metrics`` is rolled up, so to reset the
+# history clear both tables with ``DELETE FROM``, ``proxy_metrics`` FIRST — the
+# other order refills the daily table from the rows being deleted. Never ``DROP TABLE
+# proxy_metrics_daily`` while the trigger exists: the trigger would then fail
+# with "no such table", which fails every trim on every binary — rolling back
+# the write that triggered it, and the next write retries that trim (its
+# rolled-back id is reused), so nearly every write fails — and fails startup
+# reconciliation too.
+#
+# The trigger must therefore be unable to fail. Its UPSERT can fail only on a
+# NOT NULL violation, a type error, a missing table, or I/O. The table is not
+# STRICT (no type errors), the missing table is the contract above, and I/O
+# would fail the DELETE anyway. That leaves NOT NULL. The counters are
+# nullable, so no inserted value or increment can violate it even if a future
+# term forgets its guard (integer overflow in ``+`` turns REAL rather than
+# raising); in practice the ``_finite`` guard below already keeps every
+# contribution a number. Only the key
+# columns are NOT NULL, and each has a non-NULL fallback: ``date()`` returns
+# NULL for a ``created_at`` it cannot convert (text, 1e300), so such rows land
+# in the ``'unknown'`` day.
+#
+# Values are kept finite at the source rather than repaired downstream: each
+# summed column passes through ``_finite`` (see ``_row_terms``), so a NULL,
+# text, ``inf`` or NaN contributes 0 and no bucket can hold a non-finite
+# counter — which would otherwise poison every later increment (``inf + -inf``
+# is NULL) and break rendering. The increments also start from
+# ``COALESCE(counter, 0)``, so a counter blanked by outside damage recovers.
+#
+# Changing the trigger body later needs a new trigger name (the ``_v1``
+# suffix) plus a DROP of the old one: ``CREATE TRIGGER IF NOT EXISTS`` keeps an
+# existing trigger as it is.
+
+_DAILY_TABLE = "proxy_metrics_daily"
+_ROLLUP_TRIGGER = "proxy_metrics_rollup_on_delete_v1"
+_ROLLUP_INSTALLED_KEY = "rollup_installed_at"
+_ROLLUP_LOST_KEY = "rollup_rows_lost_before_install"
+_UNKNOWN_DAY = "unknown"
+
+# What one row contributes to its bucket. These are also the daily table's
+# counter columns, and the per-row terms ``read_compression_summary`` sums, so
+# the live summary and the rollup apply one rule.
+_ROLLUP_COUNTERS = (
+    "calls",
+    "errors",
+    "legacy_calls",
+    "legacy_original_chars",
+    "legacy_compressed_chars",
+    "classified_calls",
+    "unclassified_calls",
+    "structured_calls",
+    "structured_original_chars",
+    "structured_base_chars",
+    "structured_wire_bytes",
+)
+
+
+def _finite(expr: str) -> str:
+    """``expr`` when it is a number in int64 range, else 0.
+
+    A comparison, not ``abs()``: ``abs(-9223372036854775808)`` raises "integer
+    overflow", and nothing in the trigger may raise. NULL and NaN (stored as
+    NULL) fail ``BETWEEN``; text compares above every number; ``inf`` is out of
+    range — all contribute 0.
+    """
+    return f"CASE WHEN {expr} BETWEEN -9.2e18 AND 9.2e18 THEN {expr} ELSE 0 END"
+
+
+def _row_terms(cols: Collection[str], prefix: str = "") -> dict[str, str]:
+    """SQL for what one ``proxy_metrics`` row contributes to each counter.
+
+    ``prefix`` is ``""`` for an aggregate over the table and ``"OLD."`` inside
+    the delete trigger. ``cols`` is the set of columns the table has: each term
+    reads a column only when it exists, so a pre-migration DB still reads (the
+    trigger is created after ``_migrate`` and always gets the full set).
+
+    Old progressive writers used incompatible bases (#1039). Their values stay
+    in the totals, but rows of unknown basis are counted rather than
+    relabelled. "Unclassified" is limited to what can distort a saved ratio: a
+    successful MCP row that contributes size. Error and no-payload rows written
+    by current code carry no stamp and no basis. A pre-``is_error`` DB cannot
+    tell errors apart, so its sized rows all count.
+
+    Every summed value goes through ``_finite``: NULL, text, ``inf`` and NaN
+    contribute 0, so neither the rollup nor a live total can turn non-finite
+    or NULL (see the rollup notes above). No writer produces such values —
+    sizes come from ``len()`` — so this changes nothing for real rows.
+    """
+    p = prefix
+    accounting = "compression_accounting" in cols
+    structured = (
+        f"COALESCE({p}compression_accounting = 'initial_structured_v1', 0)" if accounting else "0"
+    )
+    legacy = f"NOT ({structured})"
+    known = f"COALESCE({p}compression_accounting = 'initial_response_v1', 0)" if accounting else "0"
+    mcp = f"{p}source = 'mcp'" if "source" in cols else "1"
+    success = f"{p}is_error = 0" if "is_error" in cols else "1"
+    sized = f"({p}original_chars > 0 OR {p}compressed_chars > 0)"
+    original = _finite(f"{p}original_chars")
+    compressed = _finite(f"{p}compressed_chars")
+    wire = _finite(f"{p}wire_bytes") if "wire_bytes" in cols else "0"
+
+    def when(condition: str, value: str) -> str:
+        return f"CASE WHEN {condition} THEN {value} ELSE 0 END"
+
+    return {
+        "calls": "1",
+        "errors": _finite(f"{p}is_error") if "is_error" in cols else "0",
+        "legacy_calls": when(legacy, "1"),
+        "legacy_original_chars": when(legacy, original),
+        "legacy_compressed_chars": when(legacy, compressed),
+        "classified_calls": when(f"{mcp} AND {known}", "1"),
+        "unclassified_calls": when(
+            f"{mcp} AND {legacy} AND NOT {known} AND {success} AND {sized}", "1"
+        ),
+        "structured_calls": when(structured, "1"),
+        "structured_original_chars": when(structured, original),
+        "structured_base_chars": when(structured, compressed),
+        "structured_wire_bytes": when(structured, wire),
+    }
+
+
+def _created_at_terms(prefix: str = "") -> tuple[str, str]:
+    """``(day, epoch-or-NULL)`` for a row's ``created_at``.
+
+    A value ``date()`` cannot convert maps to the ``'unknown'`` day and a NULL
+    timestamp, never to NULL day (the trigger's NOT NULL key).
+    """
+    converted = f"date({prefix}created_at, 'unixepoch')"
+    day = f"COALESCE({converted}, '{_UNKNOWN_DAY}')"
+    epoch = f"CASE WHEN {converted} IS NULL THEN NULL ELSE CAST({prefix}created_at AS REAL) END"
+    return day, epoch
+
+
+_DAILY_CREATE = (
+    f"CREATE TABLE IF NOT EXISTS {_DAILY_TABLE} (\n"
+    "    day TEXT NOT NULL,\n"
+    "    source TEXT NOT NULL,\n"
+    "    server TEXT NOT NULL,\n"
+    "    tool TEXT NOT NULL,\n"
+    # Nullable on purpose — see the rollup notes above.
+    + "".join(f"    {name} INTEGER DEFAULT 0,\n" for name in _ROLLUP_COUNTERS)
+    + "    min_created_at REAL,\n"
+    "    PRIMARY KEY (day, source, server, tool)\n"
+    ") WITHOUT ROWID"
+)
+
+
+def _rollup_trigger_ddl() -> str:
+    terms = _row_terms(_BASE_COLUMNS | set(_MIGRATIONS), prefix="OLD.")
+    day, epoch = _created_at_terms("OLD.")
+    columns = ", ".join(("day", "source", "server", "tool", *_ROLLUP_COUNTERS, "min_created_at"))
+    values = ", ".join(
+        (
+            day,
+            "COALESCE(OLD.source, '')",
+            "COALESCE(OLD.server, '')",
+            "COALESCE(OLD.tool, '')",
+            *(terms[name] for name in _ROLLUP_COUNTERS),
+            epoch,
+        )
+    )
+    increments = ", ".join(
+        f"{name} = COALESCE({name}, 0) + excluded.{name}" for name in _ROLLUP_COUNTERS
+    )
+    # Scalar ``min(x, NULL)`` is NULL in SQLite, so a NULL on either side keeps
+    # the other rather than erasing a known timestamp.
+    earliest = (
+        "min_created_at = CASE WHEN excluded.min_created_at IS NULL THEN min_created_at "
+        "WHEN min_created_at IS NULL THEN excluded.min_created_at "
+        "ELSE min(min_created_at, excluded.min_created_at) END"
+    )
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {_ROLLUP_TRIGGER} "
+        "AFTER DELETE ON proxy_metrics FOR EACH ROW BEGIN "
+        f"INSERT INTO {_DAILY_TABLE} ({columns}) VALUES ({values}) "
+        "ON CONFLICT (day, source, server, tool) DO UPDATE SET "
+        f"{increments}, {earliest}; END"
+    )
+
+
+_ROLLUP_TRIGGER_DDL = _rollup_trigger_ddl()
+
+_ROLLUP_OBJECT_NAMES = (_DAILY_TABLE, _ROLLUP_TRIGGER)
 
 
 def _schema_fingerprint() -> str:
     """Describe the schema ``initialize`` would produce, as a stable string.
 
-    Covers exactly what the slow path can apply: the set of column *names* and
-    the index names, plus the epoch. Derived from ``_MIGRATIONS`` rather than
+    Covers exactly what the slow path can apply: the set of column *names*, the
+    index names and the rollup objects, plus the epoch. Derived from ``_MIGRATIONS`` rather than
     hand-maintained, so adding a column invalidates every stamped DB on its own
     with no version to bump — see ``_SCHEMA_EPOCH`` for what it deliberately
     does not cover. Plain text, not a hash, so a stale stamp is readable with
     ``sqlite3 proxy_metrics.db 'SELECT * FROM metrics_meta'``.
     """
     columns = ",".join(sorted(_BASE_COLUMNS | set(_MIGRATIONS)))
-    return f"{_SCHEMA_EPOCH}|{columns}|{','.join(_INDEX_NAMES)}"
+    rollup = ",".join(_ROLLUP_OBJECT_NAMES)
+    return f"{_SCHEMA_EPOCH}|{columns}|{','.join(_INDEX_NAMES)}|{rollup}"
 
 
 _SCHEMA_FINGERPRINT = _schema_fingerprint()
@@ -227,6 +430,73 @@ def read_compression_summary(
     any source other than the legacy ``'mcp'`` default returns an empty (but
     ``available``) summary, since no row can carry that source.
     """
+    return _read_compression(db_path, tool=tool, source=source, all_time=False)
+
+
+def read_compression_all_time(
+    db_path: Path, tool: str | None = None, source: str | None = None
+) -> dict[str, object]:
+    """All-time compression totals: retained rows plus the daily rollup (#1316).
+
+    Same read-only contract, filters and keys as :func:`read_compression_summary`
+    with three differences:
+
+    - ``available`` is ``False`` unless the rollup is installed — the daily
+      table, its trigger AND the installation marker all present — so a DB this
+      version has not opened yet never reports its retained window under an
+      all-time label;
+    - ``by_tool`` entries have no ``tuner_calls``: the tuner reads a time window,
+      and a deleted row's tuner eligibility is not kept;
+    - a ``rollup`` key describes coverage: ``installed``, ``installed_at``
+      (epoch), ``lost_before_install`` (rows already trimmed when the trigger
+      was created; ``None`` if unreadable), ``earliest_created_at`` (the
+      earliest real timestamp among the counted rows, after filters),
+      ``incomplete_before`` (``installed_at`` when rows were lost before
+      installation and the counted rows reach back before it, else ``None``)
+      and ``unknown_date_calls`` (rows whose ``created_at`` was not a
+      convertible timestamp; counted, but undated).
+    """
+    return _read_compression(db_path, tool=tool, source=source, all_time=True)
+
+
+def _rollup_markers(db: sqlite3.Connection) -> tuple[float, int | None] | None:
+    """``(installed_at, lost_before_install)`` if the rollup is installed, else None.
+
+    Installed means all three objects exist: the daily table, the trigger that
+    feeds it, and the installation marker. They are created in one transaction,
+    so only external damage separates them — and a table with no trigger is
+    exactly the state that would under-count while looking complete.
+    """
+    names = {
+        row[0]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE (type = 'table' AND name IN (?, ?)) "
+            "OR (type = 'trigger' AND name = ?)",
+            ("metrics_meta", _DAILY_TABLE, _ROLLUP_TRIGGER),
+        )
+    }
+    if names != {"metrics_meta", _DAILY_TABLE, _ROLLUP_TRIGGER}:
+        return None
+    meta = dict(
+        db.execute(
+            "SELECT key, value FROM metrics_meta WHERE key IN (?, ?)",
+            (_ROLLUP_INSTALLED_KEY, _ROLLUP_LOST_KEY),
+        ).fetchall()
+    )
+    try:
+        installed_at = float(meta[_ROLLUP_INSTALLED_KEY])
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        lost: int | None = int(meta[_ROLLUP_LOST_KEY])
+    except (KeyError, TypeError, ValueError):
+        lost = None
+    return installed_at, lost
+
+
+def _read_compression(
+    db_path: Path, *, tool: str | None, source: str | None, all_time: bool
+) -> dict[str, object]:
     resolved = db_path.expanduser().resolve()
     summary: dict[str, object] = {
         "path": str(resolved),
@@ -250,6 +520,16 @@ def read_compression_summary(
             "wire_bytes": 0,
         },
     }
+    rollup: dict[str, object] = {
+        "installed": False,
+        "installed_at": None,
+        "lost_before_install": None,
+        "earliest_created_at": None,
+        "incomplete_before": None,
+        "unknown_date_calls": 0,
+    }
+    if all_time:
+        summary["rollup"] = rollup
     if not resolved.exists():
         return summary
 
@@ -273,7 +553,13 @@ def read_compression_summary(
         # counts, so it must not raise this flag — the missing-``source`` case is
         # handled by the ``source``-filter guard below, not this flag.
         summary["schema_outdated"] = not has_is_error
-        error_expr = "SUM(is_error)" if has_is_error else "0"
+
+        if all_time:
+            markers = _rollup_markers(db)
+            if markers is None:
+                return summary
+            rollup["installed"] = True
+            rollup["installed_at"], rollup["lost_before_install"] = markers
 
         if (tool is not None and has_lone_surrogate(tool)) or (
             source is not None and has_lone_surrogate(source)
@@ -305,56 +591,53 @@ def read_compression_summary(
             conditions.append("source = ?")
             params.append(source)
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        structured = (
-            "COALESCE(compression_accounting = 'initial_structured_v1', 0)"
-            if "compression_accounting" in cols
-            else "0"
-        )
-        legacy = f"NOT ({structured})"
-        wire = "wire_bytes" if "wire_bytes" in cols else "0"
-        # Old progressive writers used incompatible bases (#1039). Their values
-        # stay in the totals, but rows of unknown basis are counted rather
-        # than relabelled. "Unclassified" is limited to what can distort a
-        # saved ratio: a successful MCP row that contributes size. Error and
-        # no-payload rows written by current code carry no stamp and no basis.
-        # Each term reads a column only when this DB has it: a pre-``is_error``
-        # DB cannot tell errors apart, so its sized rows all count.
-        mcp = "source = 'mcp'" if has_source else "1"
-        known = (
-            "COALESCE(compression_accounting = 'initial_response_v1', 0)"
-            if "compression_accounting" in cols
-            else "0"
-        )
-        success = "is_error = 0" if has_is_error else "1"
-        sized = "(original_chars > 0 OR compressed_chars > 0)"
-        # The calls the tuner's profiles count: every row but a metadata/native
-        # bypass, which ``get_tool_profiles`` drops (#1122). A DB without the
-        # column predates the label, so all of its rows count.
-        if "compression_strategy" in cols:
-            tuner_expr = (
-                "SUM(CASE WHEN compression_strategy IS NOT ? "
-                "AND compression_strategy IS NOT ? THEN 1 ELSE 0 END)"
+        terms = _row_terms(cols)
+        live = [f"{terms[name]} AS {name}" for name in _ROLLUP_COUNTERS]
+        inner_params: list[object] = []
+        if all_time:
+            _day, epoch = _created_at_terms()
+            live.append(f"{epoch} AS min_created_at")
+            live.append(f"CASE WHEN {epoch} IS NULL THEN 1 ELSE 0 END AS unknown_date_calls")
+            daily = [
+                *_ROLLUP_COUNTERS,
+                "min_created_at",
+                f"CASE WHEN day = '{_UNKNOWN_DAY}' THEN calls ELSE 0 END",
+            ]
+            # One statement over both halves, so a trim that moves rows from the
+            # raw table into the rollup between two reads cannot count them
+            # twice or not at all.
+            inner = (
+                f"SELECT server, tool, {', '.join(live)} FROM proxy_metrics{where} "
+                f"UNION ALL SELECT server, tool, {', '.join(daily)} FROM {_DAILY_TABLE}{where}"
             )
-            select_params: list[object] = [METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY]
+            inner_params = [*params, *params]
+            extra = "0, MIN(min_created_at), SUM(unknown_date_calls)"
         else:
-            tuner_expr = "COUNT(*)"
-            select_params = []
+            # The calls the tuner's profiles count: every row but a
+            # metadata/native bypass, which ``get_tool_profiles`` drops (#1122).
+            # A DB without the column predates the label, so all of its rows
+            # count.
+            if "compression_strategy" in cols:
+                live.append(
+                    "CASE WHEN compression_strategy IS NOT ? "
+                    "AND compression_strategy IS NOT ? THEN 1 ELSE 0 END AS tuner_calls"
+                )
+                inner_params = [METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY]
+            else:
+                live.append("1 AS tuner_calls")
+            inner = f"SELECT server, tool, {', '.join(live)} FROM proxy_metrics{where}"
+            inner_params = [*inner_params, *params]
+            extra = "SUM(tuner_calls), NULL, 0"
         # One statement, so the provenance counts and size totals share a
         # snapshot while the server appends rows.
         rows = db.execute(
-            f"SELECT server, tool, SUM(CASE WHEN {legacy} THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN {legacy} THEN original_chars ELSE 0 END), "
-            f"SUM(CASE WHEN {legacy} THEN compressed_chars ELSE 0 END), {error_expr}, "
-            f"SUM(CASE WHEN {mcp} AND {known} THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN {mcp} AND {legacy} AND NOT {known} AND {success} AND {sized} "
-            f"THEN 1 ELSE 0 END), {tuner_expr}, "
-            f"SUM(CASE WHEN {structured} THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN {structured} THEN original_chars ELSE 0 END), "
-            f"SUM(CASE WHEN {structured} THEN compressed_chars ELSE 0 END), "
-            f"SUM(CASE WHEN {structured} THEN {wire} ELSE 0 END) "
-            f"FROM proxy_metrics{where} GROUP BY server, tool "
-            "ORDER BY COUNT(*) DESC",
-            [*select_params, *params],
+            "SELECT server, tool, SUM(legacy_calls), SUM(legacy_original_chars), "
+            "SUM(legacy_compressed_chars), SUM(errors), SUM(classified_calls), "
+            f"SUM(unclassified_calls), {extra}, SUM(structured_calls), "
+            "SUM(structured_original_chars), SUM(structured_base_chars), "
+            f"SUM(structured_wire_bytes) FROM ({inner}) GROUP BY server, tool "
+            "ORDER BY SUM(calls) DESC",
+            inner_params,
         ).fetchall()
     except sqlite3.Error as exc:
         summary["error"] = exception_summary(exc)
@@ -364,7 +647,8 @@ def read_compression_summary(
 
     by_tool: list[dict[str, object]] = []
     total_calls = total_error = total_orig = total_comp = 0
-    classified = unclassified = 0
+    classified = unclassified = unknown_dates = 0
+    earliest: float | None = None
     structured_totals = {
         "calls": 0,
         "original_chars": 0,
@@ -381,6 +665,8 @@ def read_compression_summary(
         known_calls,
         unknown_calls,
         tuner_calls,
+        group_earliest,
+        group_unknown_dates,
         structured_calls,
         structured_orig,
         structured_base,
@@ -392,6 +678,9 @@ def read_compression_summary(
             structured_totals[k] += v or 0
         classified += known_calls or 0
         unclassified += unknown_calls or 0
+        unknown_dates += group_unknown_dates or 0
+        if group_earliest is not None and (earliest is None or group_earliest < earliest):
+            earliest = float(group_earliest)
         calls = calls or 0
         orig = orig or 0
         comp = comp or 0
@@ -400,17 +689,17 @@ def read_compression_summary(
         total_error += errors
         total_orig += orig
         total_comp += comp
-        by_tool.append(
-            {
-                "server": server,
-                "tool": tool_name,
-                "calls": calls,
-                "original_chars": orig,
-                "compressed_chars": comp,
-                "saved_ratio": _saved_ratio(orig, comp),
-                "tuner_calls": tuner_calls or 0,
-            }
-        )
+        entry: dict[str, object] = {
+            "server": server,
+            "tool": tool_name,
+            "calls": calls,
+            "original_chars": orig,
+            "compressed_chars": comp,
+            "saved_ratio": _saved_ratio(orig, comp),
+        }
+        if not all_time:
+            entry["tuner_calls"] = tuner_calls or 0
+        by_tool.append(entry)
 
     summary["available"] = True
     summary["initial_response_calls"] = classified
@@ -425,6 +714,20 @@ def read_compression_summary(
     summary["saved_chars"] = total_orig - total_comp
     summary["saved_ratio"] = _saved_ratio(total_orig, total_comp)
     summary["by_tool"] = by_tool
+    if all_time:
+        rollup["earliest_created_at"] = earliest
+        rollup["unknown_date_calls"] = unknown_dates
+        installed_at = rollup["installed_at"]
+        lost = rollup["lost_before_install"]
+        # Rows can be missing only from before installation, and only if some
+        # were already trimmed then (an unreadable count is treated as "some").
+        if (
+            isinstance(installed_at, float)
+            and lost != 0
+            and earliest is not None
+            and earliest < installed_at
+        ):
+            rollup["incomplete_before"] = installed_at
     return summary
 
 
@@ -521,23 +824,7 @@ class MetricsStore:
                 # created after _migrate has run.
                 db.execute(_SOURCE_INDEX)
                 db.execute(_SOURCE_ID_INDEX)
-                # Stamp LAST. This is an ORDERING guarantee, not an atomic one:
-                # the base DDL above and _migrate each commit before this runs,
-                # so a failure part-way leaves that partial DDL committed. What
-                # ordering buys is that the stamp never becomes CURRENT for a
-                # schema whose build did not finish — a fresh DB is left with no
-                # stamp and an upgrading one keeps its old (now stale) value, and
-                # both read as "not current", so the next opener redoes the full
-                # path. Concurrent openers both land here and write the same
-                # value (the DDL is idempotent and _migrate tolerates the
-                # duplicate-column race), so last-writer-wins is a no-op.
-                db.execute(_META_CREATE)
-                db.execute(
-                    "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (_SCHEMA_FINGERPRINT_KEY, _SCHEMA_FINGERPRINT),
-                )
-                db.commit()
+                self._install_rollup_and_stamp(db)
             # Reconcile every source once at startup: the per-write _trim only
             # covers the writer's own source, so an over-cap source that has
             # stopped receiving writes (e.g. after lowering max_history) would
@@ -549,6 +836,64 @@ class MetricsStore:
             db.close()
             raise
         self._db = db
+
+    @staticmethod
+    def _install_rollup_and_stamp(db: sqlite3.Connection) -> None:
+        """Create the rollup objects and stamp the fingerprint in ONE transaction.
+
+        Stamp LAST. For the base DDL and ``_migrate`` above this is an ORDERING
+        guarantee, not an atomic one: each commits before this runs, so a
+        failure part-way leaves that partial DDL committed. What ordering buys
+        is that the stamp never becomes CURRENT for a schema whose build did not
+        finish — a fresh DB is left with no stamp and an upgrading one keeps its
+        old (now stale) value, and both read as "not current", so the next
+        opener redoes the full path. Concurrent openers both land here and
+        write the same value (the DDL is idempotent and _migrate tolerates the
+        duplicate-column race), so last-writer-wins is a no-op.
+
+        The rollup objects, by contrast, ARE atomic with the stamp: Python's
+        sqlite3 opens no implicit transaction for DDL, so without the explicit
+        ``BEGIN IMMEDIATE`` a failure between the statements could leave a
+        daily table with no trigger feeding it — which a reader would take as
+        complete history. Under the transaction, the table, the trigger, the
+        installation marker and the stamp land together or not at all.
+
+        The markers are first-writer-wins (``DO NOTHING``): an older binary
+        re-stamping the DB with its own fingerprint sends the next opener back
+        through here, and that pass must not move the installation time.
+        ``rollup_rows_lost_before_install`` counts rows deleted before the
+        trigger existed: AUTOINCREMENT ids are never reused once committed, so
+        ``sqlite_sequence.seq - COUNT(*)`` is how many rows already left the
+        table. Zero means the history is complete from the first row.
+        """
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute(_META_CREATE)
+            db.execute(_DAILY_CREATE)
+            db.execute(_ROLLUP_TRIGGER_DDL)
+            installed = db.execute(
+                "INSERT INTO metrics_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                (_ROLLUP_INSTALLED_KEY, str(time.time())),
+            ).rowcount
+            if installed:
+                lost = db.execute(
+                    "SELECT max(0, COALESCE((SELECT seq FROM sqlite_sequence "
+                    "WHERE name = 'proxy_metrics'), 0) - (SELECT COUNT(*) FROM proxy_metrics))"
+                ).fetchone()[0]
+                db.execute(
+                    "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (_ROLLUP_LOST_KEY, str(int(lost))),
+                )
+            db.execute(
+                "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_SCHEMA_FINGERPRINT_KEY, _SCHEMA_FINGERPRINT),
+            )
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
 
     def _schema_is_current(self, db: sqlite3.Connection) -> bool:
         """Whether this DB already carries the schema ``initialize`` would build.
