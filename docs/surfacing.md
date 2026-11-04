@@ -171,17 +171,25 @@ are unaffected.
   pattern, the raw values are passed on unchanged, so the engine sends a
   `sha256:` digest instead of the text. Tokenizing first would hide the secret
   from that check.
-- **Paths** are made relative to the call's `cwd` (or lose their home prefix),
-  and drop scratchpad locations (`/private/tmp/…`, `/tmp/…`, `$TMPDIR`; a path
-  inside `cwd` never counts, so a repository checked out there still works),
-  id-like segments, `src` / `lib` / `tests` / `packages`, and the file extension:
+- **Paths** are made relative to the call's `cwd` (or lose their `/tmp/`,
+  `/private/tmp/` or home prefix), and drop id-like segments, `src` / `lib` /
+  `tests` / `packages`, and the file extension:
   `src/memtomem_stm/surfacing/context_extractor.py` becomes
-  `memtomem stm surfacing context extractor`.
+  `memtomem stm surfacing context extractor`. A path inside `cwd` is never a
+  scratchpad, so a repository checked out under a temp directory still works.
+- **Path arguments** (Read `file_path`, Grep/Glob `path`) are scratchpads only
+  under Claude Code's own temp root (`/tmp/claude-<uid>/…`,
+  `/private/tmp/claude-<uid>/…`), `/var/folders/…` or `$TMPDIR`, compared after
+  collapsing repeated `/` and `.` segments. Anything else under `/tmp`, such as
+  a release worktree read from another checkout, is tokenized.
 - **Shell commands** are read up to their first 1,000 characters, cut at the
   first heredoc (`<<`), split at `;`, `&&`,
   `||`, `|` and newlines, and read segment by segment. A `cd`, an inline Python
-  program (`python3 -c …`, `python3 -`) or a scratchpad read contributes
-  nothing; other segments contribute their path tokens and non-plumbing words.
+  program (`python3 -c …`, `python3 -`) or a segment naming any temp path
+  outside `cwd` (`/tmp/…`, `/private/tmp/…`, `/var/folders/…`, `$TMPDIR`)
+  contributes nothing, since commands there mix repositories with many
+  throwaway probe directories; other segments contribute their path tokens
+  and non-plumbing words.
   If no segment contributes, there is no query, even though the call has a
   `description`. Otherwise the query is the description's first sentence plus
   those tokens.
