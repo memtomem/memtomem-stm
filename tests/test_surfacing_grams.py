@@ -162,7 +162,12 @@ class TestPathKey:
 
 
 class TestFullyQualified:
-    """One rule for collection and the transcript reader, the same on every Python."""
+    """One rule for collection and the transcript reader.
+
+    These rows hold on every supported Python. ``pathlib`` itself is not stable
+    for every input (an incomplete UNC such as ``//server`` is absolute on 3.13
+    but not on 3.12), but collection and reader still agree within one version.
+    """
 
     @pytest.mark.parametrize(
         ("path", "expected"),
