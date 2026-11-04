@@ -1201,6 +1201,47 @@ def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
     assert read_compression_summary(db, source="hook")["total_calls"] == 0
 
 
+def test_record_hook_metrics_degrades_when_the_rollup_install_meets_a_lock(tmp_path: Path):
+    """First hook run against a pre-#1316 DB takes the rollup install path, whose
+    ``BEGIN IMMEDIATE`` must honour the hook's short busy timeout too: no row,
+    no raise, no stall — and the next run installs."""
+    import sqlite3
+    import time
+
+    from memtomem_stm.proxy.metrics_store import MetricsStore, read_compression_all_time
+
+    db = tmp_path / "metrics.db"
+    seed = MetricsStore(db)
+    seed.initialize()
+    seed.close()
+    raw = sqlite3.connect(str(db))
+    raw.execute("DROP TRIGGER proxy_metrics_rollup_on_delete_v1")
+    raw.execute("DROP TABLE proxy_metrics_daily")
+    raw.execute("DELETE FROM metrics_meta")
+    raw.commit()
+    raw.close()
+
+    cfg = _metrics_config(tmp_path)
+    payload = _canonical(_bash_payload({"stdout": _BIG_STDOUT}))
+    blocker = sqlite3.connect(str(db), timeout=0.1)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        start = time.monotonic()
+        _record_hook_metrics(payload, None, None, cfg)
+        elapsed = time.monotonic() - start
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert elapsed < 2.0
+    assert read_compression_all_time(db)["rollup"]["installed"] is False
+
+    _record_hook_metrics(payload, None, None, cfg)
+    after = read_compression_all_time(db, source="hook")
+    assert after["rollup"]["installed"] is True
+    assert after["total_calls"] == 1
+
+
 # ── bounded canonical call + merge builder ───────────────────────────────────
 
 
