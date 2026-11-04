@@ -153,7 +153,9 @@ def test_references_are_the_reviewed_set():
         # upstream server, tool and env-variable names (#1138).
         ("cli/proxy.py", "_schema_validation_summary"): 1,
         ("cli/proxy.py", "_surfacing_bootstrap_error"): 1,
-        ("cli/proxy.py", "doctor"): 1,
+        # ``doctor`` / ``health``: the env-overlaid ProxyConfig snapshot both
+        # check (moved out of ``doctor`` so the two share it).
+        ("cli/proxy.py", "_effective_upstreams"): 1,
         # ``~/.mms`` state: keys are server, env-variable and import-entry names.
         ("mms/state.py", "load_registry"): 1,
         ("mms/state.py", "load_projects_index"): 1,

@@ -161,6 +161,8 @@ Status meanings:
 | `MEMTOMEM_STM_SURFACING__INJECTION_MODE` | `prepend / append / section` | `append` | Memory-block placement. | Bundled |
 | `MEMTOMEM_STM_SURFACING__SECTION_HEADER` | string | `## Relevant Memories` | Header for section-mode injection. | Bundled |
 | `MEMTOMEM_STM_SURFACING__DEFAULT_NAMESPACE` | string or `null` | — | Default Core namespace. | Bundled |
+| `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES` | JSON string array | `["claude-plans","codex"]` | Namespace patterns never injected by surfacing. | Bundled |
+| `MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD` | boolean | `true` | Limit hook-call search to the current repository's namespaces. | Bundled |
 | `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` | JSON string array | `[]` | Tool patterns excluded from surfacing. | Bundled |
 | `MEMTOMEM_STM_SURFACING__WRITE_TOOL_PATTERNS` | JSON string array | `["*write*","*create*","*delete*","*push*","*send*","*remove*"]` | Mutation-like tool patterns skipped by default. | Bundled |
 | `MEMTOMEM_STM_SURFACING__CONTEXT_TOOLS` | JSON object | `{}` | Per-tool query, namespace, threshold, and count overrides. | Bundled |

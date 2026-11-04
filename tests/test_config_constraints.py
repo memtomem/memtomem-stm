@@ -269,6 +269,27 @@ class TestSurfacingWarmupConfig:
         assert STMConfig().surfacing.use_daemon is True
 
 
+class TestSurfacingNamespaceScopeConfig:
+    """Namespace exclusion and cwd project scoping: defaults and env overrides."""
+
+    def test_defaults(self) -> None:
+        cfg = SurfacingConfig()
+        assert cfg.exclude_namespaces == ["claude-plans", "codex"]
+        assert cfg.project_scope_from_cwd is True
+
+    def test_default_list_is_not_shared_between_instances(self) -> None:
+        first = SurfacingConfig()
+        first.exclude_namespaces.append("mutated")
+        assert SurfacingConfig().exclude_namespaces == ["claude-plans", "codex"]
+
+    def test_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES", "[]")
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD", "false")
+        surfacing = STMConfig().surfacing
+        assert surfacing.exclude_namespaces == []
+        assert surfacing.project_scope_from_cwd is False
+
+
 class TestLLMCompressorApiKey:
     """``provider=openai|anthropic`` with empty ``api_key`` used to send a
     malformed ``Bearer `` header and silently fall back to truncate; validate

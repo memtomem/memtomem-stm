@@ -1147,10 +1147,11 @@ class TestInitializeFastPath:
         fingerprint`` is satisfied by ``trace_id``, so a substring check would
         pass even for a column the fingerprint omits.
         """
-        epoch, columns, indexes = _SCHEMA_FINGERPRINT.split("|")
+        epoch, columns, indexes, rollup = _SCHEMA_FINGERPRINT.split("|")
         assert epoch.isdigit()
         assert set(columns.split(",")) == set(_MIGRATIONS) | set(_BASE_COLUMNS)
         assert set(indexes.split(",")) == set(_INDEX_NAMES)
+        assert rollup.split(",") == ["proxy_metrics_daily", "proxy_metrics_rollup_on_delete_v1"]
 
     def test_base_columns_match_the_create_statement(self):
         """``_BASE_COLUMNS`` is hand-written beside ``_CREATE``; this is what
