@@ -11,6 +11,22 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms stats --all-time` reports compression totals that survive the
+  per-source `proxy.metrics.max_history` trim. A database trigger folds every
+  row deleted from `proxy_metrics` into a never-pruned `proxy_metrics_daily`
+  table (UTC day × source × server × tool, with the same accounting classes
+  the retained summary distinguishes), and all-time totals are those rows
+  plus the retained ones. Rows trimmed by an older STM version sharing the
+  file are counted too, since the trigger lives in the database. The rollup
+  is installed on the first open by this version; rows trimmed before then
+  are not recoverable, and the output says from when the totals may be
+  incomplete and how many rows were already lost. Progressive-read and cache
+  counters are not covered yet (#1316). To reset the history, delete the rows
+  of `proxy_metrics` and then of `proxy_metrics_daily`; do not drop
+  `proxy_metrics_daily` while its trigger exists.
+
 ### Changed
 
 - `mms stats` no longer hides one source's savings behind another's volume.
