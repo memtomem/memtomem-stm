@@ -34,7 +34,6 @@ from stm_trial_fixtures import (
     DAY,
     EVENT_ID,
     MEMORY_ID,
-    NOTE,
     SESSION,
     _block,
     _extract,
@@ -130,34 +129,40 @@ def test_grep_path_defaults_to_cwd_and_pattern_tokens() -> None:
     assert "foo.py" not in patterns  # a substring never matches
 
 
-def test_casefold_is_passed_through() -> None:
-    assert _paths("read", {"file_path": _n("/A/B.md")}) == {_n("/A/B.md")}
-    assert st.entry_path_keys("read", {"file_path": _n("/A/B.md")}, None, casefold=True)[0] == {
-        _n("/a/b.md")
-    }
+@pytest.mark.parametrize("casefold", [False, True])
+def test_casefold_is_passed_through(tmp_path: Path, casefold: bool) -> None:
+    # With no cwd, extraction requires a fully qualified path. A POSIX literal
+    # such as /A/B.md is drive-relative on Windows, not an absolute fixture.
+    note = str(tmp_path / "A" / "B.md")
+    expected = os.path.normpath(note)
+    if casefold:
+        expected = expected.lower()
+    assert st.entry_path_keys("read", {"file_path": note}, None, casefold=casefold)[0] == {expected}
 
 
-def test_entry_hashes_join_with_collection_hashes(env: dict[str, Path]) -> None:
-    _record_event(env, EVENT_ID, arm="withheld")
+def test_entry_hashes_join_with_collection_hashes(env: dict[str, Path], tmp_path: Path) -> None:
+    home = tmp_path / "tester"
+    note = str(home / "notes" / "Alpha.md")
+    _record_event(env, EVENT_ID, arm="withheld", source=note)
     key = _key(env)
     ((_, _, _, lexical, dirs, basename, _),) = _rows(
         env["feedback"], "SELECT * FROM surfacing_memory_paths"
     )
-    read = st.entry_path_keys("read", {"file_path": NOTE}, None, casefold=_PLATFORM_CASEFOLD)[0]
+    read = st.entry_path_keys("read", {"file_path": note}, None, casefold=_PLATFORM_CASEFOLD)[0]
     bash = st.entry_path_keys(
         "shell",
         {"command": "cd notes && cat Alpha.md"},
-        "/Users/tester",
+        str(home),
         casefold=_PLATFORM_CASEFOLD,
     )[0]
     grep_paths, grep_tokens = st.entry_path_keys(
-        "grep", {"pattern": "Alpha.md", "path": "/Users/tester"}, None, casefold=_PLATFORM_CASEFOLD
+        "grep", {"pattern": "Alpha.md", "path": str(home)}, None, casefold=_PLATFORM_CASEFOLD
     )
     assert {keyed_hash(k, key) for k in read} == {lexical}
     assert lexical in {keyed_hash(k, key) for k in bash}
     assert {keyed_hash(k, key) for k in grep_paths} <= set(json.loads(dirs))
     assert basename in {keyed_hash(t, key) for t in grep_tokens}
-    assert path_key(NOTE) in read
+    assert path_key(note) in read
 
 
 # ── injections ─────────────────────────────────────────────────────────
