@@ -509,6 +509,11 @@ class TestTempRepositoryFromAnotherCwd:
     def test_equivalent_spellings_of_the_claude_root_stay_scratchpads(self, path: str) -> None:
         assert _builtin("Grep", {"path": path, "pattern": "jwt_handler"}) is None
 
+    @pytest.mark.parametrize("cwd", ["/var/folders/ab/hash/T/./repo", "/tmp/claude-501/./repo"])
+    def test_cwd_is_compared_in_the_same_canonical_form(self, cwd: str) -> None:
+        q = _builtin("Read", {"file_path": f"{cwd}/src/auth/jwt_handler.py"}, cwd=cwd)
+        assert q == "auth jwt handler"
+
     @pytest.mark.parametrize(
         "path", ["/tmp/claude-501/../repo/notes.md", "$TMPDIR/../review/notes.md"]
     )

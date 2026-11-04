@@ -331,8 +331,12 @@ class ContextExtractor:
             # ``/private/tmp/./claude-501/x`` are the scratchpad too.
             # ``PurePosixPath`` collapses repeated separators and ``.``
             # segments but leaves ``..`` alone, since resolving it lexically
-            # can name a different file under a symlink.
+            # can name a different file under a symlink. ``cwd`` gets the same
+            # form, or a path inside a ``…/./repo`` checkout would no longer
+            # match it.
             p = str(PurePosixPath(p))
+            if cwd:
+                cwd = str(PurePosixPath(cwd.replace("\\", "/")))
         if cls._is_scratch_path(p, cwd, broad=broad):
             return []
         relative = False
