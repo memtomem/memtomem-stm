@@ -550,6 +550,33 @@ def test_import_wired_into_top_level_cli(runner):
     assert "--allow-project-configs" in res.output
 
 
+def test_import_help_shows_registry_workflow_examples(runner):
+    from memtomem_stm.cli.proxy import cli
+
+    result = runner.invoke(cli, ["import", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "Examples:" in result.output
+    examples = [
+        line.strip() for line in result.output.splitlines() if line.strip().startswith("mms ")
+    ]
+    assert examples == [
+        "mms import",
+        "mms import --from cursor",
+        "mms import --apply",
+        "mms import --apply --allow-project-configs",
+        "mms host status",
+    ]
+    assert all(
+        len(line) <= 80 for line in result.output.splitlines() if line.strip().startswith("mms ")
+    )
+    note = " ".join(result.output.split())
+    assert "Writes ~/.mms/registry.toml, not the proxy config that mms add writes." in note
+    assert (
+        "--apply refuses new entries from project config files under the current directory "
+        "(such as .mcp.json) unless --allow-project-configs is given."
+    ) in note
+
+
 class TestDisplayEscaping:
     """Host configs are plain ``json.loads`` with no character validation, so an
     imported or hand-edited one can carry anything in ``_disp_escapes``'s set

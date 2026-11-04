@@ -779,7 +779,7 @@ async def test_a_locked_feedback_db_does_not_stall_the_admitted_burst(tmp_path: 
                 "payload": _canonical(
                     {
                         **_READ_PAYLOAD,
-                        "tool_input": {"file_path": f"/src/{word}/handler.py"},
+                        "tool_input": {"file_path": f"/src/{word}/service/handler.py"},
                     }
                 ).to_wire(),
                 # Generous on purpose: a deadline short enough to be shed at
@@ -1715,9 +1715,10 @@ _BURST_SEARCH_SECONDS = 0.3
 # Distinct *queries*, not just distinct paths. Identical queries serialize on
 # the engine's per-key stampede lock however much concurrency the daemon
 # allows, so a burst of those would prove nothing about #874 -- and a numeric
-# suffix does not make them distinct, because `_tokenize_path` drops purely
+# suffix does not make them distinct, because path tokenization drops purely
 # numeric segments (`jwt_handler_1.py` and `jwt_handler_2.py` both extract to
-# "src auth jwt handler py").
+# "auth jwt handler"). The extra `service` level keeps each native-tool query
+# at the 3-token floor once `src` and the extension are dropped.
 _BURST_PATH_WORDS = (
     "auth",
     "billing",
@@ -1741,7 +1742,7 @@ async def _warm_and_burst(cfg: STMConfig) -> tuple[DaemonServer, list[dict | Non
             _canonical(
                 {
                     **_READ_PAYLOAD,
-                    "tool_input": {"file_path": f"/src/{word}/handler.py"},
+                    "tool_input": {"file_path": f"/src/{word}/service/handler.py"},
                 }
             )
             for word in _BURST_PATH_WORDS

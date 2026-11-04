@@ -185,7 +185,22 @@ def _classify_against_registry(
     return new, conflicts, idempotent
 
 
-@click.command("import")
+IMPORT_EPILOG = """Examples:
+
+Writes ~/.mms/registry.toml, not the proxy config that mms add writes.
+--apply refuses new entries from project config files under the current
+directory (such as .mcp.json) unless --allow-project-configs is given.
+
+\b
+  mms import
+  mms import --from cursor
+  mms import --apply
+  mms import --apply --allow-project-configs
+  mms host status
+"""
+
+
+@click.command("import", epilog=IMPORT_EPILOG)
 @click.option(
     "--from",
     "from_host",

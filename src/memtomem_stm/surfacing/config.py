@@ -142,6 +142,28 @@ class SurfacingConfig(BaseModel):
     injection_mode: Literal["prepend", "append", "section"] = "append"
     section_header: str = "## Relevant Memories"
     default_namespace: str | None = None
+    exclude_namespaces: list[str] = Field(default_factory=lambda: ["claude-plans", "codex"])
+    """fnmatch patterns over a retrieved result's namespace; matching results
+    are never injected. Applied to every surfacing call (hook or proxied,
+    project-scoped or not) before the score filter. Pinned Context is exempt:
+    it is operator-owned, not a retrieval hit.
+
+    The defaults name the two families measured as noise in automatic
+    surfacing: ``claude-plans`` holds ephemeral plans from earlier sessions,
+    ``codex`` holds another host's index and rollout files. Set ``[]`` to
+    inject them again."""
+    project_scope_from_cwd: bool = True
+    """When a native-tool hook call carries ``cwd`` and no namespace is pinned
+    (``default_namespace`` or ``context_tools.<tool>.namespace``), search only
+    the current repository's namespaces: ``claude:<slug>`` for each of its git
+    worktrees, ``shared:<repo>``, and ``default``. Any other namespace is not
+    searched for that call.
+
+    Only applied when Claude Code has a project directory for the repository
+    (``<config dir>/projects/<slug>``); otherwise the call keeps today's
+    unscoped search, so an unidentified project widens rather than narrows
+    retrieval. A session started in a subdirectory of a repository resolves to
+    the repository root. Proxied MCP calls carry no ``cwd`` and are unaffected."""
     exclude_tools: list[str] = []
     write_tool_patterns: list[str] = [
         "*write*",
