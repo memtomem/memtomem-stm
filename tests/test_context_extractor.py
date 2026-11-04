@@ -498,6 +498,15 @@ class TestTempRepositoryFromAnotherCwd:
         # token would otherwise lift a two-token pattern over the floor.
         assert _builtin("Grep", {"path": path, "pattern": "jwt_handler"}) is None
 
+    @pytest.mark.parametrize(
+        ("path", "cwd"),
+        [("/Users/u//tmp/auth/jwt.py", "/repo"), ("/repo//tmp/auth/jwt.py", "/repo")],
+    )
+    def test_temp_root_is_not_stripped_from_a_remainder(self, path: str, cwd: str) -> None:
+        # After the home prefix or cwd is removed, ``/tmp/…`` is an ordinary
+        # segment of the original path, not its temp root.
+        assert _builtin("Read", {"file_path": path}, cwd=cwd) == "tmp auth jwt"
+
     def test_command_naming_a_temp_repository_is_still_skipped(self) -> None:
         cmd = "cat /private/tmp/memtomem-release/CHANGELOG.md"
         assert _builtin("Bash", {"command": cmd, "description": "Read the changelog"}) is None
