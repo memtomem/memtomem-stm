@@ -179,17 +179,18 @@ are unaffected.
   scratchpad, so a repository checked out under a temp directory still works.
 - **Path arguments** (Read `file_path`, Grep/Glob `path`) are scratchpads only
   under Claude Code's own temp root (`/tmp/claude-<uid>/…`,
-  `/private/tmp/claude-<uid>/…`), `/var/folders/…` or `$TMPDIR`, compared after
-  collapsing repeated `/` and `.` segments. Anything else under `/tmp`, such as
-  a release worktree read from another checkout, is tokenized.
+  `/private/tmp/claude-<uid>/…`), `/var/folders/…` (or `/private/var/folders/…`)
+  or `$TMPDIR`, compared after collapsing repeated `/` and `.` segments.
+  Anything else under `/tmp`, such as a release worktree read from another
+  checkout, is tokenized.
 - **Shell commands** are read up to their first 1,000 characters, cut at the
   first heredoc (`<<`), split at `;`, `&&`,
   `||`, `|` and newlines, and read segment by segment. A `cd`, an inline Python
   program (`python3 -c …`, `python3 -`) or a segment naming any temp path
-  outside `cwd` (`/tmp/…`, `/private/tmp/…`, `/var/folders/…`, `$TMPDIR`)
-  contributes nothing, since commands there mix repositories with many
-  throwaway probe directories; other segments contribute their path tokens
-  and non-plumbing words.
+  outside `cwd` (`/tmp/…`, `/private/tmp/…`, `/var/folders/…`,
+  `/private/var/folders/…`, `$TMPDIR`) contributes nothing, since commands
+  there mix repositories with many throwaway probe directories; other segments
+  contribute their path tokens and non-plumbing words.
   If no segment contributes, there is no query, even though the call has a
   `description`. Otherwise the query is the description's first sentence plus
   those tokens.

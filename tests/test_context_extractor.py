@@ -540,6 +540,61 @@ class TestTempRepositoryFromAnotherCwd:
         assert _builtin("Bash", {"command": cmd}) == "auth jwt handler"
 
 
+class TestMacTempDirSpellings:
+    """#1334: macOS ``$TMPDIR`` is a scratchpad in both spellings (``/var`` is a
+    symlink to ``/private/var``). A path argument includes the directory itself;
+    a shell command matches descendants only."""
+
+    _CWD = "/Users/u/repo"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/private/var/folders/4n/mt3k/T/ctx.8Q5jnO/context.json",
+            "/private/var/folders/",
+            "/private/var/folders",
+            "/var/folders",
+        ],
+    )
+    def test_read_is_a_scratchpad(self, path: str) -> None:
+        assert _builtin("Grep", {"path": path, "pattern": "jwt_handler"}, cwd=self._CWD) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ls /private/var/folders/4n/mt3k/T/pytest-of-u/pytest-365/",
+            "ls /var/folders/4n/mt3k/T/pytest-of-u/pytest-365/",
+        ],
+    )
+    def test_command_segment_is_skipped(self, command: str) -> None:
+        assert _builtin("Bash", {"command": command}, cwd=self._CWD) is None
+
+    @pytest.mark.parametrize(
+        ("command", "query"),
+        [
+            # The path token stops at ``+``/``:``; the rest is not the temp dir.
+            ("cat /private/var/folders+archive/auth/jwt_handler.py", "private var folders"),
+            ("cat /private/var/folders:archive/auth/jwt_handler.py", "private var folders"),
+            # A bare root in a command is not matched (same as before #1334).
+            ("ls /private/var/folders/", "private var folders"),
+        ],
+    )
+    def test_command_root_token_is_not_a_scratchpad(self, command: str, query: str) -> None:
+        assert _builtin("Bash", {"command": command}, cwd=self._CWD) == query
+
+    def test_checkout_used_as_cwd_is_still_tokenized(self) -> None:
+        root = "/private/var/folders/4n/mt3k/T/pytest-of-u/pytest-1/repo"
+        assert _builtin("Read", {"file_path": f"{root}/src/auth/jwt_handler.py"}, cwd=root) == (
+            "auth jwt handler"
+        )
+        cmd = f"sed -n 1,20p {root}/src/auth/jwt_handler.py"
+        assert _builtin("Bash", {"command": cmd}, cwd=root) == "auth jwt handler"
+
+    def test_lookalike_directory_is_not_the_temp_root(self) -> None:
+        q = _builtin("Read", {"file_path": "/private/var/folders-other/auth/jwt_handler.py"})
+        assert q == "private var folders other auth jwt handler"
+
+
 class TestBuiltinPaths:
     def test_read_relative_to_cwd(self) -> None:
         q = _builtin(

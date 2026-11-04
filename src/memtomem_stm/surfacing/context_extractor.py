@@ -45,9 +45,23 @@ _HOME_PREFIX_RE = re.compile(r"^(?:~/|/Users/[^/]+/|/home/[^/]+/)")
 # Grep, Glob) use the narrow rule: only Claude Code's own temp root, which it
 # names ``claude-<uid>`` under the OS temp dir, plus the per-user ``$TMPDIR``
 # (``/var/folders/…`` on macOS).
-_SCRATCH_PREFIXES = ("/private/tmp/", "/tmp/", "/var/folders/", "$TMPDIR", "${TMPDIR}")
-_ARG_SCRATCH_PREFIXES = ("/var/folders/", "$TMPDIR", "${TMPDIR}")
+# ``/var`` is a symlink to ``/private/var`` on macOS and tools print either
+# spelling, so both rules list both.
+_SCRATCH_PREFIXES = (
+    "/private/tmp/",
+    "/tmp/",
+    "/var/folders/",
+    "/private/var/folders/",
+    "$TMPDIR",
+    "${TMPDIR}",
+)
+_ARG_SCRATCH_PREFIXES = ("$TMPDIR", "${TMPDIR}")
 _CLAUDE_TEMP_ROOT_RE = re.compile(r"^/(?:private/)?tmp/claude-[0-9]+(?:/|$)")
+# A path argument is the whole value, in canonical form (no trailing slash), so
+# the directory itself is matched too. A shell path token is cut by a regex and
+# may stop short of the real path (``/private/var/folders+x/…``), so shell
+# commands match descendants only, through ``_SCRATCH_PREFIXES``.
+_ARG_VAR_FOLDERS_RE = re.compile(r"^(?:/private)?/var/folders(?:/|$)")
 _TEMP_ROOT_RE = re.compile(r"^/(?:private/)?tmp/")
 _SEGMENT_SPLIT_RE = re.compile(r"\n|;|&&|\|\||\|")
 _LEADING_ASSIGNMENTS_RE = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
@@ -304,7 +318,11 @@ class ContextExtractor:
         if broad:
             if not p.startswith(_SCRATCH_PREFIXES):
                 return False
-        elif not (p.startswith(_ARG_SCRATCH_PREFIXES) or _CLAUDE_TEMP_ROOT_RE.match(p)):
+        elif not (
+            p.startswith(_ARG_SCRATCH_PREFIXES)
+            or _CLAUDE_TEMP_ROOT_RE.match(p)
+            or _ARG_VAR_FOLDERS_RE.match(p)
+        ):
             return False
         if cwd:
             root = cwd.replace("\\", "/").rstrip("/")
