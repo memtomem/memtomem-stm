@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from memtomem_stm.config import DaemonConfig, HookConfig, LangfuseConfig, STMConfig
+from memtomem_stm.config import (
+    DaemonConfig,
+    HookConfig,
+    LangfuseConfig,
+    STMConfig,
+    _is_loopback_host,
+)
 from memtomem_stm.proxy.config import (
     AutoIndexConfig,
     ExtractionConfig,
@@ -681,6 +687,28 @@ class TestLogLevel:
         monkeypatch.setenv("MEMTOMEM_STM_LOG_LEVEL", "DEBUG")
         cfg = STMConfig()
         assert cfg.log_level == "DEBUG"
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("localhost", True),
+        ("127.0.0.0", True),
+        ("127.255.255.255", True),
+        ("126.255.255.255", False),
+        ("128.0.0.1", False),
+        ("::1", True),
+        ("0:0:0:0:0:0:0:1", True),
+        ("::2", False),
+        ("fe80::1", False),
+        ("0.0.0.0", False),
+        ("::", False),
+        ("", False),
+    ],
+)
+def test_is_loopback_host_boundaries(host: str, expected: bool) -> None:
+    """Pin the daemon's loopback trust boundary for IPv4 and IPv6."""
+    assert _is_loopback_host(host) is expected
 
 
 class TestDaemonHostConstraint:
