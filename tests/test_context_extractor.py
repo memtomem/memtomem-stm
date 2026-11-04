@@ -431,6 +431,24 @@ class TestBuiltinRound2Regressions:
         ]
 
 
+class TestRepositoryUnderTmp:
+    """A repository checked out under a temp root is the work, not a scratchpad."""
+
+    _ROOT = "/tmp/pytest-of-runner/pytest-0/repo"
+
+    def test_read_inside_cwd_under_tmp_is_tokenized(self) -> None:
+        q = _builtin("Read", {"file_path": f"{self._ROOT}/src/auth/jwt_handler.py"}, cwd=self._ROOT)
+        assert q == "auth jwt handler"
+
+    def test_command_path_inside_cwd_under_tmp_is_not_a_scratchpad(self) -> None:
+        cmd = f"sed -n 1,20p {self._ROOT}/src/auth/jwt_handler.py"
+        assert _builtin("Bash", {"command": cmd}, cwd=self._ROOT) == "auth jwt handler"
+
+    def test_tmp_path_outside_cwd_is_still_a_scratchpad(self) -> None:
+        cmd = "cat /tmp/other/build.log"
+        assert _builtin("Bash", {"command": cmd, "description": "Read log"}, cwd=self._ROOT) is None
+
+
 class TestBuiltinPaths:
     def test_read_relative_to_cwd(self) -> None:
         q = _builtin(

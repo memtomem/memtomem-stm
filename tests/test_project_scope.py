@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -165,7 +166,19 @@ class TestResolveWithGit:
 
 
 class TestUnrepresentableRepositoryName:
-    @pytest.mark.parametrize("name", ["repo*", "repo,other", " repo"])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            pytest.param(
+                "repo*",
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32", reason="'*' is not a valid Windows file name"
+                ),
+            ),
+            "repo,other",
+            " repo",
+        ],
+    )
     async def test_shared_name_is_omitted_when_core_cannot_take_it_exactly(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
     ) -> None:

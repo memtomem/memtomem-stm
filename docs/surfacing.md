@@ -172,8 +172,9 @@ are unaffected.
   `sha256:` digest instead of the text. Tokenizing first would hide the secret
   from that check.
 - **Paths** are made relative to the call's `cwd` (or lose their home prefix),
-  and drop scratchpad locations (`/private/tmp/…`, `/tmp/…`, `$TMPDIR`), id-like
-  segments, `src` / `lib` / `tests` / `packages`, and the file extension:
+  and drop scratchpad locations (`/private/tmp/…`, `/tmp/…`, `$TMPDIR`; a path
+  inside `cwd` never counts, so a repository checked out there still works),
+  id-like segments, `src` / `lib` / `tests` / `packages`, and the file extension:
   `src/memtomem_stm/surfacing/context_extractor.py` becomes
   `memtomem stm surfacing context extractor`.
 - **Shell commands** are read up to their first 1,000 characters, cut at the

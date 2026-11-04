@@ -255,7 +255,7 @@ class ContextExtractor:
             # inside a flag (``--file=/tmp/patterns.txt``) or a redirection
             # (``</tmp/build.log``, ``> /tmp/out.txt``) — before either is
             # dropped below. This matches the replay's class definition.
-            if any(cls._is_scratch_path(m.group(0)) for m in _PATH_TOKEN_RE.finditer(segment)):
+            if any(cls._is_scratch_path(m.group(0), cwd) for m in _PATH_TOKEN_RE.finditer(segment)):
                 continue
             segment = _REDIRECT_RE.sub(" ", _FD_DUP_RE.sub(" ", segment))
             seg_tokens: list[str] = []
@@ -276,8 +276,17 @@ class ContextExtractor:
         return tokens if contributed else None
 
     @staticmethod
-    def _is_scratch_path(path: str) -> bool:
-        return path.replace("\\", "/").startswith(_SCRATCH_PREFIXES)
+    def _is_scratch_path(path: str, cwd: str | None) -> bool:
+        """A temp-directory path, unless it lies inside the call's ``cwd``:
+        a repository checked out under ``/tmp`` is the work, not a scratchpad."""
+        p = path.replace("\\", "/")
+        if not p.startswith(_SCRATCH_PREFIXES):
+            return False
+        if cwd:
+            root = cwd.replace("\\", "/").rstrip("/")
+            if p == root or p.startswith(root + "/"):
+                return False
+        return True
 
     @classmethod
     def _builtin_path_tokens(cls, path: str, cwd: str | None) -> list[str]:
@@ -290,7 +299,7 @@ class ContextExtractor:
         ``memtomem stm surfacing context extractor``.
         """
         p = path.strip().replace("\\", "/")
-        if cls._is_scratch_path(p):
+        if cls._is_scratch_path(p, cwd):
             return []
         if cwd:
             root = cwd.replace("\\", "/").rstrip("/")
