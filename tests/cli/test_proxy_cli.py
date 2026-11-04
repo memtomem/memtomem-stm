@@ -981,7 +981,21 @@ class TestConfigLoad:
         result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "No upstream servers configured" in result.output
+        assert "mms add" in result.output
         assert "Config not found" not in result.output
+
+    def test_list_empty_config_hint_withheld_on_invalid_proxy_env(
+        self, runner, config, monkeypatch
+    ):
+        """An invalid ``MEMTOMEM_STM_PROXY`` leaves the runtime configuration
+        invalid, so registering an upstream is not the fix and ``list`` must
+        not suggest it."""
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", "[]")
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "No upstream servers configured" in result.output
+        assert "mms add" not in result.output
 
     def test_list_json_missing_config(self, runner, config):
         """``list --json`` already returned ``config_not_found`` since #220;
@@ -1009,6 +1023,7 @@ class TestConfigLoad:
         assert "fails validation" in result.output
         assert "falls back to env/defaults" in result.output
         assert "No upstream servers configured" in result.output
+        assert "mms add" not in result.output
 
     def test_list_stays_silent_when_env_overrides_fix_the_file(self, runner, config, monkeypatch):
         """The warning claims what a *running server* does, so it has to be
@@ -1024,6 +1039,7 @@ class TestConfigLoad:
         result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "fails validation" not in result.output
+        assert "mms add" in result.output
 
         # Positive control: the same file without the override still warns,
         # so the assertion above is about the overlay and not about the

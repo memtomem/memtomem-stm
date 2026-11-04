@@ -2437,6 +2437,8 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
             )
         else:
             click.echo("No upstream servers configured.")
+            if config_error is None:
+                click.echo("Run `mms add` (or `mms init`) to register an upstream.")
         return
 
     # ``streamable_http`` is 15 chars — wider than the prior ``<12``

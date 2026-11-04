@@ -47,6 +47,13 @@ changes inline only. See the deprecation policy in
   of built-in defaults. A DB moved by an environment variable is the one it
   reads, and the `Enabled` / `Servers` lines (`enabled` / `servers` in
   `--json`) report the environment's values.
+- `mms list` now ends its empty-state message with "Run `mms add` (or
+  `mms init`) to register an upstream.", the hint `mms status` prints,
+  when the runtime configuration is valid. It stays silent when the file
+  fails validation or the proxy environment is invalid, since adding an
+  upstream is not the fix there. **Behavior change**: the human-readable
+  `mms list` output gains one line when no upstream servers are configured;
+  `--json`, `mms prune` and `mms health` are unchanged. (#1318, #1313)
 
 ### Fixed
 
