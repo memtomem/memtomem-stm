@@ -95,6 +95,19 @@ changes inline only. See the deprecation policy in
   crashing health with an `AttributeError` (exit 1 → exit 0, reported as an
   invalid config).
 
+- The holdout-trial extractor (`scripts/stm_trial.py`, repository only) decides
+  which transcript paths can be keyed without a `cwd` by the same rule
+  collection uses for memory sources, now shared as
+  `grams.fully_qualified`. It used `os.path.isabs`, which on Windows with
+  Python 3.12 accepts a rooted path without a drive (`\notes\a.md`): such a
+  path was keyed although collection never keys one, and a Bash `cd \dir`
+  replaced the working directory with the driveless `\dir` instead of keeping
+  its drive. macOS / Linux extract the same rows as before. On Windows with
+  Python 3.13+, drive-qualified, UNC, driveless and relative paths are judged
+  as before; only malformed spellings such as `/:/` can differ. (#1339, #1337)
+  **Behavior change**: none external — the script ships only in the
+  repository, and its extracted rows change only on Windows.
+
 ## [0.7.6] — 2026-11-02
 
 ### Changed

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import sqlite3
 import stat
@@ -138,6 +139,34 @@ def test_casefold_is_passed_through(tmp_path: Path, casefold: bool) -> None:
     if casefold:
         expected = expected.lower()
     assert st.entry_path_keys("read", {"file_path": note}, None, casefold=casefold)[0] == {expected}
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("C:\\notes\\a.md", {"C:\\notes\\a.md"}),
+        ("C:/notes/a.md", {"C:\\notes\\a.md"}),
+        ("\\\\server\\share\\a.md", {"\\\\server\\share\\a.md"}),
+        # Rooted but driveless: keyed by Python 3.12's ntpath.isabs, never by collection.
+        ("\\notes\\a.md", set()),
+        ("/notes/a.md", set()),
+        ("C:notes\\a.md", set()),
+    ],
+)
+def test_windows_read_without_cwd_needs_a_fully_qualified_path(
+    path: str, expected: set[str]
+) -> None:
+    keys = st.entry_path_keys("read", {"file_path": path}, None, casefold=False, pathmod=ntpath)
+    assert keys[0] == expected
+
+
+@pytest.mark.parametrize("cd", ["cd /notes", 'cd "\\notes"'])
+def test_windows_bash_rooted_cd_keeps_the_drive(cd: str) -> None:
+    keys = st.entry_path_keys(
+        "shell", {"command": f"{cd} && cat a.md"}, "C:\\r", casefold=False, pathmod=ntpath
+    )[0]
+    assert "C:\\notes\\a.md" in keys
+    assert "\\notes\\a.md" not in keys  # Python 3.12's isabs replaced the dir, dropping C:
 
 
 def test_entry_hashes_join_with_collection_hashes(env: dict[str, Path], tmp_path: Path) -> None:
