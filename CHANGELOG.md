@@ -13,14 +13,22 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
-- **Surfacing no longer injects `claude-plans` or `codex` results**, on any
-  call, and a native-tool hook call whose `cwd` is in a repository Claude Code
-  has a project directory for searches only that repository's namespaces and
-  `default`. Native-tool queries are built differently, and a query under
-  `min_query_tokens` is skipped instead of padded with the tool name.
-  `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'` and
+- **Surfacing drops retrieved `claude-plans` and `codex` results** on every
+  call, hook or proxied (Pinned Context is exempt), and a native-tool hook call
+  with no pinned namespace, whose `cwd` is in a repository Claude Code has a
+  project directory for, searches only that repository's `claude:` and
+  `shared:` namespaces and `default`. Native-tool queries are built
+  differently, and one under `min_query_tokens` is skipped instead of padded
+  with the tool name, so some Reads that surfaced memories on 0.7.6 surface
+  nothing. `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'` and
   `MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD=false` restore 0.7.6's
-  namespaces. Proxied MCP tools build their queries as before. (#1326)
+  namespaces; how queries are built has no switch. Proxied MCP tools build their
+  queries as before. (#1326)
+- **The metrics database keeps daily totals indefinitely.** The first open by
+  0.7.7 adds a `proxy_metrics_daily` table and a trigger that folds every row
+  trimmed from `proxy_metrics` into it, also when an older STM sharing the
+  file trims. To reset the history, delete the rows of `proxy_metrics`, then
+  of `proxy_metrics_daily`. (#1327)
 - **`mms health --json` `servers` includes upstreams defined only by
   environment variables**, and each probe uses the env-overridden entry. A
   non-object server entry in the file exits 0 as an invalid config instead of
@@ -28,14 +36,20 @@ changes inline only. See the deprecation policy in
 - **With an invalid proxy config file, `mms stats` reads the
   environment-derived config** instead of built-in defaults, so a DB moved by
   an environment variable is the one it reads. (#1319)
-- Human-readable output gains lines: `mms list` with no upstreams (#1318) and
-  `stm_admin(action="proxy_stats")` once a live call is recorded (#1323).
+- Output changes: `mms stats` adds per-source lines, a Progressive delivery
+  section and a window line, and `--json` adds `compression_by_source` and
+  `progressive` (#1319); `mms status` closes with a different hint when the
+  runtime configuration is invalid (#1320); `mms list` with no upstreams
+  (#1318) and `stm_admin(action="proxy_stats")` once a live call is recorded
+  (#1323) gain lines; `mms import --help` gains examples (#1332).
   `TokenTracker.get_summary()` gains `latency_samples`.
 
 ### Added
 
 - `mms import --help` shows preview, apply and verification examples, with
   the registry destination and project-config acknowledgement explained. (#1332)
+  **Behavior change**: `mms import --help` output is longer; the command's
+  options and behavior are unchanged.
 
 - `mms stats --all-time` reports compression totals that survive the
   per-source `proxy.metrics.max_history` trim. A database trigger folds every
@@ -50,6 +64,9 @@ changes inline only. See the deprecation policy in
   counters are not covered yet (#1316). To reset the history, delete the rows
   of `proxy_metrics` and then of `proxy_metrics_daily`; do not drop
   `proxy_metrics_daily` while its trigger exists. (#1327, #1316)
+  **Behavior change**: the first open by this version adds the table and the
+  trigger to the metrics database, so trimmed rows are kept as daily totals
+  whether or not `--all-time` is ever used; they stay after a downgrade.
 
 ### Changed
 
@@ -61,19 +78,21 @@ changes inline only. See the deprecation policy in
   - **Repository scope**: with the new `surfacing.project_scope_from_cwd`
     (default `true`), a hook call that carries `cwd` and has no pinned
     namespace searches only `claude:<slug>` for each git worktree of the
-    repository holding `cwd`, `shared:<repository directory name>` and
-    `default`. It applies only when Claude Code has a project directory for
-    one of those worktrees; otherwise the call searches every namespace as
-    before.
+    repository holding `cwd` and for `cwd` itself,
+    `shared:<repository directory name>` (left out when the name contains
+    `,` or `*`) and `default`. It applies only when Claude Code has a project
+    directory for one of those worktrees; otherwise the call searches every
+    namespace as before. A pinned namespace (`default_namespace` or
+    `context_tools.<tool>.namespace`) wins over the scope.
   - **Excluded namespaces**: the new `surfacing.exclude_namespaces` (default
     `["claude-plans", "codex"]`, fnmatch patterns) drops matching results
     and their context-window neighbours on every surfacing call, hook or
     proxied. Pinned Context is exempt.
   - **Queries**: paths are made relative to `cwd` and lose their home or
     temp prefix, id-like segments, `src` / `lib` / `tests` / `packages` and
-    the extension; a path argument under Claude Code's own temp root
-    (`/tmp/claude-<uid>`), `/var/folders` or `/private/var/folders`, or
-    `$TMPDIR` yields nothing. Shell commands are read segment by segment, and
+    the extension; a path argument outside `cwd` under Claude Code's own
+    temp root (`/tmp/claude-<uid>`), `/var/folders` or
+    `/private/var/folders`, or `$TMPDIR` yields nothing. Shell commands are read segment by segment, and
     a `cd`, inline Python or a segment naming a temp path outside `cwd`
     contributes nothing. Native-tool queries are no longer padded with the
     tool name. With `cwd` `/Users/u/work/repo`, a Read of
@@ -82,14 +101,15 @@ changes inline only. See the deprecation policy in
     queries `surfacing context extractor` now. Proxied MCP tools build their
     queries as before. Details: `docs/surfacing.md`.
 
-  **Behavior change**: when the scope applies, hook surfacing no longer
-  injects other repositories' memories, and no surfacing call injects
-  `claude-plans` or `codex` results. A native-tool query under
+  **Behavior change**: when the scope applies, a hook call searches only the
+  namespaces listed above, and no surfacing call injects a retrieved
+  `claude-plans` or `codex` result. A native-tool query under
   `min_query_tokens` is skipped instead of padded, so a Read of `/etc/hosts`
   or of a top-level file such as `CONTRIBUTING.md` surfaces nothing (#1325).
   `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'` and
   `MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD=false` restore 0.7.6's
-  namespaces; the query changes have no switch.
+  namespaces. How queries are built has no switch; lowering
+  `min_query_tokens` keeps shorter ones.
 - `mms stats` no longer hides one source's savings behind another's volume.
   When rows from both proxied MCP tools and `mms hook` are present, each
   source gets its own line and ratio under the aggregate, which keeps its
@@ -103,6 +123,9 @@ changes inline only. See the deprecation policy in
   source) and `proxy.progressive_reads.retention_days`. `--json` adds
   `compression_by_source` (`null` when `--source` is given) and `progressive`;
   existing keys keep their names and meanings. (#1319, #1316)
+  **Behavior change**: the human-readable `mms stats` output gains the
+  per-source lines, the Progressive delivery section and the window line, and
+  `--json` gains two keys.
 - **Behavior change**: with an invalid proxy config file, `mms stats` now
   reads the environment-derived config the server keeps in that case instead
   of built-in defaults. A DB moved by an environment variable is the one it
@@ -124,6 +147,8 @@ changes inline only. See the deprecation policy in
   for example `MEMTOMEM_STM_PROXY=[]`. Its closing line now says to fix the
   runtime configuration named in the warning above. `--json` is unchanged.
   (#1320)
+  **Behavior change**: with an invalid runtime configuration, the last line of
+  the human-readable `mms status` output differs.
 - `stm_admin(action="proxy_stats")` prints its latency percentiles. The row
   read a key the tracker does not publish, so it never appeared. The figures
   are the clean, compress and surface timers of each successful live call,
