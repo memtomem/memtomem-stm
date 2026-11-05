@@ -9,7 +9,28 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.7] — 2026-11-05
+
+### Upgrade notes
+
+- **Surfacing no longer injects `claude-plans` or `codex` results**, on any
+  call, and a native-tool hook call whose `cwd` is in a repository Claude Code
+  has a project directory for searches only that repository's namespaces and
+  `default`. Native-tool queries are built differently, and a query under
+  `min_query_tokens` is skipped instead of padded with the tool name.
+  `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'` and
+  `MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD=false` restore 0.7.6's
+  namespaces. Proxied MCP tools build their queries as before. (#1326)
+- **`mms health --json` `servers` includes upstreams defined only by
+  environment variables**, and each probe uses the env-overridden entry. A
+  non-object server entry in the file exits 0 as an invalid config instead of
+  1. (#1322)
+- **With an invalid proxy config file, `mms stats` reads the
+  environment-derived config** instead of built-in defaults, so a DB moved by
+  an environment variable is the one it reads. (#1319)
+- Human-readable output gains lines: `mms list` with no upstreams (#1318) and
+  `stm_admin(action="proxy_stats")` once a live call is recorded (#1323).
+  `TokenTracker.get_summary()` gains `latency_samples`.
 
 ### Added
 
@@ -28,10 +49,47 @@ changes inline only. See the deprecation policy in
   incomplete and how many rows were already lost. Progressive-read and cache
   counters are not covered yet (#1316). To reset the history, delete the rows
   of `proxy_metrics` and then of `proxy_metrics_daily`; do not drop
-  `proxy_metrics_daily` while its trigger exists.
+  `proxy_metrics_daily` while its trigger exists. (#1327, #1316)
 
 ### Changed
 
+- Native-tool hook calls (`mms hook` for Bash, Read, Grep and Glob) surface
+  the current repository's memories and build their queries from the paths
+  and command words that matter. In a replay of 1,872 hook events, 72.4% of
+  the injected chunks that could be traced came from other projects'
+  memories, `claude-plans` or `codex`. (#1326, #1335, #1336, #1324, #1334)
+  - **Repository scope**: with the new `surfacing.project_scope_from_cwd`
+    (default `true`), a hook call that carries `cwd` and has no pinned
+    namespace searches only `claude:<slug>` for each git worktree of the
+    repository holding `cwd`, `shared:<repository directory name>` and
+    `default`. It applies only when Claude Code has a project directory for
+    one of those worktrees; otherwise the call searches every namespace as
+    before.
+  - **Excluded namespaces**: the new `surfacing.exclude_namespaces` (default
+    `["claude-plans", "codex"]`, fnmatch patterns) drops matching results
+    and their context-window neighbours on every surfacing call, hook or
+    proxied. Pinned Context is exempt.
+  - **Queries**: paths are made relative to `cwd` and lose their home or
+    temp prefix, id-like segments, `src` / `lib` / `tests` / `packages` and
+    the extension; a path argument under Claude Code's own temp root
+    (`/tmp/claude-<uid>`), `/var/folders` or `/private/var/folders`, or
+    `$TMPDIR` yields nothing. Shell commands are read segment by segment, and
+    a `cd`, inline Python or a segment naming a temp path outside `cwd`
+    contributes nothing. Native-tool queries are no longer padded with the
+    tool name. With `cwd` `/Users/u/work/repo`, a Read of
+    `src/pkg/surfacing/context_extractor.py` under it queried
+    `Users work repo src pkg surfacing context extractor py` on 0.7.6 and
+    queries `surfacing context extractor` now. Proxied MCP tools build their
+    queries as before. Details: `docs/surfacing.md`.
+
+  **Behavior change**: when the scope applies, hook surfacing no longer
+  injects other repositories' memories, and no surfacing call injects
+  `claude-plans` or `codex` results. A native-tool query under
+  `min_query_tokens` is skipped instead of padded, so a Read of `/etc/hosts`
+  or of a top-level file such as `CONTRIBUTING.md` surfaces nothing (#1325).
+  `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'` and
+  `MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD=false` restore 0.7.6's
+  namespaces; the query changes have no switch.
 - `mms stats` no longer hides one source's savings behind another's volume.
   When rows from both proxied MCP tools and `mms hook` are present, each
   source gets its own line and ratio under the aggregate, which keeps its
@@ -44,12 +102,12 @@ changes inline only. See the deprecation policy in
   "all-time totals": a window line names `proxy.metrics.max_history` (per
   source) and `proxy.progressive_reads.retention_days`. `--json` adds
   `compression_by_source` (`null` when `--source` is given) and `progressive`;
-  existing keys keep their names and meanings.
+  existing keys keep their names and meanings. (#1319, #1316)
 - **Behavior change**: with an invalid proxy config file, `mms stats` now
   reads the environment-derived config the server keeps in that case instead
   of built-in defaults. A DB moved by an environment variable is the one it
   reads, and the `Enabled` / `Servers` lines (`enabled` / `servers` in
-  `--json`) report the environment's values.
+  `--json`) report the environment's values. (#1319)
 - `mms list` now ends its empty-state message with "Run `mms add` (or
   `mms init`) to register an upstream.", the hint `mms status` prints,
   when the runtime configuration is valid. It stays silent when the file
@@ -65,6 +123,7 @@ changes inline only. See the deprecation policy in
   servers) when the runtime configuration keeps the server from starting —
   for example `MEMTOMEM_STM_PROXY=[]`. Its closing line now says to fix the
   runtime configuration named in the warning above. `--json` is unchanged.
+  (#1320)
 - `stm_admin(action="proxy_stats")` prints its latency percentiles. The row
   read a key the tracker does not publish, so it never appeared. The figures
   are the clean, compress and surface timers of each successful live call,
@@ -87,7 +146,7 @@ changes inline only. See the deprecation policy in
   servers; when the file health read first no longer validates once
   overlaid (for example, it was edited before the runtime read), that is now
   reported invalid, as doctor already did. Probing does not depend on
-  `enabled`.
+  `enabled`. (#1322)
   **Behavior change**: `mms health --json` `servers` now includes env-only
   upstreams, and each probe uses the env-overridden entry; `config_valid` /
   `config_error` also reflect that overlaid snapshot. A non-object server
