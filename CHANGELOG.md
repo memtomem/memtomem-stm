@@ -24,8 +24,9 @@ changes inline only. See the deprecation policy in
   `MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD=false` restore 0.7.6's
   namespaces; how queries are built has no switch. Proxied MCP tools build their
   queries as before. (#1326)
-- **The metrics database keeps daily totals indefinitely.** The first open by
-  0.7.7 adds a `proxy_metrics_daily` table and a trigger that folds every row
+- **The metrics database keeps daily totals indefinitely.** The first time a
+  0.7.7 metrics writer (the MCP server, `mms hook` or `mms tune`) opens it, it
+  adds a `proxy_metrics_daily` table and a trigger that folds every row
   trimmed from `proxy_metrics` into it, also when an older STM sharing the
   file trims. To reset the history, delete the rows of `proxy_metrics`, then
   of `proxy_metrics_daily`. (#1327)
@@ -38,7 +39,8 @@ changes inline only. See the deprecation policy in
   an environment variable is the one it reads. (#1319)
 - Output changes: `mms stats` adds per-source lines, a Progressive delivery
   section and a window line, and `--json` adds `compression_by_source` and
-  `progressive` (#1319); `mms status` closes with a different hint when the
+  `progressive` (#1319) and `compression_scope` (`retained`, or `all_time`
+  with `--all-time`) (#1327); `mms status` closes with a different hint when the
   runtime configuration is invalid (#1320); `mms list` with no upstreams
   (#1318) and `stm_admin(action="proxy_stats")` once a live call is recorded
   (#1323) gain lines; `mms import --help` gains examples (#1332).
@@ -58,15 +60,19 @@ changes inline only. See the deprecation policy in
   the retained summary distinguishes), and all-time totals are those rows
   plus the retained ones. Rows trimmed by an older STM version sharing the
   file are counted too, since the trigger lives in the database. The rollup
-  is installed on the first open by this version; rows trimmed before then
+  is installed the first time a metrics writer of this version (the MCP
+  server, `mms hook` or `mms tune`) opens the database; `mms stats` opens it
+  read-only and never installs it. Rows trimmed before then
   are not recoverable, and the output says from when the totals may be
   incomplete and how many rows were already lost. Progressive-read and cache
   counters are not covered yet (#1316). To reset the history, delete the rows
   of `proxy_metrics` and then of `proxy_metrics_daily`; do not drop
   `proxy_metrics_daily` while its trigger exists. (#1327, #1316)
-  **Behavior change**: the first open by this version adds the table and the
+  **Behavior change**: a metrics writer of this version adds the table and the
   trigger to the metrics database, so trimmed rows are kept as daily totals
   whether or not `--all-time` is ever used; they stay after a downgrade.
+  `mms stats --json` gains `compression_scope`: `retained`, or `all_time`
+  with `--all-time`.
 
 ### Changed
 
@@ -125,7 +131,7 @@ changes inline only. See the deprecation policy in
   existing keys keep their names and meanings. (#1319, #1316)
   **Behavior change**: the human-readable `mms stats` output gains the
   per-source lines, the Progressive delivery section and the window line, and
-  `--json` gains two keys.
+  `--json` gains `compression_by_source` and `progressive`.
 - **Behavior change**: with an invalid proxy config file, `mms stats` now
   reads the environment-derived config the server keeps in that case instead
   of built-in defaults. A DB moved by an environment variable is the one it
