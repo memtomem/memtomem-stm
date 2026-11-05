@@ -15,9 +15,10 @@ changes inline only. See the deprecation policy in
 
 - **Surfacing drops retrieved `claude-plans` and `codex` results** on every
   call, hook or proxied (Pinned Context is exempt), and a native-tool hook call
-  with no pinned namespace, whose `cwd` is in a repository Claude Code has a
-  project directory for, searches only that repository's `claude:` and
-  `shared:` namespaces and `default`. Native-tool queries are built
+  with no pinned namespace, whose `cwd` is in a repository (or, when `git`
+  cannot answer, a directory) Claude Code has a project directory for,
+  searches only that repository's `claude:` and `shared:` namespaces and
+  `default`. Native-tool queries are built
   differently, and one under `min_query_tokens` is skipped instead of padded
   with the tool name, so some Reads that surfaced memories on 0.7.6 surface
   nothing. `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'` and
@@ -86,9 +87,12 @@ changes inline only. See the deprecation policy in
     namespace searches only `claude:<slug>` for each git worktree of the
     repository holding `cwd` and for `cwd` itself,
     `shared:<repository directory name>` (left out when the name contains
-    `,` or `*`) and `default`. It applies only when Claude Code has a project
-    directory for one of those worktrees; otherwise the call searches every
-    namespace as before. A pinned namespace (`default_namespace` or
+    `,` or `*`) and `default`. When `git` cannot answer (not installed, not
+    a repository, timed out), the repository is the nearest directory
+    holding a `.git` directory, or `cwd` itself, so a directory outside git
+    is scoped too. It applies only when Claude Code has a project directory
+    for one of those paths; otherwise the call searches every namespace as
+    before. A pinned namespace (`default_namespace` or
     `context_tools.<tool>.namespace`) wins over the scope.
   - **Excluded namespaces**: the new `surfacing.exclude_namespaces` (default
     `["claude-plans", "codex"]`, fnmatch patterns) drops matching results
