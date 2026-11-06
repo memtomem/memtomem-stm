@@ -71,6 +71,11 @@ jobs:
           - os: windows-latest
             python: "3.12"
             coverage_args: ""
+          # Advisory until the Windows 3.13 lane is stable and branch protection is updated.
+          - os: windows-latest
+            python: "3.13"
+            experimental: true
+            coverage_args: ""
     name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     steps:

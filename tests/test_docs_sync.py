@@ -276,15 +276,19 @@ def test_experimental_python_lane_matches_support_contract() -> None:
     assert "    continue-on-error: ${{ matrix.experimental == true }}" in job.splitlines()
     rows = _matrix_rows(_matrix_block(job))
     experimental = [row for row in rows if _row_values(row, "experimental") == ["true"]]
-    assert len(experimental) == 1
-    assert _row_values(experimental[0], "python") == ["3.14"]
-    assert _row_values(experimental[0], "os") == ["ubuntu-latest"]
+    # Pin both advisory rows; Python 3.13 remains supported on other CI lanes.
+    assert sorted(
+        (_row_values(row, "os")[0], _row_values(row, "python")[0])
+        for row in experimental
+    ) == [("ubuntu-latest", "3.14"), ("windows-latest", "3.13")]
     supported = [row for row in rows if row not in experimental]
     assert sorted(_row_values(row, "python")[0] for row in supported) == ["3.12", "3.12", "3.13"]
     for doc in ("README.md", "CONTRIBUTING.md"):
         content = _read(doc)
         assert "3.14" in content and "experimental" in content
         assert "`continue-on-error`" in content
+        assert re.search(r"Python 3\.13.{0,80}Windows", content, re.DOTALL), doc
+        assert re.search(r"Windows.{0,100}advisory lane", content, re.DOTALL), doc
     project = tomllib.loads(_read("pyproject.toml"))["project"]
     classifiers = project["classifiers"]
     for version in ("3.12", "3.13"):
