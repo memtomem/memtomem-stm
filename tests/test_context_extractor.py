@@ -575,12 +575,62 @@ class TestMacTempDirSpellings:
             # The path token stops at ``+``/``:``; the rest is not the temp dir.
             ("cat /private/var/folders+archive/auth/jwt_handler.py", "private var folders"),
             ("cat /private/var/folders:archive/auth/jwt_handler.py", "private var folders"),
-            # A bare root in a command is not matched (same as before #1334).
-            ("ls /private/var/folders/", "private var folders"),
         ],
     )
     def test_command_root_token_is_not_a_scratchpad(self, command: str, query: str) -> None:
         assert _builtin("Bash", {"command": command}, cwd=self._CWD) == query
+
+
+class TestShellTempDirWord:
+    """#1341: a shell word that is a temp directory itself names no topic. The
+    word yields no tokens; the segment is not a scratchpad, so its other words
+    and the description still count."""
+
+    _CWD = "/Users/u/repo"
+    _GREP = "grep -rn SurfacingConfig {} src/memtomem_stm/surfacing"
+
+    @pytest.mark.parametrize(
+        "word",
+        [
+            "/private/tmp",
+            "/private/tmp/",
+            "/var/folders",
+            "/var/folders/",
+            "/private/var/folders",
+            "/private/var/folders//",
+            "'/private/tmp'",
+            '"/private/var/folders/"',
+        ],
+    )
+    def test_temp_dir_word_yields_no_tokens(self, word: str) -> None:
+        cmd = self._GREP.format(word)
+        assert _builtin("Bash", {"command": cmd}, cwd=self._CWD) == (
+            "SurfacingConfig memtomem stm surfacing"
+        )
+
+    def test_segment_is_not_a_scratchpad(self) -> None:
+        args = {"command": "ls /private/var/folders/", "description": "List the temp dir"}
+        assert _builtin("Bash", args, cwd=self._CWD) == "List the temp dir"
+
+    @pytest.mark.parametrize(
+        ("word", "tokens"),
+        [
+            ("/private/var/folders-other", "private var folders other"),
+            ("/private/tmpdir", "private tmpdir"),
+            ("/private/tmp+x/auth", "private tmp"),
+            # Not the bare directory: a literal trailing character, an
+            # unmatched quote, or the first fragment of a quoted path with a space.
+            ("'/private/var/folders,'", "private var folders"),
+            ("'/private/var/folders)'", "private var folders"),
+            ("'/private/tmp\"", "private tmp"),
+            ("'/private/var/folders other'", "private var folders other"),
+        ],
+    )
+    def test_lookalike_word_keeps_its_tokens(self, word: str, tokens: str) -> None:
+        cmd = self._GREP.format(word)
+        assert _builtin("Bash", {"command": cmd}, cwd=self._CWD) == (
+            f"SurfacingConfig {tokens} memtomem stm surfacing"
+        )
 
     def test_checkout_used_as_cwd_is_still_tokenized(self) -> None:
         root = "/private/var/folders/4n/mt3k/T/pytest-of-u/pytest-1/repo"
