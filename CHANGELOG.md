@@ -9,6 +9,199 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [0.7.7] — 2026-11-05
+
+### Upgrade notes
+
+- **Surfacing drops retrieved `claude-plans` and `codex` results** on every
+  call, hook or proxied (Pinned Context is exempt), and a native-tool hook call
+  with no pinned namespace, whose `cwd` is in a repository (or, when `git`
+  cannot answer, a directory) Claude Code has a project directory for,
+  searches only that repository's `claude:` and `shared:` namespaces and
+  `default`. Native-tool queries are built
+  differently, and one under `min_query_tokens` is skipped instead of padded
+  with the tool name, so some Reads that surfaced memories on 0.7.6 surface
+  nothing. `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'` and
+  `MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD=false` restore 0.7.6's
+  namespaces; how queries are built has no switch. Proxied MCP tools build their
+  queries as before. (#1326)
+- **The metrics database keeps daily totals indefinitely.** The first time a
+  0.7.7 metrics writer (the MCP server, `mms hook` or `mms tune`) opens it, it
+  adds a `proxy_metrics_daily` table and a trigger that folds every row
+  trimmed from `proxy_metrics` into it, also when an older STM sharing the
+  file trims. To reset the history, delete the rows of `proxy_metrics`, then
+  of `proxy_metrics_daily`. (#1327)
+- **`mms health --json` `servers` includes upstreams defined only by
+  environment variables**, and each probe uses the env-overridden entry. A
+  non-object server entry in the file exits 0 as an invalid config instead of
+  1. (#1322)
+- **With an invalid proxy config file, `mms stats` reads the
+  environment-derived config** instead of built-in defaults, so a DB moved by
+  an environment variable is the one it reads. (#1319)
+- Output changes: `mms stats` adds per-source lines, a Progressive delivery
+  section and a window line, and `--json` adds `compression_by_source` and
+  `progressive` (#1319) and `compression_scope` (`retained`, or `all_time`
+  with `--all-time`) (#1327); `mms status` closes with a different hint when the
+  runtime configuration is invalid (#1320); `mms list` with no upstreams
+  (#1318) and `stm_admin(action="proxy_stats")` once a live call is recorded
+  (#1323) gain lines; `mms import --help` gains examples (#1332).
+  `TokenTracker.get_summary()` gains `latency_samples`.
+
+### Added
+
+- `mms import --help` shows preview, apply and verification examples, with
+  the registry destination and project-config acknowledgement explained. (#1332)
+  **Behavior change**: `mms import --help` output is longer; the command's
+  options and behavior are unchanged.
+
+- `mms stats --all-time` reports compression totals that survive the
+  per-source `proxy.metrics.max_history` trim. A database trigger folds every
+  row deleted from `proxy_metrics` into a never-pruned `proxy_metrics_daily`
+  table (UTC day × source × server × tool, with the same accounting classes
+  the retained summary distinguishes), and all-time totals are those rows
+  plus the retained ones. Rows trimmed by an older STM version sharing the
+  file are counted too, since the trigger lives in the database. The rollup
+  is installed the first time a metrics writer of this version (the MCP
+  server, `mms hook` or `mms tune`) opens the database; `mms stats` opens it
+  read-only and never installs it. Rows trimmed before then
+  are not recoverable, and the output says from when the totals may be
+  incomplete and how many rows were already lost. Progressive-read and cache
+  counters are not covered yet (#1316). To reset the history, delete the rows
+  of `proxy_metrics` and then of `proxy_metrics_daily`; do not drop
+  `proxy_metrics_daily` while its trigger exists. (#1327, #1316)
+  **Behavior change**: a metrics writer of this version adds the table and the
+  trigger to the metrics database, so trimmed rows are kept as daily totals
+  whether or not `--all-time` is ever used; they stay after a downgrade.
+  `mms stats --json` gains `compression_scope`: `retained`, or `all_time`
+  with `--all-time`.
+
+### Changed
+
+- Native-tool hook calls (`mms hook` for Bash, Read, Grep and Glob) surface
+  the current repository's memories and build their queries from the paths
+  and command words that matter. In a replay of 1,872 hook events, 72.4% of
+  the injected chunks that could be traced came from other projects'
+  memories, `claude-plans` or `codex`. (#1326, #1335, #1336, #1324, #1334)
+  - **Repository scope**: with the new `surfacing.project_scope_from_cwd`
+    (default `true`), a hook call that carries `cwd` and has no pinned
+    namespace searches only `claude:<slug>` for each git worktree of the
+    repository holding `cwd` and for `cwd` itself,
+    `shared:<repository directory name>` (left out when the name contains
+    `,` or `*`) and `default`. When `git` cannot answer (not installed, not
+    a repository, timed out), the repository is the nearest directory
+    holding a `.git` directory, or `cwd` itself, so a directory outside git
+    is scoped too. It applies only when Claude Code has a project directory
+    for one of those paths; otherwise the call searches every namespace as
+    before. A pinned namespace (`default_namespace` or
+    `context_tools.<tool>.namespace`) wins over the scope.
+  - **Excluded namespaces**: the new `surfacing.exclude_namespaces` (default
+    `["claude-plans", "codex"]`, fnmatch patterns) drops matching results
+    and their context-window neighbours on every surfacing call, hook or
+    proxied. Pinned Context is exempt.
+  - **Queries**: paths are made relative to `cwd` and lose their home or
+    temp prefix, id-like segments, `src` / `lib` / `tests` / `packages` and
+    the extension; a path argument outside `cwd` under Claude Code's own
+    temp root (`/tmp/claude-<uid>`), `/var/folders` or
+    `/private/var/folders`, or `$TMPDIR` yields nothing. Shell commands are read segment by segment, and
+    a `cd`, inline Python or a segment naming a temp path outside `cwd`
+    contributes nothing. Native-tool queries are no longer padded with the
+    tool name. With `cwd` `/Users/u/work/repo`, a Read of
+    `src/pkg/surfacing/context_extractor.py` under it queried
+    `Users work repo src pkg surfacing context extractor py` on 0.7.6 and
+    queries `surfacing context extractor` now. Proxied MCP tools build their
+    queries as before. Details: `docs/surfacing.md`.
+
+  **Behavior change**: when the scope applies, a hook call searches only the
+  namespaces listed above, and no surfacing call injects a retrieved
+  `claude-plans` or `codex` result. A native-tool query under
+  `min_query_tokens` is skipped instead of padded, so a Read of `/etc/hosts`
+  or of a top-level file such as `CONTRIBUTING.md` surfaces nothing (#1325).
+  `MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'` and
+  `MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD=false` restore 0.7.6's
+  namespaces. How queries are built has no switch; lowering
+  `min_query_tokens` keeps shorter ones.
+- `mms stats` no longer hides one source's savings behind another's volume.
+  When rows from both proxied MCP tools and `mms hook` are present, each
+  source gets its own line and ratio under the aggregate, which keeps its
+  shape and meaning. A new **Progressive delivery** section reads the
+  progressive-reads table read-only and reports chars produced against chars
+  delivered to the agent (every recorded read counts, so rereads can push the
+  ratio above 100%) and the oldest retained row; it replaces the pointer to
+  `stm_admin(action=progressive_stats)`. `--tool` filters it; `--source` still
+  scopes only the compression rows. The text and `docs/cli.md` no longer say
+  "all-time totals": a window line names `proxy.metrics.max_history` (per
+  source) and `proxy.progressive_reads.retention_days`. `--json` adds
+  `compression_by_source` (`null` when `--source` is given) and `progressive`;
+  existing keys keep their names and meanings. (#1319, #1316)
+  **Behavior change**: the human-readable `mms stats` output gains the
+  per-source lines, the Progressive delivery section and the window line, and
+  `--json` gains `compression_by_source` and `progressive`.
+- **Behavior change**: with an invalid proxy config file, `mms stats` now
+  reads the environment-derived config the server keeps in that case instead
+  of built-in defaults. A DB moved by an environment variable is the one it
+  reads, and the `Enabled` / `Servers` lines (`enabled` / `servers` in
+  `--json`) report the environment's values. (#1319)
+- `mms list` now ends its empty-state message with "Run `mms add` (or
+  `mms init`) to register an upstream.", the hint `mms status` prints,
+  when the runtime configuration is valid. It stays silent when the file
+  fails validation or the proxy environment is invalid, since adding an
+  upstream is not the fix there. **Behavior change**: the human-readable
+  `mms list` output gains one line when no upstream servers are configured;
+  `--json`, `mms prune` and `mms health` are unchanged. (#1318, #1313)
+
+### Fixed
+
+- `mms status` no longer ends with "Run `mms add` (or `mms init`) to register
+  an upstream." (empty file) or "Run `mms list` … `mms health` …" (file with
+  servers) when the runtime configuration keeps the server from starting —
+  for example `MEMTOMEM_STM_PROXY=[]`. Its closing line now says to fix the
+  runtime configuration named in the warning above. `--json` is unchanged.
+  (#1320)
+  **Behavior change**: with an invalid runtime configuration, the last line of
+  the human-readable `mms status` output differs.
+- `stm_admin(action="proxy_stats")` prints its latency percentiles. The row
+  read a key the tracker does not publish, so it never appeared. The figures
+  are the clean, compress and surface timers of each successful live call,
+  summed: surfacing's LTM lookup is in them and the upstream tool fetch is
+  not, so they are not tool latency. (#1323, #1315)
+  **Behavior change**: once a successful live call has been recorded, the
+  output gains a `Stage latency:   p50=… p95=… p99=… ms` row and a line under
+  it saying what the figures cover; after more than 10,000 live calls that
+  line also names the window (`; last 10000 calls`). `TokenTracker.get_summary()`
+  gains `latency_samples`, the number of calls the percentiles cover.
+
+- `mms health` probes the configured upstreams with environment overrides
+  applied: the config file overlaid with `MEMTOMEM_STM_PROXY` /
+  `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS…` settings, the same map `mms doctor`
+  checks since #831 (the two now share one helper). It read the file alone,
+  so an env-only upstream was never probed (an otherwise empty file printed
+  "No upstream servers configured."), and an env-overridden field such as
+  `command` was probed with the file's value. When the runtime configuration
+  or that overlaid snapshot fails validation, it still probes the file's
+  servers; when the file health read first no longer validates once
+  overlaid (for example, it was edited before the runtime read), that is now
+  reported invalid, as doctor already did. Probing does not depend on
+  `enabled`. (#1322)
+  **Behavior change**: `mms health --json` `servers` now includes env-only
+  upstreams, and each probe uses the env-overridden entry; `config_valid` /
+  `config_error` also reflect that overlaid snapshot. A non-object server
+  entry in the file (`"upstream_servers": {"bad": 7}`) is skipped instead of
+  crashing health with an `AttributeError` (exit 1 → exit 0, reported as an
+  invalid config).
+
+- The holdout-trial extractor (`scripts/stm_trial.py`, repository only) decides
+  which transcript paths can be keyed without a `cwd` by the same rule
+  collection uses for memory sources, now shared as
+  `grams.fully_qualified`. It used `os.path.isabs`, which on Windows with
+  Python 3.12 accepts a rooted path without a drive (`\notes\a.md`): such a
+  path was keyed although collection never keys one, and a Bash `cd \dir`
+  replaced the working directory with the driveless `\dir` instead of keeping
+  its drive. macOS / Linux extract the same rows as before. On Windows with
+  Python 3.13+, drive-qualified, UNC, driveless and relative paths are judged
+  as before; only malformed spellings such as `/:/` can differ. (#1339, #1337)
+  **Behavior change**: none external — the script ships only in the
+  repository, and its extracted rows change only on Windows.
+
 ## [0.7.6] — 2026-11-02
 
 ### Changed

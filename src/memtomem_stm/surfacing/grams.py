@@ -168,23 +168,36 @@ def basename_key(key: str, *, pathmod: ModuleType = os.path) -> str:
     return pathmod.basename(key)
 
 
+def _pure_path(path: str, pathmod: ModuleType) -> PurePath:
+    flavour: type[PurePath] = PureWindowsPath if pathmod.sep == "\\" else PurePosixPath
+    return flavour(path)
+
+
+def fully_qualified(path: str, *, pathmod: ModuleType = os.path) -> bool:
+    """Whether *path* names one file without a base: POSIX absolute, or on
+    Windows a drive with a root (``C:\\notes``) or a UNC share.
+
+    ``pathlib`` decides, not ``os.path.isabs``: ``ntpath.isabs`` changed meaning
+    in Python 3.13, and 3.12 calls a rooted ``\\notes\\a.md`` absolute although
+    it names a file only relative to the current drive. Collection
+    (:func:`eligible_source`) and the transcript reader share this rule so that
+    the two agree on which paths can be keyed without a ``cwd``.
+    """
+    return _pure_path(path, pathmod).is_absolute()
+
+
 def eligible_source(source: str | None, *, pathmod: ModuleType = os.path) -> bool:
     """Whether a delivered memory's ``source_file`` can anchor a file match.
 
-    Decided from the string alone, at render time: a fully qualified path —
-    POSIX absolute, or on Windows a drive with a root (``C:\\notes``) or a UNC
-    share — that is not an adapter sentinel and is within
-    :data:`MAX_SOURCE_CHARS` / :data:`MAX_SOURCE_PARTS`. ``pathlib`` decides
-    "fully qualified" because ``ntpath.isabs`` changed meaning in Python 3.13:
-    3.12 calls a rooted ``\\notes\\a.md`` absolute although it names a file
-    only relative to the current drive. A relative path is ineligible because
-    the only anchor available later is the agent's ``cwd``, not the base the
-    LTM indexed it against; a ``~`` path because expanding it can consult the
-    account database. Nothing is looked up, so a file deleted or moved after
-    delivery cannot change the answer.
+    Decided from the string alone, at render time: a :func:`fully_qualified`
+    path that is not an adapter sentinel and is within
+    :data:`MAX_SOURCE_CHARS` / :data:`MAX_SOURCE_PARTS`. A relative path is
+    ineligible because the only anchor available later is the agent's ``cwd``,
+    not the base the LTM indexed it against; a ``~`` path because expanding it
+    can consult the account database. Nothing is looked up, so a file deleted or
+    moved after delivery cannot change the answer.
     """
     if source is None or source in _SENTINEL_SOURCES or len(source) > MAX_SOURCE_CHARS:
         return False
-    flavour: type[PurePath] = PureWindowsPath if pathmod.sep == "\\" else PurePosixPath
-    pure = flavour(source)
+    pure = _pure_path(source, pathmod)
     return pure.is_absolute() and len(pure.parts) <= MAX_SOURCE_PARTS

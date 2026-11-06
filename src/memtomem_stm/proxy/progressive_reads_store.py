@@ -300,3 +300,119 @@ class ProgressiveReadsStore:
             "avg_coverage": avg_coverage,
             "by_tool": by_tool,
         }
+
+
+def read_progressive_summary(db_path: Path, tool: str | None = None) -> dict[str, object]:
+    """Aggregate progressive-delivery volume read-only from disk, for ``mms stats``.
+
+    Unlike :meth:`ProgressiveReadsStore.initialize` this never creates,
+    migrates or purges the DB: it opens the file via ``?mode=ro`` and skips
+    ``tune_connection`` (``PRAGMA journal_mode=WAL`` would write), like
+    ``read_compression_summary`` and ``read_surfacing_summary``.
+
+    ``produced_chars`` sums each response's ``total_chars`` once (per ``key``);
+    ``delivered_chars`` sums ``chars`` over every recorded row, so rereads and
+    overlapping reads count again and the ratio can exceed 1.0. Rows written
+    before ``is_initial`` existed are included in both and counted in
+    ``unclassified_reads``. ``oldest_at`` is the earliest retained row: older
+    rows may already have been purged by ``retention_days``.
+    ``follow_up_responses`` counts a response with a row marked
+    ``is_initial = 0`` even when its initial row is gone, so it can exceed what
+    :meth:`ProgressiveReadsStore.get_stats` derives from row counts alone
+    (``follow_up_rate``). ``available`` is
+    ``False`` when the file is missing or has no ``progressive_reads`` table.
+    The optional ``tool`` filter matches the raw upstream tool name.
+    """
+    from memtomem_stm.surfacing.feedback_store import _locate_db
+    from memtomem_stm.utils.json_out import has_lone_surrogate
+    from memtomem_stm.utils.redact import exception_summary
+
+    summary: dict[str, object] = {
+        "path": str(db_path),
+        "available": False,
+        "classified_supported": False,
+        "total_responses": 0,
+        "total_reads": 0,
+        "follow_up_responses": 0,
+        "unclassified_reads": 0,
+        "produced_chars": 0,
+        "delivered_chars": 0,
+        "delivered_ratio": 0.0,
+        "oldest_at": None,
+        "error": None,
+    }
+    try:
+        resolved, exists = _locate_db(db_path)
+    except (OSError, RuntimeError) as exc:
+        summary["error"] = exception_summary(exc)
+        return summary
+    summary["path"] = str(resolved)
+    if not exists:
+        return summary
+
+    try:
+        db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        summary["error"] = exception_summary(exc)
+        return summary
+
+    try:
+        tables = {
+            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        if "progressive_reads" not in tables:
+            return summary
+        columns = {str(row[1]) for row in db.execute("PRAGMA table_info('progressive_reads')")}
+        # Capability flag describes the FILE, so it is set before the filter exit.
+        has_is_initial = "is_initial" in columns
+        summary["classified_supported"] = has_is_initial
+
+        if tool is not None and has_lone_surrogate(tool):
+            # Cannot be bound as a parameter and can never match a stored row.
+            summary["available"] = True
+            return summary
+
+        where = " WHERE tool = ?" if tool is not None else ""
+        params: tuple[object, ...] = (tool,) if tool is not None else ()
+        unclassified = (
+            "SUM(CASE WHEN is_initial IS NULL THEN 1 ELSE 0 END)" if has_is_initial else "COUNT(*)"
+        )
+        # A response was followed up when a row is marked as a follow-up — even
+        # if its initial row was lost or purged — or, for legacy rows that
+        # carry no marker, when it has more than one row.
+        followed = (
+            "(COUNT(*) > 1 OR COALESCE(SUM(is_initial = 0), 0) > 0)"
+            if has_is_initial
+            else "(COUNT(*) > 1)"
+        )
+        # One statement, so every figure describes the same snapshot while the
+        # server keeps appending rows.
+        row = db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(n), 0), COALESCE(SUM(followed), 0), "
+            "COALESCE(SUM(unclassified), 0), COALESCE(SUM(total), 0), "
+            "COALESCE(SUM(delivered), 0), MIN(first_at) FROM ("
+            f"SELECT COUNT(*) AS n, {followed} AS followed, "
+            f"{unclassified} AS unclassified, "
+            "MAX(total_chars) AS total, SUM(chars) AS delivered, MIN(created_at) AS first_at "
+            f"FROM progressive_reads{where} GROUP BY key)",
+            params,
+        ).fetchone()
+        responses, reads, follow_ups, unclassified_n, produced, delivered, oldest = row
+        summary.update(
+            {
+                "available": True,
+                "total_responses": int(responses),
+                "total_reads": int(reads),
+                "follow_up_responses": int(follow_ups),
+                "unclassified_reads": int(unclassified_n),
+                "produced_chars": int(produced),
+                "delivered_chars": int(delivered),
+                "delivered_ratio": (delivered / produced) if produced > 0 else 0.0,
+                "oldest_at": float(oldest) if oldest is not None else None,
+            }
+        )
+    except sqlite3.Error as exc:
+        summary["error"] = exception_summary(exc)
+    finally:
+        db.close()
+    return summary

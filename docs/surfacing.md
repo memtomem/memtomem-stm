@@ -160,6 +160,44 @@ flowchart TD
 
 > **Note**: Steps 1 (template) and 2 (`_context_query`) are "first match wins". The heuristic fallback (step 3) iterates over **all** tool arguments and collects path-like tokenizations and semantic string values together into a merged query, rather than stopping at the first match.
 
+### Native-tool hook calls (Bash, Read, …)
+
+Calls that arrive through `mms hook` (`server == "builtin"`) take a different
+heuristic step, because their arguments are raw shell commands and absolute
+paths. Templates and `_context_query` still come first, and proxied MCP tools
+are unaffected.
+
+- **Sensitive input is checked first.** If any raw argument matches a sensitive
+  pattern, the raw values are passed on unchanged, so the engine sends a
+  `sha256:` digest instead of the text. Tokenizing first would hide the secret
+  from that check.
+- **Paths** are made relative to the call's `cwd` (or lose their `/tmp/`,
+  `/private/tmp/` or home prefix), and drop id-like segments, `src` / `lib` /
+  `tests` / `packages`, and the file extension:
+  `src/memtomem_stm/surfacing/context_extractor.py` becomes
+  `memtomem stm surfacing context extractor`. A path inside `cwd` is never a
+  scratchpad, so a repository checked out under a temp directory still works.
+- **Path arguments** (Read `file_path`, Grep/Glob `path`) are scratchpads only
+  under Claude Code's own temp root (`/tmp/claude-<uid>/…`,
+  `/private/tmp/claude-<uid>/…`), `/var/folders/…` (or `/private/var/folders/…`)
+  or `$TMPDIR`, compared after collapsing repeated `/` and `.` segments.
+  Anything else under `/tmp`, such as a release worktree read from another
+  checkout, is tokenized.
+- **Shell commands** are read up to their first 1,000 characters, cut at the
+  first heredoc (`<<`), split at `;`, `&&`,
+  `||`, `|` and newlines, and read segment by segment. A `cd`, an inline Python
+  program (`python3 -c …`, `python3 -`) or a segment naming any temp path
+  outside `cwd` (`/tmp/…`, `/private/tmp/…`, `/var/folders/…`,
+  `/private/var/folders/…`, `$TMPDIR`) contributes nothing, since commands
+  there mix repositories with many throwaway probe directories; other segments
+  contribute their path tokens and non-plumbing words.
+  If no segment contributes, there is no query, even though the call has a
+  `description`. Otherwise the query is the description's first sentence plus
+  those tokens.
+- **No tool-name padding.** A native-tool query under `min_query_tokens` is
+  skipped rather than padded with `Bash` or `Read`, so a builtin `Read` of
+  `/etc/hosts` no longer surfaces anything. Proxied tools keep the padding.
+
 ## What the Agent Sees
 
 When memories are found, they're wrapped in `<surfaced-memories>` XML tags and injected after the response (default `append`):
@@ -216,6 +254,8 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `injection_mode` | `append` | Where to inject: `prepend`, `append`, `section`. `prepend` is skipped on the progressive-delivery path (would break `stm_proxy_read_more` offsets) — counted as `progressive_mode_conflict` in `stm_admin(action="surfacing_stats")`. |
 | `section_header` | `## Relevant Memories` | Header text for injected section |
 | `default_namespace` | `null` | Restrict search to a specific namespace |
+| `exclude_namespaces` | `["claude-plans", "codex"]` | fnmatch patterns over a result's namespace; matches are never injected, on any call. Pinned Context is exempt. `[]` injects everything again. See [Scoping by repository and namespace](#scoping-by-repository-and-namespace). |
+| `project_scope_from_cwd` | `true` | On a native-tool hook call that carries `cwd`, search only the current repository's namespaces. A pinned namespace wins. See [Scoping by repository and namespace](#scoping-by-repository-and-namespace). |
 | `exclude_tools` | `[]` | fnmatch patterns to never surface, matched against **both** the bare tool name and `server__tool` — so a server-qualified glob like `["context7__*"]` disables a whole upstream (e.g. `["*debug*", "langfuse-docs__*"]`). See [Scoping surfacing per upstream](#scoping-surfacing-per-upstream). |
 | `write_tool_patterns` | `*write*`, `*create*`, `*delete*`, `*push*`, `*send*`, `*remove*` | Auto-skip write/mutation operations |
 | `context_tools` | `{}` | Per-tool `query_template`, namespace, and fixed `min_score` overrides. An explicit per-tool score wins over auto-tuning. |
@@ -333,6 +373,42 @@ experiments; reach for `surfacing_enabled` to durably opt one upstream out —
 e.g. a third-party server whose calls never match your LTM (so the per-call
 search is pure wasted latency), or a sensitive upstream whose request context
 should never become an LTM query.
+
+### Scoping by repository and namespace
+
+A native-tool hook call carries the host's `cwd`. With `project_scope_from_cwd`
+(default on) and no pinned namespace, STM sends the LTM an exact-name include
+list instead of searching every namespace:
+
+- `claude:<slug>` for every git worktree of the repository holding `cwd`
+  (Claude Code names its per-project memory directories after the worktree
+  path, so a session in a linked worktree and one in the main checkout see the
+  same memories),
+- `shared:<repository directory name>` (left out if the name contains `,` or
+  `*`, which an exact-name list cannot carry),
+- `default`.
+
+Any other namespace is not searched on that call. The repository comes from
+`git worktree list`, not from name prefixes, so `…/memtomem` and
+`…/memtomem-stm` stay separate. The scope is only applied when Claude Code has
+a project directory for one of those worktrees (under `CLAUDE_CONFIG_DIR` or
+`~/.claude`); otherwise the call keeps the unscoped search. When `git` cannot
+answer (not installed, not a repository, timed out), the repository is taken to
+be the nearest directory holding a `.git` directory, or `cwd` itself, and the
+same project-directory check decides. Results are cached per `cwd` for 60 seconds (5 seconds when
+inactive), and the scope is part of the surfacing cache key.
+
+`exclude_namespaces` applies to every call, scoped or not, hook or proxy: a
+retrieved result whose namespace matches one of its fnmatch patterns is never
+injected, and neither is a context-window neighbour from such a namespace. The
+defaults drop `claude-plans` (plans from earlier sessions) and `codex` (another
+host's index and rollout files).
+
+```bash
+# Inject plans and codex memories again, and search every namespace from hooks
+export MEMTOMEM_STM_SURFACING__EXCLUDE_NAMESPACES='[]'
+export MEMTOMEM_STM_SURFACING__PROJECT_SCOPE_FROM_CWD=false
+```
 
 ### Tuning `min_response_chars`
 

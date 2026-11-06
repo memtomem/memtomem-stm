@@ -6,10 +6,58 @@ import pytest
 
 from memtomem_stm.cli.host_runtime import (
     HostRuntimePolicy,
+    _parse_bool,
+    _parse_positive_float,
+    format_seconds,
     parse_managed_hook_runtime,
     resolve_host_runtime_policy,
     runtime_env_overrides,
 )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("garbage", None),
+        (" TRUE ", True),
+        ("On", True),
+        ("Y", True),
+        ("t", True),
+        ("f", False),
+        ("0", False),
+        ("no", False),
+    ],
+)
+def test_parse_bool_direct(raw: str | None, expected: bool | None) -> None:
+    assert _parse_bool(raw) is expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("0", None),
+        ("-0", None),
+        ("-1", None),
+        ("nan", None),
+        ("inf", None),
+        ("1e400", None),
+        ("12", 12.0),
+        (" 3.5 ", 3.5),
+    ],
+)
+def test_parse_positive_float_direct(raw: str | None, expected: float | None) -> None:
+    assert _parse_positive_float(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(12.0, "12"), (2.5, "2.5"), (0.1 + 0.2, "0.3"), (1e16, "1e+16")],
+)
+def test_format_seconds_direct(seconds: float, expected: str) -> None:
+    assert format_seconds(seconds) == expected
 
 
 @pytest.fixture(autouse=True)

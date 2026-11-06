@@ -38,11 +38,13 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from memtomem_stm.surfacing.feedback_store import load_hmac_key
 from memtomem_stm.surfacing.grams import (
     _PLATFORM_CASEFOLD,
+    fully_qualified,
     gram_hashes,
     keyed_hash,
     path_key,
@@ -206,16 +208,22 @@ def _expand_home(token: str) -> str:
     return token
 
 
-def _lexical(token: str, base: str | None, casefold: bool) -> str | None:
+def _lexical(
+    token: str, base: str | None, casefold: bool, pathmod: ModuleType = os.path
+) -> str | None:
     token = _expand_home(token)
     if not token:
         return None
-    if not os.path.isabs(token) and base is None:
+    # Collection keys only fully qualified sources (``grams.eligible_source``),
+    # so without a base the same rule decides, on every Python version.
+    if base is None and not fully_qualified(token, pathmod=pathmod):
         return None
-    return path_key(token, cwd=base, casefold=casefold)
+    return path_key(token, cwd=base, pathmod=pathmod, casefold=casefold)
 
 
-def _bash_paths(command: str, cwd: str | None, casefold: bool) -> set[str]:
+def _bash_paths(
+    command: str, cwd: str | None, casefold: bool, pathmod: ModuleType = os.path
+) -> set[str]:
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:
@@ -235,7 +243,7 @@ def _bash_paths(command: str, cwd: str | None, casefold: bool) -> set[str]:
             pieces |= {piece, _LINE_SUFFIX_RE.sub("", piece)}
         for piece in pieces:
             for base in bases:
-                lexical = _lexical(piece, base, casefold)
+                lexical = _lexical(piece, base, casefold, pathmod)
                 if lexical is not None:
                     out.add(lexical)
         if index == 0 or tokens[index - 1] != "cd":
@@ -243,10 +251,11 @@ def _bash_paths(command: str, cwd: str | None, casefold: bool) -> set[str]:
         target = _expand_home(token.strip(_REDIRECT_CHARS))
         if not target or target == "-":
             continue
-        if os.path.isabs(target):
-            current = os.path.normpath(target)
+        if fully_qualified(target, pathmod=pathmod):
+            current = pathmod.normpath(target)
         elif current is not None:
-            current = os.path.normpath(os.path.join(current, target))
+            # A rooted `\dir` on Windows is joined, so it keeps `current`'s drive.
+            current = pathmod.normpath(pathmod.join(current, target))
         if current is not None and current not in bases:
             bases.append(current)
     return out
@@ -260,32 +269,38 @@ def _pattern_tokens(tool_input: dict[str, Any], casefold: bool) -> set[str]:
 
 
 def entry_path_keys(
-    tool: str, tool_input: dict[str, Any], cwd: str | None, *, casefold: bool
+    tool: str,
+    tool_input: dict[str, Any],
+    cwd: str | None,
+    *,
+    casefold: bool,
+    pathmod: ModuleType = os.path,
 ) -> tuple[set[str], set[str]]:
     """The lexical path keys and Grep/Glob pattern tokens of one entry's input.
 
     Returned unhashed so they can be tested; the extractor hashes both.
+    *pathmod* is injectable so the Windows rules can be tested on any OS.
     """
     paths: set[str] = set()
     patterns: set[str] = set()
     if tool == "read":
         value = tool_input.get("file_path")
         if isinstance(value, str):
-            lexical = _lexical(value, cwd, casefold)
+            lexical = _lexical(value, cwd, casefold, pathmod)
             if lexical is not None:
                 paths.add(lexical)
     elif tool in ("grep", "glob"):
         value = tool_input.get("path")
         target = value if isinstance(value, str) and value else cwd
         if target is not None:
-            lexical = _lexical(target, cwd, casefold)
+            lexical = _lexical(target, cwd, casefold, pathmod)
             if lexical is not None:
                 paths.add(lexical)
         patterns = _pattern_tokens(tool_input, casefold)
     elif tool == "shell":
         value = tool_input.get("command")
         if isinstance(value, str):
-            paths = _bash_paths(value, cwd, casefold)
+            paths = _bash_paths(value, cwd, casefold, pathmod)
     return paths, patterns
 
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from memtomem_stm.proxy.cleaning import DefaultContentCleaner
+import pytest
+
+from memtomem_stm.proxy.cleaning import DefaultContentCleaner, _merge_spans
 
 
 def _clean(text: str) -> str:
@@ -38,6 +40,24 @@ class TestHTMLStripping:
         text = "Returns List<String> from the API"
         result = _clean(text)
         assert "List<String>" in result
+
+
+class TestMergeSpans:
+    @pytest.mark.parametrize(
+        ("first", "second", "expected"),
+        [
+            pytest.param([], [], [], id="both-empty"),
+            pytest.param([0, 2], [], [0, 2], id="second-empty"),
+            pytest.param([], [1, 3], [1, 3], id="first-empty"),
+            pytest.param([0, 2], [3, 4], [0, 2, 3, 4], id="gap"),
+            pytest.param([0, 2], [2, 4], [0, 4], id="touching"),
+            pytest.param([0, 10], [2, 4], [0, 10], id="contained"),
+            pytest.param([0, 2, 5, 7], [1, 6], [0, 7], id="bridging"),
+            pytest.param([5, 7], [0, 2], [0, 2, 5, 7], id="second-starts-first"),
+        ],
+    )
+    def test_merge_spans(self, first, second, expected):
+        assert _merge_spans(first, second) == expected
 
 
 class TestProtectedRegions:

@@ -19,6 +19,7 @@ from memtomem_stm.surfacing.grams import (
     ancestor_keys,
     basename_key,
     eligible_source,
+    fully_qualified,
     gram_hashes,
     keyed_hash,
     path_key,
@@ -158,6 +159,45 @@ class TestPathKey:
         assert ancestor_keys("/a/b/c.md", pathmod=posixpath) == ["/a/b", "/a", "/"]
         assert ancestor_keys("c:\\a\\b.md", pathmod=ntpath) == ["c:\\a", "c:\\"]
         assert basename_key("/a/b/c.md", pathmod=posixpath) == "c.md"
+
+
+class TestFullyQualified:
+    """One rule for collection and the transcript reader.
+
+    These rows hold on every supported Python. ``pathlib`` itself is not stable
+    for every input (an incomplete UNC such as ``//server`` is absolute on 3.13
+    but not on 3.12), but collection and reader still agree within one version.
+    """
+
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("C:\\notes\\a.md", True),
+            ("C:/notes/a.md", True),
+            ("\\\\server\\share\\a.md", True),
+            # Rooted but driveless: ntpath.isabs said True on Python 3.12.
+            ("\\notes\\a.md", False),
+            ("/notes/a.md", False),
+            ("C:notes\\a.md", False),  # drive-relative
+            ("notes\\a.md", False),
+            ("", False),
+        ],
+    )
+    def test_windows(self, path: str, expected: bool) -> None:
+        assert fully_qualified(path, pathmod=ntpath) is expected
+
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("/notes/a.md", True),
+            ("//notes", True),
+            ("notes/a.md", False),
+            ("~/a", False),
+            ("", False),
+        ],
+    )
+    def test_posix(self, path: str, expected: bool) -> None:
+        assert fully_qualified(path, pathmod=posixpath) is expected
 
 
 class TestEligibleSource:
