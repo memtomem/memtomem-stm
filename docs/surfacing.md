@@ -190,7 +190,15 @@ are unaffected.
   outside `cwd` (`/tmp/…`, `/private/tmp/…`, `/var/folders/…`,
   `/private/var/folders/…`, `$TMPDIR`) contributes nothing, since commands
   there mix repositories with many throwaway probe directories; other segments
-  contribute their path tokens and non-plumbing words.
+  contribute their path tokens and non-plumbing words. A word that is exactly
+  a temp directory (`/private/tmp`, `/var/folders/`, bare or in one pair of
+  quotes) contributes no tokens, but does not make its segment a scratchpad.
+  Known limit: a path in a command is read component by component, and a
+  component ends at a space or at any character other than a letter, digit,
+  `_`, `.`, `@` or `-`, even inside quotes. So from a `cwd` such as
+  `/tmp/repo space`, `cat "/tmp/repo space/src/x.py"` is read as naming
+  `/tmp/repo`, a temp path outside `cwd`, and its segment is skipped; a
+  relative path (`cat src/x.py`) is unaffected.
   If no segment contributes, there is no query, even though the call has a
   `description`. Otherwise the query is the description's first sentence plus
   those tokens.

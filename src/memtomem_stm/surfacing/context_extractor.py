@@ -62,6 +62,14 @@ _CLAUDE_TEMP_ROOT_RE = re.compile(r"^/(?:private/)?tmp/claude-[0-9]+(?:/|$)")
 # may stop short of the real path (``/private/var/folders+x/…``), so shell
 # commands match descendants only, through ``_SCRATCH_PREFIXES``.
 _ARG_VAR_FOLDERS_RE = re.compile(r"^(?:/private)?/var/folders(?:/|$)")
+# A shell word that is a temp directory itself (``ls /private/tmp``) names no
+# topic, so it yields no tokens. Only the word is dropped, not its segment: the
+# rest of the segment (``find ~ /private/tmp -name x``) may still be the work.
+# Matched on the whole raw word, unlike the cut path token, and only bare or in
+# one pair of matching quotes: ``/tmp+x/…``, ``'/private/var/folders,'`` and the
+# fragment ``'/private/tmp`` of a quoted path with a space are not the temp
+# directory.
+_SHELL_TEMP_DIR_WORD_RE = re.compile(r"""^(['"]?)(?:/private)?/(?:tmp|var/folders)/*\1$""")
 _TEMP_ROOT_RE = re.compile(r"^/(?:private/)?tmp/")
 _SEGMENT_SPLIT_RE = re.compile(r"\n|;|&&|\|\||\|")
 _LEADING_ASSIGNMENTS_RE = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
@@ -292,7 +300,7 @@ class ContextExtractor:
                 # Quotes are stripped, not rejected: a quoted search term
                 # (``grep -rn "SurfacingConfig"``) is often the topic itself.
                 bare = word.strip("'\"(),")
-                if not bare or bare.startswith("-"):
+                if not bare or bare.startswith("-") or _SHELL_TEMP_DIR_WORD_RE.match(word):
                     continue
                 match = _PATH_TOKEN_RE.search(bare)
                 path = match.group(0) if match else (bare if _BARE_FILE_RE.match(bare) else None)
