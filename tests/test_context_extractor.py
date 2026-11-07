@@ -776,10 +776,216 @@ class TestBuiltinPrivacyFirst:
         q = _builtin("shell", {"command": argv})
         assert q is not None and contains_sensitive_content(q)
 
+    def test_argv_sensitive_only_when_joined_is_returned_raw(self) -> None:
+        from memtomem_stm.proxy.privacy import contains_sensitive_content
+
+        argv = ["echo", "api_key", "=", "demo_secret_value"]
+        # No single element is sensitive, so only the joined-command check
+        # in ``_extract_builtin`` can catch it.
+        assert not any(contains_sensitive_content(a) for a in argv)
+        q = _builtin("shell", {"command": argv, "description": "Probe the endpoint"})
+        assert q == "echo api_key = demo_secret_value Probe the endpoint"
+        assert contains_sensitive_content(q)
+
     def test_sensitive_raw_query_is_independent_of_argument_order(self) -> None:
         a = _builtin("Bash", {"command": self._SECRET_CMD, "description": "Probe the API"})
         b = _builtin("Bash", {"description": "Probe the API", "command": self._SECRET_CMD})
         assert a == b
+
+
+class TestRawInputPrivacyFirst:
+    """#1344: every raw input a reshaping route reads (server and tool names,
+    the template and every argument string, nested ones included) is checked
+    before that route runs. On a match, a route that yields a query returns
+    the raw inputs instead, in a fixed order, so the engine's check sees them
+    whole; a route that yields none still yields none. An agent-provided query
+    is used as given and is not part of this check; a per-tool template wins
+    over it."""
+
+    @staticmethod
+    def _q(
+        args: dict[str, Any],
+        *,
+        server: str = "srv",
+        tool: str = "read_file",
+        template: str = "",
+    ) -> str | None:
+        tools = {tool: ToolSurfacingConfig(query_template=template)} if template else {}
+        cfg = SurfacingConfig(context_tools=tools)
+        return ContextExtractor().extract_query(server, tool, args, cfg)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "args", "query"),
+        [
+            # Path and pattern tokenizing split the secret apart.
+            (
+                {},
+                {"path": "/srv/cfg/api_key=demo_secret_value/x.txt"},
+                "srv read_file /srv/cfg/api_key=demo_secret_value/x.txt",
+            ),
+            (
+                {"tool": "search_code"},
+                {"pattern": "api_key=demo_secret_value"},
+                "srv search_code api_key=demo_secret_value",
+            ),
+            (
+                {},
+                {"file_path": "/home/alice@example.com/notes.md"},
+                "srv read_file /home/alice@example.com/notes.md",
+            ),
+            # Tool-name padding splits the name.
+            (
+                {"tool": "probe_api_key=demo_secret_value"},
+                {},
+                "srv probe_api_key=demo_secret_value",
+            ),
+            # Template interpolation: a glued suffix breaks the word boundary,
+            # str() of a list or dict escapes the tab the detector matches.
+            (
+                {"tool": "t", "template": "lookup {arg.email}_log entries"},
+                {"email": "alice@example.com"},
+                "srv t lookup {arg.email}_log entries alice@example.com",
+            ),
+            (
+                {"tool": "t", "template": "lookup payload {arg.query}"},
+                {"query": ["api_key\t=demo_secret_value"]},
+                "srv t lookup payload {arg.query} api_key\t=demo_secret_value",
+            ),
+            (
+                {"tool": "t", "template": "lookup {arg.cfg}"},
+                {"cfg": {"auth": {"header": "api_key\t=demo_secret_value"}}},
+                "srv t lookup {arg.cfg} auth header api_key\t=demo_secret_value",
+            ),
+            # A value carrying a placeholder that a later key expands.
+            (
+                {"tool": "t", "template": "lookup {arg.q} entries"},
+                {"q": "{arg.email}_log", "email": "alice@example.com"},
+                "srv t lookup {arg.q} entries alice@example.com {arg.email}_log",
+            ),
+            # The server name, and the template text itself.
+            (
+                {
+                    "server": "alice@example.com",
+                    "tool": "t",
+                    "template": "lookup {server}_log entries",
+                },
+                {},
+                "alice@example.com t lookup {server}_log entries",
+            ),
+            (
+                {"tool": "t", "template": "lookup alice@example.com{arg.suffix} entries"},
+                {"suffix": "_log"},
+                "srv t lookup alice@example.com{arg.suffix} entries _log",
+            ),
+            # A sensitive value the template does not use.
+            (
+                {"tool": "t", "template": "lookup {arg.topic}"},
+                {"topic": "jwt rotation policy", "note": "api_key=demo_secret_value"},
+                "srv t lookup {arg.topic} api_key=demo_secret_value jwt rotation policy",
+            ),
+        ],
+    )
+    def test_sensitive_raw_input_is_returned_raw(
+        self, kwargs: dict[str, str], args: dict[str, Any], query: str
+    ) -> None:
+        from memtomem_stm.proxy.privacy import contains_sensitive_content
+
+        q = self._q(args, **kwargs)
+        assert q == query
+        assert contains_sensitive_content(q)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "args"),
+        [
+            ({}, {"path": "/srv/cfg/api_key=demo_secret_value/x.txt"}),
+            ({"tool": "search_code"}, {"pattern": "api_key=demo_secret_value"}),
+            ({"tool": "probe_api_key=demo_secret_value"}, {}),
+            (
+                {"tool": "t", "template": "lookup {arg.email}_log entries"},
+                {"email": "alice@example.com"},
+            ),
+            (
+                {"tool": "t", "template": "lookup {arg.query}"},
+                {"query": ["api_key\t=demo_secret_value"]},
+            ),
+        ],
+    )
+    def test_each_route_would_have_hidden_it(
+        self, kwargs: dict[str, str], args: dict[str, Any]
+    ) -> None:
+        """The positive control: without the raw check, each of these routes
+        produces a query the engine's check does not flag."""
+        from memtomem_stm.proxy.privacy import contains_sensitive_content
+
+        ext = ContextExtractor()
+        server, tool = kwargs.get("server", "srv"), kwargs.get("tool", "read_file")
+        if "template" in kwargs:
+            reshaped = ext._apply_template(kwargs["template"], server, tool, args)
+        elif "path" in args:
+            reshaped = ext._tokenize_path(args["path"])
+        elif "pattern" in args:
+            reshaped = ext._tokenize_pattern(args["pattern"])
+        else:
+            reshaped = tool.replace("_", " ")
+        assert not contains_sensitive_content(reshaped)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "args"),
+        [
+            # Each template renders under the floor.
+            ({"tool": "t", "template": "{arg.email}_log"}, {"email": "alice@example.com"}),
+            ({"server": "alice@example.com", "tool": "t", "template": "{server}_log"}, {}),
+            # A one-token render holding a secret is still under the floor.
+            ({"tool": "t", "template": "{arg.q}"}, {"q": "alice@example.com"}),
+            ({"tool": "t", "template": "{arg.q}"}, {"q": "api_key=demo_secret_value"}),
+            # Interpolation assembles the secret; no single input holds it.
+            (
+                {"tool": "t", "template": "{arg.label}={arg.value}"},
+                {"label": "api_key", "value": "demo_secret_value"},
+            ),
+        ],
+    )
+    def test_a_route_without_a_query_still_yields_none(
+        self, kwargs: dict[str, str], args: dict[str, Any]
+    ) -> None:
+        """A secret does not turn a call that has no query into one."""
+        assert self._q(args, **kwargs) is None
+
+    def test_raw_query_is_independent_of_argument_order(self) -> None:
+        a = self._q({"path": "/srv/api_key=demo_secret_value", "owner": "acme"})
+        b = self._q({"owner": "acme", "path": "/srv/api_key=demo_secret_value"})
+        assert a == b == "srv read_file acme /srv/api_key=demo_secret_value"
+
+    def test_deeply_nested_value_is_walked_without_recursion(self) -> None:
+        """The raw check walks nested arguments iteratively and never renders
+        them: a container whose ``repr`` raises is still read to the leaf."""
+
+        class _NoRepr(list):
+            def __repr__(self) -> str:
+                raise AssertionError("nested argument was rendered")
+
+        nested: Any = "api_key=demo_secret_value"
+        for _ in range(5000):
+            nested = [nested]
+        args = {"q": _NoRepr([nested]), "query": "jwt rotation policy"}
+        q = self._q(args)
+        assert q == "srv read_file api_key=demo_secret_value jwt rotation policy"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "args", "query"),
+        [
+            ({}, {"path": "/srv/cfg/settings.json"}, "srv cfg settings json"),
+            (
+                {"tool": "t", "template": "lookup {arg.topic}"},
+                {"topic": "jwt rotation policy", "note": "see the runbook"},
+                "lookup jwt rotation policy",
+            ),
+        ],
+    )
+    def test_non_sensitive_query_is_unchanged(
+        self, kwargs: dict[str, str], args: dict[str, Any], query: str
+    ) -> None:
+        assert self._q(args, **kwargs) == query
 
 
 # Expected values were produced by the extractor on ``main`` before native-tool
