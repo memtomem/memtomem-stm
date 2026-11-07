@@ -28,7 +28,7 @@ from memtomem_stm.surfacing.mcp_client import (
     RemoteSearchResult,
     decode_context_compose_context,
 )
-from memtomem_stm.surfacing.observability import SurfacingObservability
+from memtomem_stm.surfacing.observability import SurfacingObservability, attribute_call
 
 # One from each end of the high and low surrogate blocks, so a range that is
 # off by one at either boundary fails. Kept in step with the corpus of the
@@ -1333,3 +1333,47 @@ class TestCoreIdentityIsNotAliasedAtIngest:
         assert hit.chunk.id == "hit"
         assert hit.context.window_before == ()
         assert [chunk.id for chunk in hit.context.window_after] == ["next"]
+
+
+@pytest.mark.asyncio
+async def test_failed_reconnect_on_compose_is_not_retried_by_legacy_search() -> None:
+    # A negotiated session marked dirty whose reconnect fails: compose used to
+    # return ``None`` here, which reads as "core has no compose", so the engine
+    # asked ``search`` -- whose heal retried the failed reconnect a second time
+    # inside the same call (#1346).
+    adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+    adapter._session = AsyncMock()
+    adapter._capabilities = LtmCapabilities(context_compose_schema=4)
+    adapter._generation = 1
+    adapter._dirty_generation = 1
+    adapter._needs_reconnect = True
+    reconnects: list[int] = []
+
+    async def failing_reconnect(expected_generation: int) -> None:
+        reconnects.append(expected_generation)
+        raise OSError("core unreachable")
+
+    adapter._shared_reconnect = failing_reconnect  # type: ignore[method-assign]
+    observability = SurfacingObservability()
+    engine = SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+        ),
+        mcp_adapter=adapter,
+        observability=observability,
+    )
+
+    with attribute_call() as ledger:
+        assert await engine.surface("docs", "read_file", {}, "response", context_query="q") == (
+            "response"
+        )
+
+    assert reconnects == [1]
+    # No request reached the transport, so this call is a fault, not a sample.
+    assert ledger.faulted is True
+    assert ledger.retrieval_attempted is False
+    assert ledger.timed_out is False
+    assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_unavailable": 1}
