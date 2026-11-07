@@ -9,6 +9,30 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Fixed
+
+- With `use_daemon` on, surfacing classifies the shared daemon's answers to
+  its context-compose request the way it already classified them for legacy
+  search. A daemon that is not running is reported as starting, after one
+  spawn request and no second request in the same call; a daemon whose
+  handshake is present but which does not answer gets a respawn request and
+  counts as LTM unavailable; a busy daemon is load shedding and no longer
+  counts toward the surfacing circuit breaker; an expired request is a
+  timeout. On the direct LTM connection, a failed reconnect is no longer
+  retried a second time within the same call. A daemon compose item whose id
+  is not UTF-8-encodable is dropped instead of failing the whole response.
+  (#1346)
+  **Behavior change**: `stm_admin(action="surfacing_stats")` counts these
+  cases under `daemon_starting`, `daemon_busy`, `ltm_unavailable` or
+  `error_timeout` where it used to count `ltm_call_failed`, and the "LTM
+  declared context_compose … but the call failed" warning no longer appears
+  for them. The durable fault counts `mms stats` shows record an unanswering
+  daemon as `ltm_unavailable` and an expired request as `error_timeout`
+  instead of `ltm_call_failed`, and no longer record a starting or busy
+  daemon at all.
+
 ## [0.7.7] — 2026-11-05
 
 ### Upgrade notes

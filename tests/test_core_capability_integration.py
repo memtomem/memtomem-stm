@@ -28,7 +28,7 @@ from memtomem_stm.surfacing.mcp_client import (
     RemoteSearchResult,
     decode_context_compose_context,
 )
-from memtomem_stm.surfacing.observability import SurfacingObservability
+from memtomem_stm.surfacing.observability import SurfacingObservability, attribute_call
 
 # One from each end of the high and low surrogate blocks, so a range that is
 # off by one at either boundary fails. Kept in step with the corpus of the
@@ -1366,9 +1366,14 @@ async def test_failed_reconnect_on_compose_is_not_retried_by_legacy_search() -> 
         observability=observability,
     )
 
-    assert await engine.surface("docs", "read_file", {}, "response", context_query="q") == (
-        "response"
-    )
+    with attribute_call() as ledger:
+        assert await engine.surface("docs", "read_file", {}, "response", context_query="q") == (
+            "response"
+        )
 
     assert reconnects == [1]
+    # No request reached the transport, so this call is a fault, not a sample.
+    assert ledger.faulted is True
+    assert ledger.retrieval_attempted is False
+    assert ledger.timed_out is False
     assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_unavailable": 1}
