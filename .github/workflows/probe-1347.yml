@@ -1,6 +1,10 @@
 # Throwaway diagnostic for PR #1354: the ubuntu Python 3.14 lane fails
 # test_overall_deadline_includes_backoff_sleep on that branch only.
 # Never merged; the probe branch is deleted after the run.
+#
+# Round 1 showed the failure needs the new test file AND the rest of the
+# suite. Round 2 records GC passes inside the timing test, and runs the
+# candidate fix (stop the managers the new test creates), each twice.
 name: probe-1347
 
 on:
@@ -12,37 +16,27 @@ permissions:
 
 env:
   FILTER: "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"
-  TARGET: "tests/test_proxy_error_paths.py::TestCallTimeout::test_overall_deadline_includes_backoff_sleep"
 
 jobs:
   probe:
     strategy:
       fail-fast: false
       matrix:
-        variant: [branch-full, branch-without-new-file, new-file-then-error-paths, main-full]
-    name: probe (${{ matrix.variant }})
+        variant: [branch-gc, fixed-gc]
+        rep: [1, 2]
+    name: probe (${{ matrix.variant }} ${{ matrix.rep }})
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ matrix.variant == 'main-full' && 'main' || github.sha }}
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.12.5"
           python-version: "3.14"
       - run: uv sync --frozen
+      - name: Use the fixed test file
+        if: matrix.variant == 'fixed-gc'
+        run: cp .github/probe/fixed_hybrid_test.py tests/test_hybrid_tail_structure_and_budget.py
       - name: Run
-        run: |
-          case "${{ matrix.variant }}" in
-            branch-full|main-full)
-              uv run pytest -m "$FILTER" --tb=short -q --durations=15 ;;
-            branch-without-new-file)
-              uv run pytest -m "$FILTER" --tb=short -q --durations=15 \
-                --ignore=tests/test_hybrid_tail_structure_and_budget.py ;;
-            new-file-then-error-paths)
-              uv run pytest --tb=short -q \
-                tests/test_hybrid_tail_structure_and_budget.py tests/test_proxy_error_paths.py ;;
-          esac
-      - name: Target alone, five times
-        if: always()
-        run: for i in 1 2 3 4 5; do uv run pytest -q --tb=line "$TARGET" | tail -1; done
+        env:
+          PYTHONPATH: .github/probe
+        run: uv run pytest -p gcprobe -m "$FILTER" --tb=short -q 2>&1 | grep -E "GCPROBE|FAILED|assert \(|[0-9]+ (passed|failed)"
