@@ -1337,7 +1337,7 @@ class MetricsStore:
         apart instead of compressed (``METADATA_BYPASS_STRATEGY``, #1122), or
         that preserve native upstream structured/non-text payloads
         (``STRUCTURED_BYPASS_STRATEGY``).
-        Every statement here drops those rows: no compressor or retention
+        The population every field is read from drops those rows: no compressor or retention
         floor ran on them, so counting them would dilute the violation rate
         and move ``p95_original_chars`` with calls the settings being tuned
         never acted on. A tool that only ever took that path has no profile.
@@ -1362,36 +1362,132 @@ class MetricsStore:
             return []
         cutoff = time.time() - since_seconds
         with self._lock:
-            # Main aggregation
+            # ONE statement for every field, so a profile shares one snapshot:
+            # the instance lock does not span processes, and ``call_count``, the
+            # p95 and the strategy counts used to come from three statements, so
+            # a writer landing between them could make them disagree. It also
+            # replaces the 2 extra statements per ``(server, tool)`` group, each
+            # re-scanning the window — 2.7 s for 200 groups over 10k rows, on the
+            # event loop when the ``stm_tuning_recommendations`` tool calls in
+            # (#1348).
+            #
+            # ``base`` is the population every field shares: the window, the
+            # ``source = 'mcp'`` scope, and the bypass exclusions.
+            #
+            # p95: the value at rank ``max(1, floor(0.95 * N))`` within each
+            # group in ascending ``original_chars`` order. Rows tied on the value
+            # are interchangeable, so the tie order cannot change the result.
+            #
+            # Strategy: the three ``auto_*`` fields describe one population — the
+            # calls AUTO chose a strategy for (``strategy_auto_selected = 1``). It
+            # is an equality, not ``IS NOT 0``, so the NULL provenance of a
+            # pre-migration row drops out rather than counting as either answer.
+            #
+            # The key is the label's pre-arrow base, not the label: the
+            # ratio-guard ladder rewrites ``compression_strategy`` on
+            # degradation, so grouping by the stored value splits one
+            # selection across ``hybrid`` and ``hybrid→progressive_fallback``
+            # and reads a perfectly consistent tool as inconsistent (#937).
+            # An undegraded call records a bare strategy; every site that
+            # writes a degradation label spells it ``<base>→<suffix>`` with
+            # a single ``CompressionStrategy`` value as the base — the same
+            # convention ``get_progressive_degradations`` matches on — so
+            # cutting at the first arrow yields what AUTO chose, and leaves
+            # an undegraded label untouched. A tie between two strategies goes
+            # to the label that sorts LAST: that is what the per-group statement
+            # this replaced returned on SQLite's sorter (every one of 765 tied
+            # groups measured), now a stated rule rather than an artifact.
             rows = self._db.execute(
                 """
-                SELECT
-                    server,
-                    tool,
-                    COUNT(*)                                          AS call_count,
-                    SUM(ratio_violation)                              AS violation_count,
-                    AVG(
-                        CASE WHEN cleaned_chars > 0 AND is_error = 0
-                              AND compression_accounting = 'initial_response_v1'
-                             THEN CAST(compressed_chars AS REAL) / cleaned_chars
-                        END
-                    )                                                 AS avg_ratio,
-                    SUM(
-                        CASE WHEN cleaned_chars > 0 AND is_error = 0
-                              AND compression_accounting = 'initial_response_v1'
-                             THEN 1 ELSE 0
-                        END
-                    )                                                 AS ratio_count,
-                    SUM(is_error)                                     AS error_count
-                FROM proxy_metrics
-                WHERE created_at >= ? AND source = 'mcp'
-                    AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
-                GROUP BY server, tool
+                WITH base AS (
+                    SELECT server, tool, original_chars, compressed_chars, cleaned_chars,
+                           is_error, compression_accounting, ratio_violation,
+                           compression_strategy, strategy_auto_selected
+                    FROM proxy_metrics
+                    WHERE created_at >= ? AND source = 'mcp'
+                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
+                ),
+                agg AS (
+                    SELECT
+                        server,
+                        tool,
+                        COUNT(*)                                      AS call_count,
+                        SUM(ratio_violation)                          AS violation_count,
+                        AVG(
+                            CASE WHEN cleaned_chars > 0 AND is_error = 0
+                                  AND compression_accounting = 'initial_response_v1'
+                                 THEN CAST(compressed_chars AS REAL) / cleaned_chars
+                            END
+                        )                                             AS avg_ratio,
+                        SUM(
+                            CASE WHEN cleaned_chars > 0 AND is_error = 0
+                                  AND compression_accounting = 'initial_response_v1'
+                                 THEN 1 ELSE 0
+                            END
+                        )                                             AS ratio_count,
+                        SUM(is_error)                                 AS error_count
+                    FROM base
+                    GROUP BY server, tool
+                ),
+                ranked AS (
+                    SELECT server, tool, original_chars,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY server, tool ORDER BY original_chars
+                           ) AS rn,
+                           COUNT(*) OVER (PARTITION BY server, tool) AS n
+                    FROM base
+                ),
+                p95 AS (
+                    SELECT server, tool, original_chars AS p95_original_chars
+                    FROM ranked
+                    WHERE rn = MAX(1, CAST(n * 0.95 AS INTEGER))
+                ),
+                chosen AS (
+                    SELECT server, tool,
+                           CASE WHEN instr(compression_strategy, '→') > 0
+                                THEN substr(compression_strategy, 1,
+                                            instr(compression_strategy, '→') - 1)
+                                ELSE compression_strategy END AS selected_strategy,
+                           COUNT(*) AS selected_count
+                    FROM base
+                    WHERE compression_strategy IS NOT NULL AND strategy_auto_selected = 1
+                    GROUP BY server, tool, selected_strategy
+                ),
+                dominant AS (
+                    SELECT server, tool, selected_strategy, selected_count,
+                           SUM(selected_count) OVER (PARTITION BY server, tool) AS auto_count,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY server, tool
+                               ORDER BY selected_count DESC, selected_strategy DESC
+                           ) AS rn
+                    FROM chosen
+                )
+                SELECT a.server, a.tool, a.call_count, a.violation_count, a.avg_ratio,
+                       a.ratio_count, a.error_count, p.p95_original_chars,
+                       d.selected_strategy, d.selected_count, d.auto_count
+                FROM agg AS a
+                JOIN p95 AS p ON p.server = a.server AND p.tool = a.tool
+                LEFT JOIN dominant AS d
+                    ON d.server = a.server AND d.tool = a.tool AND d.rn = 1
+                ORDER BY a.server, a.tool
                 """,
                 (cutoff, METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY),
             ).fetchall()
 
-            profiles: list[dict] = []
+        return [
+            {
+                "server": server,
+                "tool": tool,
+                "call_count": call_count,
+                "violation_count": violation_count or 0,
+                "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
+                "ratio_count": ratio_count or 0,
+                "p95_original_chars": p95,
+                "auto_dominant_strategy": strategy,
+                "auto_dominant_strategy_count": strategy_count or 0,
+                "auto_strategy_count": auto_count or 0,
+                "error_count": error_count or 0,
+            }
             for (
                 server,
                 tool,
@@ -1400,107 +1496,12 @@ class MetricsStore:
                 avg_ratio,
                 ratio_count,
                 error_count,
-            ) in rows:
-                # p95 approximation: pick the value at rank ceil(0.95 * N)
-                p95_row = self._db.execute(
-                    """
-                    SELECT original_chars FROM proxy_metrics
-                    WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
-                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
-                    ORDER BY original_chars ASC
-                    LIMIT 1 OFFSET MAX(0, CAST(
-                        (SELECT COUNT(*) FROM proxy_metrics
-                         WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
-                             AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?)
-                        * 0.95 AS INTEGER) - 1)
-                    """,
-                    (
-                        server,
-                        tool,
-                        cutoff,
-                        METADATA_BYPASS_STRATEGY,
-                        STRUCTURED_BYPASS_STRATEGY,
-                        server,
-                        tool,
-                        cutoff,
-                        METADATA_BYPASS_STRATEGY,
-                        STRUCTURED_BYPASS_STRATEGY,
-                    ),
-                ).fetchone()
-                # The strategy AUTO chose most often, how often it chose it,
-                # and the population both are over.  All three come from ONE
-                # statement so they share a single SQLite snapshot: another
-                # process writing between two statements could otherwise pair
-                # a numerator with a smaller denominator and yield a share
-                # above 1.0 (the instance lock does not span processes).
-                #
-                # ``strategy_auto_selected = 1`` is what narrows this to AUTO's
-                # own behavior. It is an equality, not ``IS NOT 0``, so the
-                # NULL provenance of a pre-migration row drops out rather than
-                # counting as either answer.
-                #
-                # The key is the label's pre-arrow base, not the label: the
-                # ratio-guard ladder rewrites ``compression_strategy`` on
-                # degradation, so grouping by the stored value splits one
-                # selection across ``hybrid`` and ``hybrid→progressive_fallback``
-                # and reads a perfectly consistent tool as inconsistent (#937).
-                # An undegraded call records a bare strategy; every site that
-                # writes a degradation label spells it ``<base>→<suffix>`` with
-                # a single ``CompressionStrategy`` value as the base — the same
-                # convention ``get_progressive_degradations`` matches on — so
-                # cutting at the first arrow yields what AUTO chose, and leaves
-                # an undegraded label untouched.
-                strat_row = self._db.execute(
-                    """
-                    SELECT
-                        CASE WHEN instr(compression_strategy, '→') > 0
-                             THEN substr(compression_strategy, 1,
-                                         instr(compression_strategy, '→') - 1)
-                             ELSE compression_strategy END AS selected_strategy,
-                        COUNT(*),
-                        (SELECT COUNT(*) FROM proxy_metrics
-                         WHERE server = ? AND tool = ? AND created_at >= ?
-                             AND compression_strategy IS NOT NULL
-                             AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
-                             AND strategy_auto_selected = 1 AND source = 'mcp')
-                    FROM proxy_metrics
-                    WHERE server = ? AND tool = ? AND created_at >= ?
-                        AND compression_strategy IS NOT NULL
-                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
-                        AND strategy_auto_selected = 1 AND source = 'mcp'
-                    GROUP BY selected_strategy
-                    ORDER BY COUNT(*) DESC
-                    LIMIT 1
-                    """,
-                    (
-                        server,
-                        tool,
-                        cutoff,
-                        METADATA_BYPASS_STRATEGY,
-                        STRUCTURED_BYPASS_STRATEGY,
-                        server,
-                        tool,
-                        cutoff,
-                        METADATA_BYPASS_STRATEGY,
-                        STRUCTURED_BYPASS_STRATEGY,
-                    ),
-                ).fetchone()
-                profiles.append(
-                    {
-                        "server": server,
-                        "tool": tool,
-                        "call_count": call_count,
-                        "violation_count": violation_count or 0,
-                        "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
-                        "ratio_count": ratio_count or 0,
-                        "p95_original_chars": p95_row[0] if p95_row else 0,
-                        "auto_dominant_strategy": strat_row[0] if strat_row else None,
-                        "auto_dominant_strategy_count": strat_row[1] if strat_row else 0,
-                        "auto_strategy_count": strat_row[2] if strat_row else 0,
-                        "error_count": error_count or 0,
-                    }
-                )
-        return profiles
+                p95,
+                strategy,
+                strategy_count,
+                auto_count,
+            ) in rows
+        ]
 
     def get_progressive_degradations(
         self, since_seconds: float = 86400.0, tool: str | None = None
