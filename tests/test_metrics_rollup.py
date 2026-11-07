@@ -638,3 +638,157 @@ class TestCoverage:
         assert rollup["lost_before_install"] == 0
         assert rollup["incomplete_before"] is None
         assert rollup["earliest_created_at"] == 1_000.0
+
+
+def _sql(path: Path, *statements: str) -> None:
+    db = sqlite3.connect(str(path))
+    try:
+        for statement in statements:
+            db.execute(statement)
+        db.commit()
+    finally:
+        db.close()
+
+
+class TestInt64RangeTotals:
+    """Rows ``_finite`` admits must never take the summary down (#1348).
+
+    ``SUM`` raised "integer overflow" as soon as two admitted rows added past
+    int64, and the reader's ``except sqlite3.Error`` turned the whole summary
+    into ``available: False``."""
+
+    BIG = 5 * 10**18  # in range for one row; two of them are not
+
+    def test_retained_and_all_time_totals_survive_an_int64_overflow(self, tmp_path):
+        path = tmp_path / "m.db"
+        _open(path).close()
+        for _ in range(2):
+            _insert_raw(path, created_at=time.time(), original_chars=self.BIG, compressed_chars=0)
+
+        for reader in (read_compression_summary, read_compression_all_time):
+            result = reader(path)
+            assert result["available"] is True, (reader.__name__, result.get("error"))
+            assert result["total_original_chars"] == 2 * self.BIG
+            assert type(result["total_original_chars"]) is int
+            assert type(result["total_calls"]) is int
+
+    def test_sums_below_int64_stay_exact(self, tmp_path):
+        """The float fallback is for overflow only: ``2**53 + 1`` is exact in
+        ``SUM`` and not in ``TOTAL``."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _insert_raw(path, created_at=time.time(), original_chars=2**53, compressed_chars=0)
+        _insert_raw(path, created_at=time.time(), original_chars=1, compressed_chars=0)
+
+        for reader in (read_compression_summary, read_compression_all_time):
+            assert reader(path)["total_original_chars"] == 2**53 + 1, reader.__name__
+
+    def test_all_time_total_is_unchanged_when_the_rows_are_trimmed(self, tmp_path):
+        """The trigger's ``+`` turns REAL past int64; the reader must not treat
+        that legitimate bucket as damage and zero it."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        for _ in range(2):
+            _insert_raw(path, created_at=time.time(), original_chars=self.BIG, compressed_chars=0)
+        before = read_compression_all_time(path)
+
+        _sql(path, "DELETE FROM proxy_metrics")
+        db = sqlite3.connect(str(path))
+        bucket = db.execute(
+            f"SELECT legacy_original_chars, typeof(legacy_original_chars) FROM {_DAILY}"
+        ).fetchall()
+        db.close()
+        assert bucket == [(2.0 * self.BIG, "real")], "positive control: the bucket overflowed"
+
+        after = read_compression_all_time(path)
+        assert after["available"] is True, after.get("error")
+        assert after["total_original_chars"] == before["total_original_chars"] == 2 * self.BIG
+        assert after["total_calls"] == before["total_calls"] == 2
+
+    @pytest.mark.parametrize("damage", ["'not a number'", "9e999", "-9e999", "NULL"])
+    def test_a_damaged_daily_counter_contributes_zero(self, tmp_path, damage):
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _insert_raw(path, created_at=time.time())
+        _insert_raw(path, created_at=time.time())
+        _sql(path, "DELETE FROM proxy_metrics WHERE id = 1")
+        _sql(path, f"UPDATE {_DAILY} SET legacy_original_chars = {damage}")
+
+        result = read_compression_all_time(path)
+
+        assert result["available"] is True, result.get("error")
+        assert result["total_original_chars"] == 100  # the retained row only
+        assert result["total_calls"] == 2
+
+    def test_fractional_sizes_keep_their_fraction(self, tmp_path):
+        """Only an outside write stores a fractional size; the reader reports it
+        as ``SUM`` did rather than truncating it into a different ratio."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _insert_raw(path, created_at=time.time(), original_chars=1.5, compressed_chars=0.5)
+
+        result = read_compression_summary(path)
+
+        assert result["total_original_chars"] == 1.5
+        assert result["total_compressed_chars"] == 0.5
+        assert result["saved_ratio"] == pytest.approx(2 / 3, abs=1e-4)
+
+
+class TestMarkerRepair:
+    """Erased rollup markers must not be rebuilt into a fabricated loss (#1348)."""
+
+    def _running_rollup(self, path: Path) -> dict[str, str]:
+        """Five rows, three trimmed AFTER installation: nothing was ever lost."""
+        _open(path).close()
+        for i in range(5):
+            _insert_raw(path, created_at=1_000_000.0 + i)
+        _sql(path, "DELETE FROM proxy_metrics WHERE id <= 3")
+        rollup = read_compression_all_time(path)["rollup"]
+        assert rollup["lost_before_install"] == 0, "positive control"
+        assert rollup["incomplete_before"] is None, "positive control"
+        return _meta(path)
+
+    def test_documented_repair_keeps_the_markers(self, tmp_path):
+        path = tmp_path / "m.db"
+        first = self._running_rollup(path)
+
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        _open(path).close()
+
+        after = _meta(path)
+        assert after["rollup_installed_at"] == first["rollup_installed_at"]
+        assert after["rollup_rows_lost_before_install"] == "0"
+        assert after["schema_fingerprint"] == first["schema_fingerprint"]
+
+    @pytest.mark.parametrize("reset_first", [False, True])
+    def test_erased_markers_on_a_running_rollup_record_an_unknown_loss(self, tmp_path, reset_first):
+        """``seq - COUNT(*)`` would call the three rolled-up rows lost — and after
+        a documented history reset, every row ever written."""
+        path = tmp_path / "m.db"
+        self._running_rollup(path)
+        if reset_first:
+            _sql(path, "DELETE FROM proxy_metrics", f"DELETE FROM {_DAILY}")
+            _insert_raw(path, created_at=1_000_100.0)
+
+        _sql(path, "DELETE FROM metrics_meta")
+        _open(path).close()
+
+        meta = _meta(path)
+        assert meta["rollup_rows_lost_before_install"] == "unknown"
+        rollup = read_compression_all_time(path)["rollup"]
+        assert rollup["installed"] is True
+        assert rollup["lost_before_install"] is None
+
+    def test_first_install_still_counts_the_rows_already_trimmed(self, tmp_path):
+        """Control for the rule above: no daily table before the transaction is a
+        first installation, and its count is exact."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _strip_rollup(path)
+        for i in range(6):
+            _insert_raw(path, created_at=1_000_000.0 + i)
+        _sql(path, "DELETE FROM proxy_metrics WHERE id <= 2")
+
+        _open(path).close()
+
+        assert _meta(path)["rollup_rows_lost_before_install"] == "2"
