@@ -51,6 +51,14 @@ class _Harness:
         self.engine = SurfacingEngine(
             config.surfacing, mcp_adapter=self.adapter, observability=self.observability
         )
+        self.faults: list[str] = []
+        persist = self.engine._persist_fault
+
+        def record_fault(server: str, tool: str, kind: str) -> None:
+            self.faults.append(kind)
+            persist(server, tool, kind)
+
+        monkeypatch.setattr(self.engine, "_persist_fault", record_fault)
 
     async def surface(self) -> str:
         return await self.engine.surface("docs", "read_file", {}, "response", context_query="q")
@@ -80,6 +88,7 @@ async def test_missing_daemon_is_daemon_starting_with_one_spawn_and_no_legacy_se
     h.spawn.assert_awaited_once()
     assert h.skips == {"daemon_starting": 1}
     assert h.breaker_failures == 0
+    assert h.faults == []
     # The generation is gone: its capability verdicts must not survive it.
     assert h.adapter.capabilities.context_compose_schema == 4
 
@@ -97,6 +106,7 @@ async def test_unanswering_daemon_is_ltm_unavailable_and_requests_a_respawn(
     h.spawn.assert_awaited_once()
     assert h.skips == {"ltm_unavailable": 1}
     assert h.breaker_failures == 1
+    assert h.faults == ["ltm_unavailable"]
     # Not the "declared context_compose but the call failed" contract warning.
     assert not any("context_compose" in r.getMessage() for r in caplog.records)
 
@@ -114,6 +124,7 @@ async def test_busy_daemon_is_an_operational_skip_that_spares_the_breaker(
     h.spawn.assert_not_awaited()
     assert h.skips == {"daemon_busy": 4}
     assert h.breaker_failures == 0
+    assert h.faults == []
 
 
 @pytest.mark.asyncio
@@ -203,19 +214,21 @@ def _item(chunk_id: str, content: str) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("collection", ["pinned", "retrieved"])
 @pytest.mark.parametrize("field", ["chunk_id", "id", "block_id"])
 async def test_one_unencodable_identity_drops_that_item_not_the_bundle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, collection: str
 ) -> None:
     bad = _item("ok-id", "bad")
     bad[field] = "bad-\ud800"
+    other = "retrieved" if collection == "pinned" else "pinned"
     reply = (
         "ok",
         {
             "ok": True,
             "selected_context_compose_schema": 2,
-            "pinned": [],
-            "retrieved": [bad, _item("good-id", "good")],
+            collection: [bad, _item("good-id", "good")],
+            other: [_item("other-id", "other")],
         },
     )
     h = _Harness(tmp_path, monkeypatch, reply)
@@ -223,4 +236,6 @@ async def test_one_unencodable_identity_drops_that_item_not_the_bundle(
     bundle = await h.adapter.context_compose("q")
 
     assert bundle is not None
-    assert [r.chunk.id for r in bundle.retrieved] == ["good-id"]
+    kept = getattr(bundle, collection)
+    assert [r.chunk.id for r in kept] == ["good-id"]
+    assert [r.chunk.id for r in getattr(bundle, other)] == ["other-id"]
