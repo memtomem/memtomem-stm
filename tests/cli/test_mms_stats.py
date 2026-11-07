@@ -757,6 +757,36 @@ class TestMmsStatsAllTime:
         assert result.exit_code == 0, result.output
         assert "Incomplete before 2100-01-01 00:00 UTC: 7 rows were trimmed" in result.output
 
+    def test_unknown_loss_is_not_reported_as_a_loss(self, runner, tmp_path, monkeypatch):
+        """Markers erased from a running rollup and re-created (#1348): whether any
+        row predates the trigger is unknown, so the line must not assert a trim."""
+        set_home(monkeypatch, tmp_path)
+        db = self._seed_trimmed(tmp_path)
+        raw = sqlite3.connect(str(db))
+        raw.execute("DELETE FROM metrics_meta")
+        raw.commit()
+        raw.close()
+        store = MetricsStore(db)
+        store.initialize()
+        store.close()
+        raw = sqlite3.connect(str(db))
+        assert raw.execute(
+            "SELECT value FROM metrics_meta WHERE key = 'rollup_rows_lost_before_install'"
+        ).fetchone() == ("unknown",), "positive control: the re-created count is unknown"
+        raw.execute(
+            "UPDATE metrics_meta SET value = '4102444800.0' WHERE key = 'rollup_installed_at'"
+        )
+        raw.commit()
+        raw.close()
+
+        result = runner.invoke(cli, ["stats", "--all-time"])
+
+        assert result.exit_code == 0, result.output
+        assert "Possibly incomplete before 2100-01-01 00:00 UTC" in result.output
+        assert "is unknown" in result.output
+        assert "rows were trimmed" not in result.output
+        assert "Incomplete before" not in result.output
+
     def test_coverage_outside_pythons_date_range_renders(self, runner, tmp_path, monkeypatch):
         """SQLite dates year 0, which ``datetime`` refuses; the report must not
         crash, whether the row is retained or already rolled up."""

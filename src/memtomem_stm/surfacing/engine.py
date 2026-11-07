@@ -1468,15 +1468,16 @@ class SurfacingEngine:
         the raw text of a non-sensitive query — this knob only governs **two output fields**: the
         persisted row and the surface webhook's ``query``. The LTM search
         still receives the raw text; a query that matches a sensitive
-        pattern is digested before retrieval regardless of this knob.
+        pattern is never searched for at all, regardless of this knob
+        (``surface()`` skips it as ``sensitive_query``).
 
         Secret guard: regardless of ``persist_query_text``, a query whose
         text matches a known sensitive pattern (API key, bearer token, JWT,
         ``password=``/``api_key=`` assignment, private-key header, email
-        address) is hashed before persistence, so an inline credential in a
-        Bash ``command`` argument or a tokenized URL never reaches disk
-        verbatim on the proxy path (the hook/daemon cold paths already
-        disable persistence). This deliberately scans the FULL default set
+        address) is hashed here too. ``surface()`` stops such a query before
+        a surfacing event is persisted or a webhook fires (its opportunity row
+        keeps only the digest), so this is a second line for any writer that
+        does not pass through it. This deliberately scans the FULL default set
         — credentials *and* PII — unlike the LLM compression routing gate,
         which scans ``CREDENTIAL_PATTERNS`` only: an email is fine to show
         an external summarizer but not fine to persist. Only the persisted
@@ -1789,14 +1790,16 @@ class SurfacingEngine:
             self._skip(scope, tool, "no_query")
             logger.debug("Surfacing skipped: no query extracted for %s/%s", server, tool)
             return response_text
-        # Taken before the substitution below, so the digest names the query
-        # the call extracted whether or not it looked sensitive.
         scope.opportunity.query_digest = self._hashed_query(query)
         scope.opportunity.query_tokens = len(query.split())
         if contains_sensitive_content(query):
-            # Never send raw credentials/PII to a remote LTM. A stable digest
-            # preserves cache/cooldown behavior without disclosing the source.
-            query = self._hashed_query(query)
+            # Never send raw credentials/PII to a remote LTM. Its digest is no
+            # query either — it carries none of the original's meaning — so
+            # the call ends here, before it claims a rate-limit slot or starts
+            # an LTM round trip.
+            self._skip(scope, tool, "sensitive_query")
+            logger.debug("Surfacing skipped: sensitive query for %s/%s", server, tool)
+            return response_text
         # On pass the gate eagerly claims a rate-limit slot; the claim token
         # rides along so a path that ends up starting no LTM work can give
         # back exactly its own slot (``release_claim``).

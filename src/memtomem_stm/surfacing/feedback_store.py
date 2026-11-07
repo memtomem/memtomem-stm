@@ -245,8 +245,8 @@ CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
 --   arg_shape_json counts about the arguments, never keys or values
 --                  (``arg_shape``)
 --   response_len   the response size the ``min_response_chars`` gate judged
---   query_digest   ``sha256:`` + 16 hex of the extracted query, before the
---                  sensitive-query substitution; NULL before extraction
+--   query_digest   ``sha256:`` + 16 hex of the extracted query, a sensitive
+--                  one included; NULL before extraction
 -- ``host_session_id`` is the hook host's session id; NULL on the proxy path.
 -- ``arm`` / ``holdout_rate`` (added columns, ``_OPPORTUNITIES_ADDED_COLUMNS``)
 -- are set only on a call where a holdout draw happened; such a row is never

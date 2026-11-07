@@ -744,6 +744,31 @@ class TestBuiltinPrivacyFirst:
             " ".join(ContextExtractor._command_tokens(self._SECRET_CMD, _REPO) or [])
         )
 
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [
+            # No segment contributes: ``cd`` and inline Python.
+            (
+                "Bash",
+                {
+                    "command": "cd /srv && python3 -c \"print('api_key=demo_secret_value')\"",
+                    "description": "Check the key",
+                },
+            ),
+            ("Bash", {"command": "cd /srv/api_key=demo_secret_value"}),
+            # Contributes, but below ``min_query_tokens``.
+            ("Grep", {"pattern": "a@b.io"}),
+        ],
+    )
+    def test_a_secret_does_not_make_a_query_of_a_call_that_has_none(
+        self, tool: str, args: dict[str, Any]
+    ) -> None:
+        """#1344: the raw values replace a query; they do not create one."""
+        from memtomem_stm.proxy.privacy import contains_sensitive_content
+
+        assert any(contains_sensitive_content(v) for v in args.values())
+        assert _builtin(tool, args) is None
+
     def test_sensitive_argv_command_is_returned_raw(self) -> None:
         from memtomem_stm.proxy.privacy import contains_sensitive_content
 
