@@ -41,6 +41,7 @@ from memtomem_stm.surfacing.mcp_client import (
     KNOWN_SCORE_SCALES,
     render_score_scale,
     LtmCapabilities,
+    LtmOperationalSkip,
     LtmTransportError,
     RemoteContextInfo,
     SearchOutcome,
@@ -2656,6 +2657,7 @@ class SurfacingEngine:
             search_kwargs["context_window"] = ctx_win
         compose_failed = False
         compose_transport_failed = False
+        compose_skip: SearchOutcome | None = None
         ltm_unready = False
         try:
             # Until the session negotiates, ``capabilities`` holds the schema-0
@@ -2694,6 +2696,10 @@ class SurfacingEngine:
                         context_window=ctx_win,
                         trace_id=trace_id,
                     )
+                except LtmOperationalSkip as skip:
+                    # Starting or shedding load: the skip ``search`` would have
+                    # reported, booked by the outcome branch below.
+                    compose_skip = skip.outcome
                 except LtmTransportError:
                     logger.debug("Core context composition transport failed", exc_info=True)
                     compose_transport_failed = True
@@ -2722,6 +2728,8 @@ class SurfacingEngine:
                         + ", ".join(bundle.omitted_block_ids[:5])
                     )
                 outcome: SearchOutcome = "ok" if results else "empty_results"
+            elif compose_skip is not None:
+                results, hints, outcome = [], [], compose_skip
             elif compose_transport_failed:
                 results, hints, outcome = [], [], "transport_error"
             elif compose_failed:

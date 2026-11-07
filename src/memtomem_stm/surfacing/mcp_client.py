@@ -81,6 +81,19 @@ class LtmTransportError(RuntimeError):
     """A compose RPC still failed after the adapter's reconnect attempt."""
 
 
+class LtmOperationalSkip(RuntimeError):
+    """A compose RPC was not served because the LTM is starting or shedding load.
+
+    The compose counterpart of the ``daemon_starting`` / ``daemon_busy``
+    outcomes that ``search`` returns: the engine books it as that skip, without
+    a breaker failure or a fault row, and does not retry with ``search``.
+    """
+
+    def __init__(self, outcome: Literal["daemon_starting", "daemon_busy"]) -> None:
+        super().__init__(outcome)
+        self.outcome: Literal["daemon_starting", "daemon_busy"] = outcome
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteContextChunk:
     """One adjacent chunk carried by context-compose schema 3."""
@@ -1670,9 +1683,15 @@ class McpClientSearchAdapter:
         context_window: int | None = None,
         trace_id: str | None = None,
     ) -> ContextComposeResult | None:
-        """Return a pinned-first structured bundle when core advertises it."""
+        """Return a pinned-first structured bundle when core advertises it.
+
+        ``None`` means only "core has no compose surface"; the caller then asks
+        ``search``. A session that cannot be readied raises instead: returning
+        ``None`` there sent the engine to ``search``, whose own heal retried
+        the failed reconnect a second time inside the same call.
+        """
         if not await self._heal_if_needed():
-            return None
+            raise LtmTransportError("core context_compose has no ready session")
         # Pinned for the same reason as ``search``'s parser: a reconnect can
         # renegotiate this while the RPC is in flight (#874), and the reply must
         # be read under the schema that asked for it.

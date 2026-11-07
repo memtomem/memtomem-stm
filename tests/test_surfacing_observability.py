@@ -656,10 +656,10 @@ class TestCallLedger:
 
         ``ltm_call_failed`` is deliberately not a third case here. It reads
         like one -- healing can fail on the compose path too -- but it is not
-        reachable that way: ``context_compose`` returns ``None`` when its own
-        heal fails, the engine falls back to ``search``, and that records
-        ``ltm_unavailable``. Asserting it would pin a terminal production
-        cannot produce.
+        reachable that way: ``context_compose`` raises ``LtmTransportError``
+        when its own heal fails, which the engine records as
+        ``ltm_unavailable`` without issuing a request. Asserting it would pin a
+        terminal production cannot produce.
         """
         obs = SurfacingObservability()
         with attribute_call() as pre_work_exhausted:

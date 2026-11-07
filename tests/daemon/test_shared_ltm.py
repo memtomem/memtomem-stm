@@ -33,6 +33,7 @@ from memtomem_stm.surfacing.daemon_adapter import DaemonLtmAdapter
 from memtomem_stm.surfacing.mcp_client import (
     ContextComposeResult,
     LtmCapabilities,
+    LtmTransportError,
     RemoteContextChunk,
     RemoteContextInfo,
     RemoteSearchResult,
@@ -536,6 +537,44 @@ async def test_failed_cold_negotiation_is_unavailable_not_unsupported(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("negotiated", [False, True], ids=["cold-start-failed", "reconnect-failed"])
+async def test_real_adapter_failed_heal_stays_unavailable_on_the_wire(
+    tmp_path: Path, negotiated: bool
+) -> None:
+    # The daemon asks its adapter to compose before it checks readiness, so a
+    # failed heal reaches it both on a cold start that failed and on a dirty,
+    # already negotiated session. The adapter raises on a failed heal instead
+    # of returning ``None`` (#1346); the wire answer stays ``unavailable``.
+    server = DaemonServer(_config(tmp_path))
+    adapter = McpClientSearchAdapter(server._config.surfacing)
+    adapter._capabilities = LtmCapabilities(context_compose_schema=3)
+    adapter._session = AsyncMock() if negotiated else None
+
+    async def failed_heal() -> bool:
+        return False
+
+    adapter._heal_if_needed = failed_heal  # type: ignore[method-assign]
+    server._adapter = adapter
+
+    response = await server._dispatch(
+        _request(
+            OP_LTM_CONTEXT_COMPOSE,
+            {
+                "query": "q",
+                "agent_id": None,
+                "max_chars": 100,
+                "top_k": 2,
+                "namespace": None,
+                "context_window": None,
+                "context_compose_max_schema": 3,
+            },
+        )
+    )
+
+    assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
+
+
+@pytest.mark.asyncio
 async def test_daemon_adapter_memoizes_unsupported_compose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -565,7 +604,7 @@ async def test_daemon_adapter_does_not_cache_transient_compose_unavailable(
     monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", request)
     adapter = DaemonLtmAdapter(_config(tmp_path))
 
-    with pytest.raises(RuntimeError, match="context compose unavailable"):
+    with pytest.raises(LtmTransportError, match="context compose unavailable"):
         await adapter.context_compose("q")
 
     assert adapter.capabilities.context_compose_schema == 4
