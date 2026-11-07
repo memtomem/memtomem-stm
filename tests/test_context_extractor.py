@@ -956,12 +956,20 @@ class TestRawInputPrivacyFirst:
         b = self._q({"owner": "acme", "path": "/srv/api_key=demo_secret_value"})
         assert a == b == "srv read_file acme /srv/api_key=demo_secret_value"
 
-    def test_deeply_nested_value_does_not_recurse(self) -> None:
+    def test_deeply_nested_value_is_walked_without_recursion(self) -> None:
+        """The raw check walks nested arguments iteratively and never renders
+        them: a container whose ``repr`` raises is still read to the leaf."""
+
+        class _NoRepr(list):
+            def __repr__(self) -> str:
+                raise AssertionError("nested argument was rendered")
+
         nested: Any = "api_key=demo_secret_value"
         for _ in range(5000):
             nested = [nested]
-        q = self._q({"q": nested}, tool="t", template="lookup nested {arg.q}")
-        assert q == "srv t lookup nested {arg.q} api_key=demo_secret_value"
+        args = {"q": _NoRepr([nested]), "query": "jwt rotation policy"}
+        q = self._q(args)
+        assert q == "srv read_file api_key=demo_secret_value jwt rotation policy"
 
     @pytest.mark.parametrize(
         ("kwargs", "args", "query"),
