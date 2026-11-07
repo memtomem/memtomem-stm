@@ -111,14 +111,19 @@ def test_hybrid_toc_does_not_silently_emit_truncated_legacy_text(budget):
         HybridCompressor().compress("document " * 2000, max_chars=budget)
 
 
-def test_hybrid_validates_full_frame_before_publication_or_eviction():
+# (1400, 700): the head cannot shrink, so the first frame is the only try.
+# (900, 100): the smaller heads tried, down to the minimum, all fail.
+@pytest.mark.parametrize(("budget", "min_head_chars"), [(1400, 700), (900, 100)])
+def test_hybrid_validates_full_frame_before_publication_or_eviction(budget, min_head_chars):
     store = InMemoryPendingStore()
     store.put("existing", PendingSelection({"x": "keep"}, "text", time.monotonic(), 4))
     selective = SelectiveCompressor(store=store, max_pending=1)
-    hybrid = HybridCompressor(head_chars=700, selective_compressor=selective)
+    hybrid = HybridCompressor(
+        head_chars=700, min_head_chars=min_head_chars, selective_compressor=selective
+    )
     source = "## First\n" + "a" * 2000 + "\n## Last\n" + "b" * 2000
-    with delivery_scope("structured", 1400), pytest.raises(DeliveryBudgetExceeded):
-        hybrid.compress(source, max_chars=1400)
+    with delivery_scope("structured", budget), pytest.raises(DeliveryBudgetExceeded):
+        hybrid.compress(source, max_chars=budget)
     assert store.get("existing") is not None
     assert len(store) == 1
 

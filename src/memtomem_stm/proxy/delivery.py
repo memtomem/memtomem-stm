@@ -75,6 +75,13 @@ class UnsupportedDelivery(DeliveryError):
 class DeliveryBudgetExceeded(DeliveryError):
     code = "budget_exceeded"
 
+    def __init__(self, message: str, *, code: str | None = None, excess: int | None = None) -> None:
+        super().__init__(message, code=code)
+        # Serialized characters the smallest attempted frame still needed, when
+        # a fitter measured it. Lets a caller decide how much source to move
+        # out of a fixed part (a hybrid head) before trying again.
+        self.excess = excess
+
 
 class DeliveryText(str):
     """Legacy-compatible compressor result carrying its typed origin, never parsed.
@@ -248,6 +255,18 @@ def delivery_result(value: dict[str, Any], *, owned: bool = True) -> CallToolRes
     )
 
 
+def plain_result_fits(text: str) -> bool:
+    """Whether *text* returned unchanged fits the structured base budget.
+
+    Measured as the single-text MCP result the passthrough becomes, so JSON
+    escaping and the result wrapper count, as they do for STM envelopes.
+    """
+    from mcp.types import CallToolResult, TextContent
+
+    result = CallToolResult(content=[TextContent(type="text", text=text)])
+    return len(wire_json(result)) <= delivery_budget()
+
+
 def delivery_size(value: dict[str, Any], *, owned: bool) -> int:
     """Serialized base MCP-result characters, before optional supplements."""
     return len(wire_json(delivery_result(value, owned=owned)))
@@ -366,5 +385,15 @@ def fit_toc(value: dict[str, Any], budget: int, *, owned: bool = False) -> dict[
         else:
             hi = cap - 1
     if best is None:
-        raise DeliveryBudgetExceeded("Budget cannot hold the complete selection table.")
+        smallest = {
+            **value,
+            "payload": {
+                **value["payload"],
+                "entries": [e if e.get("inline") else {**e, "preview": ""} for e in entries],
+            },
+        }
+        raise DeliveryBudgetExceeded(
+            "Budget cannot hold the complete selection table.",
+            excess=delivery_size(smallest, owned=owned) - budget,
+        )
     return best
