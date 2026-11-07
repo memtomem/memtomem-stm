@@ -202,9 +202,15 @@ are unaffected.
   If no segment contributes, there is no query, even though the call has a
   `description`. Otherwise the query is the description's first sentence plus
   those tokens.
-- **No tool-name padding.** A native-tool query under `min_query_tokens` is
-  skipped rather than padded with `Bash` or `Read`, so a builtin `Read` of
-  `/etc/hosts` no longer surfaces anything. Proxied tools keep the padding.
+- **No tool-name padding.** A native-tool query under its floor is skipped
+  rather than padded with `Bash` or `Read`. Proxied tools keep the padding.
+- **Path-only queries need one token fewer.** A query made only of path
+  argument tokens (a Read with no other text) needs `min_query_tokens - 1`
+  tokens, at least 1: with the default 3, a builtin `Read` of
+  `tests/test_server_tools.py` (`server tools`) or `/etc/hosts`
+  (`etc hosts`) surfaces, while `CHANGELOG.md` (`CHANGELOG`) does not. A
+  Bash command, a description or a Grep/Glob pattern in the query keeps the
+  full floor.
 
 ## What the Agent Sees
 
@@ -255,7 +261,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
 | `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Measured on the cleaned upstream response *before* compression; an explicit agent query (`_context_query`) bypasses the gate. Precision/cost gate — distinct from the library-only extraction threshold described below. |
-| `min_query_tokens` | `3` | Skip if extracted query has fewer tokens |
+| `min_query_tokens` | `3` | Skip if extracted query has fewer tokens (one fewer for a native-tool query made only of path tokens) |
 | `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response). Bounds the LTM round trip only: the waits a call makes on the shared feedback-store worker have their own budget, derived from the store's SQLite lock timeout rather than from this one (#996), so tightening this does not turn a neighbour writing `stm_feedback.db` into a surfacing failure. First-call latency includes the LTM child spawn + embedding-model load (~9s with ONNX `bge-m3`); on timeout the in-flight start is abandoned to finish warming in the background, so a later call meets a warm session (#664). With `warmup_enabled` (default) the child already starts warming at startup, so the first call usually fits this budget. Raise via `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` (surfacing config is env-only) if warm-up is disabled and first-call injection matters more than latency. |
 | `cooldown_seconds` | `5.0` | Skip duplicate queries (Jaccard > 0.95) within this window |
 | `max_surfacings_per_minute` | `15` | Global rate limit |

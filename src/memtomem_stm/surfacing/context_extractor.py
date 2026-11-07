@@ -221,6 +221,8 @@ class ContextExtractor:
         parts: list[str] = []
         saw_command = False
         command_contributed = False
+        # Whether anything other than a path argument added tokens.
+        non_path_tokens = False
         for key, value in items:
             if key in _COMMAND_KEYS and isinstance(value, (str, list)):
                 saw_command = True
@@ -239,6 +241,7 @@ class ContextExtractor:
                 # the tokenizer is also where scratchpad paths are dropped.
                 parts.extend(self._builtin_path_tokens(value, cwd, broad=False))
                 continue
+            before = len(parts)
             if isinstance(value, str) and len(value) > 2 and not self._is_identifier(value):
                 if key in _PATTERN_KEYS:
                     parts.append(self._tokenize_pattern(value))
@@ -252,6 +255,8 @@ class ContextExtractor:
                 val_str = str(value)
                 if not self._is_identifier(val_str):
                     parts.append(val_str)
+            if any(p.split() for p in parts[before:]):
+                non_path_tokens = True
 
         # A command whose every segment is ``cd``, inline Python or a
         # scratchpad read has no retrieval intent, and its description does
@@ -259,7 +264,15 @@ class ContextExtractor:
         if saw_command and not command_contributed:
             return None
         query = " ".join([*lead, *parts]).strip()
-        if len(query.split()) < config.min_query_tokens:
+        # A query made only of path tokens (a Read of ``tests/test_server_tools.py``
+        # → ``server tools``) needs one token fewer: its tokens are already
+        # stripped of ids, extensions and structural directories, and no
+        # tool-name padding is added. Replayed over a month of Reads, such
+        # two-token queries retrieved chunks as often as longer ones.
+        floor = config.min_query_tokens
+        if not saw_command and not lead and not non_path_tokens:
+            floor = max(1, floor - 1)
+        if len(query.split()) < floor:
             return None
         return query
 

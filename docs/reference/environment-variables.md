@@ -155,7 +155,7 @@ Status meanings:
 | `MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS` | JSON object or `null` | — | LTM network headers; values may be secret. | Startup |
 | `MEMTOMEM_STM_SURFACING__MIN_SCORE` | float `0..1` | `0.017` | Global result-score floor when scale gating permits it. On the baseline RRF scale this is the "found by both retrieval legs" boundary. | Bundled |
 | `MEMTOMEM_STM_SURFACING__MAX_RESULTS` | positive integer | `3` | Maximum injected retrieval results. | Bundled |
-| `MEMTOMEM_STM_SURFACING__MIN_QUERY_TOKENS` | positive integer | `3` | Minimum extracted query size. | Bundled |
+| `MEMTOMEM_STM_SURFACING__MIN_QUERY_TOKENS` | positive integer | `3` | Minimum extracted query size; one fewer (at least 1) for a native-tool query made only of path tokens. | Bundled |
 | `MEMTOMEM_STM_SURFACING__COOLDOWN_SECONDS` | non-negative float | `5.0` | Per-query cooldown. | Bundled |
 | `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` | positive float | `3.0` | LTM search deadline. | Bundled |
 | `MEMTOMEM_STM_SURFACING__INJECTION_MODE` | `prepend / append / section` | `append` | Memory-block placement. | Bundled |

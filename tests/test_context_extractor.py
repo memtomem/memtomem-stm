@@ -645,6 +645,58 @@ class TestShellTempDirWord:
         assert q == "private var folders other auth jwt handler"
 
 
+class TestPathOnlyFloor:
+    """#1325: a builtin query made only of path tokens needs one token fewer
+    than ``min_query_tokens`` (at least 1); anything else keeps the full floor."""
+
+    @staticmethod
+    def _q(tool: str, args: dict[str, Any], floor: int = 3) -> str | None:
+        cfg = SurfacingConfig(min_query_tokens=floor)
+        return ContextExtractor().extract_query("builtin", tool, args, cfg, cwd=_REPO)
+
+    @pytest.mark.parametrize(
+        ("path", "query"),
+        [
+            (f"{_REPO}/tests/test_server_tools.py", "server tools"),
+            ("/Users/u/.claude/settings.json", "claude settings"),
+        ],
+    )
+    def test_two_token_read_clears_the_default_floor(self, path: str, query: str) -> None:
+        assert self._q("Read", {"file_path": path, "offset": 1, "limit": 40}) == query
+
+    def test_one_token_read_is_still_skipped(self) -> None:
+        assert self._q("Read", {"file_path": f"{_REPO}/CONTRIBUTING.md"}) is None
+
+    def test_floor_follows_min_query_tokens(self) -> None:
+        two = {"file_path": f"{_REPO}/tests/test_server_tools.py"}
+        three = {"file_path": f"{_REPO}/src/auth/jwt_handler.py"}
+        assert self._q("Read", two, floor=4) is None
+        assert self._q("Read", three, floor=4) == "auth jwt handler"
+        assert self._q("Read", {"file_path": f"{_REPO}/CHANGELOG.md"}, floor=1) == "CHANGELOG"
+        # The floor never drops to 0: a Read with no tokens is still skipped.
+        scratch = {"file_path": "/tmp/claude-501/session/scratchpad/log.txt"}
+        assert self._q("Read", scratch, floor=1) is None
+
+    def test_glob_path_without_pattern_is_path_only(self) -> None:
+        assert self._q("Glob", {"path": f"{_REPO}/src/auth/session"}) == "auth session"
+
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [
+            # A pattern contributes tokens: the full floor applies.
+            ("Grep", {"pattern": "jwt", "path": f"{_REPO}/src/auth"}),
+            ("Glob", {"pattern": "*.py", "path": f"{_REPO}/src/auth"}),
+            # A command keeps the full floor even when it names only a path.
+            ("Bash", {"command": f"ls {_REPO}/src/auth/session"}),
+            ("Bash", {"command": "ls", "description": "List files"}),
+            # A description without a command keeps the full floor too.
+            ("Read", {"file_path": f"{_REPO}/session.py", "description": "Inspect"}),
+        ],
+    )
+    def test_other_text_keeps_the_full_floor(self, tool: str, args: dict[str, Any]) -> None:
+        assert self._q(tool, args) is None
+
+
 class TestBuiltinPaths:
     def test_read_relative_to_cwd(self) -> None:
         q = _builtin(
@@ -669,7 +721,8 @@ class TestBuiltinPaths:
         assert _builtin("Read", {"file_path": path}) is None
 
     def test_short_builtin_read_is_not_padded_with_the_tool_name(self) -> None:
-        assert _builtin("Read", {"file_path": "/etc/hosts"}) is None
+        assert _builtin("Read", {"file_path": "/etc/hosts"}) == "etc hosts"
+        assert _builtin("Read", {"file_path": f"{_REPO}/CHANGELOG.md"}) is None
 
     def test_short_non_builtin_read_is_still_padded(self) -> None:
         cfg = SurfacingConfig()
