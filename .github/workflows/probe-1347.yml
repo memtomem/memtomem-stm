@@ -3,8 +3,8 @@
 # Never merged; the probe branch is deleted after the run.
 #
 # Round 1 showed the failure needs the new test file AND the rest of the
-# suite. Round 2 records GC passes inside the timing test, and runs the
-# candidate fix (stop the managers the new test creates), each twice.
+# suite. Round 2 loaded a GC-recording plugin, and the failure vanished
+# with it. Round 3 drops the plugin: original vs the stop() fix, twice each.
 name: probe-1347
 
 on:
@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [branch-gc, fixed-gc]
+        variant: [branch, fixed]
         rep: [1, 2]
     name: probe (${{ matrix.variant }} ${{ matrix.rep }})
     runs-on: ubuntu-latest
@@ -34,9 +34,7 @@ jobs:
           python-version: "3.14"
       - run: uv sync --frozen
       - name: Use the fixed test file
-        if: matrix.variant == 'fixed-gc'
+        if: matrix.variant == 'fixed'
         run: cp .github/probe/fixed_hybrid_test.py tests/test_hybrid_tail_structure_and_budget.py
       - name: Run
-        env:
-          PYTHONPATH: .github/probe
-        run: uv run pytest -p gcprobe -m "$FILTER" --tb=short -q 2>&1 | grep -E "GCPROBE|FAILED|assert \(|[0-9]+ (passed|failed)"
+        run: uv run pytest -m "$FILTER" --tb=short -q 2>&1 | grep -E "FAILED|assert \(|[0-9]+ (passed|failed)"
