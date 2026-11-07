@@ -22,6 +22,8 @@ from memtomem_stm.daemon.spawn import request_spawn
 from memtomem_stm.surfacing.mcp_client import (
     ContextComposeResult,
     LtmCapabilities,
+    LtmOperationalSkip,
+    LtmTransportError,
     RemoteSearchResult,
     SearchOutcome,
     decode_context_compose_context,
@@ -118,18 +120,36 @@ class DaemonLtmAdapter:
             timeout=self._timeout,
             fingerprint=self._fingerprint,
         )
+        # Connection states and load-shedding statuses are classified as
+        # ``search`` classifies them. Only ``unsupported`` returns ``None``:
+        # that is the one answer the engine follows up with ``search``, so any
+        # other ``None`` here would issue a second daemon request (and, for a
+        # missing daemon, a second spawn request) inside the same call.
         if state == "missing":
             # The daemon generation is gone. Forget capability verdicts from
             # that generation so an upgraded replacement is probed again.
             self._compose_schema = None
             self._candidate_propose_supported = None
             await self._spawn_best_effort()
-            return None
-        if state != "ok" or resp is None or not resp.get("ok"):
-            if resp is not None and resp.get("status") == "unsupported":
+            raise LtmOperationalSkip("daemon_starting")
+        if state != "ok" or resp is None:
+            # A handshake names a daemon that did not answer: it may have died
+            # without removing it, and only a spawn request replaces it.
+            await self._spawn_best_effort()
+            raise LtmTransportError("daemon context compose did not answer")
+        if not resp.get("ok"):
+            status = resp.get("status")
+            if status == "unsupported":
                 self._compose_schema = 0
                 return None
-            raise RuntimeError("daemon context compose unavailable")
+            if status == "busy":
+                raise LtmOperationalSkip("daemon_busy")
+            if status == "expired":
+                raise asyncio.TimeoutError
+            if status == "unavailable":
+                # The daemon answered; its LTM session is what is down.
+                raise LtmTransportError("daemon context compose unavailable")
+            raise RuntimeError(f"daemon context compose rejected ({status!r})")
         selected_schema = resp.get("selected_context_compose_schema")
         if (
             isinstance(selected_schema, bool)
@@ -155,13 +175,16 @@ class DaemonLtmAdapter:
             read_score_ceiling_hint(resp.get("score_ceiling")) if score_scale == "rrf" else None
         )
 
-        def decode(item: Any, *, pinned: bool):
+        def decode(item: Any, *, pinned: bool) -> RemoteSearchResult | None:
             validate_compose_item(item, pinned=pinned)
             if any(
                 has_lone_surrogate(item.get(name, "") or "")
                 for name in ("chunk_id", "id", "block_id")
             ):
-                raise ValueError("daemon context item has invalid identity")
+                # One unencodable id costs that item, not the bundle — the
+                # same rule as the direct adapter's compose decoder.
+                logger.warning("Dropping a daemon context item whose id is not UTF-8-encodable")
+                return None
             context = None
             if not pinned and selected_schema >= 3 and "context" in item:
                 context = decode_context_compose_context(
@@ -184,8 +207,12 @@ class DaemonLtmAdapter:
                 result.chunk.id = item["chunk_id"]
             return result
 
-        pinned_items = tuple(decode(item, pinned=True) for item in raw_pinned)
-        retrieved_items = tuple(decode(item, pinned=False) for item in raw_retrieved)
+        pinned_items = tuple(
+            r for r in (decode(item, pinned=True) for item in raw_pinned) if r is not None
+        )
+        retrieved_items = tuple(
+            r for r in (decode(item, pinned=False) for item in raw_retrieved) if r is not None
+        )
         warnings = resp.get("warnings", [])
         omitted = resp.get("omitted_block_ids", [])
         self._compose_schema = selected_schema
