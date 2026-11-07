@@ -38,6 +38,9 @@ SkipReason = Literal[
     "response_too_short",
     "circuit_open",
     "no_query",
+    # The extracted query matched a credential/PII pattern. It is not sent to
+    # the LTM in any form, so the call ends before the gate or any LTM work.
+    "sensitive_query",
     "gate_excluded_tool",
     "gate_write_tool",
     "gate_tool_disabled",
@@ -113,6 +116,7 @@ HEALTHY_SKIP_REASONS: frozenset[str] = frozenset(
         "disabled",
         "response_too_short",
         "no_query",
+        "sensitive_query",
         "gate_excluded_tool",
         "gate_write_tool",
         "gate_tool_disabled",
@@ -163,13 +167,13 @@ Outcome = Literal[
 #   completed = COMPLETED_OUTCOMES + SEARCH_COMPLETED_SKIP_REASONS
 #
 # Pre-LTM healthy skips (``response_too_short``, ``gate_*``, ``no_query``,
-# ``daemon_*``, ``disabled``, ``upstream_disabled``, ``progressive_mode_conflict``)
-# are deliberately excluded from both sides: they are decided before any LTM
-# work is attempted, so counting them would let a thousand cooldowns dilute a
-# total LTM outage down to a "healthy" ratio. The ``no_results_*`` family is
-# the opposite case — the search round trip completed and returned candidates
-# that were then filtered to nothing, so those are healthy *completions* and
-# belong in the denominator.
+# ``sensitive_query``, ``daemon_*``, ``disabled``, ``upstream_disabled``,
+# ``progressive_mode_conflict``) are deliberately excluded from both sides:
+# they are decided before any LTM work is attempted, so counting them would let
+# a thousand cooldowns dilute a total LTM outage down to a "healthy" ratio. The
+# ``no_results_*`` family is the opposite case — the search round trip
+# completed and returned candidates that were then filtered to nothing, so
+# those are healthy *completions* and belong in the denominator.
 #
 # ``circuit_open`` is recorded before the relevance gate (engine.py::surface),
 # so during a sustained outage the ratio saturates toward 100% rather than
