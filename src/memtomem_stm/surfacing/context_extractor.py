@@ -199,11 +199,14 @@ class ContextExtractor:
     ) -> str | None:
         """Query for a native-tool hook call (Bash, Read, Grep, …).
 
-        Sensitive input is checked on the raw values *before* any of the lossy
-        transforms below: tokenizing ``?api_key=…`` into ``api key …`` would
-        hide it from the engine's only privacy check, which digests a
-        sensitive query instead of sending it. The raw values are returned in
-        sorted-key order so that digest does not depend on argument order.
+        Sensitive input is checked on the raw values, not on what the lossy
+        transforms below make of them: tokenizing ``?api_key=…`` into
+        ``api key …`` would hide it from the engine's only privacy check,
+        which skips a sensitive query instead of sending it. When the call
+        would yield a query at all, the raw values are returned in its place,
+        in sorted-key order so the engine's digest of them does not depend on
+        argument order. A call that would yield none still yields none, so a
+        secret does not turn a command without retrieval intent into one.
         """
         items = sorted((k, v) for k, v in arguments.items() if not k.startswith("_"))
         # Every value a transform below reads, in the form it reads it: an
@@ -214,8 +217,7 @@ class ContextExtractor:
                 raw.append(v)
             elif k in _COMMAND_KEYS and isinstance(v, list):
                 raw.append(self._join_argv(v))
-        if any(contains_sensitive_content(v) for v in raw):
-            return " ".join(v.strip() for v in raw if v.strip())
+        sensitive = any(contains_sensitive_content(v) for v in raw)
 
         lead: list[str] = []
         parts: list[str] = []
@@ -274,6 +276,8 @@ class ContextExtractor:
             floor = max(1, floor - 1)
         if len(query.split()) < floor:
             return None
+        if sensitive:
+            return " ".join(v.strip() for v in raw if v.strip())
         return query
 
     @staticmethod
@@ -413,8 +417,8 @@ class ContextExtractor:
     @staticmethod
     def _validate_query(query: str, config: SurfacingConfig, server: str, tool: str) -> str | None:
         normalized = query.strip()
-        # Sensitive queries are transformed to a safe digest by the engine;
-        # preserve the original here so that digest is stable and auditable.
+        # Sensitive queries are returned as they are: the engine recognizes
+        # them by their text and skips the call, recording only a digest.
         if contains_sensitive_content(normalized):
             return normalized
         if len(normalized.split()) < config.min_query_tokens:
