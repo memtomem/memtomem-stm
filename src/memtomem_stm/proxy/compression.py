@@ -416,12 +416,12 @@ class TruncateCompressor(_PlainTextRetention):
             relevance_weights = _scores_or_none(self._scorer, context_query, sections)
 
         # Build output: each key gets budget allocation
+        total_rel = sum(relevance_weights) if relevance_weights is not None else 0.0
         parts: list[str] = []
         for idx, (k, serialized, size) in enumerate(key_sizes):
             # Size-proportional base
             size_share = available * size / total_size if total_size else available / len(key_sizes)
             if relevance_weights is not None:
-                total_rel = sum(relevance_weights)
                 rel_share = available * relevance_weights[idx] / total_rel if total_rel else 0
                 # Blend: 40% size-proportional + 60% relevance
                 key_budget = max(40, int(0.4 * size_share + 0.6 * rel_share))
@@ -471,10 +471,23 @@ class TruncateCompressor(_PlainTextRetention):
             )
             return part.strip()[1:-1].strip()
 
+        # ``len(_assemble(parts[:keep], omitted))`` without assembling: "{\n" and
+        # "\n}" (4), the ``keep`` parts, the marker member, and a ",\n" (2)
+        # before each of the ``keep`` members that precede the marker. Building
+        # every candidate copied O(K) strings per step — quadratic in the key
+        # count (136 ms at 5000 keys, #1348) — to reject all but the last.
+        prefix = [0]
+        for part in parts:
+            prefix.append(prefix[-1] + len(part))
+
+        def _assembled_len(keep: int, omitted: int) -> int:
+            marker = f'"{marker_key}": "{omitted} of {len(parts)} keys omitted"'
+            return 4 + prefix[keep] + 2 * keep + len(marker)
+
         for keep in range(len(parts) - 1, -1, -1):
-            candidate = _assemble(parts[:keep], len(parts) - keep)
-            if len(candidate) > max_chars:
+            if _assembled_len(keep, len(parts) - keep) > max_chars:
                 continue
+            candidate = _assemble(parts[:keep], len(parts) - keep)
             # Refill the freed budget into the BOUNDARY key (the first dropped
             # one). Each part was sized against the FULL key set, so once
             # trailing keys are dropped the assembly could sit far below
@@ -1190,10 +1203,15 @@ class SelectiveCompressor:
             "metadata_complete": bool(getattr(chunks, "records", {})),
         }
         ttl = self._ttl
+        # Once per entry, not per ``build``: a JSON chunk's type comes from
+        # parsing it, and the preview search below rebuilds the TOC up to ~9
+        # times — re-parsing every chunk each time (#1348). ``items`` is final
+        # here, so the types stay aligned with it.
+        types = [self._infer_type(key, content, fmt) for key, content in items]
 
         def build(preview_cap: int) -> str:
             entries: list[dict[str, Any]] = []
-            for key, content in items:
+            for (key, content), value_type in zip(items, types, strict=True):
                 size = len(content)
                 is_inline = size < self._min_section_chars
                 # Inline short sections show their content in full; only the
@@ -1205,7 +1223,7 @@ class SelectiveCompressor:
                 entries.append(
                     {
                         "key": key,
-                        "type": self._infer_type(key, content, fmt),
+                        "type": value_type,
                         "size": size,
                         "preview": preview,
                         "inline": is_inline,
