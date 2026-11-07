@@ -160,6 +160,19 @@ flowchart TD
 
 > **Note**: Steps 1 (template) and 2 (`_context_query`) are "first match wins". The heuristic fallback (step 3) iterates over **all** tool arguments and collects path-like tokenizations and semantic string values together into a merged query, rather than stopping at the first match.
 
+An agent-provided `_context_query` is used as given (trimmed; a
+non-sensitive one must also clear `min_query_tokens`), so the engine's own
+sensitive-content check sees its text whole. The template and heuristic steps can
+reshape a value first (tokenizing splits `ghp_…` into `ghp …`,
+`{arg.email}_log` breaks an address's word boundary), so before either runs,
+every raw input they read is checked: the server and tool names, the template
+and every argument string, nested ones included. On a match, a step that
+yields a query passes on the raw inputs in its place, trimmed and joined with
+spaces, so the engine's check sees them whole and skips the call as
+`sensitive_query`, even when the sensitive value is one the step would not
+have used. A step that yields no query still yields
+none: a secret does not turn a call without retrieval intent into one.
+
 ### Native-tool hook calls (Bash, Read, …)
 
 Calls that arrive through `mms hook` (`server == "builtin"`) take a different

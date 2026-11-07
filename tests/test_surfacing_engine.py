@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 from memtomem_stm.surfacing import engine as engine_module
-from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.config import SurfacingConfig, ToolSurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine, _TimerScope
 from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS
 from memtomem_stm.utils.digest import framed_digest
@@ -6148,3 +6148,42 @@ class TestBuiltinQueryPrivacy:
 
         adapter.context_compose.assert_awaited_once()
         assert "pinned" in out
+
+
+class TestProxiedQueryPrivacy:
+    """#1344: a credential that a proxied tool's path, pattern or template
+    route would split apart is still recognized, so the call is skipped
+    before the LTM instead of searching for the tokenized words."""
+
+    @pytest.mark.parametrize(
+        ("tool", "args", "tools"),
+        [
+            ("search_files", {"path": "/srv/cfg/api_key=demo_secret_value/x.txt"}, {}),
+            ("search_files", {"pattern": "api_key=demo_secret_value"}, {}),
+            (
+                "lookup",
+                {"q": "{arg.email}_log", "email": "alice@example.com"},
+                {"lookup": ToolSurfacingConfig(query_template="lookup {arg.q} entries")},
+            ),
+        ],
+    )
+    async def test_secret_bearing_argument_is_skipped_before_the_ltm(self, tool, args, tools):
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        obs = SurfacingObservability()
+        adapter = _make_mcp_adapter([_ns_result("m", "default")])
+        engine = SurfacingEngine(
+            config=_make_config(context_tools=tools), mcp_adapter=adapter, observability=obs
+        )
+
+        out = await engine.surface("fs", tool, args, LONG_RESPONSE)
+
+        assert out == LONG_RESPONSE
+        adapter.search.assert_not_awaited()
+        assert obs.snapshot()["skip_reasons"][tool] == {"sensitive_query": 1}
+
+        # Positive control on the same engine: a clean call is searched.
+        await engine.surface(
+            "fs", "search_files", {"path": "/srv/cfg/settings.json"}, LONG_RESPONSE
+        )
+        adapter.search.assert_awaited_once()

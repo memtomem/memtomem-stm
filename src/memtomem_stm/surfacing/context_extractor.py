@@ -100,6 +100,23 @@ _SHELL_NOISE_WORDS = frozenset(
 )  # fmt: skip
 
 
+def _string_leaves(value: Any) -> list[str]:
+    """Every string inside ``value``, in order: dict keys and values, list
+    and tuple items, and the value itself when it is a string. Iterative, so
+    deeply nested tool arguments cannot raise ``RecursionError``."""
+    leaves: list[str] = []
+    stack: list[Any] = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            leaves.append(item)
+        elif isinstance(item, dict):
+            stack.extend(reversed([x for kv in item.items() for x in kv]))
+        elif isinstance(item, (list, tuple)):
+            stack.extend(reversed(item))
+    return leaves
+
+
 class ContextExtractor:
     """Extract a search query from tool call context."""
 
@@ -116,31 +133,59 @@ class ContextExtractor:
         """``cwd`` is the hook call's working directory; it only affects
         native-tool (``server == "builtin"``) extraction, where paths under it
         are made relative before tokenizing."""
-        # 1. Per-tool template
         tool_cfg = config.context_tools.get(tool)
-        if tool_cfg and tool_cfg.query_template:
-            return self._validate_query(
-                self._apply_template(tool_cfg.query_template, server, tool, arguments),
-                config,
-                server,
-                tool,
-            )
+        template = tool_cfg.query_template if tool_cfg else ""
 
-        # 2. Explicit context_query parameter (preferred path from the proxy,
-        # which extracts ``_context_query`` from upstream args and forwards it
-        # via this kwarg without re-inserting it into ``arguments``).
-        if isinstance(context_query, str) and context_query.strip():
-            return self._validate_query(context_query, config, server, tool)
-
-        # 3. Agent-provided context (legacy: kept for direct engine callers
-        # and tests that still pass ``_context_query`` inside ``arguments``).
-        if "_context_query" in arguments:
-            cq = arguments["_context_query"]
+        # An agent-provided query is used verbatim, so the engine's own check
+        # sees it whole. A per-tool template still wins over it.
+        if not template:
+            # 2. Explicit context_query parameter (preferred path from the
+            # proxy, which extracts ``_context_query`` from upstream args and
+            # forwards it via this kwarg without re-inserting it).
+            if isinstance(context_query, str) and context_query.strip():
+                return self._validate_query(context_query, config, server, tool)
+            # 3. Legacy: kept for direct engine callers and tests that still
+            # pass ``_context_query`` inside ``arguments``.
+            cq = arguments.get("_context_query")
             if isinstance(cq, str) and cq.strip():
                 return self._validate_query(cq, config, server, tool)
 
+        # Every other route reshapes its inputs before the engine's check sees
+        # the query: path and pattern tokenizing splits ``ghp_…`` into
+        # ``ghp …``, tool-name padding splits the name, ``{arg.email}_log``
+        # breaks an address's word boundary, ``str()`` of a list escapes a
+        # tab. So sensitive content is checked once, here, on every raw input
+        # those routes read: the server and tool names, the template and every
+        # argument string, nested ones included. On a match, a route that
+        # yields a query returns the raw inputs in its place, so the engine
+        # sees them whole, even when the sensitive value is one the route
+        # would not have used. A route that yields no query still yields none:
+        # a secret does not turn a call without retrieval intent into one.
+        raw = [
+            server,
+            tool,
+            template,
+            *(leaf for _, value in sorted(arguments.items()) for leaf in _string_leaves(value)),
+        ]
+        sensitive_raw: str | None = None
+        if any(contains_sensitive_content(v) for v in raw):
+            sensitive_raw = " ".join(v.strip() for v in raw if v.strip())
+
+        # 1. Per-tool template
+        if template:
+            rendered = self._apply_template(template, server, tool, arguments)
+            # Whether the template yields a query is decided by its token
+            # floor alone. ``_validate_query`` lets a sensitive query through
+            # regardless, which would turn a short render into a query only
+            # because it holds a secret, whether an input carried it or the
+            # interpolation assembled it (``{arg.label}={arg.value}``).
+            if len(rendered.split()) < config.min_query_tokens:
+                return None
+            return sensitive_raw or rendered
+
         if server == _BUILTIN_SERVER:
-            return self._extract_builtin(arguments, config, cwd)
+            result = self._extract_builtin(arguments, config, cwd)
+            return sensitive_raw if sensitive_raw and result is not None else result
 
         # 3. Heuristic extraction — prioritize argument values over tool name.
         # Iterate in sorted key order so two identical calls whose arguments
@@ -192,7 +237,7 @@ class ContextExtractor:
         query = " ".join(parts).strip()
         if len(query.split()) < config.min_query_tokens:
             return None
-        return query
+        return sensitive_raw or query
 
     def _extract_builtin(
         self, arguments: dict[str, Any], config: SurfacingConfig, cwd: str | None
