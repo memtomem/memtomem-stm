@@ -1240,14 +1240,14 @@ class TestGetToolProfiles:
         assert mixed["auto_strategy_count"] == 10
         store.close()
 
-    def test_the_two_strategy_counts_come_from_one_snapshot(self, tmp_path):
-        """A concurrent writer cannot pair a numerator with a stale denominator.
+    def test_every_profile_field_comes_from_one_snapshot(self, tmp_path):
+        """A concurrent writer cannot make one profile's fields disagree.
 
         The instance lock does not span processes, so a second proxy writing
-        between two statements used to leave the dominant count larger than
-        the population it was counted against — a share above 1.0.  Both now
-        come from a single statement.  The injected write stands in for that
-        other process: it lands after the main aggregation has been read.
+        between two statements could leave ``call_count`` counted before the
+        write and the strategy counts after it (#1348).  The whole profile now
+        comes from one statement.  The injected write stands in for that other
+        process: it lands right after that statement started.
         """
         import sqlite3 as _sq
         import time as _t
@@ -1301,12 +1301,13 @@ class TestGetToolProfiles:
             store._db = real_conn
 
         assert state["injected"], "the probe never ran; the query shape changed"
-        # call_count was read before the write and the strategy counts after,
-        # which is what proves the two reads really straddle it — without this
-        # the counts could agree simply by never having seen the new rows.
         assert p["call_count"] == 3
-        assert p["auto_dominant_strategy_count"] == 6
-        assert p["auto_strategy_count"] == 6
+        assert p["auto_dominant_strategy_count"] == 3
+        assert p["auto_strategy_count"] == 3
+        # Positive control: the write really landed, so the agreement above is
+        # one snapshot, not a write that never happened.
+        after = store.get_tool_profiles(since_seconds=3600.0)[0]
+        assert (after["call_count"], after["auto_strategy_count"]) == (6, 6)
         store.close()
 
     def test_groups_by_server_tool(self, tmp_path):
