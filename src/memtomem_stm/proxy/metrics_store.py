@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Collection
 from pathlib import Path
+from typing import Any
 
 from memtomem_stm.proxy.metrics import (
     METADATA_BYPASS_STRATEGY,
@@ -205,6 +206,9 @@ _DAILY_TABLE = "proxy_metrics_daily"
 _ROLLUP_TRIGGER = "proxy_metrics_rollup_on_delete_v1"
 _ROLLUP_INSTALLED_KEY = "rollup_installed_at"
 _ROLLUP_LOST_KEY = "rollup_rows_lost_before_install"
+# Stored when the markers are re-created on a rollup that was already running:
+# not an int, so ``_rollup_markers`` reads it as an unknown count.
+_ROLLUP_LOST_UNKNOWN = "unknown"
 _UNKNOWN_DAY = "unknown"
 
 # What one row contributes to its bucket. These are also the daily table's
@@ -234,6 +238,35 @@ def _finite(expr: str) -> str:
     range — all contribute 0.
     """
     return f"CASE WHEN {expr} BETWEEN -9.2e18 AND 9.2e18 THEN {expr} ELSE 0 END"
+
+
+def _finite_total(expr: str) -> str:
+    """``expr`` when it is any finite number, else 0 — the guard for a bucket.
+
+    Not ``_finite``: a daily counter is a SUM of guarded rows, and two in-range
+    rows can legitimately add past int64, where the trigger's ``+`` turns REAL
+    rather than raising. Zeroing that bucket would make all-time totals drop
+    the moment retention trims the rows. NULL, text (it compares above every
+    number) and ``±inf`` still contribute 0.
+    """
+    return (
+        f"CASE WHEN {expr} BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 "
+        f"THEN {expr} ELSE 0 END"
+    )
+
+
+def _count(value: Any) -> Any:
+    """An aggregate as the ``int`` it is, unless it is fractional.
+
+    A float arrives from the ``TOTAL`` fallback in ``_read_compression``, or
+    from ``SUM`` over a daily counter the trigger turned REAL past int64. An
+    integral one goes back to ``int`` so the output keeps its type; a
+    fractional one (only an outside write stores a fractional size) stays as
+    ``SUM`` returns it.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value or 0
 
 
 def _row_terms(cols: Collection[str], prefix: str = "") -> dict[str, str]:
@@ -449,7 +482,8 @@ def read_compression_all_time(
       and a deleted row's tuner eligibility is not kept;
     - a ``rollup`` key describes coverage: ``installed``, ``installed_at``
       (epoch), ``lost_before_install`` (rows already trimmed when the trigger
-      was created; ``None`` if unreadable), ``earliest_created_at`` (the
+      was created; ``None`` if unreadable, or unknown because the markers were
+      re-created on a rollup that was already running), ``earliest_created_at`` (the
       earliest real timestamp among the counted rows, after filters),
       ``incomplete_before`` (``installed_at`` when rows were lost before
       installation and the counted rows reach back before it, else ``None``)
@@ -598,10 +632,12 @@ def _read_compression(
             _day, epoch = _created_at_terms()
             live.append(f"{epoch} AS min_created_at")
             live.append(f"CASE WHEN {epoch} IS NULL THEN 1 ELSE 0 END AS unknown_date_calls")
+            # The same rule on this half: a counter blanked or overwritten from
+            # outside contributes 0 instead of turning the total non-finite.
             daily = [
-                *_ROLLUP_COUNTERS,
+                *(_finite_total(name) for name in _ROLLUP_COUNTERS),
                 "min_created_at",
-                f"CASE WHEN day = '{_UNKNOWN_DAY}' THEN calls ELSE 0 END",
+                f"CASE WHEN day = '{_UNKNOWN_DAY}' THEN {_finite_total('calls')} ELSE 0 END",
             ]
             # One statement over both halves, so a trim that moves rows from the
             # raw table into the rollup between two reads cannot count them
@@ -611,7 +647,7 @@ def _read_compression(
                 f"UNION ALL SELECT server, tool, {', '.join(daily)} FROM {_DAILY_TABLE}{where}"
             )
             inner_params = [*params, *params]
-            extra = "0, MIN(min_created_at), SUM(unknown_date_calls)"
+            extra = "0, MIN(min_created_at), {agg}(unknown_date_calls)"
         else:
             # The calls the tuner's profiles count: every row but a
             # metadata/native bypass, which ``get_tool_profiles`` drops (#1122).
@@ -627,18 +663,28 @@ def _read_compression(
                 live.append("1 AS tuner_calls")
             inner = f"SELECT server, tool, {', '.join(live)} FROM proxy_metrics{where}"
             inner_params = [*inner_params, *params]
-            extra = "SUM(tuner_calls), NULL, 0"
+            extra = "{agg}(tuner_calls), NULL, 0"
         # One statement, so the provenance counts and size totals share a
         # snapshot while the server appends rows.
-        rows = db.execute(
-            "SELECT server, tool, SUM(legacy_calls), SUM(legacy_original_chars), "
-            "SUM(legacy_compressed_chars), SUM(errors), SUM(classified_calls), "
-            f"SUM(unclassified_calls), {extra}, SUM(structured_calls), "
-            "SUM(structured_original_chars), SUM(structured_base_chars), "
-            f"SUM(structured_wire_bytes) FROM ({inner}) GROUP BY server, tool "
-            "ORDER BY SUM(calls) DESC",
-            inner_params,
-        ).fetchall()
+        statement = (
+            "SELECT server, tool, {agg}(legacy_calls), {agg}(legacy_original_chars), "
+            "{agg}(legacy_compressed_chars), {agg}(errors), {agg}(classified_calls), "
+            f"{{agg}}(unclassified_calls), {extra}, {{agg}}(structured_calls), "
+            "{agg}(structured_original_chars), {agg}(structured_base_chars), "
+            f"{{agg}}(structured_wire_bytes) FROM ({inner}) GROUP BY server, tool "
+            "ORDER BY {agg}(calls) DESC"
+        )
+        try:
+            rows = db.execute(statement.replace("{agg}", "SUM"), inner_params).fetchall()
+        except sqlite3.OperationalError as exc:
+            # ``SUM`` is exact but raises once rows that ``_finite`` admits add
+            # past int64, which would take the whole summary down. Only then
+            # fall back to ``TOTAL``: a float that never raises, approximate
+            # past 2**53 — a size no real writer reaches, since sizes come from
+            # ``len()``. ``_count`` turns its integral results back into ints.
+            if "integer overflow" not in str(exc):
+                raise
+            rows = db.execute(statement.replace("{agg}", "TOTAL"), inner_params).fetchall()
     except sqlite3.Error as exc:
         summary["error"] = exception_summary(exc)
         return summary
@@ -675,16 +721,16 @@ def _read_compression(
         for k, v in zip(
             structured_totals, (structured_calls, structured_orig, structured_base, structured_wire)
         ):
-            structured_totals[k] += v or 0
-        classified += known_calls or 0
-        unclassified += unknown_calls or 0
-        unknown_dates += group_unknown_dates or 0
+            structured_totals[k] += _count(v)
+        classified += _count(known_calls)
+        unclassified += _count(unknown_calls)
+        unknown_dates += _count(group_unknown_dates)
         if group_earliest is not None and (earliest is None or group_earliest < earliest):
             earliest = float(group_earliest)
-        calls = calls or 0
-        orig = orig or 0
-        comp = comp or 0
-        errors = errors or 0
+        calls = _count(calls)
+        orig = _count(orig)
+        comp = _count(comp)
+        errors = _count(errors)
         total_calls += calls
         total_error += errors
         total_orig += orig
@@ -698,7 +744,7 @@ def _read_compression(
             "saved_ratio": _saved_ratio(orig, comp),
         }
         if not all_time:
-            entry["tuner_calls"] = tuner_calls or 0
+            entry["tuner_calls"] = _count(tuner_calls)
         by_tool.append(entry)
 
     summary["available"] = True
@@ -783,13 +829,21 @@ class MetricsStore:
           only symptom is that its ``COUNT``/``ORDER BY`` scans and the reader
           aggregations get slower. Accepted knowingly: an index nothing drops
           is not worth a per-invocation check.
+        - a deleted *rollup marker* is not restored either while the stamp
+          stands; ``read_compression_all_time`` then reports the rollup as not
+          installed, or its loss count as unknown.
 
-        Repair is to clear the stamp (``DELETE FROM metrics_meta``) and reopen,
-        which rebuilds the indexes, the table, and every ``_MIGRATIONS`` column.
-        It does **not** restore a dropped *base* column — ``_CREATE`` is
-        ``IF NOT EXISTS`` and cannot alter an existing table — so that one case
-        needs the file rebuilt. Losing ``metrics_meta`` itself needs no action:
-        the probe reads that as "not current" and the slow path recreates it.
+        Repair is to clear the stamp alone
+        (``DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'``) and
+        reopen, which rebuilds the indexes, the table, and every
+        ``_MIGRATIONS`` column. It does **not** restore a dropped *base* column
+        — ``_CREATE`` is ``IF NOT EXISTS`` and cannot alter an existing table —
+        so that one case needs the file rebuilt. Clear only that key: the rollup
+        markers beside it record when the history began, and once erased they
+        cannot be reconstructed (see ``_install_rollup_and_stamp``). Losing
+        ``metrics_meta`` itself needs no action beyond that: the probe reads it
+        as "not current" and the slow path recreates it, with the loss count
+        unknown.
 
         Paying the probe on every one of thousands of daily hook invocations to
         keep an accidental repair for a state nothing produces is the worse
@@ -865,10 +919,29 @@ class MetricsStore:
         trigger existed: AUTOINCREMENT ids are never reused once committed, so
         ``sqlite_sequence.seq - COUNT(*)`` is how many rows already left the
         table. Zero means the history is complete from the first row.
+
+        That count is only taken on a FIRST installation — when the daily table
+        did not exist before this transaction. Writing the installation marker
+        while the table is already there means the markers were erased from a
+        DB whose rollup has been running (an older binary's restamp or a second
+        opener finds the marker present and writes nothing), and then no
+        formula over what is left can say how many rows predate the trigger:
+        ``seq - COUNT(*)`` would count every rolled-up row as lost, subtracting
+        the daily ``calls`` would still count rows cleared by a history reset,
+        and a reset or a dropped ``sqlite_sequence`` row skews both. The loss is
+        recorded as unknown instead, which the reader reports as ``None`` and
+        treats conservatively as "some".
         """
         db.execute("BEGIN IMMEDIATE")
         try:
             db.execute(_META_CREATE)
+            first_install = (
+                db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (_DAILY_TABLE,),
+                ).fetchone()
+                is None
+            )
             db.execute(_DAILY_CREATE)
             db.execute(_ROLLUP_TRIGGER_DDL)
             installed = db.execute(
@@ -876,14 +949,17 @@ class MetricsStore:
                 (_ROLLUP_INSTALLED_KEY, str(time.time())),
             ).rowcount
             if installed:
-                lost = db.execute(
-                    "SELECT max(0, COALESCE((SELECT seq FROM sqlite_sequence "
-                    "WHERE name = 'proxy_metrics'), 0) - (SELECT COUNT(*) FROM proxy_metrics))"
-                ).fetchone()[0]
+                lost_value = _ROLLUP_LOST_UNKNOWN
+                if first_install:
+                    lost = db.execute(
+                        "SELECT max(0, COALESCE((SELECT seq FROM sqlite_sequence "
+                        "WHERE name = 'proxy_metrics'), 0) - (SELECT COUNT(*) FROM proxy_metrics))"
+                    ).fetchone()[0]
+                    lost_value = str(int(lost))
                 db.execute(
                     "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO NOTHING",
-                    (_ROLLUP_LOST_KEY, str(int(lost))),
+                    (_ROLLUP_LOST_KEY, lost_value),
                 )
             db.execute(
                 "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
