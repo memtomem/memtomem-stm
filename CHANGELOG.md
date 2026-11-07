@@ -23,7 +23,7 @@ changes inline only. See the deprecation policy in
   timeout. On the direct LTM connection, a failed reconnect is no longer
   retried a second time within the same call. A daemon compose item whose id
   is not UTF-8-encodable is dropped instead of failing the whole response.
-  (#1346)
+  (#1355, #1346)
   **Behavior change**: `stm_admin(action="surfacing_stats")` counts these
   cases under `daemon_starting`, `daemon_busy`, `ltm_unavailable` or
   `error_timeout` where it used to count `ltm_call_failed`, and the "LTM
