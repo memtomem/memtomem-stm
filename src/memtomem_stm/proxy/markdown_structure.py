@@ -56,6 +56,26 @@ def headings(text: str) -> Iterator[Heading]:
                     )
 
 
+def suffix_headings(document: str, offset: int) -> Iterator[Heading]:
+    """Headings of ``document[offset:]``, in that suffix's coordinates.
+
+    The parse still runs from the document beginning. Parsing the suffix on its
+    own would read a closing fence as an opening one when ``offset`` lands
+    inside a code block, and would treat ``offset`` as a line start when it
+    lands mid-line. A heading whose line starts before ``offset`` is not
+    reported; its remaining text stays ordinary suffix content.
+    """
+    for heading in headings(document):
+        if heading.start >= offset:
+            yield Heading(
+                heading.start - offset,
+                heading.title_start - offset,
+                heading.end - offset,
+                heading.level,
+                heading.title,
+            )
+
+
 def heading_matches(text: str) -> list[re.Match[str]]:
     """Adapter for the existing section-aware compression algorithms."""
     pattern = re.compile(r"(#{1,6}[ \t]+[^\r\n]*)")

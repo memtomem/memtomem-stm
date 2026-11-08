@@ -582,10 +582,21 @@ upstream metadata is reserved from that cap; the full cap is stored for owned
 continuations. Lossless TOC/progressive delivery does not widen this limit to
 meet a lossy-content retention floor. This is an estimated token budget, not a
 model-specific tokenizer guarantee.
+Selective and hybrid (`tail_mode: "toc"`) responses short enough to return
+unchanged do so only when that serialized result also fits; JSON escaping can
+push a response past the budget its character count meets. Otherwise they build
+a TOC like longer responses.
 Hybrid TOCs are fitted with their head and complete key set before any pending
 store publication or eviction. Entries marked `inline: true` contain their full
-section; fitting shortens only non-inline previews. If the complete inline
-contents and all keys cannot fit, publication falls back to progressive delivery.
+section; fitting shortens only non-inline previews. When the table still does
+not fit, a few shorter heads are tried, sized from the overshoot and ending at
+`min_head_chars`; the text a head gives up joins the tail's first section. This
+is best effort: moving a heading into the tail adds an entry, so a shorter head
+can fit where none of the tried ones did. If no tried head fits the complete
+inline contents and all keys, publication falls back to progressive delivery,
+still within the budget. Tail headings are
+read from the whole response, so a head that ends inside a code block or
+mid-line does not change which tail lines are headings.
 
 Structured TOCs have more per-entry overhead than legacy TOCs because they carry
 chunk identity and source metadata. Capacity therefore depends on section count,
