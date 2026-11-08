@@ -431,8 +431,9 @@ class TestSelectChunks:
     async def test_delegates(self):
         """stm_proxy_select_chunks delegates to proxy_manager.select_chunks."""
         pm = _make_proxy_manager()
-        pm._selective_compressor = MagicMock()
-        pm._selective_compressor.select.return_value = "chunk data"
+        owner = MagicMock()
+        owner.select_if_present.return_value = "chunk data"
+        pm._selective_owners = {("memory", ""): owner}
 
         ctx = _make_ctx(proxy_manager=pm)
         result = await stm_proxy_select_chunks(key="k1", sections=["a"], ctx=ctx)

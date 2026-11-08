@@ -10,7 +10,6 @@ behavioral spies (not source inspection) per review feedback.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -101,10 +100,15 @@ class TestManagerSelectiveForwardsQuery:
             captured["context_query"] = context_query
             return "{}"
 
-        # Pre-seed the cached compressor (cfg None matches the None passed below)
-        # so _apply_compression reuses our spy instead of building a real one.
-        mgr._selective_compressor = SimpleNamespace(compress=spy_compress)
-        mgr._selective_compressor_cfg = None
+        # Keep the real per-call view and owner; only the view's compress spies.
+        real_view = mgr._selective_view
+
+        def spy_view(*args, **kwargs):
+            owner, view = real_view(*args, **kwargs)
+            view.compress = spy_compress
+            return owner, view
+
+        mgr._selective_view = spy_view
 
         out, fallback = await mgr._apply_compression(
             "x" * 500,

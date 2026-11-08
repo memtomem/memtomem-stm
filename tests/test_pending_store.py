@@ -344,7 +344,7 @@ class TestSelectiveCompressorWithStore:
         )
         assert cfg.pending_store == "sqlite"
 
-        # Simulate what ProxyManager._create_selective does
+        # Simulate what ProxyManager._selective_owner does
         store = SQLitePendingStore(cfg.pending_store_path)
         store.initialize()
         comp = SelectiveCompressor(
@@ -396,10 +396,10 @@ class TestSelectChunksRestartRecovery:
 
         # Post-restart: a brand-new manager, no compress call has run.
         mgr, sel = _sqlite_manager(tmp_path)
-        assert mgr._selective_compressor is None
+        assert mgr._selective_owners == {}
         result = mgr.select_chunks("k1", ["A"])
         assert result == "recovered content"
-        assert mgr._selective_compressor_cfg == sel
+        assert list(mgr._selective_owners) == [("sqlite", str(sel.pending_store_path))]
 
     def test_override_only_sqlite_is_found(self, tmp_path):
         """The fallback scan reaches a SQLite store configured only in a per-tool
@@ -446,7 +446,7 @@ class TestSelectChunksRestartRecovery:
         )
         mgr = ProxyManager(cfg, TokenTracker())
         assert "not active" in mgr.select_chunks("k1", ["A"])
-        assert mgr._selective_compressor is None
+        assert mgr._selective_owners == {}
 
 
 class TestReadMoreRestartRecovery:
@@ -560,21 +560,20 @@ class TestMultiPathRecovery:
 
         mgr, _sel_a, sel_b = _two_store_manager(tmp_path)
         assert mgr.select_chunks("kB", ["A"]) == "in store B"
-        # It bound the store that actually held the key, not merely the first.
-        assert mgr._selective_compressor_cfg == sel_b
+        # Recovery opens every configured store and keeps them (#1365).
+        assert len(mgr._selective_owners) == 2
 
-    def test_select_chunks_absent_key_falls_back_to_first(self, tmp_path):
-        """When no configured store holds the key, recovery falls back to the
-        first store so the key still degrades through the normal not-found
-        path (and the common single-store case stays a straight passthrough)."""
+    def test_select_chunks_absent_key_is_not_found(self, tmp_path):
+        """When no configured store holds the key, it degrades through the
+        normal not-found path — not the inactive sentinel, since stores exist."""
         for name in ("a.db", "b.db"):
             s = SQLitePendingStore(tmp_path / name)
             s.initialize()
             s.close()
 
-        mgr, sel_a, _sel_b = _two_store_manager(tmp_path)
+        mgr, _sel_a, _sel_b = _two_store_manager(tmp_path)
         assert "not found" in mgr.select_chunks("missing", ["A"])
-        assert mgr._selective_compressor_cfg == sel_a
+        assert len(mgr._selective_owners) == 2
 
     def test_read_more_probes_all_stores(self, tmp_path):
         """A progressive key persisted in the second store is reachable via
@@ -599,23 +598,21 @@ class TestMultiPathRecovery:
         assert "not found or expired" not in mgr2.read_more(key, len(text) // 4)
 
     def test_select_chunks_reprobes_after_caching_other_store(self, tmp_path):
-        """Even once a compressor is cached for the FIRST store (e.g. an earlier
-        absent-key call), a later key that lives in the SECOND store is still
-        reached — select_chunks re-probes on a miss instead of trusting the
-        cached store's not-found."""
+        """Even once a store is open for the FIRST path (e.g. a publication on
+        server "a"), a key that lives in the SECOND store is still reached —
+        select_chunks opens the configured stores not open yet on a miss
+        instead of trusting the open store's not-found."""
         store_b = SQLitePendingStore(tmp_path / "b.db")
         store_b.initialize()
         store_b.put("kB", _make_selection({"A": "in store B"}))
         store_b.close()
 
-        mgr, sel_a, sel_b = _two_store_manager(tmp_path)
-        # First call is for an absent key → caches the first store (a.db).
-        assert "not found" in mgr.select_chunks("absent", ["A"])
-        assert mgr._selective_compressor_cfg == sel_a
-        # A later key that lives in b.db is still served, via the miss re-probe.
+        mgr, sel_a, _sel_b = _two_store_manager(tmp_path)
+        cached = mgr._selective_owner(sel_a)
         assert mgr.select_chunks("kB", ["A"]) == "in store B"
-        # The cache was NOT disturbed — the temp store served it.
-        assert mgr._selective_compressor_cfg == sel_a
+        # The a.db store was not disturbed.
+        assert mgr._selective_owner(sel_a) is cached
+        assert len(mgr._selective_owners) == 2
 
     def test_read_more_reprobes_after_caching_other_store(self, tmp_path):
         """read_more re-probes the other configured stores on a miss even after
@@ -670,14 +667,14 @@ class TestStoreLifecycleCleanup:
 
         assert "not active" in mgr.select_chunks("k1", ["A"])
         assert "not found or expired" in mgr.read_more(progressive_key, 40)
-        assert mgr._selective_compressor is None
+        assert mgr._selective_owners == {}
         assert not mgr._progressive_stores
 
         mgr._stopped = False
         assert mgr.select_chunks("k1", ["A"]) == "recovered content"
         assert "not found or expired" not in mgr.read_more(progressive_key, 40)
         try:
-            assert mgr._selective_compressor is not None
+            assert mgr._selective_owners
             assert mgr._progressive_stores
         finally:
             await mgr.stop()
@@ -695,13 +692,12 @@ class TestStoreLifecycleCleanup:
         store.close()
 
         mgr, sel = _sqlite_manager(tmp_path)
-        mgr.select_chunks("k1", ["A"])  # opens a SQLite-backed selective compressor
+        mgr.select_chunks("k1", ["A"])  # opens a SQLite-backed selective store
         mgr._apply_progressive(
             "y " * 50, ProgressiveConfig(chunk_size=40), "srv", "t", sel, cfg_snap=mgr._config
         )
-        sel_comp = mgr._selective_compressor
+        (sel_comp,) = mgr._selective_owners.values()
         (prog,) = mgr._progressive_stores.values()
-        assert sel_comp is not None
 
         with (
             patch.object(sel_comp, "close", wraps=sel_comp.close) as sel_spy,
@@ -711,25 +707,24 @@ class TestStoreLifecycleCleanup:
 
         sel_spy.assert_called_once()
         prog_spy.assert_called_once()
-        assert mgr._selective_compressor is None
-        assert mgr._selective_compressor_cfg is None
+        assert mgr._selective_owners == {}
+        assert mgr._selective_routes == {}
         assert mgr._progressive_stores == {}
 
-    def test_rebuild_selective_closes_superseded(self, tmp_path):
-        """Rebuilding the selective compressor for a changed config closes the
-        superseded one first, so its SQLite store does not leak."""
+    def test_selective_stores_for_other_backends_coexist(self, tmp_path):
+        """Opening the selective store for another backend leaves the first one
+        open and cached (#1365): it may still hold keys handed to clients."""
         from unittest.mock import patch
 
-        mgr, sel = _sqlite_manager(tmp_path)
-        mgr._rebuild_selective_compressor(sel)
-        first = mgr._selective_compressor
-        assert first is not None
+        mgr, sel_a, sel_b = _two_store_manager(tmp_path)
+        first = mgr._selective_owner(sel_a)
 
         with patch.object(first, "close", wraps=first.close) as spy:
-            mgr._rebuild_selective_compressor(sel)
+            second = mgr._selective_owner(sel_b)
 
-        spy.assert_called_once()
-        assert mgr._selective_compressor is not first
+        spy.assert_not_called()
+        assert second is not first
+        assert mgr._selective_owner(sel_a) is first
 
     def test_progressive_stores_for_other_backends_coexist(self, tmp_path):
         """Opening the store for another backend leaves the first one open and
@@ -746,27 +741,21 @@ class TestStoreLifecycleCleanup:
         assert second is not first
         assert mgr._get_progressive_store(sel_a) is first
 
-    def test_rebuild_selective_failure_leaves_old_usable(self, tmp_path):
-        """If building the replacement compressor fails (bad SQLite path), the
-        old compressor stays cached and usable instead of a closed store behind
-        the cfg-equality fast path."""
+    def test_selective_open_failure_leaves_old_usable(self, tmp_path):
+        """If opening another backend's store fails (bad SQLite path), nothing
+        is cached for it and the open store stays usable."""
         from memtomem_stm.proxy.config import SelectiveConfig
 
         mgr, sel = _sqlite_manager(tmp_path)
-        mgr._rebuild_selective_compressor(sel)
-        first = mgr._selective_compressor
-        assert first is not None
+        first = mgr._selective_owner(sel)
 
         bad_dir = tmp_path / "as_dir"
         bad_dir.mkdir()
         bad = SelectiveConfig(pending_store="sqlite", pending_store_path=bad_dir)
         with pytest.raises(Exception):
-            mgr._rebuild_selective_compressor(bad)
+            mgr._selective_owner(bad)
 
-        # Old compressor untouched: still cached, same cfg, and NOT closed —
-        # a select on it still works (its store connection is live).
-        assert mgr._selective_compressor is first
-        assert mgr._selective_compressor_cfg == sel
+        assert list(mgr._selective_owners.values()) == [first]
         assert "not found or expired" in first.select("missing", ["A"])
 
     def test_progressive_rebuild_failure_leaves_old_usable(self, tmp_path):

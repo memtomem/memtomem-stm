@@ -650,7 +650,6 @@ class TestScorerFallbackRecorded:
     async def test_selective_cached_scorer_fallback_recorded(self, make_mgr):
         """SELECTIVE's cached compressor scorer fallback is recorded even when
         the manager's live scorer slot holds a different instance."""
-        from memtomem_stm.proxy.compression import SelectiveCompressor
         from memtomem_stm.proxy.relevance import BM25Scorer, EmbeddingScorer
 
         mgr, store, _ = make_mgr(
@@ -666,10 +665,9 @@ class TestScorerFallbackRecorded:
             raise RuntimeError("ollama offline")
 
         failing_scorer._score_via_embedding = fail_embed  # type: ignore[method-assign]
-        mgr._selective_compressor = SelectiveCompressor(scorer=failing_scorer)
-        mgr._selective_compressor_cfg = None
+        _give_selective_views(mgr, failing_scorer)
         # Live manager scorer is a healthy BM25Scorer — old delta check missed
-        # the cached SelectiveCompressor's failing EmbeddingScorer.
+        # the selective compressor's failing EmbeddingScorer.
         mgr._relevance_scorer_instance = BM25Scorer()
         md = "\n\n".join(f"## Section {i}\nlead line\n" + ("word line\n" * 30) for i in range(6))
         mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(md)
@@ -719,7 +717,6 @@ class TestScorerFallbackRecorded:
         write then raises, falling through to a healthy Tier-3 truncate must
         still preserve scorer_fallback=1."""
         import sqlite3
-        from memtomem_stm.proxy.compression import SelectiveCompressor
         from memtomem_stm.proxy.relevance import BM25Scorer, EmbeddingScorer
 
         mgr, store, _ = make_mgr(
@@ -735,15 +732,12 @@ class TestScorerFallbackRecorded:
             raise RuntimeError("ollama offline")
 
         failing_scorer._score_via_embedding = fail_embed  # type: ignore[method-assign]
-        sel_compressor = SelectiveCompressor(scorer=failing_scorer)
 
         def failing_put(*args, **kwargs):
             raise sqlite3.OperationalError("pending store write failed")
 
-        sel_compressor._store.put = failing_put  # type: ignore[method-assign]
-        mgr._selective_compressor = sel_compressor
-        mgr._selective_compressor_cfg = None
-        # Healthy Tier-3 scorer: only Tier-2 hybrid's cached scorer falls back.
+        _give_selective_views(mgr, failing_scorer, put=failing_put)
+        # Healthy Tier-3 scorer: only Tier-2 hybrid's selective scorer falls back.
         mgr._relevance_scorer_instance = BM25Scorer()
 
         # 4 headings (>=3 triggers Tier 2 hybrid; <chunk_size skips Tier 1).
@@ -756,6 +750,22 @@ class TestScorerFallbackRecorded:
         row = _latest(store, "compression_strategy", "scorer_fallback")
         assert row["compression_strategy"] == "extract_fields→truncate_fallback"
         assert row["scorer_fallback"] == 1
+
+
+def _give_selective_views(mgr, scorer, *, put=None) -> None:
+    """Every SELECTIVE/HYBRID view *mgr* builds scores with *scorer* (and, when
+    given, writes through *put*), while the manager's own scorer slot keeps
+    whatever the test put there."""
+    real = mgr._selective_view
+
+    def view_with(*args, **kwargs):
+        owner, view = real(*args, **kwargs)
+        view._scorer = scorer
+        if put is not None:
+            view._store.put = put
+        return owner, view
+
+    mgr._selective_view = view_with
 
 
 # ── #761: lone surrogates in upstream content ────────────────────────────

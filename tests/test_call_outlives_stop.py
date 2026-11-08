@@ -114,7 +114,7 @@ async def test_reply_after_stop_does_not_reopen_the_selective_store(tmp_path, co
             await _call_across_stop(mgr, fake_tool_result(text))
     finally:
         store.close()
-    assert mgr._selective_compressor is None
+    assert mgr._selective_owners == {}
 
 
 def test_superseded_publication_after_stop_raises_stopping(tmp_path):
@@ -167,7 +167,7 @@ async def test_call_parked_on_the_selective_lock_during_stop_does_not_rebuild(
             await _call_across_stop_at_selective_lock(mgr, fake_tool_result(text))
     finally:
         store.close()
-    assert mgr._selective_compressor is None
+    assert mgr._selective_owners == {}
 
 
 @pytest.mark.asyncio

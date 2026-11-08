@@ -149,8 +149,7 @@ async def test_structured_lossy_ratio_ladder_does_not_publish_rejected_hybrid(
     monkeypatch.setattr(proxy, "_apply_compression", AsyncMock(return_value=("short", None)))
     result = to_call_tool_result(await proxy.call_tool("srv", "read", {}))
     assert not result.is_error
-    if proxy._selective_compressor is not None:
-        assert len(proxy._selective_compressor._store) == 0
+    assert all(len(owner._store) == 0 for owner in proxy._selective_owners.values())
     assert not proxy._progressive_stores
 
 

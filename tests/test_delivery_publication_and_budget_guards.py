@@ -328,5 +328,5 @@ async def test_actual_sqlite_privacy_refusal_after_budget_fallback_stays_uncache
         cache.close()
         for adapter in proxy._progressive_stores.values():
             adapter.close()
-        if proxy._selective_compressor is not None:
-            proxy._selective_compressor.close()
+        for owner in proxy._selective_owners.values():
+            owner.close()

@@ -750,7 +750,6 @@ class TestSelectChunks:
     def test_no_compressor(self, tmp_path):
         """Without selective compressor, returns a descriptive message."""
         mgr = _make_manager(tmp_path=tmp_path)
-        mgr._selective_compressor = None
         result = mgr.select_chunks("key123", ["sec_a"])
         assert "not active" in result.lower()
 
@@ -758,13 +757,13 @@ class TestSelectChunks:
         """select_chunks delegates to the selective compressor."""
         mgr = _make_manager(tmp_path=tmp_path)
         mock_comp = MagicMock()
-        mock_comp.select.return_value = "chunk content"
-        mgr._selective_compressor = mock_comp
+        mock_comp.select_if_present.return_value = "chunk content"
+        mgr._selective_owners = {("memory", ""): mock_comp}
 
         result = mgr.select_chunks("key123", ["sec_a", "sec_b"])
 
         assert result == "chunk content"
-        mock_comp.select.assert_called_once_with("key123", ["sec_a", "sec_b"])
+        mock_comp.select_if_present.assert_called_once_with("key123", ["sec_a", "sec_b"])
 
 
 # ── read_more ────────────────────────────────────────────────────────────
@@ -819,45 +818,36 @@ class TestReadMore:
 
 
 class TestSelectiveHotReload:
-    """Selective compressor must be recreated when config changes via hot-reload."""
+    """A changed selective block takes effect on the next call (#1365): a new
+    per-call view with the new policy, over the SAME store when the backend is
+    unchanged, so earlier selection keys keep resolving."""
 
-    async def test_selective_recreated_on_config_change(self, tmp_path):
+    async def test_policy_change_builds_a_new_view_over_the_same_store(self, tmp_path):
         mgr = _make_manager(tmp_path=tmp_path, compression=CompressionStrategy.SELECTIVE)
-        _inject_connection(mgr, "section1\n---\nsection2\n---\nsection3")
+        _inject_connection(mgr)
+        cfg = mgr._config
 
-        sel_cfg_a = SelectiveConfig(json_depth=1)
-        sel_cfg_b = SelectiveConfig(json_depth=3)
+        owner_a, view_a = mgr._decide_selective("srv", "t", SelectiveConfig(json_depth=1), cfg)
+        owner_b, view_b = mgr._decide_selective("srv", "t", SelectiveConfig(json_depth=3), cfg)
 
-        async with mgr._selective_lock:
-            mgr._selective_compressor = mgr._create_selective(sel_cfg_a)
-            mgr._selective_compressor_cfg = sel_cfg_a
-        comp_a = mgr._selective_compressor
+        assert owner_a is owner_b, "a policy-only change must not replace the store"
+        assert view_a is not view_b
+        assert (view_a._json_depth, view_b._json_depth) == (1, 3)
+        assert view_b._store is owner_a._store
+        assert mgr._selective_routes[("srv", "t")] is view_b
 
-        async with mgr._selective_lock:
-            if mgr._selective_compressor_cfg != sel_cfg_b:
-                mgr._selective_compressor = mgr._create_selective(sel_cfg_b)
-                mgr._selective_compressor_cfg = sel_cfg_b
-        comp_b = mgr._selective_compressor
-
-        assert comp_a is not comp_b
-        assert mgr._selective_compressor_cfg == sel_cfg_b
-
-    async def test_selective_not_recreated_when_config_same(self, tmp_path):
+    async def test_backend_change_opens_a_second_store_and_keeps_the_first(self, tmp_path):
         mgr = _make_manager(tmp_path=tmp_path, compression=CompressionStrategy.SELECTIVE)
-        sel_cfg = SelectiveConfig(json_depth=2)
+        _inject_connection(mgr)
+        cfg = mgr._config
+        disk = SelectiveConfig(pending_store="sqlite", pending_store_path=tmp_path / "p.db")
 
-        async with mgr._selective_lock:
-            mgr._selective_compressor = mgr._create_selective(sel_cfg)
-            mgr._selective_compressor_cfg = sel_cfg
-        comp_first = mgr._selective_compressor
+        memory, _ = mgr._decide_selective("srv", "t", None, cfg)
+        sqlite_owner, _ = mgr._decide_selective("srv", "t", disk, cfg)
 
-        async with mgr._selective_lock:
-            if mgr._selective_compressor_cfg != sel_cfg:
-                mgr._selective_compressor = mgr._create_selective(sel_cfg)
-                mgr._selective_compressor_cfg = sel_cfg
-        comp_second = mgr._selective_compressor
-
-        assert comp_first is comp_second
+        assert memory is not sqlite_owner
+        assert list(mgr._selective_owners.values()) == [memory, sqlite_owner]
+        await mgr.stop()
 
 
 # ── _auto_index_response ─────────────────────────────────────────────────

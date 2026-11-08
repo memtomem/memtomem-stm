@@ -13,6 +13,31 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- SELECTIVE and HYBRID keep one pending store per backend (in-memory, or
+  each SQLite `pending_store_path`), as progressive delivery does since
+  #1362. A TOC `selection_key` no longer stops resolving because a
+  SELECTIVE/HYBRID call on a server with a different `selective` block — or
+  none — ran after it, or because a reload changed the block.
+  `stm_proxy_select_chunks` looks the key up in every open store and then in
+  the configured SQLite stores not opened yet, so with a single SQLite
+  pending store it now finds a selection persisted before a restart even
+  after an in-memory SELECTIVE call ran first. The non-store `selective`
+  fields (`json_depth`, `min_section_chars`, `max_pending`,
+  `pending_ttl_seconds`) and the relevance scorer are applied per call, so a
+  scorer change in a reload reaches the next SELECTIVE/HYBRID call. A
+  selection write still in progress when a reload lands goes to the store,
+  and evicts under the limits, that its own server and tool are configured
+  for once a later SELECTIVE/HYBRID call has seen the reload; it no longer
+  follows another server's call into that server's store. (#1365)
+  **Behavior change**: selection keys handed out earlier keep resolving
+  through a config reload or a call on another backend, where they used to
+  answer "not found or expired"; the in-memory selective store is no longer
+  emptied when a `selective` block changes. Tools that share one store but
+  set different `max_pending` / `pending_ttl_seconds` still evict it
+  store-wide, each write under its own tool's limits, and
+  `stm_proxy_select_chunks` expires rows by the TTL of the latest
+  SELECTIVE/HYBRID call on that store.
+
 - Progressive delivery keeps one pending store per backend (in-memory, or
   each SQLite `pending_store_path`). A tool with no `selective` block no
   longer writes its progressive responses into another server's SQLite
