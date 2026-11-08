@@ -18,6 +18,7 @@ from memtomem_stm.proxy.metrics import CallMetrics
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.server import stm_proxy_read_more, stm_proxy_select_chunks
 from memtomem_stm.surfacing.mcp_client import decode_context_compose_context
+from helpers import only_progressive_store
 
 
 @pytest.mark.asyncio
@@ -150,7 +151,7 @@ async def test_invalid_read_follows_stored_format_without_renewal(
         content=[TextContent(type="text", text="x" * 6000)]
     )
     key = payload(await proxy.call_tool("srv", "read", {}))["payload"]["key"]
-    backend = proxy._progressive_store._store
+    backend = only_progressive_store(proxy)._store
     before = backend.get(key).created_at
     if sqlite:
         proxy, _ = manager(tmp_path, sqlite=True)

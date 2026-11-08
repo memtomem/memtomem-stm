@@ -90,4 +90,4 @@ async def test_non_json_document_keeps_manager_section_selection(tmp_path, kind,
     assert desc["payload"]["metadata_complete"] is False
     selected = proxy.select_chunks(desc["payload"]["key"], ["Paragraph 2"])
     assert selected.descriptor["payload"]["chunks"]
-    assert proxy._progressive_store is None
+    assert not proxy._progressive_stores

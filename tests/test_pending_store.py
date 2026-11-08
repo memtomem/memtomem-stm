@@ -472,7 +472,7 @@ class TestReadMoreRestartRecovery:
 
         # Post-restart: a fresh manager over the same config finds the key.
         mgr2, _sel2 = _sqlite_manager(tmp_path)
-        assert mgr2._progressive_store is None
+        assert not mgr2._progressive_stores
         out = mgr2.read_more(key, len(text) // 4)
         assert "not found or expired" not in out
 
@@ -496,7 +496,7 @@ class TestReadMoreRestartRecovery:
         )
         mgr = ProxyManager(cfg, TokenTracker())
         assert "not found or expired" in mgr.read_more("k1", 0)
-        assert mgr._progressive_store is None
+        assert not mgr._progressive_stores
 
     def test_no_clobber_of_live_inmemory_store(self, tmp_path):
         """A key written to a live in-memory store (no sel_cfg) stays readable;
@@ -516,11 +516,11 @@ class TestReadMoreRestartRecovery:
         assert m is not None, first
         key = m.group(1)
 
-        store_before = mgr._progressive_store
+        store_before = dict(mgr._progressive_stores)
         out = mgr.read_more(key, len(text) // 4)
         assert "not found or expired" not in out
-        # The live in-memory store was not rebuilt from the fallback cfg.
-        assert mgr._progressive_store is store_before
+        # The live in-memory store served it; nothing was rebuilt or opened.
+        assert mgr._progressive_stores == store_before
 
 
 # ── Multi-path recovery + store lifecycle (#583 follow-up) ────────────────
@@ -591,10 +591,11 @@ class TestMultiPathRecovery:
         m = re.search(r'key="([0-9a-f]{16})"', first)
         assert m is not None, first
         key = m.group(1)
-        mgr1._progressive_store.close()  # release b.db before reopening
+        for adapter in mgr1._progressive_stores.values():
+            adapter.close()  # release b.db before reopening
 
         mgr2, *_ = _two_store_manager(tmp_path)
-        assert mgr2._progressive_store is None
+        assert not mgr2._progressive_stores
         assert "not found or expired" not in mgr2.read_more(key, len(text) // 4)
 
     def test_select_chunks_reprobes_after_caching_other_store(self, tmp_path):
@@ -630,17 +631,17 @@ class TestMultiPathRecovery:
             text, ProgressiveConfig(chunk_size=40), "b", "tool", sel_b, cfg_snap=writer._config
         )
         key = re.search(r'key="([0-9a-f]{16})"', first).group(1)
-        writer._progressive_store.close()
+        for adapter in writer._progressive_stores.values():
+            adapter.close()
 
-        mgr, _sa2, _sb2 = _two_store_manager(tmp_path)
-        # Force a cached progressive store for a.db via a miss on an absent key.
-        assert "not found or expired" in mgr.read_more("absent", 0)
-        cached = mgr._progressive_store
-        assert cached is not None
+        mgr, sa2, _sb2 = _two_store_manager(tmp_path)
+        # An a.db adapter is already open (a publication on server "a").
+        cached = mgr._get_progressive_store(sa2)
         # The b.db key is still reachable through the miss re-probe...
         assert "not found or expired" not in mgr.read_more(key, len(text) // 4)
         # ...without disturbing the cached a.db adapter.
-        assert mgr._progressive_store is cached
+        assert mgr._get_progressive_store(sa2) is cached
+        assert len(mgr._progressive_stores) == 2
 
 
 class TestStoreLifecycleCleanup:
@@ -669,14 +670,15 @@ class TestStoreLifecycleCleanup:
 
         assert "not active" in mgr.select_chunks("k1", ["A"])
         assert "not found or expired" in mgr.read_more(progressive_key, 40)
-        assert (mgr._selective_compressor, mgr._progressive_store) == (None, None)
+        assert mgr._selective_compressor is None
+        assert not mgr._progressive_stores
 
         mgr._stopped = False
         assert mgr.select_chunks("k1", ["A"]) == "recovered content"
         assert "not found or expired" not in mgr.read_more(progressive_key, 40)
         try:
             assert mgr._selective_compressor is not None
-            assert mgr._progressive_store is not None
+            assert mgr._progressive_stores
         finally:
             await mgr.stop()
 
@@ -698,8 +700,8 @@ class TestStoreLifecycleCleanup:
             "y " * 50, ProgressiveConfig(chunk_size=40), "srv", "t", sel, cfg_snap=mgr._config
         )
         sel_comp = mgr._selective_compressor
-        prog = mgr._progressive_store
-        assert sel_comp is not None and prog is not None
+        (prog,) = mgr._progressive_stores.values()
+        assert sel_comp is not None
 
         with (
             patch.object(sel_comp, "close", wraps=sel_comp.close) as sel_spy,
@@ -711,8 +713,7 @@ class TestStoreLifecycleCleanup:
         prog_spy.assert_called_once()
         assert mgr._selective_compressor is None
         assert mgr._selective_compressor_cfg is None
-        assert mgr._progressive_store is None
-        assert mgr._progressive_store_cfg is None
+        assert mgr._progressive_stores == {}
 
     def test_rebuild_selective_closes_superseded(self, tmp_path):
         """Rebuilding the selective compressor for a changed config closes the
@@ -730,19 +731,20 @@ class TestStoreLifecycleCleanup:
         spy.assert_called_once()
         assert mgr._selective_compressor is not first
 
-    def test_progressive_rebuild_closes_superseded(self, tmp_path):
-        """A progressive-store rebuild for a changed cfg closes the old adapter."""
+    def test_progressive_stores_for_other_backends_coexist(self, tmp_path):
+        """Opening the store for another backend leaves the first one open and
+        cached (#1362): it may still hold keys handed to clients."""
         from unittest.mock import patch
 
         mgr, sel_a, sel_b = _two_store_manager(tmp_path)
         first = mgr._get_progressive_store(sel_a)
-        assert first is not None
 
         with patch.object(first, "close", wraps=first.close) as spy:
-            mgr._get_progressive_store(sel_b)  # different path → rebuild
+            second = mgr._get_progressive_store(sel_b)
 
-        spy.assert_called_once()
-        assert mgr._progressive_store is not first
+        spy.assert_not_called()
+        assert second is not first
+        assert mgr._get_progressive_store(sel_a) is first
 
     def test_rebuild_selective_failure_leaves_old_usable(self, tmp_path):
         """If building the replacement compressor fails (bad SQLite path), the
@@ -782,7 +784,7 @@ class TestStoreLifecycleCleanup:
         with pytest.raises(Exception):
             mgr._get_progressive_store(bad)
 
-        assert mgr._progressive_store is first
+        assert list(mgr._progressive_stores.values()) == [first]
         assert first.get("missing") is None  # still live, not closed
 
 

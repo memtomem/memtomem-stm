@@ -122,7 +122,7 @@ async def test_upstream_structured_payload_is_preserved_without_stm_pointer(tmp_
     assert sum(len(block.text) for block in result.content if block.type == "text") <= 1600
     assert result.content[0].text == upstream.content[0].text[:len(result.content[0].text)]
     assert "truncated" in result.content[-1].text
-    assert proxy._progressive_store is None
+    assert not proxy._progressive_stores
 
 
 @pytest.mark.parametrize("handler", [stm_proxy_read_more, stm_proxy_select_chunks])
@@ -574,7 +574,8 @@ def test_unknown_metadata_in_alternate_progressive_store_closes_reader(tmp_path,
         prefix="other",
         selective=SelectiveConfig(pending_store="sqlite", pending_store_path=alternate),
     )
-    assert "not found" in proxy.read_more("missing", 0)
+    # The primary store is already open; the key lives only in the alternate.
+    primary = proxy._get_progressive_store(proxy._config.upstream_servers["srv"].selective)
     writer = SQLitePendingStore(alternate)
     writer.initialize()
     writer.put(
@@ -601,9 +602,13 @@ def test_unknown_metadata_in_alternate_progressive_store_closes_reader(tmp_path,
     monkeypatch.setattr(proxy, "_open_progressive_adapter", track)
     with pytest.raises(DeliveryError):
         proxy.read_more("bad-version", 0)
-    assert opened
-    assert all(adapter._store._db is None for adapter in opened)
-    proxy._progressive_store.close()
+    assert len(opened) == 1
+    assert opened[0]._store._db is None
+    # The failing store is forgotten; the primary stays cached and usable.
+    assert list(proxy._progressive_stores.values()) == [primary]
+    assert primary.get("missing") is None
+    for adapter in proxy._progressive_stores.values():
+        adapter.close()
 
 
 @pytest.mark.asyncio

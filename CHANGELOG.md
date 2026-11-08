@@ -13,6 +13,22 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- Progressive delivery keeps one pending store per backend (in-memory, or
+  each SQLite `pending_store_path`). A tool with no `selective` block no
+  longer writes its progressive responses into another server's SQLite
+  pending store, and a progressive key no longer stops resolving because a
+  tool on a different backend — or with a different `selective` block —
+  published after it. After a reload that removes a `selective` block with
+  `pending_store = "sqlite"`, new progressive responses go to the in-memory
+  store, while the SQLite store already open keeps serving the keys it holds
+  (subject to their TTL and eviction). With a single SQLite pending store
+  configured, `stm_proxy_read_more` now finds a key persisted before a
+  restart even when an in-memory response was published first. (#1362)
+  **Behavior change**: a progressive key handed out earlier keeps resolving
+  through a config reload or a publication on another backend, where it
+  used to answer "not found or expired"; progressive responses from tools
+  without a SQLite `selective` block are no longer stored on disk.
+
 - With `use_daemon` on, surfacing classifies the shared daemon's answers to
   its context-compose request the way it already classified them for legacy
   search. A daemon that is not running is reported as starting, after one

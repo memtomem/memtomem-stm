@@ -103,7 +103,7 @@ def test_manager_reuses_index_with_fresh_chunkers(backend, tmp_path, monkeypatch
     else:
         adapter.put("key", response(content))
     manager = ProxyManager(ProxyConfig(config_path=tmp_path / "absent.json"), TokenTracker())
-    manager._progressive_store = adapter
+    manager._progressive_stores[("memory", "")] = adapter
     before = backend.get("key").created_at
     # Ordinary non-renewing reads may repair metadata but cannot refresh TTL.
     adapter.get("key")

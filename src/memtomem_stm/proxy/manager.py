@@ -850,6 +850,18 @@ def _mark_cache_invalidated(exc: BaseException) -> None:
         pass
 
 
+def _pending_backend_key(sel_cfg: SelectiveConfig | None) -> tuple[str, str]:
+    """The physical pending store *sel_cfg* resolves to (#1362).
+
+    No selective config and ``pending_store="memory"`` are the same in-memory
+    default; a SQLite store is identified by its expanded path. Nothing else in
+    ``SelectiveConfig`` changes where a row lands, so it is not part of the key.
+    """
+    if sel_cfg is None or sel_cfg.pending_store != "sqlite":
+        return ("memory", "")
+    return ("sqlite", str(sel_cfg.pending_store_path.expanduser()))
+
+
 class ProxyManager:
     def __init__(
         self,
@@ -1033,8 +1045,11 @@ class ProxyManager:
         # library callers that inspect ``index_observability.snapshot()``.
         # See ``proxy/index_observability.py`` for the counter contract.
         self.index_observability = IndexObservability()
-        self._progressive_store: ProgressiveStoreAdapter | None = None
-        self._progressive_store_cfg: SelectiveConfig | None = None
+        # One progressive store per pending-store backend (#1362), keyed by
+        # ``_pending_backend_key``. Stores are never swapped out from under a
+        # key they hold: a publication on another backend opens its own store,
+        # and only ``stop()`` closes them.
+        self._progressive_stores: dict[tuple[str, str], ProgressiveStoreAdapter] = {}
         self._llm_compressor: LLMCompressor | None = None
         self._llm_compressor_cfg: LLMCompressorConfig | None = None
         self._llm_compressor_lock = asyncio.Lock()
@@ -3256,13 +3271,13 @@ class ProxyManager:
                     logger.debug("Failed to close selective compressor on stop", exc_info=True)
                 self._selective_compressor = None
                 self._selective_compressor_cfg = None
-        if self._progressive_store is not None:
+        progressive_stores = list(self._progressive_stores.values())
+        self._progressive_stores.clear()
+        for adapter in progressive_stores:
             try:
-                self._progressive_store.close()
+                adapter.close()
             except Exception:
                 logger.debug("Failed to close progressive store on stop", exc_info=True)
-            self._progressive_store = None
-            self._progressive_store_cfg = None
         # Clear startup-failure records too (#580) so a stopped manager reports
         # no upstreams — mirrors the double-start reset in ``start()``.
         self._failed_servers.clear()
@@ -3335,9 +3350,9 @@ class ProxyManager:
         still drives everything scoped to this call.
 
         Refuses once ``stop()`` has begun, until the next ``start()`` (#1125):
-        every caller (SELECTIVE, HYBRID, the progressive store) decides right
-        after this whether to rebuild the slot it publishes into, and an empty
-        slot is always rebuilt, so a call that waited out teardown on
+        every caller (SELECTIVE, HYBRID, the progressive stores) decides right
+        after this whether to (re)open the store it publishes into, and a
+        missing store is always opened, so a call that waited out teardown on
         ``_selective_lock`` would otherwise reopen a store ``stop()`` closes.
         """
         if self._stopped:
@@ -3876,7 +3891,7 @@ class ProxyManager:
             )
             for sel in candidates:
                 if sel is not None and sel.pending_store == "sqlite":
-                    path = str(sel.pending_store_path.expanduser())
+                    path = _pending_backend_key(sel)[1]
                     if path not in seen_paths:
                         seen_paths.add(path)
                         out.append(sel)
@@ -3889,10 +3904,11 @@ class ProxyManager:
         currently holds *key*, or ``None`` if none does (#583).
 
         ``pending_store_path`` is configurable per server and per tool, so
-        several distinct stores may exist. After a restart the retrieval
-        endpoints (``stm_proxy_select_chunks`` / ``stm_proxy_read_more``) can
-        receive a key whose row still lives in one of them while the lazily
-        built compressor/store points at a different one. Probe each distinct
+        several distinct stores may exist. After a restart
+        ``stm_proxy_select_chunks`` can receive a key whose row still lives in
+        one of them while the lazily built compressor points at a different
+        one. (``read_more`` opens every configured store instead — see
+        ``_recover_progressive_stores``.) Probe each distinct
         store read-only (a cheap ``get`` that opens then closes its own
         connection) and return the config whose store holds the key.
 
@@ -5085,9 +5101,8 @@ class ProxyManager:
 
     def _open_progressive_adapter(self, sel_cfg: SelectiveConfig | None) -> ProgressiveStoreAdapter:
         """Build (do NOT cache) a ProgressiveStoreAdapter for *sel_cfg* —
-        SQLite-backed when configured, else in-memory. ``_get_progressive_store``
-        uses it for the cached adapter; ``read_more``'s multi-store recovery uses
-        it for a throwaway adapter it closes after the call (#583)."""
+        SQLite-backed when configured, else in-memory. Only
+        ``_get_progressive_store`` calls it; that is where caching happens."""
         store: PendingStore
         if sel_cfg is not None and sel_cfg.pending_store == "sqlite":
             from memtomem_stm.proxy.pending_store import SQLitePendingStore
@@ -5104,27 +5119,54 @@ class ProxyManager:
     def _get_progressive_store(
         self, sel_cfg: SelectiveConfig | None = None
     ) -> ProgressiveStoreAdapter:
-        """The shared progressive store, rebuilt when *sel_cfg* moved it.
+        """The progressive store for *sel_cfg*'s backend, opened on first use.
 
-        Callers that mint keys pass the PUBLICATION config (see
-        ``_publication_pair``), never a superseded pin's own value, so every
-        rebuild reached from here moves the store forward.
+        ``None`` is the in-memory default, never "whatever is cached" (#1362):
+        each backend has its own store, so a publication on one backend can
+        neither write into another's file nor close the store holding another
+        backend's keys. A failed open raises and caches nothing.
         """
-        if self._progressive_store is None or (
-            sel_cfg is not None and sel_cfg != self._progressive_store_cfg
-        ):
-            # Build the replacement BEFORE closing the old one (#583): if the new
-            # SQLite store fails to open this raises with the old adapter still
-            # cached and usable rather than a closed store behind the cfg check.
-            new = self._open_progressive_adapter(sel_cfg)
-            if self._progressive_store is not None:
-                try:
-                    self._progressive_store.close()
-                except Exception:
-                    logger.debug("Failed to close superseded progressive store", exc_info=True)
-            self._progressive_store = new
-            self._progressive_store_cfg = sel_cfg
-        return self._progressive_store
+        backend = _pending_backend_key(sel_cfg)
+        adapter = self._progressive_stores.get(backend)
+        if adapter is None:
+            adapter = self._open_progressive_adapter(sel_cfg)
+            self._progressive_stores[backend] = adapter
+        return adapter
+
+    def _recover_progressive_stores(self, cfg: ProxyConfig) -> list[ProgressiveStoreAdapter]:
+        """Open (and cache) every configured SQLite store not opened yet.
+
+        A key persisted before a restart (#583) can only be in one of these,
+        and the stores already open were probed before this runs. Opening all
+        of them, rather than guessing which one holds the key, lets the caller
+        look past a store holding an expired copy, and leaves nothing to reopen
+        on the next miss. A store that fails to open is logged and skipped;
+        nothing is cached for it, so a later call retries. The candidates come
+        from *cfg*, one generation.
+        """
+        opened: list[ProgressiveStoreAdapter] = []
+        for sel in self._distinct_sqlite_selective_cfgs(cfg):
+            if _pending_backend_key(sel) in self._progressive_stores:
+                continue
+            try:
+                opened.append(self._get_progressive_store(sel))
+            except Exception:
+                logger.warning(
+                    "Could not open the configured SQLite pending store %s for read_more recovery",
+                    sel.pending_store_path,
+                    exc_info=True,
+                )
+        return opened
+
+    def _drop_progressive_store(self, adapter: ProgressiveStoreAdapter) -> None:
+        """Forget and close *adapter*; it holds no key anyone was handed."""
+        for backend, cached in list(self._progressive_stores.items()):
+            if cached is adapter:
+                del self._progressive_stores[backend]
+        try:
+            adapter.close()
+        except Exception:
+            logger.debug("Failed to close progressive store", exc_info=True)
 
     def _apply_progressive(
         self,
@@ -5137,16 +5179,11 @@ class ProxyManager:
         trace_id: str | None = None,
         cfg_snap: ProxyConfig,
     ) -> str:
-        # Cold slot: publish the LIVE value, not this pin's, so the next live
-        # request agrees with what is there instead of replacing the store the
-        # key minted below lives in. Decision and fill are one synchronous run
-        # — no await between them — so nothing can move the generation in
-        # between the way it can across a lock acquisition.
-        # Same one rule as the compressor slots: the key minted below must land
-        # in the store of the NEWEST generation, so the comparison is against
-        # the publication config and any rebuild is forward. Reusing whatever
-        # is cached would let a superseded pin write into a store the next live
-        # request is about to close — the key would be returned and then die.
+        # The key minted below lands in the store of the NEWEST generation's
+        # backend (``_publication_pair``): a superseded pin still naming a
+        # SQLite file that a reload removed must not keep writing into it.
+        # Decision and fill are one synchronous run — no await between them —
+        # so nothing can move the generation in between.
         structured = delivery_format() == "structured"
         key = uuid.uuid4().hex[:16]
         resp = ProgressiveResponse(
@@ -5263,17 +5300,9 @@ class ProxyManager:
         upstream call and otherwise loses its link to the originating
         trace_id.
         """
-        # Restart recovery (#583): if no progressive store has been built yet
-        # this process, a configured SQLite backend may hold the key from before
-        # the restart — but a bare _get_progressive_store() defaults to a fresh
-        # in-memory store and reports "not found". Pass the fallback cfg ONLY
-        # when nothing is cached: passing it once a store exists would trip the
-        # cfg-mismatch rebuild and discard a live in-memory store still holding
-        # keys written since startup. On a SQLite open failure, degrade to the
-        # sentinel; _get_progressive_store caches only after initialize()
-        # succeeds, so nothing bad is pinned and the next call retries.
-        # One generation for this recovery too — the stores probed and the one
-        # opened must not come from reads that straddle a re-load.
+        # Every open store is probed first. On a miss, a configured SQLite store
+        # not opened yet this process may still hold the key from before a
+        # restart (#583); ``_recover_progressive_stores`` opens those.
         invalid = (
             "offset must be >= 0"
             if offset < 0
@@ -5294,154 +5323,117 @@ class ProxyManager:
             if invalid
             else f"Progressive delivery key '{key}' not found or expired."
         )
-        cfg_live = self._config
-        cfgs = self._distinct_sqlite_selective_cfgs(cfg_live)
-        temp_store: ProgressiveStoreAdapter | None = None
-        if self._progressive_store is None:
-            # As in select_chunks: after stop(), answer with the missing-key
-            # sentinel rather than open or reopen a store (#1128).
-            if self._stopped:
-                return missing
-            fallback = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
-            if fallback is not None:
+        renew = invalid is None
+        fmt: dict[str, Any] = (
+            {"response_format": response_format} if response_format is not None else {}
+        )
+        resp = None
+        for candidate in list(self._progressive_stores.values()):
+            resp = candidate.get(key, renew=renew, **fmt)
+            if resp is not None:
+                break
+        # After stop() has begun (#1128) — including the window before it
+        # clears the stores — a miss opens nothing.
+        if resp is None and not self._stopped:
+            for recovered in self._recover_progressive_stores(self._config):
                 try:
-                    store = self._get_progressive_store(fallback)
+                    resp = recovered.get(key, renew=renew, **fmt)
                 except Exception:
-                    logger.warning(
-                        "Could not open the configured SQLite pending store for read_more recovery",
-                        exc_info=True,
-                    )
-                    return missing
-            else:
-                store = self._get_progressive_store()
-        else:
-            store = self._get_progressive_store()
-        try:
-            resp = store.get(
-                key,
-                renew=invalid is None,
-                **({"response_format": response_format} if response_format is not None else {}),
-            )
-            if resp is None and len(cfgs) > 1:
-                # The cached store did not hold the key, but with multiple distinct
-                # stores configured an earlier call may have cached a *different*
-                # one (#583). Probe the others and, if one holds the key, serve it
-                # from a temporary adapter (closed below) without disturbing the
-                # cache or this session's in-memory progressive responses.
-                alt = self._sqlite_cfg_holding_key(key, cfg_live)
-                if alt is not None and alt != self._progressive_store_cfg:
-                    try:
-                        temp_store = self._open_progressive_adapter(alt)
-                    except Exception:
-                        logger.warning(
-                            "Could not open alternate SQLite pending store for read_more recovery",
-                            exc_info=True,
-                        )
-                        temp_store = None
-                    if temp_store is not None:
-                        alt_resp = temp_store.get(
-                            key,
-                            renew=invalid is None,
-                            **(
-                                {"response_format": response_format}
-                                if response_format is not None
-                                else {}
-                            ),
-                        )
-                        if alt_resp is not None:
-                            store, resp = temp_store, alt_resp
-            if resp is None:
-                return missing
-            if invalid:
-                return invalid_result(resp.delivery_format)
-            with traced(
-                "proxy_call_read_more",
-                metadata={
-                    "server": resp.server,
-                    "tool": resp.tool,
-                    "trace_id": resp.trace_id,
-                    "key": key,
-                },
-            ):
-                if getattr(resp, "delivery_format", "legacy") == "structured":
-                    descriptor = fit_progressive(
-                        resp.content,
-                        key=key,
-                        offset=min(offset, len(resp.content)),
-                        limit=limit or resp.chunk_size,
-                        source_format=resp.content_type,
-                        ttl=resp.ttl_seconds,
-                        budget=resp.delivery_budget,
-                        owned=True,
-                    )
-                    chars = len(descriptor["payload"]["content"])
-                    if self._progressive_reads_tracker is not None and chars:
-                        self._progressive_reads_tracker.record_follow_up(
-                            key=key,
-                            trace_id=resp.trace_id,
-                            server=resp.server,
-                            tool=resp.tool,
-                            offset=offset,
-                            chars=chars,
-                            total_chars=resp.total_chars,
-                        )
-                    response = DeliveryText(delivery_json(descriptor), descriptor)
-                    response.response_format = "structured"
-                    if self._progressive_reads_tracker is not None and chars:
-                        self._progressive_reads_tracker.record_wire(
-                            key,
-                            len(wire_json(delivery_result(descriptor)).encode("utf-8")),
-                            initial=False,
-                            offset=offset,
-                        )
-                    return response
-                # Continue with the chunking the first chunk used (persisted on
-                # the ProgressiveResponse) — an explicit ``limit`` from the agent
-                # still wins. Hardcoding ``4000`` here made follow-ups diverge
-                # from a tuned ``progressive.chunk_size`` / hint preference.
-                chunk_size = limit or resp.chunk_size
-                chunker = ProgressiveChunker(
-                    chunk_size=chunk_size,
-                    include_hint=resp.include_structure_hint,
-                    heading_index=resp.heading_index,
+                    # e.g. unknown delivery metadata: do not keep a reader open
+                    # on a store this call just opened for nothing.
+                    self._drop_progressive_store(recovered)
+                    raise
+                if resp is not None:
+                    break
+        if resp is None:
+            return missing
+        if invalid:
+            return invalid_result(resp.delivery_format)
+        with traced(
+            "proxy_call_read_more",
+            metadata={
+                "server": resp.server,
+                "tool": resp.tool,
+                "trace_id": resp.trace_id,
+                "key": key,
+            },
+        ):
+            if getattr(resp, "delivery_format", "legacy") == "structured":
+                descriptor = fit_progressive(
+                    resp.content,
+                    key=key,
+                    offset=min(offset, len(resp.content)),
+                    limit=limit or resp.chunk_size,
+                    source_format=resp.content_type,
+                    ttl=resp.ttl_seconds,
+                    budget=resp.delivery_budget,
+                    owned=True,
                 )
-                output = chunker.read_chunk_result(
-                    resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
-                )
-                # Skip telemetry when ``read_chunk`` short-circuits with the
-                # ``(no more content)`` sentinel (offset >= len(content)) —
-                # that response delivers no payload, so logging it would
-                # inflate ``follow_up_rate`` with calls that served zero new
-                # bytes and push ``avg_chars_served`` above ``total_chars``.
-                if self._progressive_reads_tracker is not None and output.payload_chars > 0:
+                chars = len(descriptor["payload"]["content"])
+                if self._progressive_reads_tracker is not None and chars:
                     self._progressive_reads_tracker.record_follow_up(
                         key=key,
                         trace_id=resp.trace_id,
                         server=resp.server,
                         tool=resp.tool,
                         offset=offset,
-                        chars=output.payload_chars,
+                        chars=chars,
                         total_chars=resp.total_chars,
                     )
-                if self._progressive_reads_tracker is not None and output.payload_chars > 0:
-                    from mcp.types import CallToolResult, TextContent
-
-                    wire = CallToolResult(
-                        content=[TextContent(type="text", text=output.text)],
-                        structured_content={"result": output.text},
+                response = DeliveryText(delivery_json(descriptor), descriptor)
+                response.response_format = "structured"
+                if self._progressive_reads_tracker is not None and chars:
+                    self._progressive_reads_tracker.record_wire(
+                        key,
+                        len(wire_json(delivery_result(descriptor)).encode("utf-8")),
+                        initial=False,
+                        offset=offset,
                     )
-                    try:
-                        wire_bytes = len(wire_json(wire).encode("utf-8"))
-                    except (ValueError, TypeError):
-                        wire_bytes = None
-                    if wire_bytes is not None:
-                        self._progressive_reads_tracker.record_wire(
-                            key, wire_bytes, initial=False, offset=offset
-                        )
-                return output.text
-        finally:
-            if temp_store is not None:
-                temp_store.close()
+                return response
+            # Continue with the chunking the first chunk used (persisted on
+            # the ProgressiveResponse) — an explicit ``limit`` from the agent
+            # still wins. Hardcoding ``4000`` here made follow-ups diverge
+            # from a tuned ``progressive.chunk_size`` / hint preference.
+            chunk_size = limit or resp.chunk_size
+            chunker = ProgressiveChunker(
+                chunk_size=chunk_size,
+                include_hint=resp.include_structure_hint,
+                heading_index=resp.heading_index,
+            )
+            output = chunker.read_chunk_result(
+                resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
+            )
+            # Skip telemetry when ``read_chunk`` short-circuits with the
+            # ``(no more content)`` sentinel (offset >= len(content)) —
+            # that response delivers no payload, so logging it would
+            # inflate ``follow_up_rate`` with calls that served zero new
+            # bytes and push ``avg_chars_served`` above ``total_chars``.
+            if self._progressive_reads_tracker is not None and output.payload_chars > 0:
+                self._progressive_reads_tracker.record_follow_up(
+                    key=key,
+                    trace_id=resp.trace_id,
+                    server=resp.server,
+                    tool=resp.tool,
+                    offset=offset,
+                    chars=output.payload_chars,
+                    total_chars=resp.total_chars,
+                )
+            if self._progressive_reads_tracker is not None and output.payload_chars > 0:
+                from mcp.types import CallToolResult, TextContent
+
+                wire = CallToolResult(
+                    content=[TextContent(type="text", text=output.text)],
+                    structured_content={"result": output.text},
+                )
+                try:
+                    wire_bytes = len(wire_json(wire).encode("utf-8"))
+                except (ValueError, TypeError):
+                    wire_bytes = None
+                if wire_bytes is not None:
+                    self._progressive_reads_tracker.record_wire(
+                        key, wire_bytes, initial=False, offset=offset
+                    )
+            return output.text
 
     def get_upstream_health(self) -> dict[str, dict]:
         """Return per-server health: connection status, tool counts.
