@@ -949,7 +949,7 @@ class TestPerRequestSnapshot:
         from memtomem_stm.proxy.progressive import PROGRESSIVE_FOOTER_TOKEN
 
         mgr = truncate_mgr
-        assert mgr._progressive_store is None, "the slot must start cold"
+        assert not mgr._progressive_stores, "the slot must start cold"
         stale, live = self._stale_and_live(mgr)
 
         pcfg = ProgressiveConfig(chunk_size=2000, include_structure_hint=False)
@@ -1002,7 +1002,7 @@ class TestPerRequestSnapshot:
         # Warm the slot under the STALE generation's store, the way a request
         # that ran before the reload would have left it.
         mgr._get_progressive_store(mgr._resolve_tool_config("srv", "tool", stale).selective)
-        assert mgr._progressive_store is not None
+        assert mgr._progressive_stores
 
         first = mgr._apply_progressive(
             text,

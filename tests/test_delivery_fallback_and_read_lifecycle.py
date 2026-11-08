@@ -16,6 +16,7 @@ from memtomem_stm.proxy.progressive import (
     ProgressiveStoreAdapter,
 )
 from memtomem_stm.surfacing.mcp_client import decode_context_compose_context
+from helpers import progressive_row_count
 
 
 @pytest.mark.asyncio
@@ -36,7 +37,7 @@ async def test_lossy_ratio_ladder_keeps_success_when_progressive_cannot_fit(
     assert result.content[0].text != "short"
     if mode == "structured" and budget < 1600:
         assert "stm" not in (result.structured_content or {})
-        assert proxy._progressive_store is None or len(proxy._progressive_store._store) == 0
+        assert progressive_row_count(proxy) == 0
 
 
 def test_whitespace_preamble_is_omitted_without_moving_source_ranges():

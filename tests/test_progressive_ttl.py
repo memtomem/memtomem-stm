@@ -55,7 +55,7 @@ def test_manager_expiry_before_renewal(storage, tmp_path, age, live):
     backend, adapter, clock = storage
     seed(backend, clock)
     manager = ProxyManager(ProxyConfig(config_path=tmp_path / "absent.json"), TokenTracker())
-    manager._progressive_store = adapter
+    manager._progressive_stores[("memory", "")] = adapter
     clock.now += age
     result = manager.read_more("key", 0)
     assert ("synthetic payload" in result) is live
@@ -72,7 +72,7 @@ def test_successful_read_renews_sliding_lifetime(storage, tmp_path):
     backend, adapter, clock = storage
     seed(backend, clock)
     manager = ProxyManager(ProxyConfig(config_path=tmp_path / "absent.json"), TokenTracker())
-    manager._progressive_store = adapter
+    manager._progressive_stores[("memory", "")] = adapter
     clock.now += 9
     assert "synthetic payload" in manager.read_more("key", 0)
     clock.now += 9
@@ -178,12 +178,13 @@ def test_sqlite_restart_and_alternate_recovery(tmp_path, monkeypatch, legacy, al
     try:
         if alternate:
             assert "not found" in manager.read_more("absent", 0)
-            cached = manager._progressive_store
+            cached = dict(manager._progressive_stores)
         clock.now += (1800 if legacy else 10) if expired else 5
         result = manager.read_more("key", 0)
         assert ("synthetic payload" in result) is not expired
         if alternate:
-            assert manager._progressive_store is cached
+            # Recovery adds a store; it never replaces or closes one.
+            assert all(manager._progressive_stores.get(b) is a for b, a in cached.items())
         check = stores.SQLitePendingStore(path)
         check.initialize()
         try:
@@ -195,8 +196,8 @@ def test_sqlite_restart_and_alternate_recovery(tmp_path, monkeypatch, legacy, al
         finally:
             check.close()
     finally:
-        if manager._progressive_store:
-            manager._progressive_store.close()
+        for adapter in manager._progressive_stores.values():
+            adapter.close()
 
 
 @pytest.mark.parametrize("operation", ["read", "evict"])
@@ -394,13 +395,13 @@ def test_alternate_recovery_with_cached_store_locked(tmp_path):
         cached._store._get_db().execute("PRAGMA busy_timeout=0")
         writer._get_db().execute("BEGIN IMMEDIATE")
         assert "synthetic payload" in manager.read_more("key", 0)
-        assert manager._progressive_store is cached
+        assert manager._get_progressive_store(a) is cached
     finally:
         writer._get_db().rollback()
         writer.close()
         remote.close()
-        if manager._progressive_store:
-            manager._progressive_store.close()
+        for adapter in manager._progressive_stores.values():
+            adapter.close()
 
 
 @pytest.mark.parametrize(

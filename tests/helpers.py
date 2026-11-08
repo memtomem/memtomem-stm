@@ -121,6 +121,22 @@ def count_loader_reads(manager: ProxyManager) -> list[int]:
     return calls
 
 
+def only_progressive_store(manager: ProxyManager) -> Any:
+    """The manager's single open progressive store; fails if there are more.
+
+    The manager keeps one store per pending-store backend (#1362), so a test
+    that published on exactly one backend reads its rows through this.
+    """
+    stores = list(manager._progressive_stores.values())
+    assert len(stores) == 1, f"expected one progressive store, found {len(stores)}"
+    return stores[0]
+
+
+def progressive_row_count(manager: ProxyManager) -> int:
+    """Rows across every open progressive store (0 when none was opened)."""
+    return sum(len(adapter._store) for adapter in manager._progressive_stores.values())
+
+
 def wire_proxy_manager(
     proxy_cfg: ProxyConfig,
     server_cfg: UpstreamServerConfig,

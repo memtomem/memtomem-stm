@@ -198,8 +198,9 @@ class ProgressiveStoreAdapter:
         """Release the underlying store's OS resources (SQLite connection).
 
         The in-memory backend has nothing to release. ``ProxyManager`` calls
-        this on stop and before rebuilding the adapter for a changed config
-        (#583) so a cached SQLite-backed adapter does not leak its connection.
+        this on stop for every backend's adapter (#1362), and on a store a
+        ``read_more`` recovery opened when the lookup on it raised, so a
+        SQLite-backed adapter does not leak its connection.
         """
         close = getattr(self._store, "close", None)
         if callable(close):

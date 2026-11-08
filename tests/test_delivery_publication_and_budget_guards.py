@@ -23,6 +23,7 @@ from memtomem_stm.proxy.config import TailMode
 from memtomem_stm.proxy.delivery import DeliveryBudgetExceeded, delivery_scope
 from memtomem_stm.proxy.pending_store import InMemoryPendingStore
 from memtomem_stm.server import _continuation_result
+from helpers import only_progressive_store, progressive_row_count
 
 
 @pytest.mark.asyncio
@@ -35,8 +36,7 @@ async def test_impossible_structured_budget_returns_typed_error(tmp_path, strate
     result = to_call_tool_result(await proxy.call_tool("srv", "read", {}))
     assert result.is_error
     assert payload(result)["payload"]["code"] == "budget_exceeded"
-    if proxy._progressive_store is not None:
-        assert len(proxy._progressive_store._store) == 0
+    assert progressive_row_count(proxy) == 0
 
 
 @pytest.mark.asyncio
@@ -183,7 +183,7 @@ async def test_initial_key_is_not_issued_if_owned_continuation_cannot_progress(t
     result = to_call_tool_result(await proxy.call_tool("srv", "read", {}))
     assert result.is_error
     assert payload(result)["payload"]["code"] == "budget_exceeded"
-    assert proxy._progressive_store is None or len(proxy._progressive_store._store) == 0
+    assert progressive_row_count(proxy) == 0
 
 
 @pytest.mark.asyncio
@@ -197,7 +197,7 @@ async def test_continuation_uses_full_tool_budget_without_initial_upstream_metad
     assert not initial.is_error
     assert len(initial.model_dump_json(by_alias=True, exclude_none=True)) <= 1600
     next_chunk = payload(initial)["payload"]
-    assert proxy._progressive_store.get(next_chunk["key"]).delivery_budget == 1600
+    assert only_progressive_store(proxy).get(next_chunk["key"]).delivery_budget == 1600
     pieces = [next_chunk["content"]]
     while next_chunk["has_more"]:
         more = proxy.read_more(next_chunk["key"], next_chunk["next_offset"])
@@ -318,11 +318,10 @@ async def test_actual_sqlite_privacy_refusal_after_budget_fallback_stays_uncache
             assert not result.is_error
         assert session.call_tool.await_count == 2
         assert cache._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
-        if proxy._progressive_store is not None:
-            assert len(proxy._progressive_store._store) == 0
+        assert progressive_row_count(proxy) == 0
     finally:
         cache.close()
-        if proxy._progressive_store is not None:
-            proxy._progressive_store.close()
+        for adapter in proxy._progressive_stores.values():
+            adapter.close()
         if proxy._selective_compressor is not None:
             proxy._selective_compressor.close()

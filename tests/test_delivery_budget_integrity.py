@@ -20,6 +20,7 @@ from memtomem_stm.proxy.delivery import (
 from memtomem_stm.proxy.pending_store import InMemoryPendingStore
 from memtomem_stm.proxy.token_estimate import approx_tokens
 from memtomem_stm.server import _continuation_result
+from helpers import only_progressive_store
 
 
 @pytest.mark.asyncio
@@ -49,7 +50,7 @@ async def test_unicode_budget_covers_initial_and_owned_continuations(
     desc = payload(result)
     assert desc["kind"] == "progressive"
     key = desc["payload"]["key"]
-    assert proxy._progressive_store.get(key).delivery_budget == limit
+    assert only_progressive_store(proxy).get(key).delivery_budget == limit
     pieces = [desc["payload"]["content"]]
     while desc["payload"]["has_more"]:
         previous = desc["payload"]["next_offset"]

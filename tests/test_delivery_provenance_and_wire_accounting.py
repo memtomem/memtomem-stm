@@ -17,6 +17,7 @@ from memtomem_stm.proxy.pending_store import InMemoryPendingStore, SQLitePending
 from memtomem_stm.proxy.progressive import ProgressiveChunker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.server import stm_proxy_select_chunks, _continuation_result
+from helpers import only_progressive_store
 
 
 def document():
@@ -68,7 +69,7 @@ async def test_legacy_progressive_defers_analysis_until_structured_override(tmp_
     key = (
         result.descriptor["payload"]["key"]
         if hasattr(result, "descriptor")
-        else next(iter(proxy._progressive_store._store._data))
+        else next(iter(only_progressive_store(proxy)._store._data))
     )
     more = proxy.read_more(key, 1000, response_format="structured")
     assert more.descriptor["payload"]["source_format"] == "json"
@@ -150,7 +151,7 @@ async def test_structured_lossy_ratio_ladder_does_not_publish_rejected_hybrid(
     assert not result.is_error
     if proxy._selective_compressor is not None:
         assert len(proxy._selective_compressor._store) == 0
-    assert proxy._progressive_store is None
+    assert not proxy._progressive_stores
 
 
 @pytest.mark.asyncio
@@ -194,7 +195,7 @@ async def test_sdk_projection_import_failure_keeps_legacy_and_refuses_unmeasured
             assert result.structured_content is None
             assert payload(result)["payload"]["code"] == "unsupported_sdk_wire_format"
         else:
-            key = next(iter(proxy._progressive_store._store._data))
+            key = next(iter(only_progressive_store(proxy)._store._data))
 
             async def more(ctx):
                 return _continuation_result(proxy.read_more(key, 1000), None)

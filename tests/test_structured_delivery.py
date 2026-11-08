@@ -122,7 +122,7 @@ async def test_upstream_structured_payload_is_preserved_without_stm_pointer(tmp_
     assert sum(len(block.text) for block in result.content if block.type == "text") <= 1600
     assert result.content[0].text == upstream.content[0].text[:len(result.content[0].text)]
     assert "truncated" in result.content[-1].text
-    assert proxy._progressive_store is None
+    assert not proxy._progressive_stores
 
 
 @pytest.mark.parametrize("handler", [stm_proxy_read_more, stm_proxy_select_chunks])
@@ -603,7 +603,8 @@ def test_unknown_metadata_in_alternate_progressive_store_closes_reader(tmp_path,
         proxy.read_more("bad-version", 0)
     assert opened
     assert all(adapter._store._db is None for adapter in opened)
-    proxy._progressive_store.close()
+    for adapter in proxy._progressive_stores.values():
+        adapter.close()
 
 
 @pytest.mark.asyncio
