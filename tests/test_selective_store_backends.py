@@ -599,3 +599,58 @@ async def test_two_spellings_of_one_sqlite_path_share_one_store(tmp_path, monkey
         assert _serves(mgr, key, "b")
     finally:
         await mgr.stop()
+
+
+# ── a cancelled call keeps its store pinned until its worker ends (#1369) ──
+
+
+def _spy_publish_errors(monkeypatch) -> list[BaseException]:
+    errors: list[BaseException] = []
+    real = SelectiveCompressor._publish
+
+    def spy(self, *args, **kwargs):
+        try:
+            return real(self, *args, **kwargs)
+        except BaseException as exc:
+            errors.append(exc)
+            raise
+
+    monkeypatch.setattr(SelectiveCompressor, "_publish", spy)
+    return errors
+
+
+@pytest.mark.parametrize("strategy", STRATEGIES)
+async def test_a_cancelled_call_keeps_the_store_open_until_its_worker_ends(
+    tmp_path, monkeypatch, strategy
+):
+    """The issue's reproduction: stop() defers the close to the pin, the call is
+    cancelled while its worker scores, and the worker then publishes. The
+    cancelled call's ``finally`` used to release the pin at once, so the
+    deferred close ran under the worker and its publish raised
+    ``RuntimeError: SQLitePendingStore not initialized``."""
+    errors = _spy_publish_errors(monkeypatch)
+    mgr = _manager(_cfg(tmp_path, {"d": _sqlite(tmp_path / "pending.db")}))
+    gated = _gate_next_call(mgr)
+    task = asyncio.create_task(_call(mgr, "d", "a", strategy=strategy, context_query="q"))
+    try:
+        await _started(gated)
+        (owner,) = mgr._selective_owners.values()
+
+        await mgr.stop()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert owner._in_use == 1, "the cancelled call released the pin before its worker ended"
+        assert owner._store._db is not None, "the store was closed under a running worker"
+    finally:
+        gated.gate.set()
+
+    # ``end_use`` drops the count before it closes the store, so wait for the
+    # close itself, not for the count.
+    for _ in range(1000):
+        if owner._store._db is None:
+            break
+        await asyncio.sleep(0.01)
+    assert owner._store._db is None, "the deferred close never ran"
+    assert errors == [], f"the worker's publish failed: {errors!r}"
+    assert owner._in_use == 0

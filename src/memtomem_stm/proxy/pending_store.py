@@ -429,9 +429,13 @@ class SQLitePendingStore:
         return cls._has_column(db, "seq")
 
     def close(self) -> None:
-        if self._db:
-            self._db.close()
-            self._db = None
+        # Under the lock every other method takes, so a close waits out an
+        # operation in progress instead of closing the connection under it
+        # (#1369).
+        with self._lock:
+            if self._db:
+                self._db.close()
+                self._db = None
 
     def _get_db(self) -> sqlite3.Connection:
         if self._db is None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import hashlib
 import inspect
@@ -848,6 +849,41 @@ def _mark_cache_invalidated(exc: BaseException) -> None:
         exc._stm_cache_invalidated = True  # type: ignore[attr-defined]
     except (AttributeError, TypeError):
         pass
+
+
+class _PinHandoff:
+    """Decides once whether the worker or the event loop releases a store pin.
+
+    An off-thread SELECTIVE/HYBRID compress holds its store's pin (``begin_use``)
+    until the work is over (#1369). The awaiting coroutine can be cancelled at
+    any time, but a worker thread that already started cannot be stopped, and a
+    job still queued in the executor may never start. So the release belongs to
+    whichever side leaves ``pending`` first: the worker, by claiming the job
+    before compressing (it then releases in its own ``finally``), or the loop,
+    by aborting a job that has not started (it releases at once, and the
+    worker, if it ever runs, skips the compress).
+    """
+
+    def __init__(self, release: Callable[[], None]) -> None:
+        self._lock = threading.Lock()
+        self._state = "pending"
+        self._release = release
+
+    def claim_run(self) -> bool:
+        """Worker side: True if this job may compress (and must release)."""
+        with self._lock:
+            if self._state != "pending":
+                return False
+            self._state = "running"
+            return True
+
+    def abort(self) -> None:
+        """Loop side: release now unless the worker has claimed the job."""
+        with self._lock:
+            if self._state != "pending":
+                return
+            self._state = "aborted"
+        self._release()
 
 
 def _pending_backend_key(sel_cfg: SelectiveConfig | None) -> tuple[str, str]:
@@ -4218,6 +4254,7 @@ class ProxyManager:
         max_chars: int,
         context_query: str | None,
         scorer: Any,
+        release: Callable[[], None] | None = None,
     ) -> str:
         """Run a sync, scorer-carrying ``compress()`` without stalling the loop.
 
@@ -4225,7 +4262,8 @@ class ProxyManager:
         through here (#618): when the relevance scorer the compressor will
         actually use does blocking I/O (``EmbeddingScorer``'s sync httpx call
         — see ``RelevanceScorer.uses_blocking_io``), the whole sync
-        ``compress()`` runs in a worker thread via ``asyncio.to_thread`` so an
+        ``compress()`` runs in a worker thread (``asyncio.to_thread``, or the
+        same default executor reached directly when ``release`` is given) so an
         unresponsive embedding endpoint can't freeze every other proxied call
         for up to the embedding timeout. With the default BM25 scorer the gate
         is false and the call is made inline — no thread hop, byte-identical
@@ -4242,25 +4280,68 @@ class ProxyManager:
         Callers off-loading a compressor that writes a shared pending store (a
         ``SelectiveCompressor`` view, alone or inside a ``HybridCompressor``)
         must pin the store's owner with ``begin_use()`` while still holding
-        ``_selective_lock`` and balance with ``end_use()`` after this call: a
-        concurrent ``stop()`` would otherwise ``close()`` the store out from
-        under the worker thread
-        (``SQLitePendingStore.close`` is not synchronized with ``put``). The
-        pin defers the close to the last in-flight user rather than holding
-        the lock across the compress, so concurrent SELECTIVE/HYBRID calls
-        run in parallel instead of surfacing spurious ``LOCK_TIMEOUT`` behind
-        a slow embedding endpoint.
+        ``_selective_lock``, with no ``await`` before this call, and pass
+        ``release=owner.end_use``: a concurrent ``stop()`` would otherwise
+        ``close()`` the store out from under the worker thread. The pin defers
+        the close to the last in-flight user rather than holding the lock
+        across the compress, so concurrent SELECTIVE/HYBRID calls run in
+        parallel instead of surfacing spurious ``LOCK_TIMEOUT`` behind a slow
+        embedding endpoint.
+
+        ``release`` is called exactly once, when the compress is over (#1369).
+        Inline, that is after it returns or raises. Off-thread it is NOT when
+        this coroutine finishes: cancelling the caller does not stop a worker
+        that has claimed the job, so that worker releases when it returns. A job
+        no worker has claimed when the cancellation's callback runs is aborted
+        and released then, and never compresses — or, if the executor drops it
+        unrun (shut down with ``cancel_futures``), when the future completes.
+        A worker can still claim a queued job before that callback runs; it
+        then compresses and releases as usual. See ``_PinHandoff``. The executor future is awaited
+        directly, as ``asyncio.to_thread`` does, so a cancelled caller's worker
+        exception is dropped the same way; the wrapper runs in a copy of the
+        caller's context, as ``to_thread``'s does.
 
         Exceptions propagate with their original type (``asyncio.to_thread``
         re-raises), so callers' ``except`` clauses — notably the
         ``sqlite3.Error`` pending-store guard in ``_compress_and_surface`` —
         behave identically on both paths.
         """
-        if getattr(scorer, "uses_blocking_io", False):
+        if not getattr(scorer, "uses_blocking_io", False):
+            try:
+                return compressor.compress(text, max_chars=max_chars, context_query=context_query)
+            finally:
+                if release is not None:
+                    release()
+        if release is None:
             return await asyncio.to_thread(
                 compressor.compress, text, max_chars=max_chars, context_query=context_query
             )
-        return compressor.compress(text, max_chars=max_chars, context_query=context_query)
+        handoff = _PinHandoff(release)
+
+        def run() -> str | None:
+            if not handoff.claim_run():
+                return None  # aborted: nobody awaits this result
+            try:
+                result: str = compressor.compress(
+                    text, max_chars=max_chars, context_query=context_query
+                )
+                return result
+            finally:
+                release()
+
+        loop = asyncio.get_running_loop()
+        try:
+            future = loop.run_in_executor(None, contextvars.copy_context().run, run)
+        except BaseException:
+            # ``ThreadPoolExecutor.submit`` queues the job before it starts a
+            # thread, so a failed submit may still run ``run`` later; the abort
+            # makes that run skip.
+            handoff.abort()
+            raise
+        future.add_done_callback(lambda _: handoff.abort())
+        out = await future
+        assert out is not None  # only an aborted job returns None, and then
+        return out  # nobody awaits it
 
     async def _fit_structured_truncation(
         self,
@@ -4368,19 +4449,19 @@ class ProxyManager:
                 # parallel instead of queueing on the lock (which would surface
                 # as spurious LOCK_TIMEOUT under a slow embedding endpoint).
                 owner.begin_use()
-            try:
-                return (
-                    await self._compress_maybe_offthread(
-                        sel_compressor,
-                        text,
-                        max_chars=max_chars,
-                        context_query=context_query,
-                        scorer=getattr(sel_compressor, "_scorer", None),
-                    ),
-                    None,
-                )
-            finally:
-                owner.end_use()
+            # The helper owns the release: a cancelled call must keep the pin
+            # until its worker thread is done (#1369).
+            return (
+                await self._compress_maybe_offthread(
+                    sel_compressor,
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
+                    scorer=getattr(sel_compressor, "_scorer", None),
+                    release=owner.end_use,
+                ),
+                None,
+            )
 
         if compression == CompressionStrategy.LLM_SUMMARY:
             if llm_cfg is not None:
@@ -4676,16 +4757,14 @@ class ProxyManager:
             # (HybridCompressor has no scorer of its own; its truncate tail
             # mode is query-blind).
             owner.begin_use()
-        try:
-            return await self._compress_maybe_offthread(
-                compressor,
-                text,
-                max_chars=max_chars,
-                context_query=context_query,
-                scorer=getattr(sel_compressor, "_scorer", None),
-            )
-        finally:
-            owner.end_use()
+        return await self._compress_maybe_offthread(
+            compressor,
+            text,
+            max_chars=max_chars,
+            context_query=context_query,
+            scorer=getattr(sel_compressor, "_scorer", None),
+            release=owner.end_use,
+        )
 
     async def _auto_index_response(
         self,
