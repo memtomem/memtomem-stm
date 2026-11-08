@@ -4015,7 +4015,11 @@ class ProxyManager:
                     continue
                 try:
                     sel = self._resolve_tool_config(srv, name, publish_cfg).selective
-                    routes[(srv, name)] = self._selective_view(srv, name, sel, publish_cfg)[1]
+                    refreshed_owner, refreshed = self._selective_view(srv, name, sel, publish_cfg)
+                    # A paused write on this route now publishes under the
+                    # refreshed TTL, so its store must also read back by it.
+                    refreshed_owner.use_ttl(refreshed._ttl)
+                    routes[(srv, name)] = refreshed
                 except Exception:
                     logger.debug(
                         "Dropping the selective route for %s/%s on a config change",
@@ -4024,8 +4028,9 @@ class ProxyManager:
                         exc_info=True,
                     )
         owner, view = self._selective_view(server, tool, publish_sel, publish_cfg)
-        # ``select_chunks`` expires the store's rows by the TTL of the latest
-        # call on it; entry-local TTL would need the row to carry its own.
+        # ``select_chunks`` expires a store's rows by the TTL of the latest
+        # route resolved onto it — this call's last; entry-local TTL would
+        # need the row to carry its own.
         owner.use_ttl(view._ttl)
         routes[(server, tool)] = view
         with self._selective_publish_mu:

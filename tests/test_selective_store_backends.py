@@ -419,3 +419,52 @@ async def test_a_route_whose_server_is_gone_is_dropped_on_the_next_generation(tm
         assert set(mgr._selective_routes) == {("d", "t")}
     finally:
         await mgr.stop()
+
+
+async def test_a_refreshed_route_reads_back_under_its_new_ttl(tmp_path, monkeypatch):
+    """A route refreshed by another server's call must also move its store's
+    select-time TTL: the paused write publishes under the new TTL, and the key
+    has to survive past the old one."""
+    import memtomem_stm.proxy.pending_store as pending_store_mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(pending_store_mod.time, "time", lambda: clock[0])
+    db = tmp_path / "a.db"
+    mgr = _manager(_cfg(tmp_path, {"a": _sqlite(db, pending_ttl_seconds=1.0), "b": None}))
+    try:
+        gated = _gate_next_call(mgr)
+        task = asyncio.create_task(_call(mgr, "a", "a", context_query="q"))
+        await _started(gated)
+        _reload(mgr, {"a": _sqlite(db, pending_ttl_seconds=300.0)})
+        await _call(mgr, "b", "b")
+        gated.gate.set()
+        key = await task
+
+        clock[0] += 5.0
+        assert _serves(mgr, key, "a"), "the key expired under the superseded TTL"
+    finally:
+        await mgr.stop()
+
+
+async def test_a_locked_sqlite_store_does_not_block_a_key_held_elsewhere(tmp_path):
+    """A miss in one store is a read: probing a SQLite store whose file another
+    connection holds a write lock on must not fail a key another store holds."""
+    db = tmp_path / "pending.db"
+    mgr = _manager(_cfg(tmp_path, {"d": _sqlite(db), "m": None}))
+    holder = None
+    try:
+        await _call(mgr, "d", "a")
+        key = await _call(mgr, "m", "b")
+        assert list(mgr._selective_owners)[0][0] == "sqlite", "the sqlite store is probed first"
+        for owner in mgr._selective_owners.values():
+            db_conn = getattr(owner._store, "_db", None)
+            if db_conn is not None:
+                db_conn.execute("PRAGMA busy_timeout = 100")
+        holder = sqlite3.connect(db, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        assert _serves(mgr, key, "b")
+    finally:
+        if holder is not None:
+            holder.execute("ROLLBACK")
+            holder.close()
+        await mgr.stop()

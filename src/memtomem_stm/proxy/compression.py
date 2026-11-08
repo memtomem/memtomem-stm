@@ -1376,13 +1376,19 @@ class SelectiveCompressor:
         The manager probes several stores for one key (#1365); a miss has to
         be told apart from a hit by more than its text, since selected content
         or a section name can contain the miss message.
-        """
-        self._store.evict_expired(self._ttl, exclude_format="progressive")
 
-        pending = self._store.get(key)
+        A store that does not hold *key* is only read: the store-wide expiry
+        pass runs once the key is found, so probing a store for a key another
+        store holds takes no write lock on it.
+        """
         # Both strategies may share one SQLite file. Only read_more may read
         # or renew progressive rows, using their entry-local expiry checks.
+        pending = self._store.get(key)
         if pending is None or pending.format == "progressive":
+            return None
+        self._store.evict_expired(self._ttl, exclude_format="progressive")
+        pending = self._store.get(key)
+        if pending is None:
             return None
 
         mode = metadata_format(pending.metadata_json, response_format)

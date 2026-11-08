@@ -35,8 +35,8 @@ changes inline only. See the deprecation policy in
   emptied when a `selective` block changes. Tools that share one store but
   set different `max_pending` / `pending_ttl_seconds` still evict it
   store-wide, each write under its own tool's limits, and
-  `stm_proxy_select_chunks` expires rows by the TTL of the latest
-  SELECTIVE/HYBRID call on that store.
+  `stm_proxy_select_chunks` expires a store's rows by the
+  `pending_ttl_seconds` most recently resolved for a tool writing to it.
 
 - Progressive delivery keeps one pending store per backend (in-memory, or
   each SQLite `pending_store_path`). A tool with no `selective` block no
