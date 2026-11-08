@@ -71,6 +71,35 @@ def _metadata_live(meta: dict[str, Any], created_at: float, now: float) -> bool:
     return ttl > 0 and now - created_at < ttl
 
 
+def _valid_selective_ttl(ttl: object) -> bool:
+    """Whether an entry-local SELECTIVE TTL is one expiry can apply.
+
+    Mirrors the SQL guard in ``SQLitePendingStore.evict_expired``: a finite,
+    non-negative number. Anything else is an explicit invalid TTL and expires
+    the row rather than falling back to the caller's (#1370).
+    """
+    return (
+        isinstance(ttl, (int, float))
+        and not isinstance(ttl, bool)
+        and math.isfinite(ttl)
+        and ttl >= 0
+    )
+
+
+def _selective_expired(selection: PendingSelection, now: float, fallback_ttl: float) -> bool:
+    """Whether a SELECTIVE row has outlived the TTL it was published under.
+
+    A row with no entry-local TTL (written before #1370, or by an older
+    process sharing the file) expires by *fallback_ttl*.
+    """
+    ttl = selection.ttl_seconds
+    if ttl is None:
+        return (now - selection.created_at) > fallback_ttl
+    if not _valid_selective_ttl(ttl):
+        return True
+    return (now - selection.created_at) > ttl
+
+
 def _live_progressive_metadata(selection: PendingSelection, now: float) -> dict[str, Any] | None:
     if not isinstance(selection.chunks, dict):
         return None
@@ -130,6 +159,12 @@ class PendingStore(Protocol):
     renewal are atomic with deletion/replacement, and use each entry's stored
     TTL. ``evict_progressive_expired`` applies that same policy store-wide.
     Generic get/touch/evict_expired retain SELECTIVE's separate policy.
+
+    SELECTIVE rows expire by their own ``ttl_seconds`` too, the TTL their TOC
+    advertised (#1370): ``evict_expired``'s ``ttl`` is only the fallback for a
+    row that carries none. Tools sharing one store may set different TTLs, so a
+    store-wide TTL would let one tool's write or read expire another tool's
+    keys early, or keep them past what their TOC said.
 
     ``persists_to_disk`` says whether ``put`` writes the payload to a file. A
     store that does refuses a credential-bearing payload (#1148): publishers
@@ -252,7 +287,7 @@ class InMemoryPendingStore:
             expired = {
                 k
                 for k, v in self._data.items()
-                if (now - v.created_at) > ttl
+                if _selective_expired(v, now, ttl)
                 and (format is None or v.format == format)
                 and (exclude_format is None or v.format != exclude_format)
             }
@@ -293,7 +328,10 @@ class SQLitePendingStore:
     upgraded together rather than one at a time. For progressive TTL (#1155),
     old processes also apply their publisher's TTL to unrelated rows; all
     processes sharing this file must upgrade/restart together for entry-local
-    expiry to hold. No blanket purge of existing rows is needed.
+    expiry to hold. No blanket purge of existing rows is needed. The same holds
+    for SELECTIVE's entry-local TTL (#1370): an older process writes rows with
+    no ``ttl_seconds`` — they expire by the reader's or writer's TTL — and its
+    own expiry still applies one TTL to every row in the file.
 
     A row whose serialized payload matches a credential pattern is never
     written: ``put`` raises ``SensitivePayloadNotStored`` instead (#1148). The
@@ -324,7 +362,8 @@ class SQLitePendingStore:
                     created_at REAL NOT NULL,
                     total_chars INTEGER NOT NULL,
                     seq INTEGER,
-                    metadata_json TEXT
+                    metadata_json TEXT,
+                    ttl_seconds REAL
                 )"""
             )
             # ``seq`` is the eviction order (#901), added after the table
@@ -364,24 +403,30 @@ class SQLitePendingStore:
             db.close()
             raise
         try:
-            if not any(
-                r[1] == "metadata_json" for r in db.execute("PRAGMA table_info(pending_selections)")
-            ):
-                with db:
-                    db.execute("BEGIN IMMEDIATE")
-                    if not any(
-                        r[1] == "metadata_json"
-                        for r in db.execute("PRAGMA table_info(pending_selections)")
-                    ):
-                        db.execute("ALTER TABLE pending_selections ADD COLUMN metadata_json TEXT")
+            # Nullable columns added after ``seq``, each needing no backfill:
+            # NULL ``metadata_json`` reads as legacy delivery metadata, and NULL
+            # ``ttl_seconds`` makes the row expire by the caller's TTL (#1370).
+            # Same cheap-check-then-locked-recheck shape as ``seq``.
+            for column, declared in (("metadata_json", "TEXT"), ("ttl_seconds", "REAL")):
+                if not self._has_column(db, column):
+                    with db:
+                        db.execute("BEGIN IMMEDIATE")
+                        if not self._has_column(db, column):
+                            db.execute(
+                                f"ALTER TABLE pending_selections ADD COLUMN {column} {declared}"
+                            )
         except Exception:
             db.close()
             raise
         self._db = db
 
     @staticmethod
-    def _has_seq_column(db: sqlite3.Connection) -> bool:
-        return any(row[1] == "seq" for row in db.execute("PRAGMA table_info(pending_selections)"))
+    def _has_column(db: sqlite3.Connection, column: str) -> bool:
+        return any(row[1] == column for row in db.execute("PRAGMA table_info(pending_selections)"))
+
+    @classmethod
+    def _has_seq_column(cls, db: sqlite3.Connection) -> bool:
+        return cls._has_column(db, "seq")
 
     def close(self) -> None:
         if self._db:
@@ -421,8 +466,8 @@ class SQLitePendingStore:
         with self._lock:
             self._get_db().execute(
                 "INSERT OR REPLACE INTO pending_selections "
-                "(key, chunks_json, format, created_at, total_chars, metadata_json, seq) "
-                f"VALUES (?, ?, ?, ?, ?, ?, {self._NEXT_SEQ})",
+                "(key, chunks_json, format, created_at, total_chars, metadata_json, "
+                f"ttl_seconds, seq) VALUES (?, ?, ?, ?, ?, ?, ?, {self._NEXT_SEQ})",
                 (
                     key,
                     chunks_json,
@@ -430,6 +475,7 @@ class SQLitePendingStore:
                     time.time(),
                     selection.total_chars,
                     selection.metadata_json,
+                    selection.ttl_seconds,
                 ),
             )
             self._get_db().commit()
@@ -439,8 +485,8 @@ class SQLitePendingStore:
             row = (
                 self._get_db()
                 .execute(
-                    "SELECT chunks_json, format, created_at, total_chars, metadata_json "
-                    "FROM pending_selections WHERE key = ?",
+                    "SELECT chunks_json, format, created_at, total_chars, metadata_json, "
+                    "ttl_seconds FROM pending_selections WHERE key = ?",
                     (key,),
                 )
                 .fetchone()
@@ -481,12 +527,19 @@ class SQLitePendingStore:
         ):
             logger.warning("Invalid pending selection fields; treating as miss")
             return None
+        ttl = row[5] if len(row) > 5 else None
+        if ttl is not None and not _valid_selective_ttl(ttl):
+            # The row would expire on the next sweep; a read before it must not
+            # hand it out as if it had no TTL (#1370).
+            logger.warning("Invalid pending selection TTL; treating as miss")
+            return None
         return PendingSelection(
             chunks=chunks,
             format=row[1],
             created_at=row[2],
             total_chars=row[3],
             metadata_json=row[4] if len(row) > 4 else None,
+            ttl_seconds=None if ttl is None else float(ttl),
         )
 
     def get_progressive(
@@ -604,9 +657,19 @@ class SQLitePendingStore:
     def evict_expired(
         self, ttl: float, *, format: str | None = None, exclude_format: str | None = None
     ) -> None:
-        cutoff = time.time() - ttl
-        where = "created_at < ?"
-        params: list[object] = [cutoff]
+        now = time.time()
+        # Entry-local TTL (#1370), with ``ttl`` as the fallback for rows that
+        # carry none. REAL affinity has already turned numeric text and
+        # booleans into numbers and NaN into NULL, so the guard sees what the
+        # column holds; it matches ``_valid_selective_ttl`` for every value this
+        # class writes. Anything else it rejects expires the row.
+        where = (
+            "(CASE WHEN ttl_seconds IS NULL THEN created_at < ? "
+            "WHEN typeof(ttl_seconds) IN ('integer', 'real') "
+            "AND ttl_seconds >= 0 AND ttl_seconds < 9e999 "
+            "THEN created_at < ? - ttl_seconds ELSE 1 END)"
+        )
+        params: list[object] = [now - ttl, now]
         if format is not None:
             where += " AND format = ?"
             params.append(format)
