@@ -97,6 +97,7 @@ from memtomem_stm.proxy.delivery import (
     delivery_size,
     error_result,
     fit_progressive,
+    plain_result_fits,
     progressive_envelope,
     require_progressive_continuation,
     wire_json,
@@ -6655,15 +6656,7 @@ class ProxyManager:
             # ratio-guard Tier-1 call below.
             pcfg = tc.progressive or ProgressiveConfig()
             if len(cleaned) <= pcfg.chunk_size and (
-                tc.delivery_format != "structured"
-                or len(
-                    wire_json(
-                        mcp_types.CallToolResult(
-                            content=[mcp_types.TextContent(type="text", text=cleaned)]
-                        )
-                    )
-                )
-                <= delivery_budget()
+                tc.delivery_format != "structured" or plain_result_fits(cleaned)
             ):
                 # Content fits in one chunk — passthrough
                 compressed = cleaned

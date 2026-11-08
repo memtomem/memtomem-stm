@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import json
 import logging
 import math
@@ -42,15 +43,18 @@ from memtomem_stm.proxy.delivery import (
     envelope,
     fit_toc,
     metadata_format,
+    plain_result_fits,
 )
 from memtomem_stm.proxy.markdown_structure import (
     Heading,
     heading_matches,
+    suffix_headings,
 )
 from memtomem_stm.proxy.markdown_structure import (
     headings as markdown_headings,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
+from memtomem_stm.utils.json_out import dumps as surrogate_safe_dumps
 from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
 from memtomem_stm.utils.anyio_shutdown import (
     InFlightGate,
@@ -1074,14 +1078,25 @@ class SelectiveCompressor:
         source_offset: int = 0,
         hybrid_head: str | None = None,
         source_total_chars: int | None = None,
+        document: str | None = None,
     ) -> str:
         """``sensitivity_source`` is the unsliced response when *text* is only
         part of it (HYBRID's tail): a label left in the head with its value in
-        the tail is visible only there."""
-        if not text or (hybrid_head is None and len(text) <= max_chars):
+        the tail is visible only there.
+
+        ``document`` is the full response when *text* is
+        ``document[source_offset:]``. Markdown structure is read from it, since
+        a slice can begin inside a code fence or in the middle of a line."""
+        if not text or (
+            hybrid_head is None
+            and len(text) <= max_chars
+            # A structured passthrough is still a serialized MCP result; its
+            # JSON escaping can exceed the budget its character count meets.
+            and (delivery_format() != "structured" or plain_result_fits(text))
+        ):
             return text
 
-        fmt, chunks = self._detect_and_parse(text)
+        fmt, chunks = self._detect_and_parse(text, document=document, source_offset=source_offset)
 
         if len(chunks) <= 1:
             chunks = self._decompose_single_chunk(chunks, fmt)
@@ -1417,7 +1432,9 @@ class SelectiveCompressor:
             except Exception:
                 logger.debug("Failed to close pending store", exc_info=True)
 
-    def _detect_and_parse(self, text: str) -> tuple[str, dict[str, str]]:
+    def _detect_and_parse(
+        self, text: str, *, document: str | None = None, source_offset: int = 0
+    ) -> tuple[str, dict[str, str]]:
         try:
             data = _mm_json_loads(text)
             if delivery_format() == "structured" and isinstance(data, (dict, list)):
@@ -1450,8 +1467,13 @@ class SelectiveCompressor:
             # chunks do not claim JSON paths or exact source-range metadata.
             pass
 
-        if next(markdown_headings(text), None) is not None:
-            return "markdown", self._parse_markdown(text)
+        hs = list(
+            markdown_headings(text)
+            if document is None
+            else suffix_headings(document, source_offset)
+        )
+        if hs:
+            return "markdown", self._parse_markdown(text, hs)
 
         return "text", self._parse_text(text)
 
@@ -1505,10 +1527,11 @@ class SelectiveCompressor:
             chunks.records[key] = {"json_path": [i], "value_type": self._value_type(item)}
         return chunks
 
-    def _parse_markdown(self, text: str) -> ChunkMap:
+    def _parse_markdown(self, text: str, hs: list[Heading] | None = None) -> ChunkMap:
         chunks = ChunkMap()
         suffixes: dict[str, int] = {}
-        hs = list(markdown_headings(text))
+        if hs is None:
+            hs = list(markdown_headings(text))
         spans: list[tuple[str, int, int, Heading | None]] = []
         if hs and text[: hs[0].start].strip():
             spans.append(("Preamble", 0, hs[0].start, None))
@@ -3065,6 +3088,18 @@ class LLMCompressor:
         return content
 
 
+@functools.lru_cache(maxsize=1024)
+def _head_wire_cost(char: str) -> int:
+    """Serialized characters one head character costs in a structured frame.
+
+    The head is a JSON string inside the delivery JSON, which is itself the
+    JSON string of a text content block, so it is escaped twice. The delivery
+    serializer escapes a lone surrogate, which plain ``json.dumps`` leaves raw.
+    """
+    inner = surrogate_safe_dumps(char, ensure_ascii=False)[1:-1]
+    return len(surrogate_safe_dumps(inner, ensure_ascii=False)) - 2
+
+
 class HybridCompressor:
     """Head preserve + tail compress (TOC or truncate).
 
@@ -3111,12 +3146,20 @@ class HybridCompressor:
     def selective_compressor(self) -> SelectiveCompressor:
         return self._selective
 
+    # Head sizes tried after the first, guided by how far the table overshot,
+    # before one last try at ``min_head_chars``. Each try re-chunks and
+    # re-scores the tail, so the count stays small.
+    _HEAD_FIT_ATTEMPTS = 3
+
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
-        if not text or len(text) <= max_chars:
+        # Only a TOC tail publishes a key; a truncate tail is ordinary lossy
+        # compression and keeps its character budget in both delivery modes.
+        structured_toc = delivery_format() == "structured" and self._tail_mode == TailMode.TOC
+        if not text or (len(text) <= max_chars and (not structured_toc or plain_result_fits(text))):
             return text
 
         def small_budget_result() -> str:
-            if delivery_format() == "structured" and self._tail_mode == TailMode.TOC:
+            if structured_toc:
                 raise DeliveryBudgetExceeded("Budget cannot hold a complete hybrid table.")
             # An explicit truncate tail is ordinary lossy compression, not a
             # transient-key publisher. Keep that configured behavior in both modes.
@@ -3133,6 +3176,9 @@ class HybridCompressor:
             head_budget = self._head_chars
         else:
             head_budget = max(self._min_head_chars, int(available * self._head_ratio))
+        # Only a structured passthrough that failed its serialized check gets
+        # here with ``len(text) <= max_chars``; the head must leave a tail.
+        head_budget = min(head_budget, len(text) - _MIN_TAIL)
 
         if head_budget > available or head_budget < self._min_head_chars:
             return small_budget_result()
@@ -3154,17 +3200,9 @@ class HybridCompressor:
         if toc_budget < _MIN_TAIL:
             return small_budget_result()
 
+        if structured_toc:
+            return self._structured_toc(text, head_budget, toc_budget, context_query=context_query)
         if self._tail_mode == TailMode.TOC:
-            if delivery_format() == "structured":
-                return self._selective.compress(
-                    tail_text,
-                    max_chars=toc_budget,
-                    context_query=context_query,
-                    sensitivity_source=text,
-                    source_offset=head_end,
-                    hybrid_head=head,
-                    source_total_chars=len(text),
-                )
             tail_compressed = self._selective.compress(
                 tail_text,
                 max_chars=toc_budget,
@@ -3172,6 +3210,7 @@ class HybridCompressor:
                 sensitivity_source=text,
                 source_offset=head_end,
                 source_total_chars=len(text),
+                document=text,
             )
         else:
             tail_compressed = _plain_truncate(
@@ -3202,6 +3241,59 @@ class HybridCompressor:
             fallback = _plain_truncate(text, max_chars=max_chars, context_query=context_query)
             return fallback[:max_chars]
         return DeliveryText(result, descriptor) if descriptor else result
+
+    def _structured_toc(
+        self,
+        text: str,
+        head_budget: int,
+        toc_budget: int,
+        *,
+        context_query: str | None,
+    ) -> str:
+        """Publish the head and tail table, shrinking the head until they fit.
+
+        The head is sized from character arithmetic, but the structured frame
+        is measured serialized, with per-entry identity and source records. A
+        table that overshoots gives up just enough head text to cover the
+        excess at its serialized cost, and tries again; after a few such tries
+        the head drops to ``min_head_chars`` once. No cut lands below that
+        minimum. The tail is re-chunked on every try because the moved text
+        belongs to its first section. Each failed try stops before the pending
+        store is written.
+        """
+        minimum = self._min_head_chars
+        head_end = self._find_head_break(text, head_budget, minimum=minimum)
+        attempts = 0
+        while True:
+            try:
+                return self._selective.compress(
+                    text[head_end:],
+                    max_chars=toc_budget,
+                    context_query=context_query,
+                    sensitivity_source=text,
+                    source_offset=head_end,
+                    hybrid_head=text[:head_end],
+                    source_total_chars=len(text),
+                    document=text,
+                )
+            except DeliveryBudgetExceeded as exc:
+                if exc.excess is None:
+                    raise
+                attempts += 1
+                if attempts < self._HEAD_FIT_ATTEMPTS:
+                    # Moving text out of the head can add tail entries, so the
+                    # size is not monotonic in the cut; remove only what the
+                    # excess requires rather than overshooting a fitting cut.
+                    head_budget, needed = head_end, exc.excess
+                    while head_budget > minimum and needed > 0:
+                        head_budget -= 1
+                        needed -= _head_wire_cost(text[head_budget])
+                else:
+                    head_budget = minimum
+                next_end = self._find_head_break(text, head_budget, minimum=minimum)
+                if next_end >= head_end:
+                    raise
+                head_end = next_end
 
     @staticmethod
     def _fit_toc_tail(tail: str, max_chars: int, source_text: str) -> str | None:
@@ -3324,12 +3416,13 @@ class HybridCompressor:
         candidate = dumps(toc)
         return fill_preview(toc) if len(candidate) <= max_chars else None
 
-    def _find_head_break(self, text: str, budget: int) -> int:
-        floor = int(budget * 0.85)
+    def _find_head_break(self, text: str, budget: int, *, minimum: int = 0) -> int:
+        """A natural cut at or below *budget*, never below *minimum*."""
+        floor = max(int(budget * 0.85), minimum)
         for i in range(budget, floor - 1, -1):
             if i + 1 < len(text) and text[i : i + 2] == "\n\n":
                 return i
-            if i >= 2 and text[i - 2 : i] == "\n\n":
+            if i >= 2 and text[i - 2 : i] == "\n\n" and i - 2 >= minimum:
                 return i - 2
         for i in range(budget, floor - 1, -1):
             if text[i - 1] in ".!?\n" and (i >= len(text) or text[i] in " \n\t"):
