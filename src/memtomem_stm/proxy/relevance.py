@@ -86,6 +86,27 @@ class RelevanceScorer(Protocol):
     def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]: ...
 
 
+class MemoizedScorer:
+    """Reuse one scorer's results for repeated ``(query, sections)`` pairs.
+
+    For one compression rerun at several budgets: every run scores the same
+    sections, and an embedding scorer would otherwise repeat its network call,
+    or wait out its timeout again, for each budget. A fallback is noted by the
+    first call only. Not thread-safe; one instance serves one sequential search.
+    """
+
+    def __init__(self, scorer: RelevanceScorer) -> None:
+        self._scorer = scorer
+        self.uses_blocking_io = getattr(scorer, "uses_blocking_io", False)
+        self._scores: dict[tuple[str, tuple[tuple[str, str], ...]], list[float]] = {}
+
+    def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
+        key = (query, tuple(sections))
+        if key not in self._scores:
+            self._scores[key] = list(self._scorer.score_sections(query, sections))
+        return list(self._scores[key])
+
+
 # ── BM25 Scorer ───────────────────────────────────────────────────────
 
 

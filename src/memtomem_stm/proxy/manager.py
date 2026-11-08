@@ -144,7 +144,7 @@ from memtomem_stm.proxy.progressive import (
     ProgressiveStoreAdapter,
 )
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
-from memtomem_stm.proxy.relevance import scorer_fallback_scope
+from memtomem_stm.proxy.relevance import MemoizedScorer, scorer_fallback_scope
 from memtomem_stm.proxy.token_estimate import approx_tokens
 from memtomem_stm.proxy.tool_eligibility import (
     REASON_CONFIG_HIDDEN,
@@ -4215,6 +4215,39 @@ class ProxyManager:
             )
         return compressor.compress(text, max_chars=max_chars, context_query=context_query)
 
+    async def _fit_structured_truncation(
+        self,
+        compressor: TruncateCompressor,
+        text: str,
+        max_chars: int,
+        *,
+        context_query: str | None,
+        scorer: RelevanceScorer | None,
+    ) -> str:
+        """Truncate *text* so its plain MCP result fits the serialized budget.
+
+        Binary-searches the character budget below *max_chars*, keeping the
+        largest one whose truncation was measured to fit: O(log max_chars)
+        compressions on a path that runs only after a store failure. Output
+        length is not monotonic in the budget (look-alike lines collapse into
+        a short summary), so the result always fits but need not be the
+        longest truncation that would. Raises ``DeliveryBudgetExceeded`` when
+        no candidate fits, as structured key publishers do.
+        """
+        lo, hi, best = 1, max_chars - 1, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = await self._compress_maybe_offthread(
+                compressor, text, max_chars=mid, context_query=context_query, scorer=scorer
+            )
+            if plain_result_fits(candidate):
+                best, lo = candidate, mid + 1
+            else:
+                hi = mid - 1
+        if best is None:
+            raise DeliveryBudgetExceeded("Budget cannot hold the degraded response.")
+        return best
+
     async def _apply_compression(
         self,
         text: str,
@@ -6870,14 +6903,30 @@ class ProxyManager:
                             tool,
                             exc_info=True,
                         )
-                    _fb_scorer = self._relevance_scorer_for(cfg_snap)
+                    _fb_scorer: RelevanceScorer = self._relevance_scorer_for(cfg_snap)
+                    if tc.delivery_format == "structured":
+                        # The fit below may rerun the truncation at several
+                        # budgets; score its sections once for all of them.
+                        _fb_scorer = MemoizedScorer(_fb_scorer)
+                    _degrade = TruncateCompressor(scorer=_fb_scorer, min_chars=min_budget)
                     compressed = await self._compress_maybe_offthread(
-                        TruncateCompressor(scorer=_fb_scorer, min_chars=min_budget),
+                        _degrade,
                         cleaned,
                         max_chars=effective_max_chars,
                         context_query=context_query,
                         scorer=_fb_scorer,
                     )
+                    if tc.delivery_format == "structured" and not plain_result_fits(compressed):
+                        # The degrade replaces a key publisher whose frame was
+                        # held to the serialized budget; JSON escaping can push
+                        # a character-budgeted truncation past it (#1358).
+                        compressed = await self._fit_structured_truncation(
+                            _degrade,
+                            cleaned,
+                            effective_max_chars,
+                            context_query=context_query,
+                            scorer=_fb_scorer,
+                        )
                     llm_fallback = None
                     selective_store_error = True
                 _compress_ms = (_time.monotonic() - _t0) * 1000
