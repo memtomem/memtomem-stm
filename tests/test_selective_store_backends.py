@@ -468,3 +468,31 @@ async def test_a_locked_sqlite_store_does_not_block_a_key_held_elsewhere(tmp_pat
             holder.execute("ROLLBACK")
             holder.close()
         await mgr.stop()
+
+
+async def test_a_failed_decision_leaves_every_store_ttl_alone(tmp_path, monkeypatch):
+    """A decision whose own store will not open installs no route, so it must
+    not move any store's read TTL either: the paused write still publishes
+    under its old route's TTL and has to read back by it."""
+    import memtomem_stm.proxy.pending_store as pending_store_mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(pending_store_mod.time, "time", lambda: clock[0])
+    db = tmp_path / "a.db"
+    bad = tmp_path / "as_dir"
+    bad.mkdir()
+    mgr = _manager(_cfg(tmp_path, {"a": _sqlite(db, pending_ttl_seconds=300.0), "b": None}))
+    try:
+        gated = _gate_next_call(mgr)
+        task = asyncio.create_task(_call(mgr, "a", "a", context_query="q"))
+        await _started(gated)
+        _reload(mgr, {"a": _sqlite(db, pending_ttl_seconds=1.0), "b": _sqlite(bad)})
+        with pytest.raises(sqlite3.Error):
+            await _call(mgr, "b", "b")
+        gated.gate.set()
+        key = await task
+
+        clock[0] += 5.0
+        assert _serves(mgr, key, "a"), "a failed decision moved the store's read TTL"
+    finally:
+        await mgr.stop()

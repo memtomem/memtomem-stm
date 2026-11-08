@@ -4006,6 +4006,10 @@ class ProxyManager:
         the last generation change.
         """
         publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
+        # Read TTLs to apply with the routes: a paused write publishes under
+        # its route's TTL, so a store's read TTL moves only when a route onto
+        # it is installed — never for a decision that raises before installing.
+        read_ttls: list[tuple[SelectiveCompressor, float]] = []
         if self._selective_routes_cfg is publish_cfg:
             routes = dict(self._selective_routes)
         else:
@@ -4016,9 +4020,7 @@ class ProxyManager:
                 try:
                     sel = self._resolve_tool_config(srv, name, publish_cfg).selective
                     refreshed_owner, refreshed = self._selective_view(srv, name, sel, publish_cfg)
-                    # A paused write on this route now publishes under the
-                    # refreshed TTL, so its store must also read back by it.
-                    refreshed_owner.use_ttl(refreshed._ttl)
+                    read_ttls.append((refreshed_owner, refreshed._ttl))
                     routes[(srv, name)] = refreshed
                 except Exception:
                     logger.debug(
@@ -4029,13 +4031,15 @@ class ProxyManager:
                     )
         owner, view = self._selective_view(server, tool, publish_sel, publish_cfg)
         # ``select_chunks`` expires a store's rows by the TTL of the latest
-        # route resolved onto it — this call's last; entry-local TTL would
-        # need the row to carry its own.
-        owner.use_ttl(view._ttl)
+        # route installed onto it — this call's last; entry-local TTL (#1370)
+        # would need the row to carry its own.
+        read_ttls.append((owner, view._ttl))
         routes[(server, tool)] = view
         with self._selective_publish_mu:
             self._selective_routes = routes
             self._selective_routes_cfg = publish_cfg
+            for target, ttl in read_ttls:
+                target.use_ttl(ttl)
         return owner, view
 
     def _recover_selective_owners(self, cfg: ProxyConfig) -> list[SelectiveCompressor]:
