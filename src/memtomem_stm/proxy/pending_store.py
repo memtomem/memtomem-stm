@@ -71,14 +71,19 @@ def _metadata_live(meta: dict[str, Any], created_at: float, now: float) -> bool:
     return ttl > 0 and now - created_at < ttl
 
 
-def _valid_selective_ttl(ttl: float) -> bool:
+def _valid_selective_ttl(ttl: object) -> bool:
     """Whether an entry-local SELECTIVE TTL is one expiry can apply.
 
     Mirrors the SQL guard in ``SQLitePendingStore.evict_expired``: a finite,
     non-negative number. Anything else is an explicit invalid TTL and expires
     the row rather than falling back to the caller's (#1370).
     """
-    return not isinstance(ttl, bool) and math.isfinite(ttl) and ttl >= 0
+    return (
+        isinstance(ttl, (int, float))
+        and not isinstance(ttl, bool)
+        and math.isfinite(ttl)
+        and ttl >= 0
+    )
 
 
 def _selective_expired(selection: PendingSelection, now: float, fallback_ttl: float) -> bool:
@@ -523,7 +528,7 @@ class SQLitePendingStore:
             logger.warning("Invalid pending selection fields; treating as miss")
             return None
         ttl = row[5] if len(row) > 5 else None
-        if ttl is not None and (type(ttl) not in (int, float) or not _valid_selective_ttl(ttl)):
+        if ttl is not None and not _valid_selective_ttl(ttl):
             # The row would expire on the next sweep; a read before it must not
             # hand it out as if it had no TTL (#1370).
             logger.warning("Invalid pending selection TTL; treating as miss")

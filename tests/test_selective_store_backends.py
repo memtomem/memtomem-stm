@@ -16,11 +16,12 @@ import asyncio
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from memtomem_stm.proxy.compression import BM25Scorer, SelectiveCompressor
+from memtomem_stm.proxy.compression import BM25Scorer, PendingSelection, SelectiveCompressor
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
     ProxyConfig,
@@ -448,6 +449,47 @@ async def test_a_refreshed_route_reads_back_under_its_new_ttl(tmp_path, monkeypa
         assert stored.ttl_seconds == 300.0, (
             "the paused write was not stamped with its live route's TTL (#1370)"
         )
+    finally:
+        await mgr.stop()
+
+
+@pytest.mark.parametrize(
+    ("first_ttl", "later_ttl", "kept"),
+    # The first call opens the in-memory owner under its TTL; the later call
+    # installs a route with the other. Before #1370 select expired a row by the
+    # route installed last; a row with no TTL of its own now expires by the
+    # owner's.
+    [(300.0, 1.0, True), (1.0, 300.0, False)],
+)
+async def test_a_legacy_row_expires_by_the_owners_ttl_not_the_latest_routes(
+    tmp_path, first_ttl, later_ttl, kept
+):
+    mgr = _manager(
+        _cfg(
+            tmp_path,
+            {
+                "first": SelectiveConfig(pending_ttl_seconds=first_ttl),
+                "later": SelectiveConfig(pending_ttl_seconds=later_ttl),
+            },
+        )
+    )
+    try:
+        await _call(mgr, "first", "a")
+        await _call(mgr, "later", "b")
+        (owner,) = mgr._selective_owners.values()
+        owner._store.put(
+            "legacy",
+            PendingSelection(
+                chunks={"S0": "legacy-content"},
+                format="markdown",
+                created_at=time.monotonic() - 5.0,
+                total_chars=14,
+            ),
+        )
+
+        served = "legacy-content" in str(mgr.select_chunks("legacy", ["S0"]))
+
+        assert served is kept
     finally:
         await mgr.stop()
 

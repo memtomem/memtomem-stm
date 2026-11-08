@@ -263,8 +263,8 @@ def test_a_legacy_row_selected_regularly_stays_a_fallback_row(backend: _Backend)
 # --- invalid entry-local TTLs ----------------------------------------------
 
 
-@pytest.mark.parametrize("value", [-1.0, math.inf, -math.inf])
-def test_an_invalid_ttl_expires_rather_than_falling_back(backend: _Backend, value: float) -> None:
+@pytest.mark.parametrize("value", [-1.0, math.inf, -math.inf, "abc"])
+def test_an_invalid_ttl_expires_rather_than_falling_back(backend: _Backend, value: object) -> None:
     backend.store.put("bad", _selection(300.0))
     backend.set_raw_ttl("bad", value)
 
