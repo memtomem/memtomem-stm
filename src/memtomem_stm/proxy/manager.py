@@ -4262,7 +4262,8 @@ class ProxyManager:
         through here (#618): when the relevance scorer the compressor will
         actually use does blocking I/O (``EmbeddingScorer``'s sync httpx call
         — see ``RelevanceScorer.uses_blocking_io``), the whole sync
-        ``compress()`` runs in a worker thread via ``asyncio.to_thread`` so an
+        ``compress()`` runs in a worker thread (``asyncio.to_thread``, or the
+        same default executor reached directly when ``release`` is given) so an
         unresponsive embedding endpoint can't freeze every other proxied call
         for up to the embedding timeout. With the default BM25 scorer the gate
         is false and the call is made inline — no thread hop, byte-identical
@@ -4290,10 +4291,12 @@ class ProxyManager:
         ``release`` is called exactly once, when the compress is over (#1369).
         Inline, that is after it returns or raises. Off-thread it is NOT when
         this coroutine finishes: cancelling the caller does not stop a worker
-        that already started, so that worker releases when it returns, and a
-        job that has not started is aborted and released at once — or, if the
-        executor drops it unrun (shut down with ``cancel_futures``), when the
-        future completes. See ``_PinHandoff``. The executor future is awaited
+        that has claimed the job, so that worker releases when it returns. A job
+        no worker has claimed when the cancellation's callback runs is aborted
+        and released then, and never compresses — or, if the executor drops it
+        unrun (shut down with ``cancel_futures``), when the future completes.
+        A worker can still claim a queued job before that callback runs; it
+        then compresses and releases as usual. See ``_PinHandoff``. The executor future is awaited
         directly, as ``asyncio.to_thread`` does, so a cancelled caller's worker
         exception is dropped the same way; the wrapper runs in a copy of the
         caller's context, as ``to_thread``'s does.

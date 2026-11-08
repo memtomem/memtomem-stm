@@ -19,9 +19,14 @@ changes inline only. See the deprecation policy in
   cancelled call used to release the store at once, so a SQLite pending store
   was closed under the still-running worker and its write failed
   (`SQLitePendingStore not initialized`), unseen because nobody awaited the
-  cancelled call. A job cancelled before it starts is released without
-  running. `SQLitePendingStore.close()` also waits for an operation in progress
-  on the store instead of closing the connection under it. (#1369)
+  cancelled call. A queued job that no worker has picked up by then is
+  released without compressing. `SQLitePendingStore.close()` also waits for an
+  operation in progress on the store instead of closing the connection under
+  it. (#1369)
+  **Behavior change**: when such a call is cancelled during shutdown, its
+  selection is now written and the SQLite pending store closes once the worker
+  finishes, rather than the store closing first and the write failing;
+  `stop()` can wait for one store operation already in progress.
 
 - A SELECTIVE/HYBRID selection now expires by the `pending_ttl_seconds` it
   was published under — the `ttl_seconds_remaining` its table of contents

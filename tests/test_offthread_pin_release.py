@@ -232,18 +232,37 @@ async def test_a_failed_submit_releases_once_and_its_queued_job_skips(tmp_path):
 # --- SQLitePendingStore.close ----------------------------------------------
 
 
+class _ObservedLock:
+    """The store's lock, reporting when a thread starts waiting for it."""
+
+    def __init__(self, lock: threading.Lock) -> None:
+        self._lock = lock
+        self.waiting = threading.Event()
+
+    def __enter__(self) -> None:
+        self.waiting.set()
+        self._lock.acquire()
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+
+
 def test_close_waits_for_an_operation_in_progress(tmp_path):
     store = SQLitePendingStore(tmp_path / "pending.db")
     store.initialize()
+    real = threading.Lock()
+    observed = _ObservedLock(real)
+    store._lock = observed  # type: ignore[assignment]
     closed = threading.Event()
-    store._lock.acquire()
+    real.acquire()
     try:
         closer = threading.Thread(target=lambda: (store.close(), closed.set()))
         closer.start()
+        assert observed.waiting.wait(5), "close() never asked for the store lock"
         assert not closed.wait(0.2), "close() did not wait for the lock holder"
         assert store._db is not None
     finally:
-        store._lock.release()
+        real.release()
     assert closed.wait(5)
     closer.join(5)
     assert store._db is None
