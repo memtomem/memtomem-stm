@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 from memtomem_stm.surfacing import engine as engine_module
-from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.config import SurfacingConfig, ToolSurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine, _TimerScope
 from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS
 from memtomem_stm.utils.digest import framed_digest
@@ -6066,30 +6066,124 @@ class TestExcludedNeighbours:
 
 
 class TestBuiltinQueryPrivacy:
+    """A query that looks sensitive is not sent to the LTM in any form (#1344):
+    not as text, and not as its digest either, which carries none of the
+    original query's meaning."""
+
     _SECRET = "curl 'https://api.example.invalid/?api_key=demo_secret_value'"
+    _CLEAN = {"command": "curl 'https://api.example.invalid/status'"}
 
-    async def test_secret_bearing_bash_command_leaves_as_a_digest(self):
-        sent = []
-        for args in (
-            {"command": self._SECRET, "description": "Probe the API"},
-            {"description": "Probe the API", "command": self._SECRET},
-        ):
-            adapter = _make_mcp_adapter([_ns_result("m", "default")])
-            engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
-            await engine.surface("builtin", "Bash", args, LONG_RESPONSE)
-            sent.append(adapter.search.await_args.kwargs["query"])
+    @pytest.mark.parametrize(
+        ("server", "tool", "args"),
+        [
+            ("builtin", "Bash", {"command": _SECRET, "description": "Probe the API"}),
+            ("builtin", "Bash", {"description": "Probe the API", "command": _SECRET}),
+            (
+                "builtin",
+                "shell",
+                {
+                    "command": [
+                        "curl",
+                        "-H",
+                        "api_key: demo_secret_value",
+                        "https://api.example.invalid/status",
+                    ]
+                },
+            ),
+            ("lc", "search_docs", {"query": "why does api_key=demo_secret_value fail"}),
+        ],
+    )
+    async def test_a_sensitive_query_is_skipped_before_the_ltm(self, server, tool, args):
+        from memtomem_stm.surfacing.observability import SurfacingObservability
 
-        assert sent[0].startswith("sha256:")
-        assert "demo_secret_value" not in sent[0]
-        assert sent[0] == sent[1]
-
-    async def test_secret_bearing_argv_command_leaves_as_a_digest(self):
         adapter = _make_mcp_adapter([_ns_result("m", "default")])
-        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
-        argv = ["curl", "-H", "api_key: demo_secret_value", "https://api.example.invalid/status"]
+        obs = SurfacingObservability()
+        # One surfacing per minute: the clean call below can only reach the
+        # LTM if the sensitive call left the slot untouched.
+        engine = SurfacingEngine(
+            config=_make_config(max_surfacings_per_minute=1),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        should_surface = MagicMock(wraps=engine._gate.should_surface)
+        engine._gate.should_surface = should_surface
 
-        await engine.surface("builtin", "shell", {"command": argv}, LONG_RESPONSE)
+        out = await engine.surface(server, tool, args, LONG_RESPONSE)
 
-        query = adapter.search.await_args.kwargs["query"]
-        assert query.startswith("sha256:")
-        assert "demo_secret_value" not in query
+        assert out == LONG_RESPONSE
+        adapter.search.assert_not_awaited()
+        assert obs.snapshot()["skip_reasons"][tool] == {"sensitive_query": 1}
+        should_surface.assert_not_called()
+
+        # Positive control on the same engine.
+        out = await engine.surface("builtin", "Bash", self._CLEAN, LONG_RESPONSE)
+
+        assert out != LONG_RESPONSE
+        adapter.search.assert_awaited_once()
+        assert not adapter.search.await_args.kwargs["query"].startswith("sha256:")
+
+    async def test_the_compose_path_is_skipped_too_pinned_context_included(self):
+        """With ``context_compose`` available the skip covers the whole bundle:
+        pinned blocks are not composed for a sensitive call either."""
+        adapter = _make_compose_adapter(
+            [_remote_result("retrieved", 0.9)], pinned=[_remote_result("pinned", 1.0)]
+        )
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter, observability=obs)
+        args = {"command": self._SECRET, "description": "Probe the API"}
+
+        out = await engine.surface("builtin", "Bash", args, LONG_RESPONSE)
+
+        assert out == LONG_RESPONSE
+        # Reached the engine's check, not an earlier ``no_query``.
+        assert obs.snapshot()["skip_reasons"]["Bash"] == {"sensitive_query": 1}
+        adapter.context_compose.assert_not_awaited()
+        adapter.search.assert_not_awaited()
+
+        # Positive control on the same engine: a clean call composes and
+        # delivers the pinned block.
+        out = await engine.surface("builtin", "Bash", self._CLEAN, LONG_RESPONSE)
+
+        adapter.context_compose.assert_awaited_once()
+        assert "pinned" in out
+
+
+class TestProxiedQueryPrivacy:
+    """#1344: a credential that a proxied tool's path, pattern or template
+    route would split apart is still recognized, so the call is skipped
+    before the LTM instead of searching for the tokenized words."""
+
+    @pytest.mark.parametrize(
+        ("tool", "args", "tools"),
+        [
+            ("search_files", {"path": "/srv/cfg/api_key=demo_secret_value/x.txt"}, {}),
+            ("search_files", {"pattern": "api_key=demo_secret_value"}, {}),
+            (
+                "lookup",
+                {"q": "{arg.email}_log", "email": "alice@example.com"},
+                {"lookup": ToolSurfacingConfig(query_template="lookup {arg.q} entries")},
+            ),
+        ],
+    )
+    async def test_secret_bearing_argument_is_skipped_before_the_ltm(self, tool, args, tools):
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        obs = SurfacingObservability()
+        adapter = _make_mcp_adapter([_ns_result("m", "default")])
+        engine = SurfacingEngine(
+            config=_make_config(context_tools=tools), mcp_adapter=adapter, observability=obs
+        )
+
+        out = await engine.surface("fs", tool, args, LONG_RESPONSE)
+
+        assert out == LONG_RESPONSE
+        adapter.search.assert_not_awaited()
+        assert obs.snapshot()["skip_reasons"][tool] == {"sensitive_query": 1}
+
+        # Positive control on the same engine: a clean call is searched.
+        await engine.surface(
+            "fs", "search_files", {"path": "/srv/cfg/settings.json"}, LONG_RESPONSE
+        )
+        adapter.search.assert_awaited_once()

@@ -219,23 +219,32 @@ class TestSecretGuard:
     ]
 
     @pytest.mark.parametrize("secret", _SECRETS)
-    async def test_secret_query_hashed_when_persist_true(self, secret):
-        # Default config → persist_query_text=True; the secret guard must
-        # still hash it before it reaches record_surfacing.
+    async def test_secret_query_is_neither_searched_nor_persisted(self, secret):
+        # Default config → persist_query_text=True. A secret-bearing query
+        # ends the call before the LTM (#1344), so there is no event to
+        # persist it in, raw or hashed.
         tracker = _make_tracker()
+        adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)])
+        engine = SurfacingEngine(
+            config=_make_config(), mcp_adapter=adapter, feedback_tracker=tracker
+        )
+        out = await engine.surface("s", "Bash", {"_context_query": secret}, LONG_RESPONSE)
+
+        assert out == LONG_RESPONSE
+        adapter.search.assert_not_awaited()
+        tracker.record_surfacing.assert_not_called()
+
+    @pytest.mark.parametrize("secret", _SECRETS)
+    def test_secret_query_hashed_by_the_guard(self, secret):
+        # The guard itself still hashes every one of them, for any writer
+        # that does not pass through ``surface()``'s skip.
         engine = SurfacingEngine(
             config=_make_config(),
-            mcp_adapter=_make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)]),
-            feedback_tracker=tracker,
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=_make_tracker(),
         )
-        await engine.surface("s", "Bash", {"_context_query": secret}, LONG_RESPONSE)
-
-        tracker.record_surfacing.assert_called_once()
-        persisted = tracker.record_surfacing.call_args.kwargs["query"]
-        assert persisted.startswith(_QUERY_HASH_PREFIX)
-        assert secret not in persisted
         expected = _QUERY_HASH_PREFIX + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
-        assert persisted == expected
+        assert engine._persistable_query(secret) == expected
 
     @pytest.mark.parametrize("clean", _CLEAN)
     async def test_clean_query_literal_when_persist_true(self, clean):

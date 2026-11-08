@@ -2534,12 +2534,20 @@ def _all_time_coverage_lines(rollup: dict[str, Any]) -> list[str]:
     incomplete = rollup.get("incomplete_before")
     if incomplete is not None:
         lost = rollup.get("lost_before_install")
-        lost_text = f"{lost:,} rows were" if isinstance(lost, int) else "rows were"
-        lines.append(
-            f"  Incomplete before {_utc_text(float(incomplete), '%Y-%m-%d %H:%M')} UTC: "
-            f"{lost_text} trimmed\n"
-            "    before the rollup was installed, so rows created before then may be missing."
-        )
+        when = _utc_text(float(incomplete), "%Y-%m-%d %H:%M")
+        if isinstance(lost, int):
+            lines.append(
+                f"  Incomplete before {when} UTC: {lost:,} rows were trimmed\n"
+                "    before the rollup was installed, so rows created before then may be missing."
+            )
+        else:
+            # No count recorded (or the markers were re-created on a running
+            # rollup): loss is possible, not established, so don't assert it.
+            lines.append(
+                f"  Possibly incomplete before {when} UTC: the number of rows trimmed\n"
+                "    before the rollup was installed is unknown, so rows created before then"
+                " may be missing."
+            )
     undated = rollup.get("unknown_date_calls") or 0
     if undated:
         lines.append(

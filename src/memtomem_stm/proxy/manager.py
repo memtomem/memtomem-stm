@@ -1035,7 +1035,6 @@ class ProxyManager:
         self.index_observability = IndexObservability()
         self._progressive_store: ProgressiveStoreAdapter | None = None
         self._progressive_store_cfg: SelectiveConfig | None = None
-        self._progressive_lock = asyncio.Lock()
         self._llm_compressor: LLMCompressor | None = None
         self._llm_compressor_cfg: LLMCompressorConfig | None = None
         self._llm_compressor_lock = asyncio.Lock()

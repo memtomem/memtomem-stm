@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Collection
 from pathlib import Path
+from typing import Any
 
 from memtomem_stm.proxy.metrics import (
     METADATA_BYPASS_STRATEGY,
@@ -205,6 +206,9 @@ _DAILY_TABLE = "proxy_metrics_daily"
 _ROLLUP_TRIGGER = "proxy_metrics_rollup_on_delete_v1"
 _ROLLUP_INSTALLED_KEY = "rollup_installed_at"
 _ROLLUP_LOST_KEY = "rollup_rows_lost_before_install"
+# Stored when the markers are re-created on a rollup that was already running:
+# not an int, so ``_rollup_markers`` reads it as an unknown count.
+_ROLLUP_LOST_UNKNOWN = "unknown"
 _UNKNOWN_DAY = "unknown"
 
 # What one row contributes to its bucket. These are also the daily table's
@@ -234,6 +238,35 @@ def _finite(expr: str) -> str:
     range — all contribute 0.
     """
     return f"CASE WHEN {expr} BETWEEN -9.2e18 AND 9.2e18 THEN {expr} ELSE 0 END"
+
+
+def _finite_total(expr: str) -> str:
+    """``expr`` when it is any finite number, else 0 — the guard for a bucket.
+
+    Not ``_finite``: a daily counter is a SUM of guarded rows, and two in-range
+    rows can legitimately add past int64, where the trigger's ``+`` turns REAL
+    rather than raising. Zeroing that bucket would make all-time totals drop
+    the moment retention trims the rows. NULL, text (it compares above every
+    number) and ``±inf`` still contribute 0.
+    """
+    return (
+        f"CASE WHEN {expr} BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 "
+        f"THEN {expr} ELSE 0 END"
+    )
+
+
+def _count(value: Any) -> Any:
+    """An aggregate as the ``int`` it is, unless it is fractional.
+
+    A float arrives from the ``TOTAL`` fallback in ``_read_compression``, or
+    from ``SUM`` over a daily counter the trigger turned REAL past int64. An
+    integral one goes back to ``int`` so the output keeps its type; a
+    fractional one (only an outside write stores a fractional size) stays as
+    ``SUM`` returns it.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value or 0
 
 
 def _row_terms(cols: Collection[str], prefix: str = "") -> dict[str, str]:
@@ -449,7 +482,8 @@ def read_compression_all_time(
       and a deleted row's tuner eligibility is not kept;
     - a ``rollup`` key describes coverage: ``installed``, ``installed_at``
       (epoch), ``lost_before_install`` (rows already trimmed when the trigger
-      was created; ``None`` if unreadable), ``earliest_created_at`` (the
+      was created; ``None`` if unreadable, or unknown because the markers were
+      re-created on a rollup that was already running), ``earliest_created_at`` (the
       earliest real timestamp among the counted rows, after filters),
       ``incomplete_before`` (``installed_at`` when rows were lost before
       installation and the counted rows reach back before it, else ``None``)
@@ -598,10 +632,12 @@ def _read_compression(
             _day, epoch = _created_at_terms()
             live.append(f"{epoch} AS min_created_at")
             live.append(f"CASE WHEN {epoch} IS NULL THEN 1 ELSE 0 END AS unknown_date_calls")
+            # The same rule on this half: a counter blanked or overwritten from
+            # outside contributes 0 instead of turning the total non-finite.
             daily = [
-                *_ROLLUP_COUNTERS,
+                *(_finite_total(name) for name in _ROLLUP_COUNTERS),
                 "min_created_at",
-                f"CASE WHEN day = '{_UNKNOWN_DAY}' THEN calls ELSE 0 END",
+                f"CASE WHEN day = '{_UNKNOWN_DAY}' THEN {_finite_total('calls')} ELSE 0 END",
             ]
             # One statement over both halves, so a trim that moves rows from the
             # raw table into the rollup between two reads cannot count them
@@ -611,7 +647,7 @@ def _read_compression(
                 f"UNION ALL SELECT server, tool, {', '.join(daily)} FROM {_DAILY_TABLE}{where}"
             )
             inner_params = [*params, *params]
-            extra = "0, MIN(min_created_at), SUM(unknown_date_calls)"
+            extra = "0, MIN(min_created_at), {agg}(unknown_date_calls)"
         else:
             # The calls the tuner's profiles count: every row but a
             # metadata/native bypass, which ``get_tool_profiles`` drops (#1122).
@@ -627,18 +663,28 @@ def _read_compression(
                 live.append("1 AS tuner_calls")
             inner = f"SELECT server, tool, {', '.join(live)} FROM proxy_metrics{where}"
             inner_params = [*inner_params, *params]
-            extra = "SUM(tuner_calls), NULL, 0"
+            extra = "{agg}(tuner_calls), NULL, 0"
         # One statement, so the provenance counts and size totals share a
         # snapshot while the server appends rows.
-        rows = db.execute(
-            "SELECT server, tool, SUM(legacy_calls), SUM(legacy_original_chars), "
-            "SUM(legacy_compressed_chars), SUM(errors), SUM(classified_calls), "
-            f"SUM(unclassified_calls), {extra}, SUM(structured_calls), "
-            "SUM(structured_original_chars), SUM(structured_base_chars), "
-            f"SUM(structured_wire_bytes) FROM ({inner}) GROUP BY server, tool "
-            "ORDER BY SUM(calls) DESC",
-            inner_params,
-        ).fetchall()
+        statement = (
+            "SELECT server, tool, {agg}(legacy_calls), {agg}(legacy_original_chars), "
+            "{agg}(legacy_compressed_chars), {agg}(errors), {agg}(classified_calls), "
+            f"{{agg}}(unclassified_calls), {extra}, {{agg}}(structured_calls), "
+            "{agg}(structured_original_chars), {agg}(structured_base_chars), "
+            f"{{agg}}(structured_wire_bytes) FROM ({inner}) GROUP BY server, tool "
+            "ORDER BY {agg}(calls) DESC"
+        )
+        try:
+            rows = db.execute(statement.replace("{agg}", "SUM"), inner_params).fetchall()
+        except sqlite3.OperationalError as exc:
+            # ``SUM`` is exact but raises once rows that ``_finite`` admits add
+            # past int64, which would take the whole summary down. Only then
+            # fall back to ``TOTAL``: a float that never raises, approximate
+            # past 2**53 — a size no real writer reaches, since sizes come from
+            # ``len()``. ``_count`` turns its integral results back into ints.
+            if "integer overflow" not in str(exc):
+                raise
+            rows = db.execute(statement.replace("{agg}", "TOTAL"), inner_params).fetchall()
     except sqlite3.Error as exc:
         summary["error"] = exception_summary(exc)
         return summary
@@ -675,16 +721,16 @@ def _read_compression(
         for k, v in zip(
             structured_totals, (structured_calls, structured_orig, structured_base, structured_wire)
         ):
-            structured_totals[k] += v or 0
-        classified += known_calls or 0
-        unclassified += unknown_calls or 0
-        unknown_dates += group_unknown_dates or 0
+            structured_totals[k] += _count(v)
+        classified += _count(known_calls)
+        unclassified += _count(unknown_calls)
+        unknown_dates += _count(group_unknown_dates)
         if group_earliest is not None and (earliest is None or group_earliest < earliest):
             earliest = float(group_earliest)
-        calls = calls or 0
-        orig = orig or 0
-        comp = comp or 0
-        errors = errors or 0
+        calls = _count(calls)
+        orig = _count(orig)
+        comp = _count(comp)
+        errors = _count(errors)
         total_calls += calls
         total_error += errors
         total_orig += orig
@@ -698,7 +744,7 @@ def _read_compression(
             "saved_ratio": _saved_ratio(orig, comp),
         }
         if not all_time:
-            entry["tuner_calls"] = tuner_calls or 0
+            entry["tuner_calls"] = _count(tuner_calls)
         by_tool.append(entry)
 
     summary["available"] = True
@@ -783,13 +829,21 @@ class MetricsStore:
           only symptom is that its ``COUNT``/``ORDER BY`` scans and the reader
           aggregations get slower. Accepted knowingly: an index nothing drops
           is not worth a per-invocation check.
+        - a deleted *rollup marker* is not restored either while the stamp
+          stands; ``read_compression_all_time`` then reports the rollup as not
+          installed, or its loss count as unknown.
 
-        Repair is to clear the stamp (``DELETE FROM metrics_meta``) and reopen,
-        which rebuilds the indexes, the table, and every ``_MIGRATIONS`` column.
-        It does **not** restore a dropped *base* column — ``_CREATE`` is
-        ``IF NOT EXISTS`` and cannot alter an existing table — so that one case
-        needs the file rebuilt. Losing ``metrics_meta`` itself needs no action:
-        the probe reads that as "not current" and the slow path recreates it.
+        Repair is to clear the stamp alone
+        (``DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'``) and
+        reopen, which rebuilds the indexes, the table, and every
+        ``_MIGRATIONS`` column. It does **not** restore a dropped *base* column
+        — ``_CREATE`` is ``IF NOT EXISTS`` and cannot alter an existing table —
+        so that one case needs the file rebuilt. Clear only that key: the rollup
+        markers beside it record when the history began, and once erased they
+        cannot be reconstructed (see ``_install_rollup_and_stamp``). Losing
+        ``metrics_meta`` itself needs no action beyond that: the probe reads it
+        as "not current" and the slow path recreates it, with the loss count
+        unknown.
 
         Paying the probe on every one of thousands of daily hook invocations to
         keep an accidental repair for a state nothing produces is the worse
@@ -865,10 +919,29 @@ class MetricsStore:
         trigger existed: AUTOINCREMENT ids are never reused once committed, so
         ``sqlite_sequence.seq - COUNT(*)`` is how many rows already left the
         table. Zero means the history is complete from the first row.
+
+        That count is only taken on a FIRST installation — when the daily table
+        did not exist before this transaction. Writing the installation marker
+        while the table is already there means the markers were erased from a
+        DB whose rollup has been running (an older binary's restamp or a second
+        opener finds the marker present and writes nothing), and then no
+        formula over what is left can say how many rows predate the trigger:
+        ``seq - COUNT(*)`` would count every rolled-up row as lost, subtracting
+        the daily ``calls`` would still count rows cleared by a history reset,
+        and a reset or a dropped ``sqlite_sequence`` row skews both. The loss is
+        recorded as unknown instead, which the reader reports as ``None`` and
+        treats conservatively as "some".
         """
         db.execute("BEGIN IMMEDIATE")
         try:
             db.execute(_META_CREATE)
+            first_install = (
+                db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (_DAILY_TABLE,),
+                ).fetchone()
+                is None
+            )
             db.execute(_DAILY_CREATE)
             db.execute(_ROLLUP_TRIGGER_DDL)
             installed = db.execute(
@@ -876,14 +949,17 @@ class MetricsStore:
                 (_ROLLUP_INSTALLED_KEY, str(time.time())),
             ).rowcount
             if installed:
-                lost = db.execute(
-                    "SELECT max(0, COALESCE((SELECT seq FROM sqlite_sequence "
-                    "WHERE name = 'proxy_metrics'), 0) - (SELECT COUNT(*) FROM proxy_metrics))"
-                ).fetchone()[0]
+                lost_value = _ROLLUP_LOST_UNKNOWN
+                if first_install:
+                    lost = db.execute(
+                        "SELECT max(0, COALESCE((SELECT seq FROM sqlite_sequence "
+                        "WHERE name = 'proxy_metrics'), 0) - (SELECT COUNT(*) FROM proxy_metrics))"
+                    ).fetchone()[0]
+                    lost_value = str(int(lost))
                 db.execute(
                     "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO NOTHING",
-                    (_ROLLUP_LOST_KEY, str(int(lost))),
+                    (_ROLLUP_LOST_KEY, lost_value),
                 )
             db.execute(
                 "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
@@ -1261,7 +1337,7 @@ class MetricsStore:
         apart instead of compressed (``METADATA_BYPASS_STRATEGY``, #1122), or
         that preserve native upstream structured/non-text payloads
         (``STRUCTURED_BYPASS_STRATEGY``).
-        Every statement here drops those rows: no compressor or retention
+        The population every field is read from drops those rows: no compressor or retention
         floor ran on them, so counting them would dilute the violation rate
         and move ``p95_original_chars`` with calls the settings being tuned
         never acted on. A tool that only ever took that path has no profile.
@@ -1286,36 +1362,132 @@ class MetricsStore:
             return []
         cutoff = time.time() - since_seconds
         with self._lock:
-            # Main aggregation
+            # ONE statement for every field, so a profile shares one snapshot:
+            # the instance lock does not span processes, and ``call_count``, the
+            # p95 and the strategy counts used to come from three statements, so
+            # a writer landing between them could make them disagree. It also
+            # replaces the 2 extra statements per ``(server, tool)`` group, each
+            # re-scanning the window — 2.7 s for 200 groups over 10k rows, on the
+            # event loop when the ``stm_tuning_recommendations`` tool calls in
+            # (#1348).
+            #
+            # ``base`` is the population every field shares: the window, the
+            # ``source = 'mcp'`` scope, and the bypass exclusions.
+            #
+            # p95: the value at rank ``max(1, floor(0.95 * N))`` within each
+            # group in ascending ``original_chars`` order. Rows tied on the value
+            # are interchangeable, so the tie order cannot change the result.
+            #
+            # Strategy: the three ``auto_*`` fields describe one population — the
+            # calls AUTO chose a strategy for (``strategy_auto_selected = 1``). It
+            # is an equality, not ``IS NOT 0``, so the NULL provenance of a
+            # pre-migration row drops out rather than counting as either answer.
+            #
+            # The key is the label's pre-arrow base, not the label: the
+            # ratio-guard ladder rewrites ``compression_strategy`` on
+            # degradation, so grouping by the stored value splits one
+            # selection across ``hybrid`` and ``hybrid→progressive_fallback``
+            # and reads a perfectly consistent tool as inconsistent (#937).
+            # An undegraded call records a bare strategy; every site that
+            # writes a degradation label spells it ``<base>→<suffix>`` with
+            # a single ``CompressionStrategy`` value as the base — the same
+            # convention ``get_progressive_degradations`` matches on — so
+            # cutting at the first arrow yields what AUTO chose, and leaves
+            # an undegraded label untouched. A tie between two strategies goes
+            # to the label that sorts LAST: that is what the per-group statement
+            # this replaced returned on SQLite's sorter (every one of 765 tied
+            # groups measured), now a stated rule rather than an artifact.
             rows = self._db.execute(
                 """
-                SELECT
-                    server,
-                    tool,
-                    COUNT(*)                                          AS call_count,
-                    SUM(ratio_violation)                              AS violation_count,
-                    AVG(
-                        CASE WHEN cleaned_chars > 0 AND is_error = 0
-                              AND compression_accounting = 'initial_response_v1'
-                             THEN CAST(compressed_chars AS REAL) / cleaned_chars
-                        END
-                    )                                                 AS avg_ratio,
-                    SUM(
-                        CASE WHEN cleaned_chars > 0 AND is_error = 0
-                              AND compression_accounting = 'initial_response_v1'
-                             THEN 1 ELSE 0
-                        END
-                    )                                                 AS ratio_count,
-                    SUM(is_error)                                     AS error_count
-                FROM proxy_metrics
-                WHERE created_at >= ? AND source = 'mcp'
-                    AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
-                GROUP BY server, tool
+                WITH base AS (
+                    SELECT server, tool, original_chars, compressed_chars, cleaned_chars,
+                           is_error, compression_accounting, ratio_violation,
+                           compression_strategy, strategy_auto_selected
+                    FROM proxy_metrics
+                    WHERE created_at >= ? AND source = 'mcp'
+                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
+                ),
+                agg AS (
+                    SELECT
+                        server,
+                        tool,
+                        COUNT(*)                                      AS call_count,
+                        SUM(ratio_violation)                          AS violation_count,
+                        AVG(
+                            CASE WHEN cleaned_chars > 0 AND is_error = 0
+                                  AND compression_accounting = 'initial_response_v1'
+                                 THEN CAST(compressed_chars AS REAL) / cleaned_chars
+                            END
+                        )                                             AS avg_ratio,
+                        SUM(
+                            CASE WHEN cleaned_chars > 0 AND is_error = 0
+                                  AND compression_accounting = 'initial_response_v1'
+                                 THEN 1 ELSE 0
+                            END
+                        )                                             AS ratio_count,
+                        SUM(is_error)                                 AS error_count
+                    FROM base
+                    GROUP BY server, tool
+                ),
+                ranked AS (
+                    SELECT server, tool, original_chars,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY server, tool ORDER BY original_chars
+                           ) AS rn,
+                           COUNT(*) OVER (PARTITION BY server, tool) AS n
+                    FROM base
+                ),
+                p95 AS (
+                    SELECT server, tool, original_chars AS p95_original_chars
+                    FROM ranked
+                    WHERE rn = MAX(1, CAST(n * 0.95 AS INTEGER))
+                ),
+                chosen AS (
+                    SELECT server, tool,
+                           CASE WHEN instr(compression_strategy, '→') > 0
+                                THEN substr(compression_strategy, 1,
+                                            instr(compression_strategy, '→') - 1)
+                                ELSE compression_strategy END AS selected_strategy,
+                           COUNT(*) AS selected_count
+                    FROM base
+                    WHERE compression_strategy IS NOT NULL AND strategy_auto_selected = 1
+                    GROUP BY server, tool, selected_strategy
+                ),
+                dominant AS (
+                    SELECT server, tool, selected_strategy, selected_count,
+                           SUM(selected_count) OVER (PARTITION BY server, tool) AS auto_count,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY server, tool
+                               ORDER BY selected_count DESC, selected_strategy DESC
+                           ) AS rn
+                    FROM chosen
+                )
+                SELECT a.server, a.tool, a.call_count, a.violation_count, a.avg_ratio,
+                       a.ratio_count, a.error_count, p.p95_original_chars,
+                       d.selected_strategy, d.selected_count, d.auto_count
+                FROM agg AS a
+                JOIN p95 AS p ON p.server = a.server AND p.tool = a.tool
+                LEFT JOIN dominant AS d
+                    ON d.server = a.server AND d.tool = a.tool AND d.rn = 1
+                ORDER BY a.server, a.tool
                 """,
                 (cutoff, METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY),
             ).fetchall()
 
-            profiles: list[dict] = []
+        return [
+            {
+                "server": server,
+                "tool": tool,
+                "call_count": call_count,
+                "violation_count": violation_count or 0,
+                "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
+                "ratio_count": ratio_count or 0,
+                "p95_original_chars": p95,
+                "auto_dominant_strategy": strategy,
+                "auto_dominant_strategy_count": strategy_count or 0,
+                "auto_strategy_count": auto_count or 0,
+                "error_count": error_count or 0,
+            }
             for (
                 server,
                 tool,
@@ -1324,107 +1496,12 @@ class MetricsStore:
                 avg_ratio,
                 ratio_count,
                 error_count,
-            ) in rows:
-                # p95 approximation: pick the value at rank ceil(0.95 * N)
-                p95_row = self._db.execute(
-                    """
-                    SELECT original_chars FROM proxy_metrics
-                    WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
-                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
-                    ORDER BY original_chars ASC
-                    LIMIT 1 OFFSET MAX(0, CAST(
-                        (SELECT COUNT(*) FROM proxy_metrics
-                         WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
-                             AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?)
-                        * 0.95 AS INTEGER) - 1)
-                    """,
-                    (
-                        server,
-                        tool,
-                        cutoff,
-                        METADATA_BYPASS_STRATEGY,
-                        STRUCTURED_BYPASS_STRATEGY,
-                        server,
-                        tool,
-                        cutoff,
-                        METADATA_BYPASS_STRATEGY,
-                        STRUCTURED_BYPASS_STRATEGY,
-                    ),
-                ).fetchone()
-                # The strategy AUTO chose most often, how often it chose it,
-                # and the population both are over.  All three come from ONE
-                # statement so they share a single SQLite snapshot: another
-                # process writing between two statements could otherwise pair
-                # a numerator with a smaller denominator and yield a share
-                # above 1.0 (the instance lock does not span processes).
-                #
-                # ``strategy_auto_selected = 1`` is what narrows this to AUTO's
-                # own behavior. It is an equality, not ``IS NOT 0``, so the
-                # NULL provenance of a pre-migration row drops out rather than
-                # counting as either answer.
-                #
-                # The key is the label's pre-arrow base, not the label: the
-                # ratio-guard ladder rewrites ``compression_strategy`` on
-                # degradation, so grouping by the stored value splits one
-                # selection across ``hybrid`` and ``hybrid→progressive_fallback``
-                # and reads a perfectly consistent tool as inconsistent (#937).
-                # An undegraded call records a bare strategy; every site that
-                # writes a degradation label spells it ``<base>→<suffix>`` with
-                # a single ``CompressionStrategy`` value as the base — the same
-                # convention ``get_progressive_degradations`` matches on — so
-                # cutting at the first arrow yields what AUTO chose, and leaves
-                # an undegraded label untouched.
-                strat_row = self._db.execute(
-                    """
-                    SELECT
-                        CASE WHEN instr(compression_strategy, '→') > 0
-                             THEN substr(compression_strategy, 1,
-                                         instr(compression_strategy, '→') - 1)
-                             ELSE compression_strategy END AS selected_strategy,
-                        COUNT(*),
-                        (SELECT COUNT(*) FROM proxy_metrics
-                         WHERE server = ? AND tool = ? AND created_at >= ?
-                             AND compression_strategy IS NOT NULL
-                             AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
-                             AND strategy_auto_selected = 1 AND source = 'mcp')
-                    FROM proxy_metrics
-                    WHERE server = ? AND tool = ? AND created_at >= ?
-                        AND compression_strategy IS NOT NULL
-                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
-                        AND strategy_auto_selected = 1 AND source = 'mcp'
-                    GROUP BY selected_strategy
-                    ORDER BY COUNT(*) DESC
-                    LIMIT 1
-                    """,
-                    (
-                        server,
-                        tool,
-                        cutoff,
-                        METADATA_BYPASS_STRATEGY,
-                        STRUCTURED_BYPASS_STRATEGY,
-                        server,
-                        tool,
-                        cutoff,
-                        METADATA_BYPASS_STRATEGY,
-                        STRUCTURED_BYPASS_STRATEGY,
-                    ),
-                ).fetchone()
-                profiles.append(
-                    {
-                        "server": server,
-                        "tool": tool,
-                        "call_count": call_count,
-                        "violation_count": violation_count or 0,
-                        "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
-                        "ratio_count": ratio_count or 0,
-                        "p95_original_chars": p95_row[0] if p95_row else 0,
-                        "auto_dominant_strategy": strat_row[0] if strat_row else None,
-                        "auto_dominant_strategy_count": strat_row[1] if strat_row else 0,
-                        "auto_strategy_count": strat_row[2] if strat_row else 0,
-                        "error_count": error_count or 0,
-                    }
-                )
-        return profiles
+                p95,
+                strategy,
+                strategy_count,
+                auto_count,
+            ) in rows
+        ]
 
     def get_progressive_degradations(
         self, since_seconds: float = 86400.0, tool: str | None = None

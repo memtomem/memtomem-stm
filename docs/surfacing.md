@@ -160,6 +160,19 @@ flowchart TD
 
 > **Note**: Steps 1 (template) and 2 (`_context_query`) are "first match wins". The heuristic fallback (step 3) iterates over **all** tool arguments and collects path-like tokenizations and semantic string values together into a merged query, rather than stopping at the first match.
 
+An agent-provided `_context_query` is used as given (trimmed; a
+non-sensitive one must also clear `min_query_tokens`), so the engine's own
+sensitive-content check sees its text whole. The template and heuristic steps can
+reshape a value first (tokenizing splits `ghp_…` into `ghp …`,
+`{arg.email}_log` breaks an address's word boundary), so before either runs,
+every raw input they read is checked: the server and tool names, the template
+and every argument string, nested ones included. On a match, a step that
+yields a query passes on the raw inputs in its place, trimmed and joined with
+spaces, so the engine's check sees them whole and skips the call as
+`sensitive_query`, even when the sensitive value is one the step would not
+have used. A step that yields no query still yields
+none: a secret does not turn a call without retrieval intent into one.
+
 ### Native-tool hook calls (Bash, Read, …)
 
 Calls that arrive through `mms hook` (`server == "builtin"`) take a different
@@ -167,10 +180,12 @@ heuristic step, because their arguments are raw shell commands and absolute
 paths. Templates and `_context_query` still come first, and proxied MCP tools
 are unaffected.
 
-- **Sensitive input is checked first.** If any raw argument matches a sensitive
-  pattern, the raw values are passed on unchanged, so the engine sends a
-  `sha256:` digest instead of the text. Tokenizing first would hide the secret
-  from that check.
+- **Sensitive input is checked on the raw arguments.** If any raw argument
+  matches a sensitive pattern and the call yields a query, the raw values are
+  passed on in its place, so the engine sees the secret and skips the call
+  (`sensitive_query`) without querying the LTM. Tokenizing first would hide the
+  secret from that check. A call that yields no query (a `cd`-only command, a
+  query under `min_query_tokens`) still yields none.
 - **Paths** are made relative to the call's `cwd` (or lose their `/tmp/`,
   `/private/tmp/` or home prefix), and drop id-like segments, `src` / `lib` /
   `tests` / `packages`, and the file extension:
@@ -277,7 +292,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `dedup_ttl_seconds` | `604800` (7d) | Cross-session dedup window; `0` to disable |
 | `query_retention_days` | `30` | Days to keep the raw extracted query text in `surfacing_events.query` before the opportunistic cleanup nulls it out; `0` to disable (column keeps whatever `record_surfacing` wrote, indefinitely). This knob only clears the column — the event row itself is deleted by `stats_retention_days` (below), not here. |
 | `stats_retention_days` | `90` | Days to keep the `surfacing_events` row itself (and its `surfacing_feedback`) before the cleanup **deletes** it; `0` to disable (rows kept indefinitely — the pre-#584 behavior). Unlike `query_retention_days` (which only nulls the query column, keeping the row for aggregates), this bounds the table so the `surfacing_stats` action cannot full-scan an ever-growing history. Runs both opportunistically from `surface()` and once at startup, so a stats read right after a restart still sees a bounded table. Keep it `>= query_retention_days` if you want the nulled-query rows to survive for aggregates before deletion. |
-| `persist_query_text` | `true` | When `false`, `FeedbackStore` stores `sha256:<16-hex>` instead of the raw extracted query in `surfacing_events.query`. The in-process surfacing call (relevance cooldown, formatter, MCP search) keeps the raw text of a non-sensitive query — this knob only governs two output fields: the persisted query and the `query` field of the surface webhook payload. Both are also hashed whenever the query matches a sensitive pattern, and that check runs before the LTM search too, independent of this knob. The `surfacing_stats` action renders the hash verbatim and prints a one-line legend so the substitution is visible. |
+| `persist_query_text` | `true` | When `false`, `FeedbackStore` stores `sha256:<16-hex>` instead of the raw extracted query in `surfacing_events.query`. The in-process surfacing call (relevance cooldown, formatter, MCP search) keeps the raw text of a non-sensitive query — this knob only governs two output fields: the persisted query and the `query` field of the surface webhook payload. A query that matches a sensitive pattern reaches neither field: independent of this knob, the call is skipped as `sensitive_query` before the LTM is queried, so it writes no event row and fires no webhook. The `surfacing_stats` action renders the hash verbatim and prints a one-line legend so the substitution is visible. |
 | `opportunities_enabled` | `true` | Write one `surfacing_opportunities` row per call that entered surfacing, labelled with how it ended (see [Opportunity log](#opportunity-log)). Only engines with a feedback tracker write rows. |
 | `opportunities_sample_rate` | `1.0` | Share of opportunity rows kept, `0.0`–`1.0`. Rows the rate drops are counted in the `surfacing_stats` action but not stored. |
 | `holdout_rate` | `0.0` | Share of eligible hook-path injections withheld at random, for measuring whether surfacing changes what the agent does (see [Holdout](#holdout-opt-in)). Clamped to `0.0`–`0.5`; `0.0` never draws. |
@@ -689,7 +704,7 @@ The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key
 | `server`, `tool` | As on `surfacing_events`. |
 | `arg_shape_json` | Counts about the call's arguments, never their keys or values: how many top-level arguments it had (`key_count`); the depth of a `file_path` / `path` argument and its extension when that is one of a fixed set of common file types (otherwise `"other"`); and the query's token count. Key names are left out because a tool that accepts arbitrary keys lets the caller choose them. |
 | `response_len` | The response size the `min_response_chars` gate judged. |
-| `query_digest` | `sha256:` + 16 hex of the extracted query, taken before a query that looks sensitive is replaced by its digest; `NULL` when the call ended before a query was extracted. For a non-sensitive query this equals the event row's `query` under `persist_query_text=false`. |
+| `query_digest` | `sha256:` + 16 hex of the extracted query, including one that looks sensitive (`skip:sensitive_query`); `NULL` when the call ended before a query was extracted. For a non-sensitive query this equals the event row's `query` under `persist_query_text=false`. |
 | `score_scale` | The core-reported scale of the batch, when the call got that far; a label outside the known set (`rrf`, `bm25`, `dense`, `none`, `rerank`) is stored as `other`. |
 | `arm`, `holdout_rate` | `shown` or `withheld` and the rate used, when a [holdout](#holdout-opt-in) draw happened on this call; `NULL` otherwise. |
 
@@ -966,6 +981,11 @@ hit:
   `content` is dropped on its own.
 - `no_query` — `ContextExtractor` could not synthesize a query
   from the tool arguments and fell below `min_query_tokens`.
+- `sensitive_query` — the extracted query matched a sensitive-content
+  pattern (a credential, or PII such as an email address). It is not
+  sent to the LTM in any form — not even as its digest — and the call
+  claims no rate-limit slot. Like any skip, it delivers nothing, Pinned
+  Context included.
 - `no_results_score` — LTM returned results, none above
   `min_score`. When five consecutive non-empty searches for the same
   upstream tool remain below the active floor, STM logs a one-shot
