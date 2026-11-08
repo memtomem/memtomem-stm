@@ -192,8 +192,8 @@ class TestConcurrentCalls:
         results = await asyncio.gather(*tasks)
 
         assert len(results) == 10
-        # Verify single compressor was created (not 10)
-        assert mgr._selective_compressor is not None
+        # One store for the one backend, not one per call
+        assert len(mgr._selective_owners) == 1
 
     async def test_concurrent_hybrid_compression(self):
         """Concurrent HYBRID calls also go through selective_lock."""
@@ -213,7 +213,7 @@ class TestConcurrentCalls:
         results = await asyncio.gather(*tasks)
 
         assert len(results) == 10
-        assert mgr._selective_compressor is not None
+        assert len(mgr._selective_owners) == 1
 
     async def test_concurrent_mixed_strategies(self):
         """Different servers with different strategies called concurrently."""

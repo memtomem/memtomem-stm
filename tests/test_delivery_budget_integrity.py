@@ -65,8 +65,7 @@ async def test_unicode_budget_covers_initial_and_owned_continuations(
         assert part["content"] == source[previous : previous + len(part["content"])]
         pieces.append(part["content"])
     assert "".join(pieces) == source
-    if proxy._selective_compressor is not None:
-        assert len(proxy._selective_compressor._store) == 0
+    assert all(len(owner._store) == 0 for owner in proxy._selective_owners.values())
 
 
 @pytest.mark.parametrize("budget", [7000, 8000, 9000])

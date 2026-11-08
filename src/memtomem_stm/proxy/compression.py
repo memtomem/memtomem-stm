@@ -1047,26 +1047,64 @@ class SelectiveCompressor:
         self._min_section_chars = min_section_chars
         self._scorer = scorer or BM25Scorer()
         # In-flight guard for the off-thread compress path (#618): close()
-        # defers to the last end_use() so a config-change rebuild can't pull
-        # the pending store out from under a worker thread mid-write.
+        # defers to the last end_use() so ``stop()`` can't pull the pending
+        # store out from under a worker thread mid-write.
         self._use_lock = threading.Lock()
         self._in_use = 0
         self._close_requested = False
         # Write-time publication barrier (#898). A compress that started under
         # one generation must not mint a key into a store the readers no longer
-        # consult; ``live_provider`` re-resolves the manager's current selective
-        # compressor at put time. Both None (standalone construction) keeps the
-        # single-generation behavior. The manager injects them on every instance
-        # it builds, including the throwaway recovery/probe ones — those are
-        # inert here because they only ``select()``, never compress.
+        # consult; ``live_provider`` re-resolves the manager's current view for
+        # this call's (server, tool) at put time. Both None (standalone
+        # construction, and the manager's per-backend owners, which only
+        # ``select()``) keeps the single-generation behavior.
         self._live_provider = live_provider
         self._publish_lock = publish_lock or threading.Lock()
+        # False on a ``with_policy`` view: the store belongs to the instance the
+        # view was derived from, which is the one that closes it.
+        self._owns_store = True
         if store is not None:
             self._store = store
         else:
             from memtomem_stm.proxy.pending_store import InMemoryPendingStore
 
             self._store = InMemoryPendingStore()
+
+    def with_policy(
+        self,
+        *,
+        max_pending: int = 100,
+        pending_ttl_seconds: float = 300.0,
+        json_depth: int = 1,
+        min_section_chars: int = 50,
+        scorer: RelevanceScorer | None = None,
+        live_provider: Callable[[], SelectiveCompressor | None] | None = None,
+        publish_lock: threading.Lock | None = None,
+    ) -> SelectiveCompressor:
+        """A compressor writing into THIS instance's store under its own policy.
+
+        ``ProxyManager`` keeps one store per pending-store backend (#1365) and
+        servers sharing a backend may configure different parsing and eviction
+        policies, so the policy travels with the call rather than with the
+        store. The view does not own the store: its :meth:`close` releases
+        nothing, and pinning (:meth:`begin_use`) belongs on this instance.
+        """
+        view = SelectiveCompressor(
+            max_pending=max_pending,
+            pending_ttl_seconds=pending_ttl_seconds,
+            json_depth=json_depth,
+            min_section_chars=min_section_chars,
+            store=self._store,
+            scorer=scorer,
+            live_provider=live_provider,
+            publish_lock=publish_lock,
+        )
+        view._owns_store = False
+        return view
+
+    def use_ttl(self, pending_ttl_seconds: float) -> None:
+        """Set the TTL :meth:`select` expires this store's rows by."""
+        self._ttl = pending_ttl_seconds
 
     def compress(
         self,
@@ -1161,9 +1199,9 @@ class SelectiveCompressor:
         # The response-side half of the #1148 verdict (the store checks the row
         # it would write). Computed at most once, and only for a store that
         # persists: the in-memory default pays nothing. The common case is
-        # evaluated here, before ``_publish`` takes the lock a config rebuild on
-        # the event loop waits for; a retarget onto a persisting store from a
-        # non-persisting one evaluates it under the lock instead.
+        # evaluated here, before ``_publish`` takes the lock the manager's route
+        # installs on the event loop wait for; a retarget onto a persisting
+        # store from a non-persisting one evaluates it under the lock instead.
         sources = (text,) if sensitivity_source is None else (text, sensitivity_source)
         verdict: list[bool] = []
 
@@ -1188,8 +1226,8 @@ class SelectiveCompressor:
         # compress was off-loaded to a worker thread at all — so it is by far
         # the widest window a config reload can land in. Publishing first would
         # resolve the live generation, then sit through that entire call while a
-        # rebuild retired the store underneath, which is the very race the write
-        # barrier exists to close.
+        # reload moved this tool to another store or policy, which is the very
+        # race the write barrier exists to close.
         items = list(chunks.items())
         if context_query and context_query.strip():
             scores = _scores_or_none(self._scorer, context_query, items)
@@ -1325,13 +1363,33 @@ class SelectiveCompressor:
     def select(
         self, key: str, sections: list[str], response_format: DeliveryFormat | None = None
     ) -> str:
-        self._store.evict_expired(self._ttl, exclude_format="progressive")
+        result = self.select_if_present(key, sections, response_format)
+        if result is None:
+            return f"Selection key '{key}' not found or expired."
+        return result
 
-        pending = self._store.get(key)
+    def select_if_present(
+        self, key: str, sections: list[str], response_format: DeliveryFormat | None = None
+    ) -> str | None:
+        """:meth:`select`, but ``None`` when this store does not hold *key*.
+
+        The manager probes several stores for one key (#1365); a miss has to
+        be told apart from a hit by more than its text, since selected content
+        or a section name can contain the miss message.
+
+        A store that does not hold *key* is only read: the store-wide expiry
+        pass runs once the key is found, so probing a store for a key another
+        store holds takes no write lock on it.
+        """
         # Both strategies may share one SQLite file. Only read_more may read
         # or renew progressive rows, using their entry-local expiry checks.
+        pending = self._store.get(key)
         if pending is None or pending.format == "progressive":
-            return f"Selection key '{key}' not found or expired."
+            return None
+        self._store.evict_expired(self._ttl, exclude_format="progressive")
+        pending = self._store.get(key)
+        if pending is None:
+            return None
 
         mode = metadata_format(pending.metadata_json, response_format)
 
@@ -1382,16 +1440,16 @@ class SelectiveCompressor:
         """Register an in-flight ``compress()`` before the manager lock drops.
 
         ``ProxyManager`` may run ``compress()`` in a worker thread (#618)
-        after releasing ``_selective_lock``; a concurrent config-change
-        rebuild (or ``stop()``) calling :meth:`close` in that window would
-        otherwise close the pending store mid-write. ``begin_use`` runs on
-        the event loop while the manager lock is still held, so a later
-        ``close()`` defers to the balancing :meth:`end_use` instead.
+        after releasing ``_selective_lock``; a concurrent ``stop()`` calling
+        :meth:`close` in that window would otherwise close the pending store
+        mid-write. ``begin_use`` runs on the event loop while the manager lock
+        is still held, so a later ``close()`` defers to the balancing
+        :meth:`end_use` instead. The manager pins the backend's owner, whose
+        store its ``with_policy`` views write through.
 
-        The pin keeps this instance's parser, scorer and store USABLE for the
-        duration; it does not make them the ones a later reader consults. The
-        selection write itself targets the live generation (:meth:`_publish`,
-        #898), so the pin no longer carries that reachability burden.
+        The pin keeps the store USABLE for the duration; it does not make it
+        the one the write lands in. The selection write itself targets the
+        call's current route (:meth:`_publish`, #898).
         """
         with self._use_lock:
             self._in_use += 1
@@ -1408,9 +1466,9 @@ class SelectiveCompressor:
         """Release the underlying pending store's OS resources.
 
         The SQLite backend holds a connection; the in-memory backend has
-        nothing to release. Called by ``ProxyManager`` on stop and before it
-        rebuilds a compressor for a changed config (#583), so a cached
-        SQLite-backed compressor does not leak its connection. While a
+        nothing to release. Called by ``ProxyManager`` on stop (#583), so a
+        cached SQLite-backed store does not leak its connection, and a no-op on
+        a ``with_policy`` view, which does not own its store. While a
         ``begin_use``/``end_use`` span is in flight (an off-thread compress,
         #618) the close is deferred to the last ``end_use`` — the store must
         not disappear under a worker thread mid-write.
@@ -1425,6 +1483,8 @@ class SelectiveCompressor:
         # Never raises: the deferred path runs inside the manager's `finally`
         # after a successful compress, and a close failure must not eat that
         # result (callers of close() already wrap or tolerate failures too).
+        if not self._owns_store:
+            return
         close = getattr(self._store, "close", None)
         if callable(close):
             try:
@@ -1629,38 +1689,33 @@ class SelectiveCompressor:
         policy of whoever owns that store. Returns the enforcing TTL.
 
         A SELECTIVE/HYBRID compress can run off-thread (#618) for as long as its
-        scorer takes, and ``begin_use`` only keeps THIS instance alive — a
-        config-change rebuild in that window repoints the manager's slot, which
-        is what ``select_chunks`` consults. Writing to ``self._store`` then mints
-        a key into a retired store and hands the client a key that was never
-        reachable (#898). Re-resolving the live generation at write time lands
-        the key in the store the next reader opens.
+        scorer takes, and a config reload in that window can move this call's
+        (server, tool) to another pending store or policy. ``live_provider``
+        returns the manager's current view for that (server, tool), so the key
+        lands in the store its tool is now configured for (#898).
 
         Eviction follows the same target for the same reason: ``_evict`` is an
         instance policy with a store-wide effect, so a superseded ``max_pending``
-        applied to a shared ``pending_store_path`` deletes the live generation's
-        keys. The current owner's policy is the only correct one to run.
+        applied to a shared ``pending_store_path`` deletes the keys the current
+        generation wrote there. The current route's policy is the one to run.
 
         The publish lock covers resolving the target AND the store work, and the
-        manager holds the same lock across its slot swap and the superseded
-        close. Resolving under the lock and then releasing it before the write
-        does not work: a pin keeps the target open but not CURRENT, so a rebuild
-        landing between the pin and the put would leave the key in a store the
-        reader no longer consults — the original defect, one generation over —
-        and would run that generation's now-superseded eviction over a shared
-        path. Both halves need the target to still be live when the write lands,
-        which means holding the lock across it.
+        manager holds the same lock while it installs routes and while
+        ``stop()`` clears them and closes the stores. Resolving under the lock
+        and then releasing it before the write does not work: a route install
+        landing between the two would leave the key in a store the tool no
+        longer uses and run a superseded eviction over a shared path. Both
+        halves need the target to still be current when the write lands, which
+        means holding the lock across it.
 
-        The cost is that a rebuild on the event loop can wait for one put and
-        two eviction passes against a local SQLite file. That is accepted rather
-        than overlooked: it is bounded, small, and the same synchronous
+        The cost is that a route install on the event loop can wait for one put
+        and two eviction passes against a local SQLite file. That is accepted
+        rather than overlooked: it is bounded, small, and the same synchronous
         store-on-the-loop pattern every sibling write here already has (#879
         tracks that class repo-wide).
 
         With no ``live_provider`` (standalone construction) there is only one
-        generation and this is the historical put-then-evict. The throwaway
-        recovery/probe instances DO get a provider, but never reach this method
-        — they only ``select()``.
+        generation and this is the historical put-then-evict.
 
         Whether the response may be persisted (#1148) is decided against the
         store actually written, so it is checked after the target is resolved.

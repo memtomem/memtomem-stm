@@ -300,7 +300,7 @@ class TestPerRequestSnapshot:
         calls = count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         assert calls[0] == 2, f"expected the 2-read baseline, got {calls[0]}"
-        assert mgr._selective_compressor is not None
+        assert mgr._selective_owners, "no selective store was opened"
 
     async def test_cache_hit_path_stays_on_the_two_read_baseline(self, truncate_mgr):
         """The hit path re-applies surfacing and so reads config of its own;
@@ -360,7 +360,7 @@ class TestPerRequestSnapshot:
         try:
             calls = count_loader_reads(mgr)
             await mgr.call_tool("srv", "tool", {"a": 1})
-            assert mgr._selective_compressor is not None and mgr._extractor is not None
+            assert mgr._selective_owners and mgr._extractor is not None
             assert calls[0] == 3, f"expected 2 baseline + 1 live extractor read, got {calls[0]}"
 
             calls[0] = 0
@@ -526,7 +526,7 @@ class TestPerRequestSnapshot:
         stamping the new cfg before the build succeeds, would park a closed
         extractor behind the equality fast path and take extraction down until
         the next config edit. Mirrors
-        ``test_rebuild_selective_failure_leaves_old_usable``.
+        ``test_selective_open_failure_leaves_old_usable``.
         """
         import memtomem_stm.proxy.manager as manager_mod
 
@@ -910,12 +910,14 @@ class TestPerRequestSnapshot:
         compression = CS.SELECTIVE if strategy == "selective" else CS.HYBRID
         hybrid_cfg = None if strategy == "selective" else HybridConfig()
 
-        # Warm the slot under a config the next call will disagree with.
-        mgr._rebuild_selective_compressor(SelectiveConfig(max_pending=5))
-        warm = mgr._selective_compressor
+        # Warm the route under a policy the next call will disagree with.
         cfg_snap = mgr._config
+        _owner, warm = mgr._decide_selective(
+            "srv", "tool", SelectiveConfig(max_pending=5), cfg_snap
+        )
         sel_cfg = mgr._resolve_tool_config("srv", "tool", cfg_snap).selective
-        assert mgr._selective_compressor_cfg != sel_cfg, "the rebuild branch must be taken"
+        expected_max = sel_cfg.max_pending if sel_cfg is not None else 100
+        assert warm._max_pending != expected_max, "the next call must change the policy"
 
         calls = count_loader_reads(mgr)
         await mgr._apply_compression(
@@ -930,9 +932,11 @@ class TestPerRequestSnapshot:
             cfg_snap=cfg_snap,
         )
 
-        assert mgr._selective_compressor is not warm, "the rebuild did not happen"
+        view = mgr._selective_routes[("srv", "tool")]
+        assert view is not warm, "the call did not build its own view"
         assert calls[0] == 0, f"the warm rebuild took {calls[0]} loader read(s) of its own"
-        assert mgr._selective_compressor_cfg == sel_cfg
+        assert view._max_pending == expected_max
+        assert view._scorer is mgr._relevance_scorer_for(cfg_snap)
 
     async def test_stale_request_key_survives_the_next_live_request(self, truncate_mgr):
         """The end-to-end property: a key handed out under a stale pin still reads.
@@ -1036,7 +1040,7 @@ class TestPerRequestSnapshot:
         """
         from memtomem_stm.proxy.config import CompressionStrategy as CS
 
-        assert mgr._selective_compressor is None, "the slot must start cold"
+        assert not mgr._selective_owners, "the slot must start cold"
         stale, live = self._stale_and_live(mgr)
         live_sel = mgr._resolve_tool_config("srv", "tool", live).selective
         stale_sel = mgr._resolve_tool_config("srv", "tool", stale).selective
@@ -1054,7 +1058,8 @@ class TestPerRequestSnapshot:
             cfg_snap=stale,
         )
 
-        assert mgr._selective_compressor_cfg == live_sel, (
+        assert mgr._selective_routes_cfg is live
+        assert mgr._selective_routes[("srv", "tool")]._max_pending == live_sel.max_pending, (
             "a stale pin published its own generation into the shared slot"
         )
 

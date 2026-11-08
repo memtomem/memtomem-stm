@@ -854,12 +854,22 @@ def _pending_backend_key(sel_cfg: SelectiveConfig | None) -> tuple[str, str]:
     """The physical pending store *sel_cfg* resolves to (#1362).
 
     No selective config and ``pending_store="memory"`` are the same in-memory
-    default; a SQLite store is identified by its expanded path. Nothing else in
-    ``SelectiveConfig`` changes where a row lands, so it is not part of the key.
+    default; a SQLite store is identified by its resolved path, so two
+    spellings of one file (``a/../x.db``, a symlinked directory) share one
+    store rather than two connections that each expire the file's rows by
+    their own TTL (#1365). Nothing else in ``SelectiveConfig`` changes where a
+    row lands, so it is not part of the key.
     """
     if sel_cfg is None or sel_cfg.pending_store != "sqlite":
         return ("memory", "")
-    return ("sqlite", str(sel_cfg.pending_store_path.expanduser()))
+    path = sel_cfg.pending_store_path.expanduser()
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        # A symlink loop or an unreadable parent: the store fails to open
+        # anyway, so the expanded spelling is as good a key as any.
+        path = path.absolute()
+    return ("sqlite", str(path))
 
 
 class ProxyManager:
@@ -1007,17 +1017,27 @@ class ProxyManager:
         # server later connects (e.g. via reconnect).
         self._failed_servers: dict[str, str] = {}
         self._stack: AsyncExitStack | None = None
-        self._selective_compressor: SelectiveCompressor | None = None
-        self._selective_compressor_cfg: SelectiveConfig | None = None
+        # One selective pending store per pending-store backend (#1365), keyed
+        # by ``_pending_backend_key`` and held by an "owner" compressor that
+        # only ``stop()`` closes. A call compresses through a ``with_policy``
+        # view of its backend's owner, so servers on different backends — or on
+        # one backend with different policies — never close each other's store.
+        self._selective_owners: dict[tuple[str, str], SelectiveCompressor] = {}
+        # The newest view decided per (server, tool), and the generation every
+        # route was resolved under. An off-thread compress resolves its
+        # (server, tool) route at write time (#898), so a write that started
+        # under a superseded generation lands where, and evicts as, that tool's
+        # current configuration says. See ``_decide_selective``.
+        self._selective_routes: dict[tuple[str, str], SelectiveCompressor] = {}
+        self._selective_routes_cfg: ProxyConfig | None = None
         self._selective_lock = asyncio.Lock()
         # Publication barrier for the off-thread selective write (#898). A
-        # WORKER THREAD holds this while it resolves the live compressor and
-        # writes its selection key into that generation's store; the event loop
-        # holds it across a rebuild's slot swap and the superseded close, so the
-        # target cannot be retired underneath a write in progress. Not the
-        # asyncio ``_selective_lock``: this one is taken from a non-loop thread.
-        # A rebuild therefore waits for one put and two eviction passes against
-        # a local SQLite file — see ``SelectiveCompressor._publish`` for why
+        # WORKER THREAD holds this while it resolves its route and writes its
+        # selection key into that store; the event loop holds it while it
+        # installs routes and while ``stop()`` clears them and closes the
+        # owners, so the target cannot be retired underneath a write in
+        # progress. Not the asyncio ``_selective_lock``: this one is taken from
+        # a non-loop thread. See ``SelectiveCompressor._publish`` for why
         # resolving under the lock and writing outside it is not equivalent.
         self._selective_publish_mu = threading.Lock()
         self._extractor: FactExtractor | None = None
@@ -3259,18 +3279,20 @@ class ProxyManager:
         # recovery or a SELECTIVE/HYBRID/progressive call may have opened a
         # SQLite-backed store that ``_connections`` cleanup never touches, so
         # without this the connection leaks across stop()/reuse.
-        # Under the publish mutex (#898) for the same reason as the rebuild: a
-        # worker mid-publish completes its write before the slot clears, and one
-        # that arrives after falls back to its own store — still open, since the
-        # compress path pins the instance it runs on — instead of this one.
+        # Under the publish mutex (#898): a worker mid-publish completes its
+        # write before the routes clear, and one that arrives after falls back
+        # to its own view — whose store is still open, since the compress path
+        # pins that view's owner and ``close()`` defers to the last ``end_use``.
         with self._selective_publish_mu:
-            if self._selective_compressor is not None:
+            self._selective_routes.clear()
+            self._selective_routes_cfg = None
+            owners = list(self._selective_owners.values())
+            self._selective_owners.clear()
+            for owner in owners:
                 try:
-                    self._selective_compressor.close()
+                    owner.close()
                 except Exception:
-                    logger.debug("Failed to close selective compressor on stop", exc_info=True)
-                self._selective_compressor = None
-                self._selective_compressor_cfg = None
+                    logger.debug("Failed to close selective store on stop", exc_info=True)
         progressive_stores = list(self._progressive_stores.values())
         self._progressive_stores.clear()
         for adapter in progressive_stores:
@@ -3897,138 +3919,174 @@ class ProxyManager:
                         out.append(sel)
         return out
 
-    def _sqlite_cfg_holding_key(
-        self, key: str, cfg: ProxyConfig | None = None
-    ) -> SelectiveConfig | None:
-        """The distinct configured SQLite ``SelectiveConfig`` whose store
-        currently holds *key*, or ``None`` if none does (#583).
+    @staticmethod
+    def _selective_policy(sel_cfg: SelectiveConfig | None) -> dict[str, Any]:
+        """The ``SelectiveConfig`` fields a compressor applies per call.
 
-        ``pending_store_path`` is configurable per server and per tool, so
-        several distinct stores may exist. After a restart
-        ``stm_proxy_select_chunks`` can receive a key whose row still lives in
-        one of them while the lazily built compressor points at a different
-        one. (``read_more`` opens every configured store instead — see
-        ``_recover_progressive_stores``.) Probe each distinct
-        store read-only (a cheap ``get`` that opens then closes its own
-        connection) and return the config whose store holds the key.
-
-        Single-store / no-store configs return ``None`` **without probing** —
-        callers fall back to the sole (or first) configured store, so the common
-        case pays no extra open and only genuinely multi-store configs probe.
-
-        ``cfg`` is the recovery's pinned generation. Enumerating the candidate
-        stores from a read of its own would let the store CHOSEN here come from
-        a different generation than the compressor the caller then builds
-        around it.
+        Everything but the store location: parsing (``json_depth``,
+        ``min_section_chars``) and eviction (``max_pending``,
+        ``pending_ttl_seconds``). No config means the compressor's defaults,
+        which ``SelectiveConfig``'s defaults equal.
         """
-        cfgs = self._distinct_sqlite_selective_cfgs(cfg)
-        if len(cfgs) <= 1:
-            return None
+        if sel_cfg is None:
+            return {}
+        return {
+            "max_pending": sel_cfg.max_pending,
+            "pending_ttl_seconds": sel_cfg.pending_ttl_seconds,
+            "json_depth": sel_cfg.json_depth,
+            "min_section_chars": sel_cfg.min_section_chars,
+        }
 
-        from memtomem_stm.proxy.pending_store import SQLitePendingStore
+    def _selective_owner(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
+        """The owner of *sel_cfg*'s backend store, opened on first use (#1365).
 
-        for sel_cfg in cfgs:
-            try:
-                probe = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
-                probe.initialize()
-            except Exception:
-                logger.warning(
-                    "Could not open configured SQLite pending store %s while probing "
-                    "for a persisted key",
-                    sel_cfg.pending_store_path,
-                    exc_info=True,
-                )
-                continue
-            try:
-                if probe.get(key) is not None:
-                    return sel_cfg
-            finally:
-                probe.close()
-        return None
-
-    def _rebuild_selective_compressor(
-        self, sel_cfg: SelectiveConfig | None, *, cfg: ProxyConfig | None = None
-    ) -> SelectiveCompressor:
-        """Replace the cached selective compressor, closing the superseded one
-        so a SQLite-backed store from a changed config does not leak its
-        connection (#583). Returns the new compressor. Only called when the cfg
-        changed or nothing is cached; the recovery path in ``select_chunks``
-        builds inline because it needs its own degrade-on-open-failure handling.
-
-        Build the replacement BEFORE closing the old one: if ``_create_selective``
-        fails to open the new SQLite store it raises here, leaving the still-open
-        old compressor cached and usable rather than a closed store behind the
-        cfg-equality fast path.
-
-        The swap and the superseded close run under ``_selective_publish_mu``
-        (#898) so an off-thread worker's selection write either lands in this
-        generation before it is retired or resolves the replacement — never into
-        a store this call is about to close. The build stays outside the lock —
-        it can open SQLite and construct a scorer, and the other side of this
-        mutex is a worker thread.
+        Each backend (the in-memory default, or one SQLite file) has its own
+        store, so a call on one backend can neither write into another's file
+        nor close the store holding another backend's keys. Only ``stop()``
+        closes an owner; ``select_chunks`` recovery may drop one it just opened.
+        The owner never compresses — calls go through ``_selective_view`` — but
+        :meth:`SelectiveCompressor.select` runs on it. A failed open raises and
+        caches nothing.
         """
-        new = self._create_selective(sel_cfg, cfg=cfg)
-        with self._selective_publish_mu:
-            old = self._selective_compressor
-            self._selective_compressor = new
-            self._selective_compressor_cfg = sel_cfg
-            if old is not None:
-                try:
-                    old.close()
-                except Exception:
-                    logger.debug("Failed to close superseded selective compressor", exc_info=True)
-        return new
-
-    def _create_selective(
-        self, sel_cfg: SelectiveConfig | None, *, cfg: ProxyConfig | None = None
-    ) -> SelectiveCompressor:
-        """Create a SelectiveCompressor with the appropriate PendingStore backend."""
-        kwargs: dict[str, Any] = {}
-        store = None
-        if sel_cfg is not None:
-            kwargs = {
-                "max_pending": sel_cfg.max_pending,
-                "pending_ttl_seconds": sel_cfg.pending_ttl_seconds,
-                "json_depth": sel_cfg.json_depth,
-                "min_section_chars": sel_cfg.min_section_chars,
-            }
-            if sel_cfg.pending_store == "sqlite":
+        backend = _pending_backend_key(sel_cfg)
+        owner = self._selective_owners.get(backend)
+        if owner is None:
+            store: PendingStore | None = None
+            if sel_cfg is not None and backend[0] == "sqlite":
                 from memtomem_stm.proxy.pending_store import SQLitePendingStore
 
-                store = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
-                store.initialize()
-        if store is not None:
-            kwargs["store"] = store
-        # Inject the manager's relevance scorer so SELECTIVE/HYBRID rank their
-        # TOC with the operator's configured scorer (e.g. embedding) instead of
-        # SelectiveCompressor's built-in BM25 default. With the default bm25
-        # scorer this is a no-op (passing a BM25Scorer == the class default).
-        # LIVE read, not the request snapshot: this scorer is baked into a
-        # compressor that outlives the call, and the rebuild predicate keys only
-        # on ``sel_cfg``, so a scorer-only hot-reload keeps the cached
-        # compressor (and its scorer) until the next selective-config rebuild —
-        # an accepted edge case, tracked as a follow-up. Baking in a snapshot
-        # captured before the upstream call would make that stale instance one
-        # generation older still.
-        # ``cfg`` is the generation the CALLER decided to publish under. A
-        # bare ``self._relevance_scorer`` is another loader read, and
-        # ``get()`` can re-load from disk here — so without it the scorer
-        # baked into this compressor can come from a LATER generation than the
-        # config it is being published as, inside the very lock that exists to
-        # keep one fill on one generation.
-        kwargs["scorer"] = (
-            self._relevance_scorer_for(cfg) if cfg is not None else self._relevance_scorer
+                sqlite_store = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
+                sqlite_store.initialize()
+                store = sqlite_store
+            owner = SelectiveCompressor(store=store, **self._selective_policy(sel_cfg))
+            self._selective_owners[backend] = owner
+        return owner
+
+    def _selective_view(
+        self, server: str, tool: str, sel_cfg: SelectiveConfig | None, cfg: ProxyConfig
+    ) -> tuple[SelectiveCompressor, SelectiveCompressor]:
+        """``(owner, view)`` for one call on *server*/*tool* under *cfg*.
+
+        The view carries *sel_cfg*'s policy and *cfg*'s relevance scorer, so a
+        scorer reload applies to the next call. Its write target is resolved
+        at write time from the (server, tool) route (#898) — see
+        ``_decide_selective``.
+
+        ``cfg`` is the generation the CALLER decided to publish under. A bare
+        ``self._relevance_scorer`` is another loader read, and ``get()`` can
+        re-load from disk here — so the scorer baked into this view could come
+        from a LATER generation than the config it is published as.
+        """
+        owner = self._selective_owner(sel_cfg)
+        policy = self._selective_policy(sel_cfg)
+        route = (server, tool)
+        view = owner.with_policy(
+            **policy,
+            scorer=self._relevance_scorer_for(cfg),
+            live_provider=lambda: self._selective_routes.get(route),
+            publish_lock=self._selective_publish_mu,
         )
-        # Write-time publication barrier (#898): a compress that runs off-thread
-        # publishes its selection key into whatever generation is CURRENT when
-        # the write happens, not the one it was built under, so the key is
-        # reachable from ``select_chunks`` and the eviction that follows applies
-        # the live instance's policy rather than a superseded one. Inert on the
-        # throwaway instances ``select_chunks``/``read_more`` build for their
-        # multi-store probe — those only ``select()``, never compress.
-        kwargs["live_provider"] = lambda: self._selective_compressor
-        kwargs["publish_lock"] = self._selective_publish_mu
-        return SelectiveCompressor(**kwargs)
+        return owner, view
+
+    def _decide_selective(
+        self,
+        server: str,
+        tool: str,
+        sel_cfg: SelectiveConfig | None,
+        cfg_snap: ProxyConfig,
+    ) -> tuple[SelectiveCompressor, SelectiveCompressor]:
+        """Resolve, build and install the view a SELECTIVE/HYBRID call uses.
+
+        Must run under ``_selective_lock`` with no ``await`` between it and the
+        caller's ``begin_use`` on the returned owner: decisions are then
+        serialized, and each installs routes for a generation at least as new
+        as the one before it (``_publication_pair``), so a stale request can
+        never install its pinned configuration over a newer route.
+
+        Routes are what an off-thread compress resolves when it writes (#898):
+        a write that started under a superseded generation lands in the
+        backend, and evicts under the policy, of its (server, tool)'s CURRENT
+        route. When this decision is the first to see a new generation, every
+        other route is re-resolved under it too, so a write paused across a
+        reload follows its own tool's new configuration even when a different
+        tool made the decision; a route that no longer resolves (its server is
+        gone, or its store will not open) is dropped, and its writer falls back
+        to its own view. A reload no call has observed yet retargets nothing.
+        Routes therefore number at most the (server, tool) pairs called since
+        the last generation change.
+        """
+        publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
+        # Read TTLs to apply with the routes: a paused write publishes under
+        # its route's TTL, so a store's read TTL moves only when a route onto
+        # it is installed — never for a decision that raises before installing.
+        read_ttls: list[tuple[SelectiveCompressor, float]] = []
+        if self._selective_routes_cfg is publish_cfg:
+            routes = dict(self._selective_routes)
+        else:
+            routes = {}
+            for srv, name in list(self._selective_routes):
+                if (srv, name) == (server, tool):
+                    continue
+                try:
+                    sel = self._resolve_tool_config(srv, name, publish_cfg).selective
+                    refreshed_owner, refreshed = self._selective_view(srv, name, sel, publish_cfg)
+                    read_ttls.append((refreshed_owner, refreshed._ttl))
+                    routes[(srv, name)] = refreshed
+                except Exception:
+                    logger.debug(
+                        "Dropping the selective route for %s/%s on a config change",
+                        srv,
+                        name,
+                        exc_info=True,
+                    )
+        owner, view = self._selective_view(server, tool, publish_sel, publish_cfg)
+        # ``select_chunks`` expires a store's rows by the TTL of the latest
+        # route installed onto it — this call's last; entry-local TTL (#1370)
+        # would need the row to carry its own.
+        read_ttls.append((owner, view._ttl))
+        routes[(server, tool)] = view
+        with self._selective_publish_mu:
+            self._selective_routes = routes
+            self._selective_routes_cfg = publish_cfg
+            for target, ttl in read_ttls:
+                target.use_ttl(ttl)
+        return owner, view
+
+    def _recover_selective_owners(self, cfg: ProxyConfig) -> list[SelectiveCompressor]:
+        """Open (and cache) every configured SQLite store not opened yet.
+
+        A selection persisted before a restart (#583) can only be in one of
+        these, and the owners already open were probed before this runs.
+        Opening all of them, rather than guessing which one holds the key, lets
+        the caller look past a store holding an expired copy, and leaves
+        nothing to reopen on the next miss. A store that fails to open is
+        logged and skipped; nothing is cached for it, so a later call retries.
+        The candidates come from *cfg*, one generation.
+        """
+        opened: list[SelectiveCompressor] = []
+        for sel in self._distinct_sqlite_selective_cfgs(cfg):
+            if _pending_backend_key(sel) in self._selective_owners:
+                continue
+            try:
+                opened.append(self._selective_owner(sel))
+            except Exception:
+                logger.warning(
+                    "Could not open the configured SQLite pending store %s for "
+                    "select_chunks recovery",
+                    sel.pending_store_path,
+                    exc_info=True,
+                )
+        return opened
+
+    def _drop_selective_owner(self, owner: SelectiveCompressor) -> None:
+        """Forget and close *owner*; no route or in-flight call uses it."""
+        for backend, cached in list(self._selective_owners.items()):
+            if cached is owner:
+                del self._selective_owners[backend]
+        try:
+            owner.close()
+        except Exception:
+            logger.debug("Failed to close selective store", exc_info=True)
 
     def _connection_or_stopping(self, server: str) -> UpstreamConnection:
         """The registered connection, or :class:`ManagerStoppingError` once
@@ -4186,18 +4244,18 @@ class ProxyManager:
         preserving the status quo for custom scorers that don't opt in.
 
         ``scorer`` must be the instance the compressor captured, not a fresh
-        ``self._relevance_scorer`` read: after a scorer-only hot-reload the
-        cached selective compressor keeps its old scorer until the next
-        rebuild (see the note in ``_build_compressor_kwargs``), and gating on
-        the property would run a still-embedding-backed compress inline —
-        re-introducing the stall this helper exists to prevent.
+        ``self._relevance_scorer`` read: the compressor was built from the
+        generation its caller decided under, and gating on the property could
+        run a compress whose scorer embeds inline after a reload that switched
+        the property to BM25 — re-introducing the stall this helper exists to
+        prevent.
 
-        Callers off-loading a compressor with shared mutable state (the cached
-        ``SelectiveCompressor`` and its pending store, alone or inside a
-        ``HybridCompressor``) must pin it with ``begin_use()`` while still
-        holding ``_selective_lock`` and balance with ``end_use()`` after this
-        call: a concurrent config-change rebuild (or ``stop()``) would
-        otherwise ``close()`` the store out from under the worker thread
+        Callers off-loading a compressor that writes a shared pending store (a
+        ``SelectiveCompressor`` view, alone or inside a ``HybridCompressor``)
+        must pin the store's owner with ``begin_use()`` while still holding
+        ``_selective_lock`` and balance with ``end_use()`` after this call: a
+        concurrent ``stop()`` would otherwise ``close()`` the store out from
+        under the worker thread
         (``SQLitePendingStore.close`` is not synchronized with ``put``). The
         pin defers the close to the last in-flight user rather than holding
         the lock across the compress, so concurrent SELECTIVE/HYBRID calls
@@ -4302,46 +4360,25 @@ class ProxyManager:
                 timeout=cfg_snap.lock_timeout_seconds,
                 name="selective_lock",
             ):
-                # This compressor OWNS the pending store that later
+                # The view decided here writes into the pending store later
                 # ``stm_proxy_read_more`` / ``stm_proxy_select_chunks`` lookups
-                # read, so the ONE rule is: every request works on the store of
-                # the newest generation, and any rebuild is therefore forward.
+                # read. Each backend has its own store and nothing but
+                # ``stop()`` closes one (#1365), so another server's call — on
+                # another backend or with another policy — cannot strand a key
+                # this call returns.
                 #
-                # Both failure modes come from breaking that rule in one
-                # direction or the other. Letting a superseded pin publish its
-                # own config replaces a live store and strands keys the client
-                # already holds. Making a superseded pin merely REUSE whatever
-                # is cached is no better: if that is an old-generation store,
-                # this request mints a key into one the next live request is
-                # about to close, so the key it just returned dies. Comparing
-                # the slot against the PUBLICATION generation covers both and
-                # collapses the two cases into one condition.
-                #
-                # Resolution and fill happen HERE, under the lock and with no
-                # await between them. Deciding before the lock leaves a window:
-                # a third generation can land while this coroutine waits.
-                publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
-                if (
-                    self._selective_compressor is None
-                    or self._selective_compressor_cfg != publish_sel
-                ):
-                    sel_compressor = self._rebuild_selective_compressor(
-                        publish_sel, cfg=publish_cfg
-                    )
-                else:
-                    sel_compressor = self._selective_compressor
-                # Pin the compressor before the lock drops: the off-thread
-                # compress below must not lose its pending store to a
-                # concurrent config-change rebuild's close(). begin_use/
-                # end_use defer that close to the last in-flight user, so
-                # concurrent SELECTIVE calls run in parallel instead of
-                # queueing on the lock (which would surface as spurious
-                # LOCK_TIMEOUT under a slow embedding endpoint). The pin keeps
-                # this instance USABLE, not reachable — the selection key is
-                # published into the live generation at write time (#898).
-                _begin = getattr(sel_compressor, "begin_use", None)
-                if _begin is not None:
-                    _begin()
+                # Resolution and installation happen HERE, under the lock and
+                # with no await between them. Deciding before the lock leaves a
+                # window: a third generation can land while this coroutine
+                # waits. See ``_decide_selective`` for the route rules.
+                owner, sel_compressor = self._decide_selective(server, tool, sel_cfg, cfg_snap)
+                # Pin the backend's owner before the lock drops: the off-thread
+                # compress below writes through its store, and ``stop()`` must
+                # not close it mid-write. begin_use/end_use defer that close to
+                # the last in-flight user, so concurrent SELECTIVE calls run in
+                # parallel instead of queueing on the lock (which would surface
+                # as spurious LOCK_TIMEOUT under a slow embedding endpoint).
+                owner.begin_use()
             try:
                 return (
                     await self._compress_maybe_offthread(
@@ -4354,9 +4391,7 @@ class ProxyManager:
                     None,
                 )
             finally:
-                _end = getattr(sel_compressor, "end_use", None)
-                if _end is not None:
-                    _end()
+                owner.end_use()
 
         if compression == CompressionStrategy.LLM_SUMMARY:
             if llm_cfg is not None:
@@ -4636,14 +4671,9 @@ class ProxyManager:
             timeout=cfg_snap.lock_timeout_seconds,
             name="selective_lock",
         ):
-            # Same one rule as the SELECTIVE branch, decided in the same place
-            # and for the same reason: this shares that compressor, and with it
-            # the pending store behind live TOC keys.
-            publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
-            if self._selective_compressor is None or self._selective_compressor_cfg != publish_sel:
-                self._rebuild_selective_compressor(publish_sel, cfg=publish_cfg)
-
-            sel_compressor = self._selective_compressor
+            # Same rules as the SELECTIVE branch, decided in the same place and
+            # for the same reason: the TOC tail writes through the same view.
+            owner, sel_compressor = self._decide_selective(server, tool, sel_cfg, cfg_snap)
             compressor = HybridCompressor(
                 head_chars=cfg.head_chars,
                 tail_mode=cfg.tail_mode,
@@ -4652,17 +4682,11 @@ class ProxyManager:
                 head_ratio=cfg.head_ratio,
                 selective_compressor=sel_compressor,
             )
-            # Pin the shared selective compressor before the lock drops —
-            # same rebuild/close race as the SELECTIVE branch: the hybrid TOC
-            # path writes through its pending store. The scorer gate reads
-            # the selective compressor's captured scorer (HybridCompressor
-            # has no scorer of its own; its truncate tail mode is
-            # query-blind). As in the SELECTIVE branch the pin is about the
-            # instance staying usable; the write itself follows the live
-            # generation (#898), through the same shared instance.
-            _begin = getattr(sel_compressor, "begin_use", None)
-            if _begin is not None:
-                _begin()
+            # Pin the owner before the lock drops — same stop()/close race as
+            # the SELECTIVE branch. The scorer gate reads the view's scorer
+            # (HybridCompressor has no scorer of its own; its truncate tail
+            # mode is query-blind).
+            owner.begin_use()
         try:
             return await self._compress_maybe_offthread(
                 compressor,
@@ -4672,9 +4696,7 @@ class ProxyManager:
                 scorer=getattr(sel_compressor, "_scorer", None),
             )
         finally:
-            _end = getattr(sel_compressor, "end_use", None)
-            if _end is not None:
-                _end()
+            owner.end_use()
 
     async def _auto_index_response(
         self,
@@ -4994,110 +5016,50 @@ class ProxyManager:
     # Backward-compatible delegate
     _format_fact_md = staticmethod(format_fact_md)
 
-    @staticmethod
-    def _is_recovery_miss(text: str) -> bool:
-        """Whether a select/read_more result is a store MISS (key absent) as
-        opposed to a hit or a section-mismatch. Both endpoints render the miss
-        with this stable suffix; used to decide whether to re-probe other
-        configured SQLite stores for the key (#583)."""
-        return "not found or expired" in text
-
     def select_chunks(
         self, key: str, sections: list[str], response_format: DeliveryFormat | None = None
     ) -> str:
-        # ONE generation for the whole recovery: the configs probed, the one
-        # chosen, and the scorer baked into the compressor cached below must
-        # not come from separate loader reads that can straddle a re-load.
+        """Serve *sections* of selection *key* from whichever store holds it.
+
+        Every open backend store is probed first (#1365). On a miss, a
+        configured SQLite store not opened yet this process may still hold the
+        key from before a restart (#583); ``_recover_selective_owners`` opens
+        those, one generation. A store holding the key ends the search, with a
+        selection, a section mismatch, or the structured error it raises.
+        """
+
         def inactive() -> str:
             message = "Selective compression not active — no pending TOC selections."
             if response_format == "structured":
                 raise DeliveryError(message, code="unavailable")
             return message
 
-        cfg_live = self._config
-        cfgs = self._distinct_sqlite_selective_cfgs(cfg_live)
-        if self._selective_compressor is None:
-            # Restart recovery (#583): no compress call has run yet this process,
-            # so the compressor (and its store handle) hasn't been built — but a
-            # configured SQLite pending store may hold a selection persisted
-            # before the restart. Build the configured compressor on first use so
-            # the key becomes reachable — from the store that actually holds it
-            # (multi-store) or the first configured store otherwise. A later
-            # SELECTIVE/HYBRID compress with the same cfg reuses it via the
-            # cfg-equality check. If nothing configures SQLite, or the store
-            # can't be opened, degrade to the existing sentinel and cache NOTHING
-            # (a failed open must not pin a bad state).
-            #
-            # The install goes through ``_selective_publish_mu`` (#898). No await
-            # runs between the check and the assignment, which used to be the
-            # whole argument — but the other writer is no longer only the event
-            # loop: an off-thread compress reads this slot to pick its write
-            # target. Publishing here unguarded lets that worker resolve the
-            # still-cold slot to its own store, this recovery install a different
-            # generation, and the key the worker then returns be unreachable —
-            # the very defect this mutex exists to prevent. The build stays
-            # outside the lock (it opens SQLite), so the slot is re-checked under
-            # it and a candidate that lost the race is closed rather than leaked.
-            #
-            # After stop(), recovery must not open or reopen a store: one
-            # opened here would outlive the teardown that already ran (#1128).
-            # start() clears the flag, so restart recovery is unaffected.
-            if self._stopped:
-                return inactive()
-            sel_cfg = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
-            if sel_cfg is None:
-                return inactive()
-            try:
-                compressor = self._create_selective(sel_cfg, cfg=cfg_live)
-            except Exception:
-                logger.warning(
-                    "Could not open the configured SQLite pending store for select_chunks recovery",
-                    exc_info=True,
-                )
-                return inactive()
-            with self._selective_publish_mu:
-                installed = self._selective_compressor is None
-                if installed:
-                    self._selective_compressor = compressor
-                    self._selective_compressor_cfg = sel_cfg
-            if not installed:
-                try:
-                    compressor.close()
-                except Exception:
-                    logger.debug("Failed to close unused recovery compressor", exc_info=True)
-        # Read the slot ONCE. It is no longer only the event loop's to change:
-        # a concurrent ``stop()`` can clear it between the recovery install and
-        # here, and re-reading would turn that into an AttributeError instead of
-        # the endpoint's own sentinel.
-        active = self._selective_compressor
-        if active is None:
-            return inactive()
-        result = active.select(
-            key,
-            sections,
-            **({"response_format": response_format} if response_format is not None else {}),
+        fmt: dict[str, Any] = (
+            {"response_format": response_format} if response_format is not None else {}
         )
-        if len(cfgs) > 1 and self._is_recovery_miss(result):
-            # The cached compressor's store did not hold the key, but with
-            # multiple distinct stores configured an earlier call may have
-            # cached a *different* store (#583). Probe the others; if one holds
-            # the key, serve it from a temporary compressor without disturbing
-            # the cache or this session's in-memory selections.
-            alt = self._sqlite_cfg_holding_key(key, cfg_live)
-            if alt is not None and alt != self._selective_compressor_cfg:
+        for owner in list(self._selective_owners.values()):
+            result = owner.select_if_present(key, sections, **fmt)
+            if result is not None:
+                return result
+        # After stop() has begun (#1128) — including the window before it
+        # clears the owners — a miss opens nothing.
+        if not self._stopped:
+            for recovered in self._recover_selective_owners(self._config):
                 try:
-                    tmp = self._create_selective(alt, cfg=cfg_live)
+                    result = recovered.select_if_present(key, sections, **fmt)
+                except DeliveryError:
+                    # The store holds the key; the selection itself was refused.
+                    raise
                 except Exception:
-                    logger.warning(
-                        "Could not open alternate SQLite pending store for select_chunks recovery",
-                        exc_info=True,
-                    )
+                    # e.g. a corrupt row: do not keep a reader open on a store
+                    # this call just opened for nothing.
+                    self._drop_selective_owner(recovered)
+                    raise
+                if result is not None:
                     return result
-                try:
-                    return tmp.select(key, sections, response_format=response_format)
-                finally:
-                    tmp.close()
-        return result
+        if not self._selective_owners:
+            return inactive()
+        return f"Selection key '{key}' not found or expired."
 
     def _open_progressive_adapter(self, sel_cfg: SelectiveConfig | None) -> ProgressiveStoreAdapter:
         """Build (do NOT cache) a ProgressiveStoreAdapter for *sel_cfg* —
