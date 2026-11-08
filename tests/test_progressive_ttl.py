@@ -177,14 +177,16 @@ def test_sqlite_restart_and_alternate_recovery(tmp_path, monkeypatch, legacy, al
     )
     try:
         if alternate:
-            assert "not found" in manager.read_more("absent", 0)
-            cached = dict(manager._progressive_stores)
+            # An a.db store is already open (an earlier publication on "a").
+            warm = manager._get_progressive_store(configs["a"].selective)
         clock.now += (1800 if legacy else 10) if expired else 5
         result = manager.read_more("key", 0)
         assert ("synthetic payload" in result) is not expired
         if alternate:
-            # Recovery adds a store; it never replaces or closes one.
-            assert all(manager._progressive_stores.get(b) is a for b, a in cached.items())
+            # Recovery added the b.db store; the a.db one stays cached and open.
+            assert manager._get_progressive_store(configs["a"].selective) is warm
+            assert warm.get("absent") is None
+            assert len(manager._progressive_stores) == 2
         check = stores.SQLitePendingStore(path)
         check.initialize()
         try:

@@ -574,7 +574,8 @@ def test_unknown_metadata_in_alternate_progressive_store_closes_reader(tmp_path,
         prefix="other",
         selective=SelectiveConfig(pending_store="sqlite", pending_store_path=alternate),
     )
-    assert "not found" in proxy.read_more("missing", 0)
+    # The primary store is already open; the key lives only in the alternate.
+    primary = proxy._get_progressive_store(proxy._config.upstream_servers["srv"].selective)
     writer = SQLitePendingStore(alternate)
     writer.initialize()
     writer.put(
@@ -601,8 +602,11 @@ def test_unknown_metadata_in_alternate_progressive_store_closes_reader(tmp_path,
     monkeypatch.setattr(proxy, "_open_progressive_adapter", track)
     with pytest.raises(DeliveryError):
         proxy.read_more("bad-version", 0)
-    assert opened
-    assert all(adapter._store._db is None for adapter in opened)
+    assert len(opened) == 1
+    assert opened[0]._store._db is None
+    # The failing store is forgotten; the primary stays cached and usable.
+    assert list(proxy._progressive_stores.values()) == [primary]
+    assert primary.get("missing") is None
     for adapter in proxy._progressive_stores.values():
         adapter.close()
 

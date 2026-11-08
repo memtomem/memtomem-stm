@@ -3903,10 +3903,11 @@ class ProxyManager:
         currently holds *key*, or ``None`` if none does (#583).
 
         ``pending_store_path`` is configurable per server and per tool, so
-        several distinct stores may exist. After a restart the retrieval
-        endpoints (``stm_proxy_select_chunks`` / ``stm_proxy_read_more``) can
-        receive a key whose row still lives in one of them while the lazily
-        built compressor/store points at a different one. Probe each distinct
+        several distinct stores may exist. After a restart
+        ``stm_proxy_select_chunks`` can receive a key whose row still lives in
+        one of them while the lazily built compressor points at a different
+        one. (``read_more`` opens every configured store instead — see
+        ``_recover_progressive_stores``.) Probe each distinct
         store read-only (a cheap ``get`` that opens then closes its own
         connection) and return the config whose store holds the key.
 
@@ -5098,43 +5099,30 @@ class ProxyManager:
             self._progressive_stores[backend] = adapter
         return adapter
 
-    def _recover_progressive_store(
-        self, key: str, cfg: ProxyConfig
-    ) -> ProgressiveStoreAdapter | None:
-        """Open (and cache) the configured SQLite store that may hold *key*.
+    def _recover_progressive_stores(self, cfg: ProxyConfig) -> list[ProgressiveStoreAdapter]:
+        """Open (and cache) every configured SQLite store not opened yet.
 
-        Only stores not opened yet are candidates — the open ones were already
-        probed. One candidate is opened without probing; several are probed
-        read-only and the holder, if any, is opened. Returns ``None`` when there
-        is nothing to open or the open fails (logged; nothing is cached, so the
-        next call retries). The candidates come from *cfg*, one generation.
+        A key persisted before a restart (#583) can only be in one of these,
+        and the stores already open were probed before this runs. Opening all
+        of them, rather than guessing which one holds the key, lets the caller
+        look past a store holding an expired copy, and leaves nothing to reopen
+        on the next miss. A store that fails to open is logged and skipped;
+        nothing is cached for it, so a later call retries. The candidates come
+        from *cfg*, one generation.
         """
-        uncached = [
-            sel
-            for sel in self._distinct_sqlite_selective_cfgs(cfg)
-            if _pending_backend_key(sel) not in self._progressive_stores
-        ]
-        if len(uncached) == 1:
-            candidate: SelectiveConfig | None = uncached[0]
-        elif uncached:
-            candidate = self._sqlite_cfg_holding_key(key, cfg)
-            if (
-                candidate is not None
-                and _pending_backend_key(candidate) in self._progressive_stores
-            ):
-                candidate = None
-        else:
-            candidate = None
-        if candidate is None:
-            return None
-        try:
-            return self._get_progressive_store(candidate)
-        except Exception:
-            logger.warning(
-                "Could not open the configured SQLite pending store for read_more recovery",
-                exc_info=True,
-            )
-            return None
+        opened: list[ProgressiveStoreAdapter] = []
+        for sel in self._distinct_sqlite_selective_cfgs(cfg):
+            if _pending_backend_key(sel) in self._progressive_stores:
+                continue
+            try:
+                opened.append(self._get_progressive_store(sel))
+            except Exception:
+                logger.warning(
+                    "Could not open the configured SQLite pending store %s for read_more recovery",
+                    sel.pending_store_path,
+                    exc_info=True,
+                )
+        return opened
 
     def _drop_progressive_store(self, adapter: ProgressiveStoreAdapter) -> None:
         """Forget and close *adapter*; it holds no key anyone was handed."""
@@ -5280,7 +5268,7 @@ class ProxyManager:
         """
         # Every open store is probed first. On a miss, a configured SQLite store
         # not opened yet this process may still hold the key from before a
-        # restart (#583); ``_recover_progressive_store`` opens that one.
+        # restart (#583); ``_recover_progressive_stores`` opens those.
         invalid = (
             "offset must be >= 0"
             if offset < 0
@@ -5313,8 +5301,7 @@ class ProxyManager:
         # After stop() has begun (#1128) — including the window before it
         # clears the stores — a miss opens nothing.
         if resp is None and not self._stopped:
-            recovered = self._recover_progressive_store(key, self._config)
-            if recovered is not None:
+            for recovered in self._recover_progressive_stores(self._config):
                 try:
                     resp = recovered.get(key, renew=renew, **fmt)
                 except Exception:
@@ -5322,6 +5309,8 @@ class ProxyManager:
                     # on a store this call just opened for nothing.
                     self._drop_progressive_store(recovered)
                     raise
+                if resp is not None:
+                    break
         if resp is None:
             return missing
         if invalid:
