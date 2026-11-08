@@ -854,12 +854,22 @@ def _pending_backend_key(sel_cfg: SelectiveConfig | None) -> tuple[str, str]:
     """The physical pending store *sel_cfg* resolves to (#1362).
 
     No selective config and ``pending_store="memory"`` are the same in-memory
-    default; a SQLite store is identified by its expanded path. Nothing else in
-    ``SelectiveConfig`` changes where a row lands, so it is not part of the key.
+    default; a SQLite store is identified by its resolved path, so two
+    spellings of one file (``a/../x.db``, a symlinked directory) share one
+    store rather than two connections that each expire the file's rows by
+    their own TTL (#1365). Nothing else in ``SelectiveConfig`` changes where a
+    row lands, so it is not part of the key.
     """
     if sel_cfg is None or sel_cfg.pending_store != "sqlite":
         return ("memory", "")
-    return ("sqlite", str(sel_cfg.pending_store_path.expanduser()))
+    path = sel_cfg.pending_store_path.expanduser()
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        # A symlink loop or an unreadable parent: the store fails to open
+        # anyway, so the expanded spelling is as good a key as any.
+        path = path.absolute()
+    return ("sqlite", str(path))
 
 
 class ProxyManager:

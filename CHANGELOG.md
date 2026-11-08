@@ -14,7 +14,8 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - SELECTIVE and HYBRID keep one pending store per backend (in-memory, or
-  each SQLite `pending_store_path`), as progressive delivery does since
+  each SQLite `pending_store_path`, compared after resolving it, so two
+  spellings of one file share a store), as progressive delivery does since
   #1362. A TOC `selection_key` no longer stops resolving because a
   SELECTIVE/HYBRID call on a server with a different `selective` block — or
   none — ran after it, or because a reload changed the block.

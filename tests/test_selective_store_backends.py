@@ -496,3 +496,34 @@ async def test_a_failed_decision_leaves_every_store_ttl_alone(tmp_path, monkeypa
         assert _serves(mgr, key, "a"), "a failed decision moved the store's read TTL"
     finally:
         await mgr.stop()
+
+
+async def test_two_spellings_of_one_sqlite_path_share_one_store(tmp_path, monkeypatch):
+    """``pending.db`` and ``sub/../pending.db`` are one file. Two owners on it
+    would each expire the shared rows by their own read TTL, so the short-TTL
+    alias deleted a key the long-TTL alias had just published."""
+    import memtomem_stm.proxy.pending_store as pending_store_mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(pending_store_mod.time, "time", lambda: clock[0])
+    (tmp_path / "sub").mkdir()
+    plain = tmp_path / "pending.db"
+    alias = tmp_path / "sub" / ".." / "pending.db"
+    mgr = _manager(
+        _cfg(
+            tmp_path,
+            {
+                "a": _sqlite(plain, pending_ttl_seconds=1.0),
+                "b": _sqlite(alias, pending_ttl_seconds=300.0),
+            },
+        )
+    )
+    try:
+        await _call(mgr, "a", "a")
+        key = await _call(mgr, "b", "b")
+        assert len(mgr._selective_owners) == 1, "one file, one store"
+
+        clock[0] += 5.0
+        assert _serves(mgr, key, "b")
+    finally:
+        await mgr.stop()

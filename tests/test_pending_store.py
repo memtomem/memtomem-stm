@@ -399,7 +399,7 @@ class TestSelectChunksRestartRecovery:
         assert mgr._selective_owners == {}
         result = mgr.select_chunks("k1", ["A"])
         assert result == "recovered content"
-        assert list(mgr._selective_owners) == [("sqlite", str(sel.pending_store_path))]
+        assert list(mgr._selective_owners) == [("sqlite", str(sel.pending_store_path.resolve()))]
 
     def test_override_only_sqlite_is_found(self, tmp_path):
         """The fallback scan reaches a SQLite store configured only in a per-tool
