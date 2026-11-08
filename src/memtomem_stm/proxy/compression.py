@@ -1000,6 +1000,11 @@ class PendingSelection:
     created_at: float
     total_chars: int
     metadata_json: str | None = None
+    # The TTL a SELECTIVE row was published under, which its TOC advertised; it
+    # expires by this rather than by whichever TTL the expiring caller holds
+    # (#1370). ``None``: a row written before that, which expires by the
+    # caller's TTL. Progressive rows keep theirs in ``__meta__`` instead.
+    ttl_seconds: float | None = None
 
 
 class ChunkMap(dict[str, str]):
@@ -1101,10 +1106,6 @@ class SelectiveCompressor:
         )
         view._owns_store = False
         return view
-
-    def use_ttl(self, pending_ttl_seconds: float) -> None:
-        """Set the TTL :meth:`select` expires this store's rows by."""
-        self._ttl = pending_ttl_seconds
 
     def compress(
         self,
@@ -1724,6 +1725,7 @@ class SelectiveCompressor:
             if before_write is not None:
                 before_write(self._ttl)
             self._refuse_sensitive(self._store, sensitive)
+            pending.ttl_seconds = self._ttl
             self._store.put(key, pending)
             self._evict()
             return self._ttl
@@ -1736,6 +1738,9 @@ class SelectiveCompressor:
             if before_write is not None:
                 before_write(target._ttl)
             self._refuse_sensitive(target._store, sensitive)
+            # The row expires by the TTL its TOC reports (#1370), not by
+            # whatever TTL a later writer or reader of a shared store holds.
+            pending.ttl_seconds = target._ttl
             target._store.put(key, pending)
             target._evict()
             return target._ttl

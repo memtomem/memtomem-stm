@@ -13,6 +13,24 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- A SELECTIVE/HYBRID selection now expires by the `pending_ttl_seconds` it
+  was published under — the `ttl_seconds_remaining` its table of contents
+  reported — even when tools with a different TTL share its pending store
+  (the in-memory default, or one `pending_store_path`). A call from a
+  shorter-TTL tool no longer deletes a longer-TTL tool's selections early, and
+  `stm_proxy_select_chunks` no longer expires a selection by whichever TTL was
+  resolved last for the store, in either direction. A successful selection
+  still renews the TTL, under the selection's own value. The SQLite pending
+  store gains a nullable `ttl_seconds` column, added on first open. (#1370)
+  **Behavior change**: selections written before this change (rows already
+  in a SQLite pending store at upgrade, or written by an older process
+  sharing the file) carry no TTL of their own. `stm_proxy_select_chunks`
+  expires them by the `pending_ttl_seconds` of the configuration that first
+  opened that store in this process, rather than the one resolved last, and
+  one that keeps being selected stays judged that way. An older process
+  sharing the file still expires every row by its own TTL, so instances
+  sharing a `pending_store_path` should be upgraded together.
+
 - SELECTIVE and HYBRID keep one pending store per backend (in-memory, or
   each SQLite `pending_store_path`, compared after resolving it, so two
   spellings of one file share a store), as progressive delivery does since
@@ -34,10 +52,8 @@ changes inline only. See the deprecation policy in
   through a config reload or a call on another backend, where they used to
   answer "not found or expired"; the in-memory selective store is no longer
   emptied when a `selective` block changes. Tools that share one store but
-  set different `max_pending` / `pending_ttl_seconds` still evict it
-  store-wide, each write under its own tool's limits, and
-  `stm_proxy_select_chunks` expires a store's rows by the
-  `pending_ttl_seconds` most recently resolved for a tool writing to it.
+  set different `max_pending` still trim it store-wide, each write under its
+  own tool's limit; `pending_ttl_seconds` is per selection since #1370.
 
 - Progressive delivery keeps one pending store per backend (in-memory, or
   each SQLite `pending_store_path`). A tool with no `selective` block no

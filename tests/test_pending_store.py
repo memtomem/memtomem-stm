@@ -1088,6 +1088,13 @@ class TestSQLiteEvictionOrder:
             t.join(timeout=10)
         try:
             assert not errors, f"concurrent initialize() raised: {errors}"
+            columns = [
+                r[1] for r in stores[0]._get_db().execute("PRAGMA table_info(pending_selections)")
+            ]
+            assert columns.count("ttl_seconds") == 1, columns
+            for key in ("old1", "old2"):
+                legacy = stores[0].get(key)
+                assert legacy is not None and legacy.ttl_seconds is None
 
             ranks = [
                 row[0] for row in stores[0]._get_db().execute("SELECT seq FROM pending_selections")
@@ -1264,7 +1271,7 @@ class TestSQLiteEvictionOrder:
             store.put("k", _make_selection())
             old = sqlite3.connect(str(tmp_path / "pending.db"))
             try:
-                with pytest.raises(sqlite3.OperationalError, match="7 columns but 5 values"):
+                with pytest.raises(sqlite3.OperationalError, match="8 columns but 5 values"):
                     old.execute(
                         "INSERT OR REPLACE INTO pending_selections VALUES (?,?,?,?,?)",
                         ("legacy", '{"sec": "x"}', "markdown", 1000.0, 1),

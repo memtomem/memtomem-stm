@@ -442,6 +442,36 @@ async def test_a_refreshed_route_reads_back_under_its_new_ttl(tmp_path, monkeypa
 
         clock[0] += 5.0
         assert _serves(mgr, key, "a"), "the key expired under the superseded TTL"
+        stored = next(
+            row for o in mgr._selective_owners.values() if (row := o._store.get(key)) is not None
+        )
+        assert stored.ttl_seconds == 300.0, (
+            "the paused write was not stamped with its live route's TTL (#1370)"
+        )
+    finally:
+        await mgr.stop()
+
+
+async def test_a_short_ttl_server_does_not_expire_a_long_ttl_servers_key(tmp_path):
+    """Two servers on the in-memory backend share one store (#1365). The 1 s
+    server's call used to expire the 300 s server's key store-wide, and
+    ``select_chunks`` read back by the TTL resolved last (#1370)."""
+    mgr = _manager(
+        _cfg(
+            tmp_path,
+            {
+                "long": SelectiveConfig(pending_ttl_seconds=300.0),
+                "short": SelectiveConfig(pending_ttl_seconds=1.0),
+            },
+        )
+    )
+    try:
+        key = await _call(mgr, "long", "a")
+        (owner,) = mgr._selective_owners.values()
+        owner._store._data[key].created_at -= 5.0
+        await _call(mgr, "short", "b")
+
+        assert _serves(mgr, key, "a"), "a shorter-TTL server's call expired the key"
     finally:
         await mgr.stop()
 
