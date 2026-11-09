@@ -174,6 +174,8 @@ class ContextExtractor:
         # 1. Per-tool template
         if template:
             rendered = self._apply_template(template, server, tool, arguments)
+            if rendered is None:
+                return None
             # Whether the template yields a query is decided by its token
             # floor alone. ``_validate_query`` lets a sensitive query through
             # regardless, which would turn a short render into a query only
@@ -476,10 +478,27 @@ class ContextExtractor:
         server: str,
         tool: str,
         arguments: dict[str, Any],
-    ) -> str:
+    ) -> str | None:
+        """Render ``template``, or return ``None`` when ``str()`` of an
+        argument it names raises ``RecursionError``.
+
+        A value is rendered only when its placeholder occurs in the template
+        as substituted so far, so an argument the template does not name is
+        never stringified. ``str()`` of a list nested past the interpreter's
+        recursion limit raises ``RecursionError``, at a depth that varies by
+        platform and Python version; such a template yields no query rather
+        than a partial one whose meaning would silently differ.
+        """
         result = template.replace("{tool_name}", tool).replace("{server}", server)
         for key, value in arguments.items():
-            result = result.replace(f"{{arg.{key}}}", str(value))
+            placeholder = f"{{arg.{key}}}"
+            if placeholder not in result:
+                continue
+            try:
+                rendered = str(value)
+            except RecursionError:
+                return None
+            result = result.replace(placeholder, rendered)
         return result.strip()
 
     @staticmethod
