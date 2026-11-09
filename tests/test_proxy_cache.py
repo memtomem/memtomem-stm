@@ -2256,13 +2256,15 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0  # legacy rows wiped
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 6
+            assert version == 7
         finally:
             reopened.close()
 
-    @pytest.mark.parametrize("old_version", [4, 5])
-    def test_prior_rows_are_purged_by_v6_without_touching_other_tables(self, tmp_path, old_version):
-        """Old rows lack identity/size/metadata guarantees; other stores survive."""
+    # v6 rows may hold a structured SELECTIVE/HYBRID success over its
+    # serialized budget, served on a hit before any fit check (#1359).
+    @pytest.mark.parametrize("old_version", [4, 5, 6])
+    def test_prior_rows_are_purged_by_v7_without_touching_other_tables(self, tmp_path, old_version):
+        """Old rows lack identity/size/metadata/budget guarantees; other stores survive."""
         db_path = tmp_path / "c.db"
         cache = ProxyCache(db_path, max_entries=10)
         cache.initialize()
@@ -2278,7 +2280,7 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 6
+            assert version == 7
             assert (
                 reopened._db.execute("SELECT value FROM unrelated_metrics").fetchone()[0] == "keep"
             )
@@ -2335,7 +2337,7 @@ class TestKeySchemaVersionPurge:
             assert "envelope_safe" in columns
             assert "envelope_json" in columns
             (version,) = cache._db.execute("PRAGMA user_version").fetchone()
-            assert version == 6
+            assert version == 7
         finally:
             cache.close()
 
@@ -2451,7 +2453,7 @@ class TestSurrogateRoundTrip:
         assert proxy_cache.get(literal, "t", {}) == "literal-body"
         assert proxy_cache.get(f"srv{surrogate}", "t", {}) is None
 
-    def test_key_derivation_matches_the_pinned_v6_shape(self):
+    def test_key_derivation_matches_the_pinned_v7_shape(self):
         """The framed derivation, spelled out literally.
 
         Fails if the raw shape drifts without a ``_KEY_SCHEMA_VERSION`` bump —
@@ -2462,7 +2464,8 @@ class TestSurrogateRoundTrip:
         # both sides together and pass, when a bump is exactly the event that
         # orphans every stored entry and must be acknowledged deliberately.
         # (v4 → v5 was such a bump: the framing fix #784 changed every key,
-        # and the startup purge dropped the orphaned rows.)
+        # and the startup purge dropped the orphaned rows. v6 → v7 (#1359)
+        # drops rows that may hold a structured result over its budget.)
         # Components chosen so BYTE length differs from character length in
         # three ways at once: a 3-byte CJK character, a 2-byte accented one,
         # and a lone surrogate that only ``surrogatepass`` can encode (3
@@ -2473,7 +2476,7 @@ class TestSurrogateRoundTrip:
         args = {"k": "\u4e2d"}
         fingerprint = "fp\ud800"
         parts = [
-            "6",
+            "7",
             server,
             tool,
             json.dumps(args, sort_keys=True, ensure_ascii=False),
