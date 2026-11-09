@@ -586,7 +586,17 @@ model-specific tokenizer guarantee.
 Selective and hybrid (`tail_mode: "toc"`) responses short enough to return
 unchanged do so only when that serialized result also fits; JSON escaping can
 push a response past the budget its character count meets. Otherwise they build
-a TOC like longer responses.
+a TOC like longer responses. This holds for an empty text block and for a
+response within `max_result_tokens` as well. The budget reserves the upstream
+metadata the result keeps (result `_meta`, text-block annotations), so when that
+metadata leaves no room for even an empty result, the call returns
+`budget_exceeded`, as progressive delivery does.
+
+Only these key-publishing strategies (progressive, selective, and hybrid with
+`tail_mode: "toc"`) are held to the serialized budget. The other strategies
+compress to their character budget as in legacy delivery (`none` does not
+compress), so JSON escaping or retained upstream metadata can take their
+serialized result past `max_result_chars`.
 Hybrid TOCs are fitted with their head and complete key set before any pending
 store publication or eviction. Entries marked `inline: true` contain their full
 section; fitting shortens only non-inline previews. When the table still does

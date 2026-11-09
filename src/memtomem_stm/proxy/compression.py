@@ -1126,6 +1126,15 @@ class SelectiveCompressor:
         ``document`` is the full response when *text* is
         ``document[source_offset:]``. Markdown structure is read from it, since
         a slice can begin inside a code fence or in the middle of a line."""
+        if (
+            not text
+            and hybrid_head is None
+            and delivery_format() == "structured"
+            and not plain_result_fits(text)
+        ):
+            # Even an empty result must fit: the budget reserves the upstream
+            # metadata the final result keeps, which can exceed it (#1359).
+            raise DeliveryBudgetExceeded("Budget cannot hold the response metadata.")
         if not text or (
             hybrid_head is None
             and len(text) <= max_chars
@@ -3215,6 +3224,10 @@ class HybridCompressor:
         # Only a TOC tail publishes a key; a truncate tail is ordinary lossy
         # compression and keeps its character budget in both delivery modes.
         structured_toc = delivery_format() == "structured" and self._tail_mode == TailMode.TOC
+        if not text and structured_toc and not plain_result_fits(text):
+            # Even an empty result must fit: the budget reserves the upstream
+            # metadata the final result keeps, which can exceed it (#1359).
+            raise DeliveryBudgetExceeded("Budget cannot hold the response metadata.")
         if not text or (len(text) <= max_chars and (not structured_toc or plain_result_fits(text))):
             return text
 

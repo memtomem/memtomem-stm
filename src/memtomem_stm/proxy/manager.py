@@ -406,6 +406,22 @@ class ToolConfig:
     delivery_format: DeliveryFormat = "legacy"
 
 
+def _structured_key_publisher(strategy: CompressionStrategy, tc: ToolConfig) -> bool:
+    """Whether *strategy* publishes a retrieval key under structured delivery.
+
+    SELECTIVE, and HYBRID with a TOC tail, hold their result to the serialized
+    frame budget; a truncate tail is ordinary lossy compression and keeps its
+    character budget. PROGRESSIVE has its own branch.
+    """
+    return tc.delivery_format == "structured" and (
+        strategy == CompressionStrategy.SELECTIVE
+        or (
+            strategy == CompressionStrategy.HYBRID
+            and (tc.hybrid is None or tc.hybrid.tail_mode == TailMode.TOC)
+        )
+    )
+
+
 def _response_budget(cleaned: str, tc: ToolConfig) -> tuple[int, int | None]:
     """Resolve the pre-retention char cap and optional Unicode token estimate.
 
@@ -6869,6 +6885,13 @@ class ProxyManager:
                 estimated_tokens is not None
                 and tc.token_budget is not None
                 and estimated_tokens <= tc.token_budget
+                # A structured key publisher's intact response is still a
+                # serialized MCP result held to the frame budget; when it does
+                # not fit, the configured strategy fits it instead (#1359).
+                and not (
+                    _structured_key_publisher(effective_compression, tc)
+                    and not plain_result_fits(cleaned)
+                )
             ):
                 # A response already within the token budget stays intact,
                 # even if it crossed the operator's static char conversion.
@@ -6902,13 +6925,7 @@ class ProxyManager:
                 # attributed to AUTO afterwards (#933).
                 strategy_auto_selected = True
 
-            if tc.delivery_format == "structured" and (
-                effective_compression == CompressionStrategy.SELECTIVE
-                or (
-                    effective_compression == CompressionStrategy.HYBRID
-                    and (tc.hybrid is None or tc.hybrid.tail_mode == TailMode.TOC)
-                )
-            ):
+            if _structured_key_publisher(effective_compression, tc):
                 # Recoverable keys retain the source in full. A lossy-content
                 # retention floor must not widen their serialized result limit.
                 effective_max_chars, min_budget, dynamic = base_max_chars, 0, 0.0

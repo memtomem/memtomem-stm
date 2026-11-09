@@ -524,7 +524,11 @@ class CachedResponse(str):
 # v5: framed (length-prefixed) key derivation, args/context_query serialized
 # with ``ensure_ascii=False`` (#784).
 # v6: connection-scoped keys, pre-compression size, and text-block metadata.
-_KEY_SCHEMA_VERSION = 6
+# v7: a cached structured SELECTIVE/HYBRID (TOC) result fits its serialized
+# budget; older releases could store one over it under the same key (an empty
+# text block with large upstream metadata, or one within a Unicode token
+# budget), and a hit is served before any fit check (#1359).
+_KEY_SCHEMA_VERSION = 7
 
 
 def _make_key(

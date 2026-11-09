@@ -13,6 +13,25 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- Under `delivery_format: "structured"`, SELECTIVE and HYBRID (`tail_mode:
+  "toc"`) now hold two more passthroughs to the serialized result budget. An
+  empty text block whose upstream metadata (result `_meta` or text-block
+  annotations) leaves no room in the budget used to succeed over it (599
+  serialized characters at a 500-character budget, as reported); it now returns
+  `budget_exceeded`, as PROGRESSIVE and any non-empty text already did. With
+  `token_estimation_mode: "unicode"`, a response within `max_result_tokens` was
+  returned intact without the serialized check, so JSON escaping or metadata
+  could take it past the budget (675 serialized characters at 500, escaped text
+  and no metadata); it is now returned intact only when it fits, and otherwise
+  gets a table, progressive delivery or `budget_exceeded` like a longer
+  response. Other strategies keep their character budget in structured
+  delivery; `docs/compression.md` now says so. (#1359)
+  **Behavior change**: these structured calls return `budget_exceeded` or a
+  table where they used to return an over-budget success. The response cache
+  schema moves to v7, so the cache is emptied once on upgrade: entries stored
+  by older releases could hold such a success, and a cache hit is served
+  before any budget check.
+
 - Under `delivery_format: "structured"`, a PROGRESSIVE call whose progressive
   store fails, or whose credential-bearing response a persistent pending store
   refuses (#1148), is now held to the serialized result budget. It used to
