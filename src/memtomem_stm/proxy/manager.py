@@ -4376,6 +4376,46 @@ class ProxyManager:
             raise DeliveryBudgetExceeded("Budget cannot hold the degraded response.")
         return best
 
+    async def _degrade_truncation(
+        self,
+        cleaned: str,
+        max_chars: int,
+        *,
+        min_chars: int,
+        structured: bool,
+        context_query: str | None,
+        cfg_snap: ProxyConfig,
+    ) -> str:
+        """Boundary-aware truncation that replaces a key publisher whose store failed.
+
+        Cut at *max_chars* characters; when *structured*, the plain MCP result
+        must also fit the serialized budget the key publisher's frame was held
+        to, since JSON escaping can push a character-budgeted cut past it
+        (#1358). Raises ``DeliveryBudgetExceeded`` when no cut fits.
+        """
+        scorer: RelevanceScorer = self._relevance_scorer_for(cfg_snap)
+        if structured:
+            # The fit below may rerun the truncation at several budgets; score
+            # its sections once for all of them.
+            scorer = MemoizedScorer(scorer)
+        degrade = TruncateCompressor(scorer=scorer, min_chars=min_chars)
+        compressed = await self._compress_maybe_offthread(
+            degrade,
+            cleaned,
+            max_chars=max_chars,
+            context_query=context_query,
+            scorer=scorer,
+        )
+        if structured and not plain_result_fits(compressed):
+            compressed = await self._fit_structured_truncation(
+                degrade,
+                cleaned,
+                max_chars,
+                context_query=context_query,
+                scorer=scorer,
+            )
+        return compressed
+
     async def _apply_compression(
         self,
         text: str,
@@ -6710,6 +6750,7 @@ class ProxyManager:
             # ToolConfig off the silent-passthrough path, and mirrors the
             # ratio-guard Tier-1 call below.
             pcfg = tc.progressive or ProgressiveConfig()
+            _compress_ms = 0.0
             if len(cleaned) <= pcfg.chunk_size and (
                 tc.delivery_format != "structured" or plain_result_fits(cleaned)
             ):
@@ -6732,39 +6773,61 @@ class ProxyManager:
                 except Exception as exc:
                     # Progressive build/store failed (e.g. a SQLite-backed
                     # pending/reads store I/O error inside ``_apply_progressive``).
-                    # Degrade to a zero-loss passthrough of the full cleaned
-                    # upstream content instead of letting the exception escape
+                    # Degrade to a passthrough of the cleaned upstream content
+                    # instead of letting the exception escape
                     # ``_call_tool_inner`` — an escape here is recorded as
                     # INTERNAL_ERROR and DISCARDS an otherwise-successful upstream
                     # response. The ratio-guard fallback already wraps its Tier-1
                     # progressive call below; the primary PROGRESSIVE path now
-                    # mirrors that best-effort handling, but stays zero-loss
+                    # mirrors that best-effort handling, and stays zero-loss
                     # (passthrough, not lossy hybrid/truncate) because the
-                    # PROGRESSIVE strategy has no retention floor to satisfy.
+                    # PROGRESSIVE strategy has no retention floor to satisfy —
+                    # except in structured delivery, where a passthrough over the
+                    # serialized budget degrades to the same fitted truncation as
+                    # the SELECTIVE/HYBRID degrade below (#1368).
                     # A credential-bearing response refused by a persistent
                     # store (#1148) takes the same passthrough, but it is a
                     # policy outcome rather than a fault: no traceback, and its
                     # own label below.
+                    fit = tc.delivery_format == "structured" and not plain_result_fits(cleaned)
+                    # Logged before the fit, which may still end in budget_exceeded.
+                    fallback = (
+                        "falling back to a truncation fitted to the structured budget"
+                        if fit
+                        else "returning full cleaned content (passthrough)"
+                    )
                     if isinstance(exc, SensitivePayloadNotStored):
                         logger.info(
                             "Credential-bearing response from %s/%s not written to the "
-                            "persistent pending store; returning full cleaned content "
-                            "(passthrough)",
+                            "persistent pending store; %s",
                             server,
                             tool,
+                            fallback,
                         )
                     else:
                         logger.warning(
-                            "Progressive delivery failed for %s/%s; returning full "
-                            "cleaned content (passthrough)",
+                            "Progressive delivery failed for %s/%s; %s",
                             server,
                             tool,
+                            fallback,
                             exc_info=True,
                         )
                     compressed = cleaned
+                    if fit:
+                        _t0 = _time.monotonic()
+                        with scorer_fallback_scope() as _degrade_scorer_fb:
+                            compressed = await self._degrade_truncation(
+                                cleaned,
+                                base_max_chars,
+                                min_chars=0,
+                                structured=True,
+                                context_query=context_query,
+                                cfg_snap=cfg_snap,
+                            )
+                        _compress_ms = (_time.monotonic() - _t0) * 1000
+                        scorer_fallback = _degrade_scorer_fb[0]
                     progressive_passthrough_on_error = True
                     progressive_sensitive = isinstance(exc, SensitivePayloadNotStored)
-            _compress_ms = 0.0
             compressed_chars_for_metrics = len(compressed)
             # The metrics record at the bottom reads ``metrics_strategy`` on
             # every path; mirror the assignment at the top of the compression
@@ -6933,30 +6996,14 @@ class ProxyManager:
                             tool,
                             exc_info=True,
                         )
-                    _fb_scorer: RelevanceScorer = self._relevance_scorer_for(cfg_snap)
-                    if tc.delivery_format == "structured":
-                        # The fit below may rerun the truncation at several
-                        # budgets; score its sections once for all of them.
-                        _fb_scorer = MemoizedScorer(_fb_scorer)
-                    _degrade = TruncateCompressor(scorer=_fb_scorer, min_chars=min_budget)
-                    compressed = await self._compress_maybe_offthread(
-                        _degrade,
+                    compressed = await self._degrade_truncation(
                         cleaned,
-                        max_chars=effective_max_chars,
+                        effective_max_chars,
+                        min_chars=min_budget,
+                        structured=tc.delivery_format == "structured",
                         context_query=context_query,
-                        scorer=_fb_scorer,
+                        cfg_snap=cfg_snap,
                     )
-                    if tc.delivery_format == "structured" and not plain_result_fits(compressed):
-                        # The degrade replaces a key publisher whose frame was
-                        # held to the serialized budget; JSON escaping can push
-                        # a character-budgeted truncation past it (#1358).
-                        compressed = await self._fit_structured_truncation(
-                            _degrade,
-                            cleaned,
-                            effective_max_chars,
-                            context_query=context_query,
-                            scorer=_fb_scorer,
-                        )
                     llm_fallback = None
                     selective_store_error = True
                 _compress_ms = (_time.monotonic() - _t0) * 1000

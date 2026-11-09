@@ -13,6 +13,21 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- Under `delivery_format: "structured"`, a PROGRESSIVE call whose progressive
+  store fails, or whose credential-bearing response a persistent pending store
+  refuses (#1148), is now held to the serialized result budget. It used to
+  return the whole cleaned response however large it was (5485 serialized
+  characters at a 1600-character budget, as reported). A passthrough that does
+  not fit is now replaced by the boundary-aware truncation the SELECTIVE/HYBRID
+  degrade uses (#1367), shortened until it fits, and `budget_exceeded` is
+  returned when no truncation does. A passthrough that fits is unchanged, and
+  legacy delivery still returns the full response. The metrics labels
+  (`progressive→passthrough_on_error` / `→passthrough_on_sensitive`) and the
+  cache exclusion are unchanged. (#1368)
+  **Behavior change**: in structured delivery this degrade is no longer
+  zero-loss when the response is over the budget; the agent gets a truncation,
+  with no key to read the rest, since the store that would hold it failed.
+
 - The surfacing auto-tuner no longer adjusts a tool's `min_score` on a call
   where LTM retrieved nothing (an empty result, or only pinned blocks). Such a
   batch carries no RRF reference, so the tuner fell back to the configured

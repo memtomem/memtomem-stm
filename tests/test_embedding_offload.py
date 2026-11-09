@@ -327,7 +327,8 @@ class TestAllScorerSitesRouteThroughHelper:
         [
             ("_apply_compression", 5),  # selective, no_config, truncate, schema, skeleton
             ("_apply_hybrid", 1),
-            ("_compress_and_surface", 2),  # store-fault fallback, ratio-guard tier 3
+            ("_compress_and_surface", 1),  # ratio-guard tier 3
+            ("_degrade_truncation", 1),  # store-fault / sensitive degrade (#1368)
         ],
     )
     def test_sites_use_helper(self, method_name: str, expected_helper_calls: int):
