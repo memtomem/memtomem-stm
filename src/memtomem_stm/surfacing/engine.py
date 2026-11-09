@@ -1074,10 +1074,11 @@ class SurfacingEngine:
           out at ``0.03``, and a structured one is never lower than that.
 
         ``None`` when the batch says nothing about the RRF scale: nothing was
-        retrieved, or the first retrieved result carries a core-named non-RRF
-        scale (such a batch reaches the tuner only with
-        ``scale_gated_min_score`` off). A cap set too low costs a little noise
-        where one set too high silences the tool for good. Same
+        retrieved (the engine does not tune on such a batch, #1346), or the
+        first retrieved result carries a core-named non-RRF scale (such a
+        batch reaches the tuner only with ``scale_gated_min_score`` off). A
+        cap set too low costs a little noise where one set too high silences
+        the tool for good. Same
         first-retrieved-result rule as :meth:`_result_score_scale`.
         """
         for r in results:
@@ -2830,10 +2831,14 @@ class SurfacingEngine:
         # maybe_adjust is skipped on a suspended batch so the RRF-scale
         # tuner doesn't move on evidence from a foreign scale; on a pinned
         # tool ``_active_min_score`` returns the pin before the tuner runs,
-        # so the pre-existing "pinned tools don't learn" behavior holds.
+        # so the pre-existing "pinned tools don't learn" behavior holds. A
+        # batch with nothing retrieved (empty, or pinned-only) is skipped too:
+        # it carries no RRF reference, so the tuner would spend fresh feedback
+        # under the configured ceiling, above the reference (#1346). The
+        # feedback waits for the next non-empty batch that tunes.
         filter_suspended = self._scale_gate_suspends(tool, score_scale)
         batch_ceiling = self._batch_score_ceiling(retrieved_results)
-        if not filter_suspended:
+        if retrieved_results and not filter_suspended:
             await self._maybe_auto_tune(tool, batch_ceiling)
         min_score = self._active_min_score(tool, batch_ceiling)
         self._observe_score_scale(

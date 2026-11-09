@@ -13,6 +13,18 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The surfacing auto-tuner no longer adjusts a tool's `min_score` on a call
+  where LTM retrieved nothing (an empty result, or only pinned blocks). Such a
+  batch carries no RRF reference, so the tuner fell back to the configured
+  `auto_tune_score_ceiling` (`0.05`, above the two-leg reference `2/61`): it
+  could raise the stored value toward that ceiling, or lower a stored value
+  above the reference by one step from where it was, where an RRF batch steps
+  down from the reference. Either way it marked the feedback as read, so the
+  next RRF batch did not act on it. Later RRF batches already filtered with
+  the tuned value capped at their reference, and an empty batch has nothing to
+  filter; what was wrong is the stored value `stm_surfacing_stats` shows. That
+  feedback now waits for the next non-empty batch that tunes. (#1346)
+
 - A SELECTIVE/HYBRID call cancelled while its compress runs off-thread (a
   relevance scorer that does blocking I/O, such as the embedding scorer) now
   keeps its pending store open until that worker finishes. During shutdown the
