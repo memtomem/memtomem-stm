@@ -1510,7 +1510,8 @@ class MetricsStore:
 
         A row whose ``compression_strategy`` ends in ``→passthrough_on_error``
         records the proxy degrading a failed primary ``PROGRESSIVE`` store to an
-        uncached full-content passthrough (see ``ProxyManager``). The
+        uncached passthrough of the cleaned content — truncated to fit in
+        structured delivery when it would not (see ``ProxyManager``). The
         ``passthrough_on_error`` suffix is unique to this family, so a
         ``LIKE '%passthrough_on_error'`` match never collides with the other
         ``X→Y_fallback`` strategy labels (e.g. ``timeout_fallback``).
