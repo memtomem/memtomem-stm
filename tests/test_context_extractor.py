@@ -42,6 +42,73 @@ class TestQueryTemplate:
         assert result == "server search hello"
 
 
+class _TooDeep(list):  # type: ignore[type-arg]
+    """Stands in for a list nested past the C recursion limit: ``str()`` of the
+    real thing raises ``RecursionError`` at a depth that depends on the
+    platform (5,000 on the Windows CI lanes, about 10,000 on macOS), #1364."""
+
+    def __repr__(self) -> str:
+        raise RecursionError("maximum recursion depth exceeded while getting the repr")
+
+
+class _NeverRendered:
+    """An argument the template does not name; rendering it fails the test."""
+
+    def __str__(self) -> str:
+        raise AssertionError("an argument the template does not name was rendered")
+
+    __repr__ = __str__
+
+
+# Static text alone clears the default ``min_query_tokens`` (3), so a ``None``
+# below cannot come from the token floor or from rendering the value as "".
+_LOOKUP = {
+    "context_tools": {
+        "lookup": ToolSurfacingConfig(query_template="lookup stored {arg.q} entries here")
+    }
+}
+
+
+class TestTemplateRendering:
+    def test_unrenderable_named_argument_yields_no_query(self) -> None:
+        assert _extract("lookup", {"q": _TooDeep()}, **_LOOKUP) is None
+
+    def test_unrenderable_value_with_a_secret_still_yields_no_query(self) -> None:
+        """The raw privacy check returns the raw inputs only in place of a
+        query the route yields; an unrenderable template yields none."""
+        args = {"q": _TooDeep(), "note": "api_key=demo_secret_value"}
+        assert _extract("lookup", args, **_LOOKUP) is None
+
+    def test_argument_the_template_does_not_name_is_not_rendered(self) -> None:
+        args = {"blob": _NeverRendered(), "q": "auth tokens", "deep": _TooDeep()}
+        assert _extract("lookup", args, **_LOOKUP) == "lookup stored auth tokens entries here"
+
+    def test_named_list_still_renders_as_its_str(self) -> None:
+        cfg = {
+            "context_tools": {"lookup": ToolSurfacingConfig(query_template="{arg.q}")},
+            "min_query_tokens": 1,
+        }
+        assert _extract("lookup", {"q": ["a", "b"]}, **cfg) == "['a', 'b']"
+
+    def test_placeholder_introduced_by_an_earlier_value_is_still_substituted(self) -> None:
+        cfg = {
+            "context_tools": {
+                "lookup": ToolSurfacingConfig(query_template="find {arg.a} please now")
+            }
+        }
+        args = {"a": "{arg.b} docs", "b": "routing"}
+        assert _extract("lookup", args, **cfg) == "find routing docs please now"
+
+    def test_real_deep_list_does_not_raise(self) -> None:
+        """Past every platform's limit: either rendering works (a future
+        interpreter) or the template yields no query; it never raises."""
+        deep: Any = "x"
+        for _ in range(200_000):
+            deep = [deep]
+        result = _extract("lookup", {"q": deep}, **_LOOKUP)
+        assert result is None or result.startswith("lookup stored")
+
+
 class TestContextQuery:
     def test_context_query_argument(self):
         result = _extract("any_tool", {"_context_query": "find authentication code", "path": "x"})

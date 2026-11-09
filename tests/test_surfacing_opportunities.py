@@ -28,7 +28,7 @@ from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.server import _surfacing_verdict_line, stm_surfacing_stats
 from memtomem_stm.surfacing import engine as engine_module
 from memtomem_stm.surfacing.arg_shape import arg_shape_json
-from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.config import SurfacingConfig, ToolSurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.surfacing.feedback_store import FeedbackStore, OpportunityRow
@@ -214,6 +214,30 @@ class TestOneRowPerCall:
         engine._extractor.extract_query = lambda *a, **k: None  # type: ignore[method-assign]
         try:
             assert await engine.surface("gh", "read_file", ARGS, RESPONSE) == RESPONSE
+            await engine.drain_store_writes()
+            (row,) = _opps(tracker.store.db_path)
+            assert (row["gate_decision"], row["query_digest"]) == ("skip:no_query", None)
+        finally:
+            await _close(engine, tracker)
+
+    async def test_unrenderable_template_argument_is_no_query(self, tmp_path: Path) -> None:
+        """A template argument whose ``str()`` raises ``RecursionError`` (a list
+        nested past the C recursion limit, #1364) ends the call as a
+        ``no_query`` skip, not an ``error:RecursionError`` raised out of
+        ``surface``. The real extractor runs; only the value is a stand-in."""
+
+        class TooDeep(list):  # type: ignore[type-arg]
+            def __repr__(self) -> str:
+                raise RecursionError("maximum recursion depth exceeded")
+
+        engine, tracker = _engine(
+            tmp_path,
+            [_result("m1")],
+            context_tools={"lookup": ToolSurfacingConfig(query_template="lookup {arg.q} entries")},
+        )
+        try:
+            out = await engine.surface("gh", "lookup", {"q": TooDeep()}, RESPONSE)
+            assert out == RESPONSE
             await engine.drain_store_writes()
             (row,) = _opps(tracker.store.db_path)
             assert (row["gate_decision"], row["query_digest"]) == ("skip:no_query", None)

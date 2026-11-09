@@ -13,6 +13,14 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- A per-tool `query_template` no longer raises `RecursionError` out of
+  surfacing when a tool argument is nested past the interpreter's recursion
+  limit (about 5,000 levels on the Windows CI lanes and 10,000 on macOS). Every
+  argument used to be stringified, including ones the template does not name;
+  now only named arguments are rendered, and one that cannot be rendered makes
+  the template yield no query, so the call is skipped as `no_query` instead of
+  being recorded as `error:RecursionError` and raised to the caller. Templates
+  that rendered JSON arguments before render the same text. (#1364)
 - Under `delivery_format: "structured"`, SELECTIVE and HYBRID (`tail_mode:
   "toc"`) now hold two more passthroughs to the serialized result budget. An
   empty text block whose upstream metadata (result `_meta` or text-block
