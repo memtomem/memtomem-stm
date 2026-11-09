@@ -5686,6 +5686,110 @@ class TestAutoTuneRrfReferenceCeiling:
             tracker.close()
 
 
+class TestAutoTuneSkipsBatchesWithNothingRetrieved:
+    """#1346: a batch with no retrieved result has no RRF reference, so the
+    tuner would fall back to the configured ceiling (0.05, above the 2/61
+    reference) and spend fresh feedback under it. Feedback must wait for the
+    next non-empty batch that tunes."""
+
+    STAMPED_TOP = 2 / 61
+
+    def _setup(self, tmp_path: Path, rating: str, stuck: float, adapter=None):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        config = _make_config(auto_tune_enabled=True, auto_tune_min_samples=3, min_score=0.017)
+        tracker = FeedbackTracker(config=config, db_path=tmp_path / "fb.db")
+        tracker.store.save_adjustment("read_file", stuck)
+        tracker.store.record_surfacing("seed", "gh", "read_file", "q", ["m1"], [0.03])
+        for _ in range(5):
+            tracker.store.record_feedback("seed", rating)
+        if adapter is None:
+            adapter = _make_mcp_adapter([])
+        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
+        return engine, tracker, adapter
+
+    def _stamped(self) -> list[FakeSearchResult]:
+        return [
+            FakeSearchResult(
+                chunk=FakeChunk(content="both legs rank first"),
+                score=0.0328,
+                score_scale="rrf",
+                score_ceiling=self.STAMPED_TOP,
+            )
+        ]
+
+    async def test_helpful_feedback_waits_for_a_known_cap(self, tmp_path: Path):
+        engine, tracker, adapter = self._setup(tmp_path, "helpful", stuck=0.05)
+        try:
+            await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            # Nothing retrieved: no step under the configured 0.05 ceiling.
+            assert tracker.store.load_adjustments()["read_file"] == 0.05
+
+            adapter.search.return_value = (self._stamped(), [], "ok")
+            args = {**VALID_ARGS, "_context_query": "a different query for the stamped batch"}
+            await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+            # The same feedback now steps down from the applied 0.0327, so the
+            # stored value lands below the reference instead of at 0.048.
+            stored = tracker.store.load_adjustments()["read_file"]
+            assert stored == pytest.approx(0.0327 - 0.002)
+            assert stored < self.STAMPED_TOP
+        finally:
+            tracker.close()
+
+    async def test_negative_feedback_does_not_raise_on_an_empty_batch(self, tmp_path: Path):
+        engine, tracker, _ = self._setup(tmp_path, "not_relevant", stuck=0.04)
+        try:
+            await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            # Under the configured 0.05 ceiling this would store 0.042.
+            assert tracker.store.load_adjustments()["read_file"] == 0.04
+        finally:
+            tracker.close()
+
+    async def test_pinned_only_batch_is_also_skipped(self, tmp_path: Path):
+        engine, tracker, adapter = self._setup(tmp_path, "not_relevant", stuck=0.04)
+        pinned = FakeSearchResult(chunk=FakeChunk(content="pinned"), score=0.9)
+        pinned.pinned = True  # type: ignore[attr-defined]
+        adapter.search.return_value = ([pinned], [], "ok")
+        try:
+            await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert tracker.store.load_adjustments()["read_file"] == 0.04
+        finally:
+            tracker.close()
+
+    async def test_pinned_only_compose_answer_is_also_skipped(self, tmp_path: Path):
+        pinned = _remote_result("pinned block", 1.0, source="pin.md")
+        pinned.pinned = True
+        adapter = _make_compose_adapter([], pinned=[pinned])
+        engine, tracker, _ = self._setup(tmp_path, "not_relevant", stuck=0.04, adapter=adapter)
+        try:
+            out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            adapter.context_compose.assert_awaited_once()
+            assert "pinned block" in out
+            assert tracker.store.load_adjustments()["read_file"] == 0.04
+        finally:
+            tracker.close()
+
+    async def test_known_non_rrf_batch_still_tunes_with_the_gate_off(self, tmp_path: Path):
+        # ``None`` ceiling from a named non-RRF scale is not "nothing
+        # retrieved": with ``scale_gated_min_score`` off it keeps tuning.
+        engine, tracker, adapter = self._setup(tmp_path, "not_relevant", stuck=0.04)
+        engine._config.scale_gated_min_score = False
+        adapter.search.return_value = (
+            [
+                FakeSearchResult(
+                    chunk=FakeChunk(content="reranked"), score=0.9, score_scale="rerank"
+                )
+            ],
+            [],
+            "ok",
+        )
+        try:
+            await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert tracker.store.load_adjustments()["read_file"] == pytest.approx(0.042)
+        finally:
+            tracker.close()
+
+
 class TestBatchScoreCeiling:
     """Which batches hand the tuner and the filter a cap, and at what
     precision (#1062)."""

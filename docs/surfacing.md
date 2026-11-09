@@ -829,7 +829,8 @@ at:
 | `rrf` with a valid `score_ceiling` stamp (`sum(rrf_weights) / (rrf_k + 1)`) | the stamp, floored to 4 places |
 | `rrf` without a valid stamp | `2/61` floored to 4 places (`0.0327`) |
 | no `score_scale` (compact format, older cores) | `2/61` floored to 2 places (`0.03`) |
-| empty, or a named non-RRF scale | none; only the configured bounds apply |
+| a named non-RRF scale (tunes only with `scale_gated_min_score` off) | none; only the configured bounds apply |
+| nothing retrieved (empty, or pinned blocks only) | not tuned; new feedback waits for the next batch that tunes |
 
 The effective cap is `min(auto_tune_score_ceiling, max(cap, min_score))`, so a
 top-level `min_score` above the cap is kept. Each search filters with the tuned value
