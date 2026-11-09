@@ -44,8 +44,8 @@ class TestQueryTemplate:
 
 class _TooDeep(list):  # type: ignore[type-arg]
     """Stands in for a list nested past the C recursion limit: ``str()`` of the
-    real thing raises ``RecursionError`` at a depth that depends on the
-    platform (5,000 on the Windows CI lanes, about 10,000 on macOS), #1364."""
+    real thing raises ``RecursionError`` at a depth that varies by platform
+    and Python version (5,000 failed on the Windows CI lanes), #1364."""
 
     def __repr__(self) -> str:
         raise RecursionError("maximum recursion depth exceeded while getting the repr")
@@ -100,8 +100,8 @@ class TestTemplateRendering:
         assert _extract("lookup", args, **cfg) == "find routing docs please now"
 
     def test_real_deep_list_does_not_raise(self) -> None:
-        """Past every platform's limit: either rendering works (a future
-        interpreter) or the template yields no query; it never raises."""
+        """A 200,000-level nesting stress test: whether this interpreter can
+        render it or not, the template yields a query or none; it never raises."""
         deep: Any = "x"
         for _ in range(200_000):
             deep = [deep]

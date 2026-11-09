@@ -479,15 +479,15 @@ class ContextExtractor:
         tool: str,
         arguments: dict[str, Any],
     ) -> str | None:
-        """Render ``template``, or return ``None`` when an argument it names
-        cannot be rendered.
+        """Render ``template``, or return ``None`` when ``str()`` of an
+        argument it names raises ``RecursionError``.
 
         A value is rendered only when its placeholder occurs in the template
         as substituted so far, so an argument the template does not name is
-        never stringified. ``str()`` of a list nested past the interpreter's C
-        recursion limit raises ``RecursionError``, and that limit is lower on
-        Windows; such a template yields no query rather than a partial one
-        whose meaning would silently differ.
+        never stringified. ``str()`` of a list nested past the interpreter's
+        recursion limit raises ``RecursionError``, at a depth that varies by
+        platform and Python version; such a template yields no query rather
+        than a partial one whose meaning would silently differ.
         """
         result = template.replace("{tool_name}", tool).replace("{server}", server)
         for key, value in arguments.items():

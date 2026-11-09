@@ -517,9 +517,9 @@ export MEMTOMEM_STM_SURFACING__CONTEXT_TOOLS='{
 Template variables: `{tool_name}`, `{server}`, `{arg.ARGUMENT_NAME}`
 
 An argument value is rendered with `str()`, and only when its placeholder
-occurs in the template as substituted so far. If a value cannot be rendered
-(a list nested past the interpreter's recursion limit), the template yields no
-query and the call is skipped as `no_query`.
+occurs in the template as substituted so far. If `str()` of a value raises
+`RecursionError` (a list nested past the interpreter's recursion limit), the
+template yields no query and the call is skipped as `no_query`.
 
 **`min_score` precedence (highest wins):** per-tool `context_tools.<name>.min_score` → scale-gate suspension (when `scale_gated_min_score=true` and the core names a non-RRF `score_scale` — no floor is applied to that batch) → auto-tuned value (when `auto_tune_enabled=true`) → top-level `min_score`. An explicit per-tool override always wins, even with auto-tune on and even on a scale-gated batch — set it when you want a fixed threshold that neither the tuner nor the gate should move.
 
