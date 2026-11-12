@@ -21,7 +21,9 @@ from re._constants import AT, AT_BOUNDARY, AT_NON_BOUNDARY
 
 import pytest
 
+from memtomem_stm.proxy import cache as cache_module
 from memtomem_stm.proxy import privacy
+from test_privacy_pkcs8 import _open, _rows, _stamp
 
 _LEADING = "(?<![A-Za-z0-9_])"
 _TRAILING = "(?![A-Za-z0-9_])"
@@ -232,3 +234,28 @@ def test_a_label_still_matches_across_an_ideographic_space():
 def test_the_credential_scan_sees_a_token_inside_cjk_prose(text):
     assert privacy.contains_sensitive_content(text, privacy.CREDENTIAL_PATTERNS)
     assert privacy.contains_sensitive_content(text)
+
+
+def test_a_response_cached_before_the_fix_is_swept_on_upgrade(tmp_path, monkeypatch):
+    # The rewrite changes DEFAULT_PATTERNS, so it changes the cache's policy
+    # fingerprint, and the first open under it drops the rows the old spelling
+    # let through. Checked straight after the open, before a read could evict.
+    path = tmp_path / "c.db"
+    with monkeypatch.context() as old_build:
+        old_build.setattr(
+            privacy,
+            "DEFAULT_PATTERNS",
+            [*map(_with_word_boundaries, privacy.CREDENTIAL_PATTERNS), *privacy.PII_PATTERNS],
+        )
+        old_stamp = cache_module._privacy_policy_fingerprint()
+        seed = _open(path)
+        try:
+            seed.set("s", "keyed", {}, f"배포 키 {_TOKENS[9]}를 사용한다", ttl_seconds=None)
+            seed.set("s", "clean", {}, "배포 키를 사용한다", ttl_seconds=None)
+        finally:
+            seed.close()
+    assert set(_rows(path)) == {"keyed", "clean"}
+
+    _open(path).close()
+    assert _rows(path) == {"clean": "배포 키를 사용한다"}
+    assert _stamp(path) == cache_module._privacy_policy_fingerprint() != old_stamp

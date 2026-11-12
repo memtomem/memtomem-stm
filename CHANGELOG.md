@@ -167,14 +167,17 @@ changes inline only. See the deprecation policy in
   tokens) were anchored with a word boundary that counts Hangul, kana and Han
   characters as part of a word, so a token with such text directly in front
   of it, or with a particle attached behind it (`키 AKIA…를 사용한다`),
-  matched nothing. Every gate that reads the scan treated that text as clean:
-  LLM compression and extraction could send it to their provider, the
-  response cache and selection telemetry could store it, and a surfacing
-  query carrying it was searched and persisted. The boundaries now count
+  matched nothing. Every gate that reads the scan treated that text as clean,
+  among them LLM compression and extraction routing, the response cache, LTM
+  auto-indexing and fact persistence, tool-metadata eligibility, the
+  selection log, and the surfacing query guard, which searched and persisted
+  such a query. The boundaries now count
   only ASCII letters, digits and `_` as word characters, the same strings
   memtomem LTM uses (memtomem#3298). Nothing changes for a token between
   ASCII neighbours; a token directly after an accented Latin letter is now
-  matched too.
+  matched too. Upgrading from 0.7.7 or earlier already empties the response
+  cache; a cache written by a later build drops, on its first open, the
+  responses the old patterns let through.
 
 ## [0.7.7] — 2026-11-05
 
