@@ -160,6 +160,21 @@ changes inline only. See the deprecation policy in
   daemon as `ltm_unavailable` and an expired request as `error_timeout`
   instead of `ltm_call_failed`, and no longer record a starting or busy
   daemon at all.
+- A credential written directly against Korean, Japanese or Chinese text is
+  no longer missed by the privacy scan. Ten of the twenty credential patterns
+  (npm, AWS access key id, JWT, the newer OpenAI and Anthropic keys, GitHub
+  `gho_`/`ghu_`/`ghs_`/`ghr_`, Google API, GitLab, Hugging Face and PyPI
+  tokens) were anchored with a word boundary that counts Hangul, kana and Han
+  characters as part of a word, so a token with such text directly in front
+  of it, or with a particle attached behind it (`키 AKIA…를 사용한다`),
+  matched nothing. Every gate that reads the scan treated that text as clean:
+  LLM compression and extraction could send it to their provider, the
+  response cache and selection telemetry could store it, and a surfacing
+  query carrying it was searched and persisted. The boundaries now count
+  only ASCII letters, digits and `_` as word characters, the same strings
+  memtomem LTM uses (memtomem#3298). Nothing changes for a token between
+  ASCII neighbours; a token directly after an accented Latin letter is now
+  matched too.
 
 ## [0.7.7] — 2026-11-05
 

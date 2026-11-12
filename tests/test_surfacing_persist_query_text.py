@@ -209,6 +209,7 @@ class TestSecretGuard:
         "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36",
         "psql password=hunter2secret",
         "aws AKIAIOSFODNN7EXAMPLE",
+        "배포 키 AKIAIOSFODNN7EXAMPLE를 사용한다",
         "gh ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
         "-----BEGIN RSA PRIVATE KEY-----",
     ]
