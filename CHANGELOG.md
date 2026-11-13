@@ -9,6 +9,24 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Fixed
+
+- A new upstream prefix can no longer end in a newline. The prefix rule is now
+  checked against the whole value: before, `"fs\n"` passed (`$` also matches
+  just before a final newline) while `"fs\n\n"` was refused. This applies to
+  the prefix given to `mms add` or typed at the `mms add --from-clients` and
+  `mms init` prompts, and to the prefix that `mms import` and `mms host sync`
+  derive from a host config entry's name: a name ending in a newline now gets
+  the fallback prefix `mcp` instead of keeping the newline.
+  **Behavior change**: `mms add --prefix` with a trailing newline now exits
+  with the invalid-prefix error, and an imported or synced host entry whose
+  name ends in a newline is registered with prefix `mcp`. Prefixes already
+  saved in the proxy config or `~/.mms/registry.toml` are not migrated on
+  upgrade or load; `mms host sync --apply --force` can still replace such a
+  registry entry with the newly derived one when its host shape changed.
+
 ## [0.7.8] — 2026-11-14
 
 ### Upgrade notes

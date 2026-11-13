@@ -169,6 +169,15 @@ class TestDerivePrefix:
         assert ih._derive_prefix("123") == "mcp"
         assert ih._derive_prefix("---") == "mcp"
 
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [("fs\n", "mcp"), ("9lives\n", "mcp"), ("fs\n\n", "mcp")],
+    )
+    def test_trailing_newline_is_not_a_valid_prefix(self, name, expected):
+        # A host config key can end in a newline; it must not survive into
+        # the derived prefix (``$`` alone accepts one trailing newline).
+        assert ih._derive_prefix(name) == expected
+
 
 # ---------------------------------------------------------------------------
 # Per-host scanners

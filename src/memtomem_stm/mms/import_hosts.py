@@ -194,11 +194,11 @@ def _derive_prefix(name: str) -> str:
     one.
     """
     candidate = name.lower().replace("-", "_")
-    if _PREFIX_RE.match(candidate):
+    if _PREFIX_RE.fullmatch(candidate):
         return candidate
     # Strip leading non-letters then re-check; if still bad, fall back to "mcp".
     stripped = re.sub(r"^[^a-zA-Z]+", "", candidate)
-    if stripped and _PREFIX_RE.match(stripped):
+    if stripped and _PREFIX_RE.fullmatch(stripped):
         return stripped
     return "mcp"
 
