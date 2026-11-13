@@ -127,6 +127,12 @@ changes inline only. See the deprecation policy in
   - the demo upstream: set `upstream_servers.demo.args` in `stm_proxy.json` to
     `["-P", "-m", "memtomem_stm.demo_server"]` (`mms init --demo --resume`
     leaves that entry as it is).
+- deps: the lockfile moves `opentelemetry-api` from 1.45.1 to 1.45.2 for
+  CVE-2026-126360 (GHSA-mf5v-w3w3-f6cg, quadratic-time `traceparent`
+  parsing), with the OpenTelemetry SDK and exporter packages it is released
+  with. STM declares no `opentelemetry-api` floor; it arrives through `mcp`
+  and the `otlp` and `langfuse` extras, so an environment that pins an older
+  version must move it up itself (#1388).
 
 ### Fixed
 
