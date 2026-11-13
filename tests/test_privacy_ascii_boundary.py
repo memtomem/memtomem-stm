@@ -4,7 +4,8 @@ Python's ``\\b`` counts every Unicode letter and digit as a word character, so a
 credential with a Korean particle attached, or sitting inside Chinese or
 Japanese prose, had no boundary on that side and ten of the token rules missed
 it. The rules now spell their boundaries as ASCII lookarounds, as memtomem LTM
-does.
+does. STM's email rule, which LTM does not have, ended in ``\\b`` too and takes
+the same spelling.
 
 What that must and must not change is checked against two references built
 from the patterns themselves: the set as it was spelled before (the same
@@ -194,8 +195,30 @@ def test_an_underscore_behind_is_still_not_a_boundary(index):
 def test_no_rule_uses_a_word_boundary_escape():
     # A rule synced in with ``\b`` reintroduces the miss; write the boundary as
     # the ASCII lookarounds described above ``CREDENTIAL_PATTERNS``.
-    rules = privacy.CREDENTIAL_PATTERNS
+    rules = privacy.DEFAULT_PATTERNS
     assert {rule: _boundary_assertions(rule) for rule in rules if _boundary_assertions(rule)} == {}
+
+
+_EMAIL_RULE = privacy.PII_PATTERNS[0]
+_ADDRESSES = ("user@example.com", "a.b+c@sub.example.co.uk", "git@github.com:org/repo.git")
+
+
+def test_the_email_rule_matches_what_an_ascii_word_boundary_matches():
+    rule = re.compile(_EMAIL_RULE)
+    reference = _ascii_boundary(_EMAIL_RULE)
+    assert reference.pattern != rule.pattern
+    for body in _ADDRESSES:
+        for before in _NEIGHBOURS:
+            for after in _NEIGHBOURS:
+                text = f"{before}{body}{after}"
+                assert _spans(rule, text) == _spans(reference, text), repr(text)
+
+
+@pytest.mark.parametrize("neighbour", _NON_ASCII)
+def test_an_address_with_non_ascii_text_behind_is_pii(neighbour):
+    text = f"메일 user@example.com{neighbour}"
+    assert privacy.contains_sensitive_content(text, privacy.PII_PATTERNS)
+    assert not privacy.contains_sensitive_content(text, privacy.CREDENTIAL_PATTERNS)
 
 
 def test_the_boundary_check_sees_what_it_is_looking_for():

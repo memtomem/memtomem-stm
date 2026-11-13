@@ -171,11 +171,17 @@ changes inline only. See the deprecation policy in
   among them LLM compression and extraction routing, the response cache, LTM
   auto-indexing and fact persistence, tool-metadata eligibility, the
   selection log, and the surfacing query guard, which searched and persisted
-  such a query. The boundaries now count
-  only ASCII letters, digits and `_` as word characters, the same strings
-  memtomem LTM uses (memtomem#3298). Nothing changes for a token between
-  ASCII neighbours; a token directly after an accented Latin letter is now
-  matched too. Upgrading from 0.7.7 or earlier already empties the response
+  such a query. The boundaries now count only ASCII letters, digits and `_`
+  as word characters, the same strings memtomem LTM uses (memtomem#3298).
+  Nothing changes for a token between ASCII neighbours; a token directly
+  after an accented Latin letter is now matched too. The email rule, which
+  only STM has, ended the same way, so an address with a particle attached
+  (`user@example.com을`) was not PII. It now is, and the storage gates treat
+  it as they already treated an address between ASCII neighbours: the
+  response cache does not store it, auto-indexing skips it, the selection
+  log drops a line carrying it, and a surfacing query carrying it is skipped
+  as `sensitive_query`.
+  Upgrading from 0.7.7 or earlier already empties the response
   cache; a cache written by a later build drops, on its first open, the
   responses the old patterns let through.
 

@@ -273,14 +273,21 @@ class TestSecretGuard:
         assert out.startswith(_QUERY_HASH_PREFIX)
         assert engine._persistable_query("ordinary search text") == "ordinary search text"
 
-    async def test_email_query_hashed_pii_not_credential(self):
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "email bob.smith@example.com about the outage",
+            # Korean particle on the TLD: ``\b`` read it as part of the word.
+            "bob.smith@example.com으로 장애 알림 메일",
+        ],
+    )
+    async def test_email_query_hashed_pii_not_credential(self, query):
         # L278 contrast pin: an email is NOT a credential — the LLM routing
         # gate (CREDENTIAL_PATTERNS) ignores it — but it IS
         # persist-sensitive: this guard scans the full default set
         # (credentials + PII), so an email-bearing query still hashes.
         from memtomem_stm.proxy import privacy
 
-        query = "email bob.smith@example.com about the outage"
         assert privacy.contains_sensitive_content(query, privacy.CREDENTIAL_PATTERNS) is False
 
         engine = SurfacingEngine(

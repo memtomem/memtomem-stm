@@ -370,7 +370,13 @@ class TestCredentialPiiSplit:
             ("--@example.com", True),
             ("..@example.com", True),
             ("jöe@bar.com", True),
+            # New: non-ASCII text directly after the TLD, which ``\b`` read as
+            # part of the word (a Korean particle, an accented letter).
+            ("user@example.com을", True),
+            ("메일 user@example.com으로 보낸다", True),
+            ("user@example.comé", True),
             # Not addresses, before or after.
+            ("user@example.com_x", False),
             ("user@localhost", False),
             ("user@host.123", False),
             ("@scope/pkg@1.2.3", False),

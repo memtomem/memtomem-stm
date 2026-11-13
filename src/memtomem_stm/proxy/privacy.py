@@ -245,9 +245,11 @@ CREDENTIAL_PATTERNS = [
 # that scanned to the end of the run, which made the search quadratic (64 KB
 # took about 2 s). Every address the ``\b`` form found is still found; it
 # additionally matches a local part with no word boundary in it (``--@x.io``)
-# or one right after a non-ASCII letter (``jöe@x.io``).
+# or one right after a non-ASCII letter (``jöe@x.io``). The end is the ASCII
+# form of ``\b``, as in ``CREDENTIAL_PATTERNS`` above: with ``\b`` an address
+# with a Korean particle attached (``user@example.com을``) matched nothing.
 PII_PATTERNS = [
-    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9_])",
 ]
 
 # Backwards-compatible union — the default for contains_sensitive_content
