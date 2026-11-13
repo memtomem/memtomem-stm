@@ -20,6 +20,18 @@ changes inline only. See the deprecation policy in
   project directory on Python's import path. The command for each client, and
   the `args` to set for the demo upstream, are under **Action required** in
   the Security entry below. (GHSA-2p94-5932-5f3p)
+- **Stop a running daemon after upgrading.** The daemon protocol stays v9 and
+  the package version is not part of a daemon's fingerprint, so hook calls
+  keep reaching a daemon the old build started, which runs 0.7.7's code,
+  started without `-P`, until it exits (an idle one does after
+  `idle_timeout_seconds`, 900 by default). After upgrading, quit the MCP hosts
+  that run STM and stop the old daemon as in steps 1–3 of the
+  [Upgrading runbook](docs/guides/operations.md#upgrading): on macOS and
+  Linux `mms daemon stop --all` reaches a daemon a host started under another
+  config fingerprint; on Windows `--all` does not signal one, so stop its
+  process from Task Manager. Fix an OTLP endpoint the #1378 note below
+  refuses first, since `mms daemon` loads the config. Nothing has to be
+  stopped before upgrading.
 - **Surfacing skips a call whose query carries a credential or an email
   address.** A query that matches a privacy pattern is no longer searched as
   its digest (#1353). When the query comes from a `query_template` or from
@@ -32,9 +44,15 @@ changes inline only. See the deprecation policy in
   no switch.
 - **More text counts as sensitive at every privacy gate:** a credential
   directly against Hangul, kana, Han or an accented Latin letter, and an
-  email address with a particle attached. A JWT whose third segment is only
-  hyphens from its eighth character on, directly before a non-ASCII word
-  character, no longer matches. (#1378)
+  email address with a particle attached. Under the default
+  `exposure.profile` `strict`, an upstream tool whose metadata carries such a
+  credential is withheld from `tools/list` (`review` demotes it). Two inputs
+  that loaded on 0.7.7 are now refused: an OTLP `endpoint` whose host or path
+  carries such text fails config validation, also with OTLP disabled, and
+  `mms selection replay --dataset` exits 1 on a dataset that carries it
+  ("dataset matched sensitive-content patterns"). A JWT whose third segment
+  is only hyphens from its eighth character on, directly before a non-ASCII
+  word character, no longer matches. (#1378)
 - **More Reads surface memories at the default settings.** A native-tool
   query made only of path tokens needs `max(1, min_query_tokens - 1)`
   tokens, 2 at the default, so `tests/test_server_tools.py` and `/etc/hosts`
@@ -48,8 +66,9 @@ changes inline only. See the deprecation policy in
   delivery or `budget_exceeded` where they returned an over-budget success
   (#1354, #1376); their store-error degrade returns a shorter truncation or
   `budget_exceeded` (#1367); the PROGRESSIVE store-error degrade returns a
-  truncation with no key instead of the full text when that would not fit
-  (#1375). Legacy delivery is unchanged.
+  truncation with no key instead of the full text when that would not fit,
+  or `budget_exceeded` when no truncation fits (#1375). Legacy delivery is
+  unchanged.
 - **The response cache is emptied once on upgrade** (schema v7). (#1376)
 - **A legacy hybrid table of contents lists the tail's real headings** when
   the head cut lands inside a code fence or mid-line, so the listed keys
@@ -72,6 +91,11 @@ changes inline only. See the deprecation policy in
   and `error_timeout` instead of `ltm_call_failed` (#1355). `mms stats`
   reports totals on a database whose sums overflow, and prints "Possibly
   incomplete before …" after the rollup markers were erased (#1356).
+- **Smaller output changes:** a `query_template` argument that cannot be
+  rendered is a `no_query` skip, and a deeply nested argument the template
+  does not name no longer stops the call from surfacing (#1377); the
+  auto-tuner leaves `min_score` alone on an empty batch (#1374); tool
+  profiles are read as one snapshot (#1360).
 
 ### Security
 
@@ -115,6 +139,12 @@ changes inline only. See the deprecation policy in
   the call is skipped as `no_query` instead of
   being recorded as `error:RecursionError` and raised to the caller. Templates
   that rendered JSON arguments before render the same text. (#1377, #1364)
+  **Behavior change**: on 0.7.7 such a call still returned the tool result,
+  without memories, and logged "Surfacing failed for …" with a traceback.
+  A call whose deeply nested argument the template does not name now
+  surfaces on the rendered query; one whose named argument cannot be rendered
+  is recorded as the healthy skip `no_query` instead of
+  `error:RecursionError`.
 - Under `delivery_format: "structured"`, SELECTIVE and HYBRID (`tail_mode:
   "toc"`) hold two further passthroughs to the serialized result budget, beyond
   the within-budget one in the next entry. An
@@ -192,6 +222,10 @@ changes inline only. See the deprecation policy in
   the tuned value capped at their reference, and an empty batch has nothing to
   filter; what was wrong is the stored value `stm_surfacing_stats` shows. That
   feedback now waits for the next non-empty batch that tunes. (#1374, #1346)
+  **Behavior change**: with `auto_tune_enabled` on (the default), the
+  `min_score` stored for a tool, and shown by `stm_surfacing_stats`, no
+  longer moves on an empty or pinned-only batch; feedback that arrived before
+  such a batch is applied by the next non-empty batch that tunes.
 - Surfacing no longer runs on a query that matches a credential or PII
   pattern. The engine used to replace such a query with `sha256:<16-hex>` and
   carry on: it claimed a rate-limit slot, sent a live LTM search (or
@@ -374,7 +408,19 @@ changes inline only. See the deprecation policy in
   **Behavior change**: text the old patterns passed as clean is now treated
   as sensitive by every gate above: a credential directly against Hangul,
   kana, Han or an accented Latin letter, and an email address with a particle
-  attached. One case goes the other way: a JWT whose third segment is only
+  attached. Under the default `exposure.profile` `strict`, an upstream tool
+  whose description, schema or override carries such a credential is now
+  withheld from `tools/list` as `sensitive_metadata` (`review` advertises it
+  with a risk penalty): on 0.7.7 a description reading
+  `배포 키 AKIAIOSFODNN7EXAMPLE를 사용한다` was advertised, and it is now
+  withheld. An email address in tool metadata does not withhold a tool,
+  before or after. Two inputs are refused where 0.7.7 accepted them: an OTLP
+  `endpoint` such as `https://collector.example/v1/user@example.com을/traces`
+  fails config validation, also with `enabled: false`, and
+  `mms selection replay --dataset` exits 1 with "dataset matched
+  sensitive-content patterns" on a dataset carrying such text; remove the
+  credential or address from the endpoint or the dataset. One case goes the
+  other way: a JWT whose third segment is only
   hyphens from its eighth character on, directly before a non-ASCII word
   character (`….abcdefg-가`), matched before and no longer does, so those
   gates treat it as clean.
@@ -400,6 +446,9 @@ changes inline only. See the deprecation policy in
   and a write landing between them gave a profile whose fields disagreed. A
   count tie between two strategies goes to the label that sorts last, which
   is what the old statements returned without saying so. (#1360, #1348)
+  **Behavior change**: a profile read while calls are being recorded no
+  longer combines counts from different moments, so a recommendation built
+  from it can differ from one 0.7.7 built at the same time.
 
 ## [0.7.7] — 2026-11-05
 
