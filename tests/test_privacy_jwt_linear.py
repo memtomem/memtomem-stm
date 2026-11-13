@@ -21,7 +21,12 @@ import pytest
 
 from memtomem_stm.proxy import privacy
 
-OLD_JWT_RULE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+# The quadratic rule, with its boundaries spelled as ASCII lookarounds like the
+# rule it is compared with (memtomem#3298; ``test_privacy_ascii_boundary.py``).
+OLD_JWT_RULE = re.compile(
+    r"(?<![A-Za-z0-9_])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r"(?<=[A-Za-z0-9_])(?![A-Za-z0-9_])"
+)
 NEW_JWT_RULE = re.compile(next(p for p in privacy.CREDENTIAL_PATTERNS if "eyJ" in p))
 
 _ALPHABET = [*"ab9_-.", "eyJ", "-eyJ", "eyJAAAAAAAA", " ", "AAAAAAAA", "é", "\n", "가", "--"]

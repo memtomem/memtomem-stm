@@ -31,6 +31,18 @@ logger = logging.getLogger(__name__)
 # external LLM provider?") should use this set — matching here means the
 # payload likely carries a credential, which is categorically worth a
 # degraded compression strategy.
+#
+# Token boundaries are written as ASCII lookarounds, never ``\b``. Python's
+# ``\b`` counts every Unicode letter and digit as a word character, so a token
+# written against Hangul, kana or Han text (a key id with a Korean particle
+# attached) has no boundary there and ``\b`` misses it, so every gate that
+# reads this set treated the text as carrying no credential.
+# ``(?<![A-Za-z0-9_])`` in front and ``(?![A-Za-z0-9_])`` behind are what
+# ``\b`` means over ASCII. After a class that includes ``-`` the trailing form
+# is ``(?<=[A-Za-z0-9_])(?![A-Za-z0-9_])``, so the match still ends at a word
+# character. ``re.ASCII`` is not the fix: ``\s`` and ``(?i)`` are Unicode-aware
+# on purpose, and an ideographic space between a label and its ``=`` has to
+# keep matching. Same spelling as memtomem LTM (memtomem#3298).
 CREDENTIAL_PATTERNS = [
     r"(?i)(api[_-]?key|secret[_-]?key|access[_-]?token)\s*[:=]",
     r"(?i)(password|passwd|pwd)\s*[:=]",
@@ -134,13 +146,14 @@ CREDENTIAL_PATTERNS = [
     r"(?i)(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|xox[bps]-[0-9A-Za-z-]+)",
     r"github_pat_[A-Za-z0-9_]{20,}",
     r"(?:(?:sk|pk|rk)_(?:live|test)|whsec)_[A-Za-z0-9]{20,}",
-    r"\bnpm_[A-Za-z0-9]{20,}\b",
-    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+    r"(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{20,}(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9_])",
     # JWT-ish: three base64url segments separated by dots, anchored to the
     # canonical ``eyJ`` header prefix to limit false positives on arbitrary
-    # dotted identifiers. It finds the same tokens as
-    # ``\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`` —
-    # the same yes/no answer, match count and match ends — in linear time.
+    # dotted identifiers. It finds the same tokens as ``eyJ`` followed by
+    # ``[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`` between the
+    # same two boundaries — the same yes/no answer, match count and match
+    # ends — in linear time.
     # That form tried a start after every ``-`` in a run of segment
     # characters, and each start scanned to the end of the run, so ``eyJ-``
     # repeated cost quadratic time. Here the first segment
@@ -150,8 +163,9 @@ CREDENTIAL_PATTERNS = [
     # end. The segment is consumed a word-character run at a time and
     # possessively, so no backtracking state builds up. Only a ``.`` may
     # follow it, and giving characters back never exposes one.
-    r"\beyJ(?=[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+(?:-(?!eyJ[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+)*+"
-    r"\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    r"(?<![A-Za-z0-9_])eyJ(?=[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+"
+    r"(?:-(?!eyJ[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+)*+"
+    r"\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?<=[A-Za-z0-9_])(?![A-Za-z0-9_])",
     r"(?i)(BEGIN\s+(RSA|EC|OPENSSH|DSA|PGP)\s+PRIVATE\s+KEY)",
     # PKCS#8 private keys, plain and encrypted: the header carries no
     # algorithm label, so the rule above never sees it. This is what OpenSSL 3
@@ -183,37 +197,39 @@ CREDENTIAL_PATTERNS = [
     # ``T3BlbkFJ`` marker (base64 of "OpenAI") between two base64url segments.
     # The trailing ``(?![A-Za-z0-9_-])`` guard stops the capped greedy from
     # matching only the first 200 chars of a longer token-char run.
-    r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,200}T3BlbkFJ[A-Za-z0-9_-]{20,200}(?![A-Za-z0-9_-])",
+    r"(?<![A-Za-z0-9_])sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,200}T3BlbkFJ"
+    r"[A-Za-z0-9_-]{20,200}(?![A-Za-z0-9_-])",
     # Anthropic keys (sk-ant-apiNN-/adminNN-): also missed by the legacy rule.
     # Anchored on the exact canonical body — 93 base64url chars + the literal
     # "AA" terminal (a bit-alignment artifact every real key carries). The
     # exact length + AA terminal rejects digit-bearing kebab slugs like
     # "sk-ant-api03-release-notes-2026-migration-guide". The terminal guard is
-    # ``(?![A-Za-z0-9_-])``, NOT ``\b``: ``-`` is in the body charset, so a
-    # bare ``\b`` would treat ``AA-`` as a boundary. The OAuth token
+    # ``(?![A-Za-z0-9_-])``, NOT the word-boundary form: ``-`` is in the body
+    # charset, so ``(?![A-Za-z0-9_])`` would treat ``AA-`` as a boundary. The
+    # OAuth token
     # (sk-ant-oat01-) has no canonical length and is omitted.
-    r"\bsk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{93}AA(?![A-Za-z0-9_-])",
+    r"(?<![A-Za-z0-9_])sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{93}AA(?![A-Za-z0-9_-])",
     # GitHub token family completion: gho_ (OAuth), ghu_ (user-to-server),
     # ghs_ (server-to-server / Actions GITHUB_TOKEN), ghr_ (refresh). Same
     # base62 shape as the already-covered ghp_. {36,} min — ghs_ runs longer.
-    r"\bgh[ousr]_[A-Za-z0-9]{36,}\b",
+    r"(?<![A-Za-z0-9_])gh[ousr]_[A-Za-z0-9]{36,}(?![A-Za-z0-9_])",
     # Google API key (GCP / Firebase / Maps / Gemini): fixed AIza + 35
     # base64url chars (39 total). Trailing lookahead pins the exact length so
     # it won't fire on the AIza-prefixed head of a longer blob.
-    r"\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])",
+    r"(?<![A-Za-z0-9_])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])",
     # GitLab personal access token: the ``glpat-`` literal + the exact classic
     # 20-char body with a terminal guard. Exact length rejects digit-bearing
     # kebab slugs like "glpat-form-builder-component-name-2026". Newer 17.x
     # routable tokens (longer body + ".<checksum>") are a separate follow-up.
-    r"\bglpat-[0-9A-Za-z_-]{20}(?![0-9A-Za-z_-])",
+    r"(?<![A-Za-z0-9_])glpat-[0-9A-Za-z_-]{20}(?![0-9A-Za-z_-])",
     # Hugging Face access token. The short ``hf_`` prefix is collision-prone
     # (hf_hub, hf_model), so: exact 34-char alnum body, both word boundaries,
     # and a digit-in-body lookahead to reject letter-only identifiers.
-    r"\bhf_(?=[A-Za-z0-9]{0,33}[0-9])[A-Za-z0-9]{34}\b",
+    r"(?<![A-Za-z0-9_])hf_(?=[A-Za-z0-9]{0,33}[0-9])[A-Za-z0-9]{34}(?![A-Za-z0-9_])",
     # PyPI / TestPyPI upload token. The macaroon header ``AgEIcHlwaS5vcmc`` /
     # ``AgENdGVzdC5weXBpLm9yZw`` (base64 of "pypi.org" / "test.pypi.org") is
     # an exact fingerprint → lowest FP of the set.
-    r"\bpypi-Ag(?:EIcHlwaS5vcmc|ENdGVzdC5weXBpLm9yZw)[A-Za-z0-9_-]{50,}",
+    r"(?<![A-Za-z0-9_])pypi-Ag(?:EIcHlwaS5vcmc|ENdGVzdC5weXBpLm9yZw)[A-Za-z0-9_-]{50,}",
 ]
 
 # PII that is sensitive to PERSIST but not a credential. Email addresses
@@ -229,9 +245,11 @@ CREDENTIAL_PATTERNS = [
 # that scanned to the end of the run, which made the search quadratic (64 KB
 # took about 2 s). Every address the ``\b`` form found is still found; it
 # additionally matches a local part with no word boundary in it (``--@x.io``)
-# or one right after a non-ASCII letter (``jöe@x.io``).
+# or one right after a non-ASCII letter (``jöe@x.io``). The end is the ASCII
+# form of ``\b``, as in ``CREDENTIAL_PATTERNS`` above: with ``\b`` an address
+# with a Korean particle attached (``user@example.com을``) matched nothing.
 PII_PATTERNS = [
-    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9_])",
 ]
 
 # Backwards-compatible union — the default for contains_sensitive_content

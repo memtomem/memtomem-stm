@@ -160,6 +160,30 @@ changes inline only. See the deprecation policy in
   daemon as `ltm_unavailable` and an expired request as `error_timeout`
   instead of `ltm_call_failed`, and no longer record a starting or busy
   daemon at all.
+- A credential written directly against Korean, Japanese or Chinese text is
+  no longer missed by the privacy scan. Ten of the twenty credential patterns
+  (npm, AWS access key id, JWT, the newer OpenAI and Anthropic keys, GitHub
+  `gho_`/`ghu_`/`ghs_`/`ghr_`, Google API, GitLab, Hugging Face and PyPI
+  tokens) were anchored with a word boundary that counts Hangul, kana and Han
+  characters as part of a word, so a token with such text directly in front
+  of it, or with a particle attached behind it (`키 AKIA…를 사용한다`),
+  matched nothing. Every gate that reads the scan treated that text as clean,
+  among them LLM compression and extraction routing, the response cache, LTM
+  auto-indexing and fact persistence, tool-metadata eligibility, the
+  selection log, and the surfacing query guard, which searched and persisted
+  such a query. The boundaries now count only ASCII letters, digits and `_`
+  as word characters, the same strings memtomem LTM uses (memtomem#3298).
+  Nothing changes for a token between ASCII neighbours; a token directly
+  after an accented Latin letter is now matched too. The email rule, which
+  only STM has, ended the same way, so an address with a particle attached
+  (`user@example.com을`) was not PII. It now is, and the storage gates treat
+  it as they already treated an address between ASCII neighbours: the
+  response cache does not store it, auto-indexing skips it, the selection
+  log drops a line carrying it, and a surfacing query carrying it is skipped
+  as `sensitive_query`.
+  Upgrading from 0.7.7 or earlier already empties the response
+  cache; a cache written by a later build drops, on its first open, the
+  responses the old patterns let through.
 
 ## [0.7.7] — 2026-11-05
 
