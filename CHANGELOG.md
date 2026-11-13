@@ -21,25 +21,45 @@ changes inline only. See the deprecation policy in
   when `str()` of one raises `RecursionError` the template yields no query, so
   the call is skipped as `no_query` instead of
   being recorded as `error:RecursionError` and raised to the caller. Templates
-  that rendered JSON arguments before render the same text. (#1364)
+  that rendered JSON arguments before render the same text. (#1377, #1364)
 - Under `delivery_format: "structured"`, SELECTIVE and HYBRID (`tail_mode:
-  "toc"`) now hold two more passthroughs to the serialized result budget. An
+  "toc"`) hold two further passthroughs to the serialized result budget, beyond
+  the within-budget one in the next entry. An
   empty text block whose upstream metadata (result `_meta` or text-block
   annotations) leaves no room in the budget used to succeed over it (599
   serialized characters at a 500-character budget, as reported); it now returns
-  `budget_exceeded`, as PROGRESSIVE and any non-empty text already did. With
+  `budget_exceeded`, as PROGRESSIVE already did. With
   `token_estimation_mode: "unicode"`, a response within `max_result_tokens` was
   returned intact without the serialized check, so JSON escaping or metadata
   could take it past the budget (675 serialized characters at 500, escaped text
   and no metadata); it is now returned intact only when it fits, and otherwise
   gets a table, progressive delivery or `budget_exceeded` like a longer
   response. Other strategies keep their character budget in structured
-  delivery; `docs/compression.md` now says so. (#1359)
+  delivery; `docs/compression.md` now says so. (#1376, #1359)
   **Behavior change**: these structured calls return `budget_exceeded` or a
   table where they used to return an over-budget success. The response cache
   schema moves to v7, so the cache is emptied once on upgrade: entries stored
   by older releases could hold such a success, and a cache hit is served
   before any budget check.
+- HYBRID (`tail_mode: "toc"`) reads the tail's headings from the whole
+  response. The tail slice was parsed on its own, so a head that ended inside
+  a code fence turned `# comment` lines in the code into headings and lost
+  every real heading after the fence, and a head that ended mid-line made the
+  rest of that line a heading. On 0.7.7 a document cut inside a fence listed
+  `Preamble` and `fake heading inside code fence`; it now lists `Preamble`,
+  `Real Section One` and `Real Section Two`. Under
+  `delivery_format: "structured"`, SELECTIVE and HYBRID also returned a
+  response unchanged whenever its character count met the budget, although
+  JSON escaping can take the serialized result past it; they now pass it
+  through only when the serialized result fits, and otherwise build a table or
+  fall back to progressive delivery. A structured hybrid table that does not
+  fit is retried with a shorter head, down to `min_head_chars`, before falling
+  back. (#1354, #1347)
+  **Behavior change**: a legacy hybrid table of contents lists different
+  headings, the real ones, when the head cut lands in a fence or mid-line.
+  Structured SELECTIVE/HYBRID responses whose serialized form exceeds the
+  budget no longer pass through, and return `budget_exceeded` at a budget
+  where no frame fits.
 
 - Under `delivery_format: "structured"`, a PROGRESSIVE call whose progressive
   store fails, or whose credential-bearing response a persistent pending store
@@ -51,11 +71,23 @@ changes inline only. See the deprecation policy in
   returned when no truncation does. A passthrough that fits is unchanged, and
   legacy delivery still returns the full response. The metrics labels
   (`progressive→passthrough_on_error` / `→passthrough_on_sensitive`) and the
-  cache exclusion are unchanged. (#1368)
+  cache exclusion are unchanged. (#1375, #1368)
   **Behavior change**: in structured delivery this degrade is no longer
   zero-loss when the response is over the budget; the agent gets a truncation,
   with no key to read the rest, since the store that would hold it failed.
 
+- Under `delivery_format: "structured"`, the truncation a SELECTIVE or HYBRID
+  call degrades to when its pending-store write fails, or when a persistent
+  store refuses a credential-bearing response (#1148), is held to the
+  serialized result budget. It was returned whenever it met the character
+  budget, and JSON escaping could take it past the serialized one. It is now
+  measured as the plain MCP result; when it does not fit, a shorter
+  truncation that does is searched for, and `budget_exceeded` is returned
+  when none fits. Legacy delivery, and a structured truncation that already
+  fits, are unchanged. (#1367, #1358)
+  **Behavior change**: in structured delivery this degrade returns a shorter
+  truncation, or `budget_exceeded`, where it used to return an over-budget
+  success.
 - The surfacing auto-tuner no longer adjusts a tool's `min_score` on a call
   where LTM retrieved nothing (an empty result, or only pinned blocks). Such a
   batch carries no RRF reference, so the tuner fell back to the configured
@@ -66,7 +98,63 @@ changes inline only. See the deprecation policy in
   next RRF batch did not act on it. Later RRF batches already filtered with
   the tuned value capped at their reference, and an empty batch has nothing to
   filter; what was wrong is the stored value `stm_surfacing_stats` shows. That
-  feedback now waits for the next non-empty batch that tunes. (#1346)
+  feedback now waits for the next non-empty batch that tunes. (#1374, #1346)
+- Surfacing no longer runs on a query that matches a credential or PII
+  pattern. The engine used to replace such a query with `sha256:<16-hex>` and
+  carry on: it claimed a rate-limit slot, sent a live LTM search (or
+  `context_compose`) for the digest, and injected whatever came back. Run
+  against the 0.7.7 sources with a stub LTM, a call whose arguments read
+  `api_key=demo_secret_value` returned with a `<surfaced-memories>` block
+  appended. The call now ends before the relevance gate, the cache and any LTM
+  work, as a new healthy skip, `sensitive_query`. A native-tool call that
+  yields no query on its own (a `cd`-only command, or one under
+  `min_query_tokens`) also no longer gets one because a secret appears in it.
+  (#1353, #1344)
+  **Behavior change**: such a call delivers nothing, Pinned Context included.
+  No `surfacing_events` row is written and no webhook fires for it; its
+  opportunity row keeps the query's digest and records
+  `skip:sensitive_query`. `stm_admin(action="surfacing_stats")` shows a
+  new `sensitive_query` skip reason.
+- Surfacing checks a call's raw inputs for sensitive content before any
+  extraction route reshapes them. The check ran on the extracted query, and
+  tokenizing a path or pattern argument, or rendering a `query_template`,
+  could take a secret apart first: on 0.7.7 a proxied call with
+  `file_path: "notes/ghp_<36 characters>/setup.md"` produced the query
+  `notes ghp <36 characters> setup md`, which the scan passed, so it was
+  searched and stored like any other query. The server and tool names, the
+  template and every argument string, nested ones included, are now scanned
+  first. On a match, a route that yields a query returns the raw inputs in its
+  place, so the engine sees the secret whole and skips the call as
+  `sensitive_query`; a route that yields no query still yields none. A query
+  the agent supplies (`context_query`, `_context_query`), which is used when
+  the tool has no template, is taken as given as before and is not part of
+  this check. (#1357, #1344)
+  **Behavior change**: a proxied call whose query comes from a
+  `query_template` or from the arguments no longer surfaces when a credential
+  or an email address appears anywhere in its arguments, even in one the
+  query would not have used. A call with an agent-supplied query still
+  surfaces on that query when the query itself is clean.
+- A native-tool (hook) query made only of path tokens needs one token fewer
+  than `min_query_tokens`: `max(1, min_query_tokens - 1)`, 2 at the default.
+  Path tokenizing drops extensions, ids and structural directories, so a Read
+  of a shallow file fell under the floor and surfaced nothing: on 0.7.7
+  `tests/test_server_tools.py` and `/etc/hosts` gave no query, and they now
+  give `server tools` and `etc hosts`. A command, a description or a
+  Grep/Glob pattern that contributes a token keeps the full floor, and a
+  one-token Read such as `CHANGELOG.md` is still skipped. (#1350, #1325)
+  **Behavior change**: more Reads surface memories at the default settings,
+  among them the `/etc/hosts` Read that the 0.7.7 upgrade notes named as one
+  that surfaces nothing. The floor follows `min_query_tokens`, so raising
+  that setting tightens Reads again.
+- A shell command that names a temp directory by itself no longer puts that
+  directory's words into the hook query. A whitespace word that is exactly
+  `/tmp`, `/private/tmp`, `/var/folders` or `/private/var/folders` (with any
+  trailing slashes, bare or in one pair of matching quotes) now yields no
+  tokens: on 0.7.7 `find ~ /private/tmp -name notes.md` gave the query
+  `private tmp notes`, and it now gives none, `notes` alone being under
+  `min_query_tokens`. (#1343, #1341)
+  **Behavior change**: such a command gives a shorter query, or none, and a
+  hook call with no query surfaces nothing.
 
 - A SELECTIVE/HYBRID call cancelled while its compress runs off-thread (a
   relevance scorer that does blocking I/O, such as the embedding scorer) now
@@ -77,7 +165,7 @@ changes inline only. See the deprecation policy in
   cancelled call. A queued job that no worker has picked up by then is
   released without compressing. `SQLitePendingStore.close()` also waits for an
   operation in progress on the store instead of closing the connection under
-  it. (#1369)
+  it. (#1373, #1369)
   **Behavior change**: when such a call is cancelled during shutdown, its
   selection is now written and the SQLite pending store closes once the worker
   finishes, rather than the store closing first and the write failing;
@@ -91,7 +179,8 @@ changes inline only. See the deprecation policy in
   `stm_proxy_select_chunks` no longer expires a selection by whichever TTL was
   resolved last for the store, in either direction. A successful selection
   still renews the TTL, under the selection's own value. The SQLite pending
-  store gains a nullable `ttl_seconds` column, added on first open. (#1370)
+  store gains a nullable `ttl_seconds` column, added on first open.
+  (#1372, #1370)
   **Behavior change**: selections written before this change (rows already
   in a SQLite pending store at upgrade, or written by an older process
   sharing the file) carry no TTL of their own. `stm_proxy_select_chunks`
@@ -117,7 +206,10 @@ changes inline only. See the deprecation policy in
   selection write still in progress when a reload lands goes to the store,
   and evicts under the limits, that its own server and tool are configured
   for once a later SELECTIVE/HYBRID call has seen the reload; it no longer
-  follows another server's call into that server's store. (#1365)
+  follows another server's call into that server's store. A lookup only
+  reads a store that does not hold the requested key, so a SQLite store that
+  another connection has locked does not fail a lookup for a key held in a
+  different store. (#1371, #1365)
   **Behavior change**: selection keys handed out earlier keep resolving
   through a config reload or a call on another backend, where they used to
   answer "not found or expired"; the in-memory selective store is no longer
@@ -135,7 +227,7 @@ changes inline only. See the deprecation policy in
   store, while the SQLite store already open keeps serving the keys it holds
   (subject to their TTL and eviction). With a single SQLite pending store
   configured, `stm_proxy_read_more` now finds a key persisted before a
-  restart even when an in-memory response was published first. (#1362)
+  restart even when an in-memory response was published first. (#1366, #1362)
   **Behavior change**: a progressive key handed out earlier keeps resolving
   through a config reload or a publication on another backend, where it
   used to answer "not found or expired"; progressive responses from tools
@@ -152,14 +244,16 @@ changes inline only. See the deprecation policy in
   retried a second time within the same call. A daemon compose item whose id
   is not UTF-8-encodable is dropped instead of failing the whole response.
   (#1355, #1346)
-  **Behavior change**: `stm_admin(action="surfacing_stats")` counts these
-  cases under `daemon_starting`, `daemon_busy`, `ltm_unavailable` or
-  `error_timeout` where it used to count `ltm_call_failed`, and the "LTM
-  declared context_compose … but the call failed" warning no longer appears
-  for them. The durable fault counts `mms stats` shows record an unanswering
-  daemon as `ltm_unavailable` and an expired request as `error_timeout`
-  instead of `ltm_call_failed`, and no longer record a starting or busy
-  daemon at all.
+  **Behavior change**: `stm_admin(action="surfacing_stats")` counts a busy
+  daemon under `daemon_busy`, an unanswering one under `ltm_unavailable` and
+  an expired request under `error_timeout` where it used to count
+  `ltm_call_failed`, and the "LTM declared context_compose … but the call
+  failed" warning no longer appears for them. The durable fault counts
+  `mms stats` shows record an unanswering daemon as `ltm_unavailable` and an
+  expired request as `error_timeout` instead of `ltm_call_failed`, and no
+  longer record a busy daemon at all. A daemon that is not running was
+  already counted as `daemon_starting` and recorded no fault; that call now
+  makes one request and one spawn request where it made two of each.
 - A credential written directly against Korean, Japanese or Chinese text is
   no longer missed by the privacy scan. Ten of the twenty credential patterns
   (npm, AWS access key id, JWT, the newer OpenAI and Anthropic keys, GitHub
@@ -183,7 +277,36 @@ changes inline only. See the deprecation policy in
   as `sensitive_query`.
   Upgrading from 0.7.7 or earlier already empties the response
   cache; a cache written by a later build drops, on its first open, the
-  responses the old patterns let through.
+  responses the old patterns let through. (#1378)
+  **Behavior change**: text the old patterns passed as clean is now treated
+  as sensitive by every gate above: a credential directly against Hangul,
+  kana, Han or an accented Latin letter, and an email address with a particle
+  attached. One case goes the other way: a JWT whose third segment is only
+  hyphens from its eighth character on, directly before a non-ASCII word
+  character (`….abcdefg-가`), matched before and no longer does, so those
+  gates treat it as clean.
+- `mms stats` and the compression summaries stay available when a metrics sum
+  passes the 64-bit integer range. The readers summed rows with `SUM`, which
+  raises "integer overflow", and that error turned the whole result into
+  `available: false`; the statement is now re-run with float sums only when
+  that overflow occurs, so a database that never overflows keeps exact integer
+  sums. Repairing the metrics schema markers no longer
+  invents a loss either. The documented repair (`DELETE FROM metrics_meta`)
+  also erased the rollup markers, and the next open counted every rolled-up
+  row as lost and printed a false "Incomplete before" warning. The count is
+  now taken only on a first installation and recorded as unknown otherwise,
+  which the CLI shows as "Possibly incomplete before …", and the documented
+  repair clears only the `schema_fingerprint` key. (#1356, #1348)
+  **Behavior change**: on a database whose sums overflow, `mms stats` reports
+  totals where it reported the statistics as unavailable. After the rollup
+  markers have been erased it prints "Possibly incomplete before …" where it
+  printed "Incomplete before …" with a row count.
+- The tool profiles behind `stm_tuning_recommendations` are read in one
+  statement, so every field of a profile comes from the same snapshot.
+  `call_count`, the p95 and the strategy counts came from three statements,
+  and a write landing between them gave a profile whose fields disagreed. A
+  count tie between two strategies goes to the label that sorts last, which
+  is what the old statements returned without saying so. (#1360, #1348)
 
 ## [0.7.7] — 2026-11-05
 
