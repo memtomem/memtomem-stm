@@ -173,4 +173,5 @@ def test_w1_acceptance_empty_registry_friendly_error(runner, tmp_path, monkeypat
     res = runner.invoke(project_group, ["enable", "filesystem"])
     assert res.exit_code != 0
     assert "Registry is empty" in res.output
-    assert "mms import --from" in res.output
+    # --apply, not the preview default: plain `mms import` writes nothing.
+    assert "mms import --apply" in res.output

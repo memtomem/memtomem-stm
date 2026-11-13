@@ -260,6 +260,9 @@ def test_enable_against_empty_registry_friendly_error(runner, sandbox):
     assert res.exit_code != 0
     # stderr in CliRunner with mix_stderr=True (default) lands in res.output
     assert _REGISTRY_EMPTY_MSG.strip() in res.output
+    # Plain `mms import` only previews (--plan is the default) and writes
+    # nothing, so the hint must name --apply or re-running still fails.
+    assert "Run `mms import --apply` to import" in res.output
 
 
 def test_enable_requires_marker(runner, sandbox):
@@ -305,6 +308,10 @@ def test_enable_unknown_name_rejected_with_hint(runner, sandbox):
     assert res.exit_code != 0
     assert "Unknown MCP name(s): filesytem" in res.output
     assert "filesystem" in res.output  # registered set shown as the hint
+    # The names checked are ~/.mms/registry.toml's, which `mms import --apply`
+    # populates; `mms list` reads the proxy config, a different set.
+    assert "Run `mms import --apply` to add MCP definitions from host configs." in res.output
+    assert "mms list" not in res.output
 
     cfg = state.load_project_config(sandbox["cwd"] / state.PROJECT_MARKER_RELPATH)
     assert cfg.mcp.enabled == []  # nothing persisted
