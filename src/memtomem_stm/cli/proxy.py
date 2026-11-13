@@ -975,7 +975,11 @@ def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, 
             "registration's runtime policy" + detail
         ) from exc
     env.update(policy.mcp_env())
-    return command, ["-m", "memtomem_stm"], env
+    from memtomem_stm.utils.exec_env import safe_module_argv
+
+    # Hosts start the server in the user's project; ``-P`` keeps that directory
+    # off its import path.
+    return command, safe_module_argv("memtomem_stm", python=command)[1:], env
 
 
 def _check_already_registered(name: str = "memtomem-stm") -> bool:
@@ -1232,6 +1236,49 @@ def _restore_codex_registration(plan: _CodexRestorePlan) -> bool:
         return _run_codex_mcp(plan.command).returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
+
+
+_PRE_SAFE_PATH_REGISTRATION_ARGS = ["-m", "memtomem_stm"]
+
+
+def _pre_safe_path_registration_refresh(mcp_path: Path) -> str | None:
+    """The refresh command for a kept ``.mcp.json`` entry that predates ``-P``.
+
+    Registrations are kept unless ``--replace-registration`` is passed, so one
+    written before STM launched itself with ``-P`` still starts the server with
+    the project directory first on its import path, and nothing the server does
+    after starting can undo that. Returns ``None`` for the current
+    shape, for an entry someone edited into another shape, and for a file that
+    cannot be read: this is a hint, and the caller already reported the keep.
+
+    The refresh writes the config path resolved where it runs, so the entry's
+    own ``MEMTOMEM_STM_PROXY__CONFIG_PATH`` is carried into the command.
+    """
+    try:
+        data = json.loads(mcp_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    entry = servers.get("memtomem-stm") if isinstance(servers, dict) else None
+    if not isinstance(entry, dict) or entry.get("args") != _PRE_SAFE_PATH_REGISTRATION_ARGS:
+        return None
+    refresh = ["mms", "register", "--client", "json", "--replace-registration"]
+    env = entry.get("env")
+    config = env.get("MEMTOMEM_STM_PROXY__CONFIG_PATH") if isinstance(env, dict) else None
+    if isinstance(config, str) and config:
+        refresh += ["--config", config]
+    return _shell_join(refresh)
+
+
+def _echo_kept_registration(mcp_path: Path) -> None:
+    click.echo(f"  {_ok('Kept existing registration')} (use --replace-registration to refresh)")
+    refresh = _pre_safe_path_registration_refresh(mcp_path)
+    if refresh is not None:
+        click.echo(
+            f"  {_warn('Security:')} this entry starts memtomem-stm with the project "
+            "directory on Python's import path. Refresh it:"
+        )
+        click.echo(f"    {_disp(refresh)}")
 
 
 def _write_mcp_json_for_stm(
@@ -1556,9 +1603,7 @@ def _run_mcp_integration(
         if written:
             click.echo(f"  {_ok('Wrote')} {mcp_path}")
         else:
-            click.echo(
-                f"  {_ok('Kept existing registration')} (use --replace-registration to refresh)"
-            )
+            _echo_kept_registration(mcp_path)
         _emit_mcp_paste_hints()
         return
 
@@ -1618,7 +1663,7 @@ def _run_mcp_integration(
     if written:
         click.echo(f"  {_ok('Wrote')} {mcp_path}")
     else:
-        click.echo(f"  {_ok('Kept existing registration')} (use --replace-registration to refresh)")
+        _echo_kept_registration(mcp_path)
     _emit_mcp_paste_hints()
 
 
@@ -6542,11 +6587,14 @@ def init(
     imported_candidates: list[_DiscoveredCandidate] = []
 
     if demo:
+        from memtomem_stm.utils.exec_env import safe_module_argv
+
         imported["demo"] = {
             "prefix": "demo",
             "transport": "stdio",
             "command": os.path.abspath(sys.executable),
-            "args": ["-m", "memtomem_stm.demo_server"],
+            # Started by the proxy in the user's project, like the server itself.
+            "args": safe_module_argv("memtomem_stm.demo_server")[1:],
             "compression": "auto",
             "cache": True,
         }

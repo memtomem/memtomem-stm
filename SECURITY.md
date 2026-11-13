@@ -74,6 +74,7 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
 
 - **No unsafe deserialization**: No pickle, no unsafe YAML loading
 - **No command injection**: Subprocess spawns (the surfacing daemon, and stdio MCP child servers such as the LTM-consult client and the optional tool-graph eligibility provider) use static or config-derived argv lists — `shell=True` is never set, so no untrusted input is interpolated into a shell. No `eval` / `exec` on input.
+- **No automatic import path into the project**: The interpreters STM starts with `python -m` (the surfacing daemon, the command it writes into host registrations, and the demo upstream) are started with `-P`, so Python does not put the working directory first on their import path. A `PYTHONPATH` entry that names the working directory still applies. A registration written before `-P` was added keeps its old command, and is not protected, until it is refreshed: the commands for each client, and the `--config` they must carry, are under **Action required** in the GHSA-2p94-5932-5f3p entry of [CHANGELOG.md](CHANGELOG.md).
 - **SQL injection**: All queries in the optional SQLite `PendingStore` use parameterized statements
 
 ## Best Practices

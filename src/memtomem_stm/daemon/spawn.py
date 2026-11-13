@@ -16,11 +16,11 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-import sys
 import threading
 from typing import TYPE_CHECKING, Any
 
 from memtomem_stm.utils.child_reaper import release_claim, spawn_claimed
+from memtomem_stm.utils.exec_env import safe_module_argv
 
 if TYPE_CHECKING:
     from memtomem_stm.config import STMConfig
@@ -29,8 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 def _spawn_detached() -> None:
-    """Launch ``mms daemon run --detached`` as a background process."""
-    cmd = [sys.executable, "-m", "memtomem_stm", "daemon", "run", "--detached"]
+    """Launch ``mms daemon run --detached`` as a background process.
+
+    The child inherits this process's working directory, which under the hook
+    is the user's project; ``safe_module_argv`` keeps that directory off the
+    child's import path.
+    """
+    cmd = safe_module_argv("memtomem_stm", "daemon", "run", "--detached")
     kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,

@@ -9,7 +9,100 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.8] — 2026-11-14
+
+### Upgrade notes
+
+- **Refresh every host registration written by an earlier version, and the
+  demo upstream if it is configured.** STM now writes
+  `<python> -P -m memtomem_stm`, but an existing registration, and an existing
+  `upstream_servers.demo` entry, is kept on upgrade and still starts with the
+  project directory on Python's import path. The command for each client, and
+  the `args` to set for the demo upstream, are under **Action required** in
+  the Security entry below. (GHSA-2p94-5932-5f3p)
+- **Surfacing skips a call whose query carries a credential or an email
+  address.** A query that matches a privacy pattern is no longer searched as
+  its digest (#1353). When the query comes from a `query_template` or from
+  the arguments, the raw arguments are checked first, so a secret in an
+  argument the query would not have used also ends the call (#1357); a query
+  the agent supplies for a tool without a template is used as given, and such
+  a call still surfaces when that query is clean. A skipped call delivers
+  nothing, Pinned Context included, writes no `surfacing_events` row and
+  fires no webhook; `surfacing_stats` shows it as `sensitive_query`. There is
+  no switch.
+- **More text counts as sensitive at every privacy gate:** a credential
+  directly against Hangul, kana, Han or an accented Latin letter, and an
+  email address with a particle attached. A JWT whose third segment is only
+  hyphens from its eighth character on, directly before a non-ASCII word
+  character, no longer matches. (#1378)
+- **More Reads surface memories at the default settings.** A native-tool
+  query made only of path tokens needs `max(1, min_query_tokens - 1)`
+  tokens, 2 at the default, so `tests/test_server_tools.py` and `/etc/hosts`
+  now give a query. Raising
+  `min_query_tokens` tightens Reads again. (#1350)
+- **A shell command that names a bare temp directory** (`/tmp`,
+  `/private/tmp`, `/var/folders`, `/private/var/folders`) gives a shorter
+  hook query, or none. (#1343)
+- **Under `delivery_format: "structured"`, results are held to the serialized
+  budget on more paths.** SELECTIVE and HYBRID return a table, progressive
+  delivery or `budget_exceeded` where they returned an over-budget success
+  (#1354, #1376); their store-error degrade returns a shorter truncation or
+  `budget_exceeded` (#1367); the PROGRESSIVE store-error degrade returns a
+  truncation with no key instead of the full text when that would not fit
+  (#1375). Legacy delivery is unchanged.
+- **The response cache is emptied once on upgrade** (schema v7). (#1376)
+- **A legacy hybrid table of contents lists the tail's real headings** when
+  the head cut lands inside a code fence or mid-line, so the listed keys
+  differ for such a response. (#1354)
+- **Selection and progressive keys keep resolving** through a config reload
+  or a call on another pending-store backend, where they answered "not found
+  or expired"; the in-memory selective store is no longer emptied when a
+  `selective` block changes, and progressive responses from tools without a
+  SQLite `selective` block are no longer stored on disk. (#1366, #1371)
+- **A selection expires by the `pending_ttl_seconds` it was published
+  under.** Rows written before the upgrade carry no TTL of their own and
+  expire by the configuration that first opened the store; upgrade together
+  the instances that share a `pending_store_path`. (#1372)
+- **A SELECTIVE/HYBRID call cancelled during shutdown while its compress is
+  already running off-thread now writes its selection,** and `stop()` can
+  wait for one store operation in progress. A queued job that no worker has
+  picked up is released without compressing. (#1373)
+- **Stats classify more precisely.** With `use_daemon` on, a busy, an
+  unanswering and an expired daemon count as `daemon_busy`, `ltm_unavailable`
+  and `error_timeout` instead of `ltm_call_failed` (#1355). `mms stats`
+  reports totals on a database whose sums overflow, and prints "Possibly
+  incomplete before …" after the rollup markers were erased (#1356).
+
+### Security
+
+- STM now starts its own `python -m` interpreters with `-P`. The surfacing
+  daemon, the command that `mms init` and `mms register` write into a host
+  registration, and the demo upstream were started as plain `python -m …`,
+  which puts the working directory, normally the user's project, first on the
+  import path. A `memtomem_stm` package there, or a module that Python or STM
+  imports (`types.py`, `click.py`, `mcp/`), ran in STM's place. `-P` stops
+  Python from adding that entry; a `PYTHONPATH` entry that names the working
+  directory still applies. (GHSA-2p94-5932-5f3p)
+  **Behavior change**: the registration STM writes is now
+  `<python> -P -m memtomem_stm`, and the demo upstream's `args` are
+  `["-P", "-m", "memtomem_stm.demo_server"]`.
+  **Action required**: an existing registration is kept on upgrade, so one
+  written by an earlier version still starts without `-P`, and STM cannot
+  protect such a launch from inside: Python imports from the working directory
+  before any STM code runs. Refresh each one,
+  passing the same `--config <path>` if the registration uses a non-default
+  config (the refresh writes the config path resolved where it runs):
+  - project `.mcp.json`: from that project,
+    `mms register --client json --replace-registration`. `mms register` now
+    prints this command when it keeps such an entry;
+  - Claude Code user scope:
+    `mms register --client claude --replace-registration`;
+  - Codex: `mms register --client codex --replace-registration`;
+  - a host config edited or copied by hand: insert `"-P"` before `"-m"` in the
+    entry's `args`;
+  - the demo upstream: set `upstream_servers.demo.args` in `stm_proxy.json` to
+    `["-P", "-m", "memtomem_stm.demo_server"]` (`mms init --demo --resume`
+    leaves that entry as it is).
 
 ### Fixed
 
@@ -206,10 +299,10 @@ changes inline only. See the deprecation policy in
   selection write still in progress when a reload lands goes to the store,
   and evicts under the limits, that its own server and tool are configured
   for once a later SELECTIVE/HYBRID call has seen the reload; it no longer
-  follows another server's call into that server's store. A lookup only
-  reads a store that does not hold the requested key, so a SQLite store that
-  another connection has locked does not fail a lookup for a key held in a
-  different store. (#1371, #1365)
+  follows another server's call into that server's store. A store that does
+  not hold the requested key is only read, without running expiry, so a
+  SQLite store that another connection has locked does not fail a lookup for
+  a key held in a different store. (#1371, #1365)
   **Behavior change**: selection keys handed out earlier keep resolving
   through a config reload or a call on another backend, where they used to
   answer "not found or expired"; the in-memory selective store is no longer

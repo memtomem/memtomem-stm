@@ -77,3 +77,23 @@ def harden_exec_search(environ: MutableMapping[str, str] | None = None) -> None:
         env["PATH"] = kept
     if windows:
         env.setdefault(_WINDOWS_CWD_SEARCH_OFF, "1")
+
+
+def safe_module_argv(module: str, *args: str, python: str | None = None) -> list[str]:
+    """argv that runs ``module`` without the working directory prepended to ``sys.path``.
+
+    ``python -m`` puts the working directory first on the import path, so a
+    project could supply its own ``memtomem_stm`` package, or a module that
+    Python or STM imports, to an interpreter STM starts there. ``-P`` stops the
+    interpreter from prepending it. Every STM-owned ``-m`` launch is built
+    here: the surfacing daemon, the command written into host registrations,
+    and the demo upstream.
+
+    Only the automatic entry is affected. A ``PYTHONPATH`` entry that names the
+    working directory still applies, as does anything a ``.pth`` file or
+    ``sitecustomize`` adds; those belong to the environment the user set up.
+
+    ``python`` defaults to ``sys.executable``; a registration passes the
+    absolute, unresolved path it records instead.
+    """
+    return [python or sys.executable, "-P", "-m", module, *args]
