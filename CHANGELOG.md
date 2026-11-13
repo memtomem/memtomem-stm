@@ -35,6 +35,8 @@ changes inline only. See the deprecation policy in
   `mms import --apply` instead of `mms import --from <host>`: without
   `--apply`, `mms import` only previews and writes nothing, so re-running
   `mms project enable` as the message said failed again.
+  **Behavior change**: only the hint text of these two errors changes; the
+  exit code and the name check are the same.
 
 ## [0.7.8] — 2026-11-14
 

@@ -1280,7 +1280,7 @@ Options:
   --project TEXT  Target project (default: detect from cwd).
 ```
 
-`enable` adds MCP names to the project's `[mcp].enabled` list; `disable` removes them. Both require either a marker at cwd (or up the tree) or an explicit `--project NAME`. `enable` additionally requires a non-empty `~/.mms/registry.toml` — populate it with `mms import` first. `disable` works regardless of registry state since it only mutates project state.
+`enable` adds MCP names to the project's `[mcp].enabled` list; `disable` removes them. Both require either a marker at cwd (or up the tree) or an explicit `--project NAME`. `enable` additionally requires a non-empty `~/.mms/registry.toml` — populate it with `mms import --apply` first (plain `mms import` only previews). `disable` works regardless of registry state since it only mutates project state.
 
 `enable` validates every requested name against the registry and rejects unknown ones, listing the registered set as a hint — register or import the MCP first, then enable it. (The validity check was originally deferred to sync time, but no sync surface ever consumed the project enabled list, so a typo would have sat in `project.toml` and silently resolved to nothing at proxy time.) `disable` stays registry-agnostic by design.
 
