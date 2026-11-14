@@ -1056,3 +1056,95 @@ def test_section_aware_truncate_preserves_closing_code_fences():
     out = comp.compress(doc, max_chars=250)
     # Both opening and closing fences of the first block should survive when budget allows
     assert out.count("```") >= 2
+
+
+class TestCodeAwareSignaturesFirst:
+    """TRUNCATE's code-aware path previews the blocks that do not fit whole:
+    every signature that fits goes in before any block gets a body line."""
+
+    @staticmethod
+    def _methods(n: int, body_lines: int = 5) -> str:
+        body = "".join(f"        step_{{i}}_{j} = compute_{j}(value)\n" for j in range(body_lines))
+        methods = "\n".join(
+            f"    def method_{i}(self, value):\n" + body.format(i=i) for i in range(n)
+        )
+        return "class Pipeline:\n    NAME = 'p'\n\n" + methods
+
+    @staticmethod
+    def _previews(out: str) -> list[list[str]]:
+        tail = out.split("more blocks)\n", 1)[1].rsplit("\n(original:", 1)[0]
+        return [p.strip("\n").split("\n") for p in tail.split("\n\n") if p.strip()]
+
+    def test_a_tight_budget_names_every_remaining_block(self):
+        text = self._methods(8)
+        out = TruncateCompressor().compress(text, max_chars=600)
+        assert len(out) <= 600
+        assert "more blocks)" in out
+        assert all(f"def method_{i}(self, value):" in out for i in range(8))
+        # A preview keeps the signature's indentation.
+        assert "\n    def method_7(self, value):\n" in out
+
+    def test_body_lines_are_added_one_round_at_a_time(self):
+        text = self._methods(8)
+        out = TruncateCompressor().compress(text, max_chars=900)
+        remaining = int(out.split("... (", 1)[1].split(" more blocks)", 1)[0])
+        counts = [len(p) for p in self._previews(out)]
+        assert len(counts) == remaining
+        # Uniform blocks: no preview is two lines ahead of another, and a later
+        # block never shows more than an earlier one.
+        assert max(counts) - min(counts) <= 1
+        assert counts == sorted(counts, reverse=True)
+        assert max(counts) > 1
+
+    def test_a_preview_is_at_most_the_signature_and_three_lines(self):
+        text = self._methods(8) + "\n" + "x = 1\n" * 2000
+        out = TruncateCompressor().compress(text, max_chars=3000)
+        counts = [len(p) for p in self._previews(out)]
+        assert counts and max(counts) == 4
+
+    def test_a_sql_signature_is_its_whole_first_line(self):
+        query = "WITH daily_{i} AS (\n" + "    SELECT col_a, col_b, col_c FROM events\n" * 6 + ")\n"
+        text = "\n".join(query.format(i=i) for i in range(6))
+        out = TruncateCompressor().compress(text, max_chars=300)
+        assert "... (" in out
+        assert "WITH daily_5 AS (" in out
+        assert "# WITH" not in out
+
+    def test_a_signature_longer_than_the_budget_is_cut_not_dropped(self):
+        text = "SELECT " + "x," * 130 + "x FROM a;\n\nSELECT " + "y," * 130 + "y FROM b;"
+        out = TruncateCompressor().compress(text, max_chars=200)
+        assert len(out) <= 200
+        assert "more blocks)" in out
+        cut = [ln for ln in out.split("\n") if ln.endswith("…")]
+        assert cut and all(ln.startswith("SELECT x,x,x,") and len(ln) == 80 for ln in cut)
+
+    def test_a_cut_signature_gets_its_whole_line_back_before_body_lines(self):
+        args = ", ".join(f"arg_{j}: int" for j in range(12))
+        block = "def fn_{i}(" + args + ") -> int:\n" + "    total = 0\n" * 30
+        text = "\n".join(block.format(i=i) for i in range(4))
+        out = TruncateCompressor().compress(text, max_chars=1150)
+        assert "more blocks)" in out
+        assert f"def fn_3({args}) -> int:" in out
+        assert "…" not in out
+
+    @pytest.mark.parametrize(
+        ("text", "max_chars"),
+        [
+            ("SELECT " + "x," * 130 + "x FROM a;\n\nSELECT " + "y," * 130 + "y FROM b;", 140),
+            ("SELECT " + "a," * 32 + "a FROM t;\n\nSELECT " + "b," * 130 + "b FROM u;", 200),
+        ],
+    )
+    def test_a_block_with_no_room_for_a_cut_signature_is_still_marked(self, text, max_chars):
+        out = TruncateCompressor().compress(text, max_chars=max_chars)
+        assert len(out) <= max_chars
+        assert "more blocks)" in out
+        assert out.rstrip().split("\n(original:")[0].endswith("# SELECT")
+
+    def test_a_marked_block_gets_no_body_lines(self):
+        wide = "SELECT " + "w," * 130 + "w FROM a\n" + "  WHERE w > 0\n" * 5
+        narrow = "SELECT n FROM b\n" + "  WHERE n > 0\n" * 5
+        text = "SELECT 1;\n\n" + "SELECT 2;\n\n" + narrow + "\n" + wide
+        out = TruncateCompressor().compress(text, max_chars=170)
+        previews = self._previews(out)
+        assert ["# SELECT"] in previews
+        assert any(p[0] == "SELECT n FROM b" and len(p) > 1 for p in previews)

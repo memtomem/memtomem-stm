@@ -13,6 +13,25 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- TRUNCATE's code-aware output names more of the blocks it cannot keep whole.
+  Those blocks are previewed after a `... (N more blocks)` line, and the
+  previews used to be built one block at a time, each with its body lines, so
+  on a tight budget the first few blocks used it up and the rest were dropped
+  or shown as `# <signature>` — for SQL only the keyword, `# WITH` or
+  `# SELECT`. Now every block's signature line goes in first, and body lines
+  are added one round at a time while the budget lasts. On the bench's
+  `code-python-etl` task at its 800-character budget this names all 7
+  remaining blocks instead of 4. Since 0.6.6 a block no longer opens with the
+  blank lines before it, so they stopped filling its preview window, previews
+  grew a body line, and fewer blocks fit.
+  **Behavior change**: a preview is the block's first non-blank line plus up
+  to three more non-blank lines, in place of the non-blank lines among the
+  block's first four physical lines, and keeps its indentation. A signature
+  line is placed cut to 80 characters with `…` and, when the budget allows,
+  gets its whole line back before any block gets a body line; a
+  block is shown as `# <signature>` only when not even its cut signature
+  fits. Blocks are named in order, so a long block early can take the room a
+  later short block used to get.
 - On macOS with Python 3.12, the leaked-child sweep that runs when an LTM
   adapter's shutdown fails no longer raises `AttributeError: module 'os' has
   no attribute 'waitid'` instead of terminating the child. CPython has

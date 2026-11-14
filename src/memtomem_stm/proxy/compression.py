@@ -838,6 +838,8 @@ class TruncateCompressor(_PlainTextRetention):
                     alloc_left -= len(line) + 1
                 enriched[i] = "\n".join(kept)
 
+    _PREVIEW_SIGNATURE_CAP = 80
+
     def _code_aware_truncate(self, text: str, max_chars: int, boundaries: list[re.Match]) -> str:
         """Preserve signatures/names from ALL code blocks, not just the first ones.
 
@@ -845,13 +847,13 @@ class TruncateCompressor(_PlainTextRetention):
         For SQL: keeps first query full + signature of remaining queries.
         """
         # Parse blocks: each boundary starts a logical block
-        blocks: list[tuple[str, str]] = []  # (signature_line, full_body)
+        blocks: list[str] = []
+        labels: list[str] = []  # what each boundary pattern captured, stripped
         for i, m in enumerate(boundaries):
             start = m.start()
             end = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(text)
-            sig = m.group(1).strip()
-            body = text[start:end].rstrip()
-            blocks.append((sig, body))
+            blocks.append(text[start:end].rstrip())
+            labels.append(m.group(1).strip())
 
         # Preamble (imports, docstrings before first boundary)
         preamble = text[: boundaries[0].start()].rstrip() if boundaries[0].start() > 0 else ""
@@ -873,7 +875,7 @@ class TruncateCompressor(_PlainTextRetention):
             parts.append(preamble)
             used += len(preamble) + 1
 
-        for i, (sig, body) in enumerate(blocks):
+        for i, body in enumerate(blocks):
             if used + len(body) + 2 <= full_budget:
                 parts.append(body)
                 used += len(body) + 2
@@ -881,28 +883,58 @@ class TruncateCompressor(_PlainTextRetention):
             else:
                 break
 
-        # Phase 2: signatures of remaining blocks
-        remaining = [(sig, body) for i, (sig, body) in enumerate(blocks) if i >= full_count]
+        # Phase 2: the remaining blocks, signatures first. Each preview is the
+        # block's first non-blank line (its signature) plus up to 3 more
+        # non-blank lines. Every signature that fits goes in before any block
+        # gets a body line, and body lines are then added one round at a time,
+        # so a tight budget names more blocks rather than showing more of the
+        # first few. A signature line is first placed cut to
+        # _PREVIEW_SIGNATURE_CAP chars, so one long first line (a wide SELECT)
+        # cannot crowd out every block. A block whose cut signature does not
+        # fit either is marked `# <label>` (for SQL just the keyword) when that
+        # fits, so it is still counted in. Cut signatures then get their whole
+        # line back before any body line is added; a marked block gets neither.
+        # Separators are counted: 2 per preview, 1 per added line.
+        remaining = blocks[full_count:]
         if remaining:
             sig_budget = max_chars - used - 60
-            sig_parts: list[str] = []
+            cap = self._PREVIEW_SIGNATURE_CAP
+            previews = [[ln for ln in body.split("\n") if ln.strip()][:4] for body in remaining]
+            heads = [ln[0] if len(ln[0]) <= cap else ln[0][: cap - 1] + "…" for ln in previews]
+            shown: list[int] = []
             sig_used = 0
-            for sig, body in remaining:
-                # Show signature + first non-empty body line
-                body_lines = body.split("\n")
-                sig_lines = [body_lines[0]]
-                for line in body_lines[1:4]:  # up to 3 more lines
-                    stripped = line.strip()
-                    if stripped:
-                        sig_lines.append(line)
-                snippet = "\n".join(sig_lines)
-                if sig_used + len(snippet) + 2 > sig_budget:
-                    if sig_used + len(sig) + 4 <= sig_budget:
-                        sig_parts.append(f"# {sig}")
-                        sig_used += len(sig) + 4
+            for head in heads:
+                cost = len(head) + 2
+                if sig_used + cost <= sig_budget:
+                    shown.append(1)
+                    sig_used += cost
                 else:
-                    sig_parts.append(snippet)
-                    sig_used += len(snippet) + 2
+                    shown.append(0)
+            marked: set[int] = set()
+            for i, label in enumerate(labels[full_count:]):
+                if not shown[i] and sig_used + len(label) + 4 <= sig_budget:
+                    heads[i] = f"# {label}"
+                    shown[i] = 1
+                    marked.add(i)
+                    sig_used += len(label) + 4
+            for i, lines in enumerate(previews):
+                if shown[i] and i not in marked and heads[i] != lines[0]:
+                    cost = len(lines[0]) - len(heads[i])
+                    if sig_used + cost <= sig_budget:
+                        heads[i] = lines[0]
+                        sig_used += cost
+            for depth in range(1, 4):
+                for i, lines in enumerate(previews):
+                    if shown[i] == depth and i not in marked and depth < len(lines):
+                        cost = len(lines[depth]) + 1
+                        if sig_used + cost <= sig_budget:
+                            shown[i] += 1
+                            sig_used += cost
+            sig_parts = [
+                "\n".join([head, *lines[1:n]])
+                for head, lines, n in zip(heads, previews, shown, strict=True)
+                if n
+            ]
 
             if sig_parts:
                 parts.append(f"\n... ({len(remaining)} more blocks)\n")
