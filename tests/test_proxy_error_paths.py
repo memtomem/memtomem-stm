@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -1185,13 +1184,13 @@ class TestCallTimeout:
             f"saw {session.call_tool.call_count} attempts"
         )
 
-    async def test_overall_deadline_includes_backoff_sleep(self):
+    async def test_overall_deadline_includes_backoff_sleep(self, deadline_clock):
         """The retry backoff sleep runs under the remaining overall deadline: a
         0.2 s backoff after 0.03 s of a 0.05 s deadline is given a 0.02 s budget
         and cut short, never slept in full.
 
-        The deadline clock (``manager._time``) is faked, so a scheduler stall on
-        a loaded runner cannot consume the budget before the backoff is reached;
+        ``deadline_clock`` fakes the deadline's clock, so a scheduler stall on a
+        loaded runner cannot consume the budget before the backoff is reached;
         the event-loop clock stays real, so the budget still expires (#1363)."""
         mgr = _make_manager(
             max_retries=3,
@@ -1202,11 +1201,9 @@ class TestCallTimeout:
             tools=_read_only_tools(),
         )
         session = _get_session(mgr)
-        fake_now = 100.0
 
         def reset_after_30ms(*_a, **_kw):
-            nonlocal fake_now
-            fake_now += 0.03
+            deadline_clock.advance(0.03)
             raise ConnectionError("ambiguous reset")
 
         session.call_tool.side_effect = reset_after_30ms
@@ -1232,10 +1229,8 @@ class TestCallTimeout:
             backoffs.append((budget, "completed"))
             return result
 
-        fake_time = SimpleNamespace(monotonic=lambda: fake_now, perf_counter=time.perf_counter)
         with (
             patch.object(mgr, "_reconnect_server", new_callable=AsyncMock),
-            patch("memtomem_stm.proxy.manager._time", fake_time),
             patch("memtomem_stm.proxy.manager.asyncio.timeout", side_effect=spy_timeout),
             patch("memtomem_stm.proxy.manager.asyncio.sleep", side_effect=spy_sleep),
         ):
@@ -1362,8 +1357,10 @@ class TestTimeoutReplayGuard:
         assert session.call_tool.call_count == 1
         mock_reconnect.assert_awaited_once_with("srv", ANY)
 
-    async def test_readonly_timeout_is_retried(self):
+    async def test_readonly_timeout_is_retried(self, deadline_clock):
         """A declared read-only tool is replay-safe: timeout still retries."""
+        # ``deadline_clock`` holds the 1.0 s deadline still: it bounds the call, not
+        # the retry under test, and a stall must not spend it first (#1408).
         mgr = _make_manager(
             max_retries=1,
             call_timeout=0.05,
@@ -1435,10 +1432,12 @@ class TestTimeoutReplayGuard:
 
         assert attempts == 1
 
-    async def test_per_tool_cache_true_override_keeps_replay(self):
+    async def test_per_tool_cache_true_override_keeps_replay(self, deadline_clock):
         """An explicit per-tool ``cache: true`` is the operator's 'effectively
         read-only' assertion, so timeout-retry is preserved for an otherwise
         unannotated tool."""
+        # ``deadline_clock`` holds the 1.0 s deadline still: it bounds the call, not
+        # the retry under test, and a stall must not spend it first (#1408).
         mgr = _make_manager(
             max_retries=1,
             call_timeout=0.05,
@@ -1899,7 +1898,12 @@ class TestUpstreamCircuitBreaker:
         assert breaker.state == "open"
         assert breaker.opened_at != first_opened_at  # fresh window from the probe failure
 
-    async def test_overall_deadline_terminal_records_breaker_failure(self):
+    async def test_overall_deadline_terminal_records_breaker_failure(self, deadline_clock):
+        """A deadline spent after an RPC failed charges the breaker once.
+
+        The deadline clock moves only inside the RPC: a stall before dispatch
+        would spend the 0.05 s deadline with no RPC made, and that deadline
+        rightly charges nothing (#1408)."""
         mgr = _make_manager(
             max_retries=10,
             call_timeout=0.01,
@@ -1910,6 +1914,7 @@ class TestUpstreamCircuitBreaker:
         session = _get_session(mgr)
 
         async def hang(*args, **kwargs):
+            deadline_clock.advance(0.06)
             await asyncio.sleep(10)
 
         session.call_tool.side_effect = hang
@@ -1920,6 +1925,7 @@ class TestUpstreamCircuitBreaker:
 
         breaker = mgr._connections["srv"].breaker
         assert breaker.failure_count == 1
+        assert session.call_tool.call_count == 1
 
     async def test_disabled_breaker_never_fast_fails(self):
         mgr = _make_manager(max_retries=0, circuit_max_failures=0)

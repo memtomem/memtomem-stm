@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -112,6 +113,31 @@ def proxy_cache(tmp_path: Path) -> ProxyCache:
 @pytest.fixture
 def token_tracker() -> TokenTracker:
     return TokenTracker(metrics_store=None)
+
+
+class DeadlineClock:
+    """Stands in for ``memtomem_stm.proxy.manager._time``, the clock a call's
+    ``overall_deadline_seconds`` is measured on. ``monotonic`` moves only on
+    ``advance``, so a scheduler stall on a loaded runner cannot spend a short
+    deadline before the step under test is reached. The event-loop clock is
+    untouched: every ``asyncio.timeout`` budget still expires in real time."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.perf_counter = time.perf_counter
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def deadline_clock(monkeypatch: pytest.MonkeyPatch) -> DeadlineClock:
+    clock = DeadlineClock()
+    monkeypatch.setattr("memtomem_stm.proxy.manager._time", clock)
+    return clock
 
 
 @pytest.fixture(autouse=True)

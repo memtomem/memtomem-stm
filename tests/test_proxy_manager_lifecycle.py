@@ -2433,9 +2433,13 @@ class TestCleanupLogCredentialRedaction:
         )
         return session
 
-    async def test_fetch_post_deadline_reconnect_redacts(self, caplog):
+    async def test_fetch_post_deadline_reconnect_redacts(self, caplog, deadline_clock):
         """A failed RPC generation is recovered after its overall deadline;
-        a reconnect failure must not leak the credentialed URL."""
+        a reconnect failure must not leak the credentialed URL.
+
+        ``deadline_clock`` holds the deadline clock still, so the 0.05 s budget
+        is spent in the backoff after the failed RPC, not by a stall before
+        dispatch, which would leave no failed generation to recover (#1408)."""
         import pytest as _pt
 
         cfg = self._cfg(
