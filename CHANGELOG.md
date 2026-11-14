@@ -58,8 +58,11 @@ changes inline only. See the deprecation policy in
   `"state": "unknown"` with an `error` field, and still lists the daemons
   published under `data_dir`), `mms daemon stop --all` first acts on those
   daemons as it does on any under a different config (signalling them on
-  macOS and Linux; on Windows, end the processes), the hook takes its configured fallback, standalone surfacing logs
-  one warning and reports the daemon as unavailable until STM restarts, and
+  macOS and Linux; on Windows, end the processes), the hook takes its
+  configured fallback, standalone surfacing logs one warning and reports the
+  daemon as unavailable until STM restarts (from the moment it reads the
+  key: at startup, or at its next spawn request if the key is damaged later
+  — requests to a daemon it already found go on), and
   `mms health` / `mms doctor` report it as an unreachable daemon with their
   usual exit codes. Moving the file aside makes a new one (#1416).
   **Behavior change**: every daemon started by an earlier build is under a
@@ -67,7 +70,7 @@ changes inline only. See the deprecation policy in
   `mms daemon status` lists it as running under a different config,
   `mms daemon stop` and `restart` do not reach it, and `mms daemon stop --all`
   does (on Windows, end the process). One with an idle timeout exits on its
-  own; one with `daemon.idle_timeout_seconds = 0` needs the `stop --all`.
+  own; one with `daemon.idle_timeout_seconds = 0` has to be stopped that way.
   The earlier build's `stm-daemon-*.lock` files are not removed and still
   carry the old, recomputable fingerprint in their names: after
   `mms daemon stop --all`, with no STM process running under any environment
@@ -75,7 +78,8 @@ changes inline only. See the deprecation policy in
   there can be deleted (they are recreated on demand; keep
   `stm-discovery.key`). Deleting or replacing the key while daemons run
   leaves them under a fingerprint nothing derives any more — `status` lists
-  them as foreign, `stop --all` stops them, and a standalone proxy that was
+  them as foreign, `stop --all` signals them (on Windows, end the processes),
+  and a standalone proxy that was
   already running keeps looking for the old one until it restarts. The key is
   created with a hard link, so on a `data_dir` whose filesystem has none the
   daemon cannot be used. `mms daemon status` on a `data_dir` it cannot walk

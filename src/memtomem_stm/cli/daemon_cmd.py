@@ -522,11 +522,13 @@ def stop_cmd(stop_all: bool) -> None:
         except SystemExit as exc:
             stop_error = exc
     if key_error is not None:
-        hint = (
-            ""
-            if stop_all
-            else "; `mms daemon stop --all` stops every daemon published under data_dir"
-        )
+        if stop_all:
+            hint = ""
+        elif _can_force_terminate():
+            hint = "; `mms daemon stop --all` signals every daemon published under data_dir"
+        else:
+            # ``stop --all`` refuses to signal by pid on Windows.
+            hint = "; end the daemon processes `mms daemon status` lists from Task Manager"
         click.echo(_warn(_disp(_key_error_text(key_error)) + hint), err=True)
         raise SystemExit(1)
     if stop_error is not None:

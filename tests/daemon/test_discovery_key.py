@@ -464,10 +464,14 @@ def test_stop_all_still_cleans_up_when_the_key_goes_bad_mid_command(
     assert "stm-discovery.key: gone bad" in result.output
 
 
-def test_stop_with_an_unusable_key_names_the_file_and_points_at_all(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("can_signal", [True, False], ids=["posix", "windows"])
+def test_stop_with_an_unusable_key_names_the_file_and_the_way_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, can_signal: bool
 ) -> None:
+    """The hint must not send a Windows operator to ``stop --all``, which
+    refuses to signal by pid there."""
     monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: can_signal)
     key_path = _break_key(tmp_path)
     _put_foreign(tmp_path, "0ldunkeyedfp0000")
     _accepting(monkeypatch)
@@ -478,7 +482,8 @@ def test_stop_with_an_unusable_key_names_the_file_and_points_at_all(
 
     assert result.exit_code == 1
     assert str(key_path) in result.output
-    assert "mms daemon stop --all" in result.output
+    assert ("mms daemon stop --all" in result.output) is can_signal
+    assert ("Task Manager" in result.output) is not can_signal
     assert killed == []
 
 

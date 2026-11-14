@@ -1236,14 +1236,18 @@ A key that exists but cannot be read, or does not hold a key, is an error:
   pid, so end those processes from Task Manager. It reaches daemons that have
   a handshake; one that holds its lock without one (starting, or finishing its
   teardown) is not listed.
-- `mms hook` takes its configured `hook.fallback`; standalone surfacing logs
-  one warning naming the file and reports the daemon as unavailable until STM
-  restarts; `mms health` and `mms doctor` report an unreachable daemon, with
-  their usual exit codes, and point here.
+- `mms hook` takes its configured `hook.fallback`. Standalone surfacing reads
+  the key when it starts and again whenever it asks for a daemon to be
+  spawned; from the first of those that fails it logs one warning naming the
+  file and reports the daemon as unavailable until STM restarts. A key damaged
+  while its daemon keeps answering changes nothing until that daemon is gone.
+  `mms health` and `mms doctor` report an unreachable daemon, with their usual
+  exit codes, and point here.
 
 Moving the file aside lets the next `start` create a new one. A new key means
 new fingerprints: daemons still running under the old one are listed as
-running under a different config and stopped by `stop --all`, and a standalone
+running under a different config, to be stopped with `stop --all` (on Windows,
+from Task Manager), and a standalone
 proxy that was already running keeps looking for the old fingerprint until it
 restarts — so replace the key only with STM stopped. The key is created with a
 hard link (two processes creating it at once must end up with one key), so a
