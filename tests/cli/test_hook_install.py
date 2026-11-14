@@ -434,6 +434,63 @@ def test_config_path_respects_host_home_override(
     assert _config_path(HOOK_HOSTS[host]).parent == home
 
 
+def test_empty_codex_home_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Codex reads ~/.codex for an empty CODEX_HOME (measured on 0.167.2).
+    monkeypatch.setenv("CODEX_HOME", "")
+    assert _config_path(HOOK_HOSTS["codex"]) == HOOK_HOSTS["codex"].config_path.expanduser()
+
+
+@pytest.mark.parametrize(
+    ("host", "env_name", "value"),
+    [
+        ("claude", "CLAUDE_CONFIG_DIR", ""),
+        ("claude", "CLAUDE_CONFIG_DIR", "rel"),
+        ("codex", "CODEX_HOME", "rel"),
+        ("kimi", "KIMI_CODE_HOME", ""),
+        ("kimi", "KIMI_CODE_HOME", "rel"),
+    ],
+)
+def test_config_path_refuses_a_home_it_cannot_place(
+    host: str, env_name: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A relative value names a file under the current directory, which a
+    # repository checkout controls (#1345); STM refuses rather than guess.
+    monkeypatch.setenv(env_name, value)
+    with pytest.raises(HookInstallError, match=f"{env_name} is ") as excinfo:
+        _config_path(HOOK_HOSTS[host])
+    if value:
+        assert f"'{value}'" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("action", ["install", "uninstall"])
+def test_cli_refuses_an_empty_kimi_code_home_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    # Kimi Code reads <its cwd>/config.toml when KIMI_CODE_HOME is empty, so
+    # neither that file nor the default one is the right file to edit.
+    home = Path.home()
+    default = home / ".kimi-code" / "config.toml"
+    default.parent.mkdir(parents=True)
+    installed = plan_install("kimi", _CMD.format(host="kimi")).new_text
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    in_cwd = cwd / "config.toml"
+    prior = installed if action == "uninstall" else 'model = "x"\n'
+    default.write_text(prior, encoding="utf-8")
+    in_cwd.write_text(prior, encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("KIMI_CODE_HOME", "")
+
+    result = CliRunner().invoke(cli, ["hook", action, "--host", "kimi", "--apply"])
+
+    assert result.exit_code == 1, result.output
+    assert "KIMI_CODE_HOME is empty, relative" in result.output
+    assert default.read_text(encoding="utf-8") == prior
+    assert in_cwd.read_text(encoding="utf-8") == prior
+    assert sorted(p.name for p in cwd.iterdir()) == ["config.toml"]
+    assert sorted(p.name for p in default.parent.iterdir()) == ["config.toml"]
+
+
 @pytest.mark.parametrize(
     "payload",
     [{"hooks": "not-an-object"}, {"hooks": {"PostToolUse": "not-a-list"}}],

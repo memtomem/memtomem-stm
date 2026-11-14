@@ -2567,6 +2567,50 @@ class TestNotInspected:
 
         self._assert_kept(runner, "proj-srv", "no_key")
 
+    @pytest.mark.parametrize("force", [False, True])
+    def test_unplaceable_codex_home_keeps_both_codex_layers(
+        self, runner, sandbox, monkeypatch, force
+    ):
+        # Both labels are gaps: the project layer is admitted by a trust entry
+        # in the user layer, so neither can be read when CODEX_HOME cannot be
+        # placed (#1345).
+        cwd = sandbox["cwd"]
+        codex_dir = sandbox["home"] / ".codex"
+        codex_dir.mkdir()
+        escaped = str(cwd.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+        (codex_dir / "config.toml").write_text(
+            f'[mcp_servers.kept-user]\ncommand = "npx"\n'
+            f'[projects."{escaped}"]\ntrust_level = "trusted"\n',
+            encoding="utf-8",
+        )
+        (cwd / ".codex").mkdir()
+        (cwd / ".codex" / "config.toml").write_text(
+            '[mcp_servers.kept-proj]\ncommand = "npx"\n', encoding="utf-8"
+        )
+        res = runner.invoke(
+            import_command, ["--from", "codex", "--apply", "--allow-project-configs"]
+        )
+        assert res.exit_code == 0, res.output
+        baselines = state.load_import_state().entries
+        assert {n: baselines[n].source_label for n in baselines} == {
+            "kept-user": "Codex CLI",
+            "kept-proj": "Codex CLI (project)",
+        }
+        monkeypatch.setenv("CODEX_HOME", "relative/codex")
+
+        args = ["--apply", "--yes", "--json"] + (["--force"] if force else [])
+        res = _sync(runner, *args)
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["plan"]["remove"] == []
+        assert payload["summary"]["removed"] == 0
+        assert sorted((r["name"], r["reason"]) for r in payload["plan"]["not_inspected"]) == [
+            ("kept-proj", "codex_home"),
+            ("kept-user", "codex_home"),
+        ]
+        assert set(state.load_registry().servers) == {"kept-user", "kept-proj"}
+        assert state.load_import_state().entries == baselines
+
     def test_a_readable_config_without_the_entry_still_removes_it(self, runner, sandbox):
         """Control: the new state does not swallow a real removal."""
         _seed_claude_code(sandbox, {"gone": {"command": "npx"}})

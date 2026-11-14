@@ -79,6 +79,11 @@ import tomli_w
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, get_adapter
 from memtomem_stm.cli.host_runtime import _shell_tokens
+from memtomem_stm.mms.host_homes import (
+    HOST_HOME_UNKNOWN_REASONS,
+    HostHomeUnknown,
+    host_home_override,
+)
 from memtomem_stm.utils.fileio import atomic_write_text
 
 # Executable basenames that mark a command as an STM hook invocation. Mirrors
@@ -438,16 +443,28 @@ HOOK_HOSTS: dict[str, HookHostSpec] = {
 }
 
 
+_HOME_FILES = {"claude": "settings.json", "codex": "config.toml", "kimi": "config.toml"}
+
+
 def _config_path(spec: HookHostSpec) -> Path:
-    """Resolve host homes without ignoring the host's supported home override."""
-    env_and_name = {
-        "claude": ("CLAUDE_CONFIG_DIR", "settings.json"),
-        "codex": ("CODEX_HOME", "config.toml"),
-        "kimi": ("KIMI_CODE_HOME", "config.toml"),
-    }.get(spec.host_tag)
-    if env_and_name and (home := os.environ.get(env_and_name[0])):
-        return Path(home).expanduser() / env_and_name[1]
-    return spec.config_path.expanduser()
+    """Resolve host homes without ignoring the host's supported home override.
+
+    Raises :class:`HookInstallError` when STM cannot tell which directory the
+    host's variable points at
+    (:func:`~memtomem_stm.mms.host_homes.host_home_override`), rather than
+    reading or writing a file relative to the current directory.
+    """
+    filename = _HOME_FILES.get(spec.host_tag)
+    if filename is None:
+        return spec.config_path.expanduser()
+    home = host_home_override(spec.host_tag)
+    if home is None:
+        return spec.config_path.expanduser()
+    if isinstance(home, HostHomeUnknown):
+        raise HookInstallError(
+            f"cannot tell which {spec.label} config to use: {HOST_HOME_UNKNOWN_REASONS[home.code]}"
+        )
+    return home / filename
 
 
 def matcher_for(host_tag: str) -> str | None:

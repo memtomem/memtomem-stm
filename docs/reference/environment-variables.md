@@ -272,10 +272,10 @@ provider, host, or standard SDK. They do not change `STMConfig` completeness.
 | `NO_COLOR` | Disable ANSI color in CLI output. |
 | `OPENAI_API_KEY` | Fallback credential for OpenAI compression or embedding relevance scoring. |
 | `ANTHROPIC_API_KEY` | Fallback credential for Anthropic compression. |
-| `CODEX_HOME` | Codex user config discovery root; defaults to `~/.codex`. |
+| `CODEX_HOME` | Codex user config and hook config root; defaults to `~/.codex`, also when empty. Must be an absolute path with no `.` or `..` component, or Codex discovery is skipped and `mms hook install`/`uninstall` refuse. |
 | `CLAUDE_CONFIG_DIR` | Claude hook config discovery root, and the directory of the Claude Code config (`.claude.json`) that MCP discovery, `prune` and `eject` read when it is an absolute path; see [Which Claude Code config STM reads](../cli.md#which-claude-code-config-stm-reads). |
 | `CLAUDE_CODE_CUSTOM_OAUTH_URL` | When set, Claude Code reads a differently named config file, so STM reads no Claude Code MCP servers or `/mcp` disables. |
-| `KIMI_CODE_HOME` | Kimi Code hook config discovery root. |
+| `KIMI_CODE_HOME` | Kimi Code hook config root. When set, it must be an absolute path with no `.` or `..` component (an empty value included), or `mms hook install`/`uninstall` refuse. |
 | `APPDATA` | Native Windows Claude Desktop config discovery root. |
 | `OTEL_SERVICE_NAME` | Standard OpenTelemetry service name; STM supplies its configured/default name only when this is absent. |
 | `OTEL_RESOURCE_ATTRIBUTES` and standard `OTEL_EXPORTER_OTLP_*` controls | Read by the OpenTelemetry SDK for resource/TLS/compression settings not owned by STM. `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` are rejected while STM OTLP export is enabled; put credentials in `MEMTOMEM_STM_OTLP__HEADERS`. |

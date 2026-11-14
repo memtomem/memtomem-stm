@@ -1032,10 +1032,20 @@ tool call. `uninstall` removes it.
 
 | host     | config file               | format |
 | -------- | ------------------------- | ------ |
-| `claude` | `~/.claude/settings.json` | JSON   |
+| `claude` | `$CLAUDE_CONFIG_DIR/settings.json`, otherwise `~/.claude/settings.json` | JSON   |
 | `cursor` | `~/.cursor/hooks.json`    | JSON   |
 | `kimi`   | `$KIMI_CODE_HOME/config.toml`, otherwise `~/.kimi-code/config.toml` | TOML |
-| `codex`  | `~/.codex/config.toml`    | TOML   |
+| `codex`  | `$CODEX_HOME/config.toml`, otherwise `~/.codex/config.toml` | TOML   |
+
+A home variable is used only when it is an absolute path with no `.` or `..`
+component; an empty `CODEX_HOME` counts as unset, as it does for Codex. For any
+other value (empty `CLAUDE_CONFIG_DIR` or `KIMI_CODE_HOME`, relative, a literal
+`~`, or a `.`/`..` component) `install` and `uninstall` exit with an error
+naming the variable. A relative value, and an empty `CLAUDE_CONFIG_DIR` or
+`KIMI_CODE_HOME`, is resolved against the host's own working directory, which
+STM does not know; a `..` can name a different
+directory for the host than for STM (Kimi Code and Claude Code join it
+lexically, the filesystem resolves it through symlinks).
 
 ```
 Usage: mms hook install [OPTIONS]
@@ -1349,7 +1359,7 @@ Where each host config lives:
 |------|---------|
 | `claude-code` | Claude Code's [global config](#which-claude-code-config-stm-reads) (user + the project entry Claude Code uses for cwd, `projects.<repository root>.mcpServers`) and `<cwd>/.mcp.json` |
 | `cursor` | `~/.cursor/mcp.json` (user) and `<cwd>/.cursor/mcp.json` (project) |
-| `codex` | `$CODEX_HOME/config.toml` plus trusted `<cwd>/.codex/config.toml` |
+| `codex` | `$CODEX_HOME/config.toml` plus trusted `<cwd>/.codex/config.toml` (an empty `CODEX_HOME` means `~/.codex`; one that is relative or has a `.` or `..` component skips both, and `mms host status`/`sync` report their entries as `not_inspected`) |
 | `claude-desktop` | macOS `~/Library/Application Support/Claude/...`; Windows `%APPDATA%\Claude\...`; Linux `~/.config/Claude/...` |
 
 Missing configs are silently treated as "no candidates" so `--from all` works across native Windows, macOS, Linux, and WSL2.
