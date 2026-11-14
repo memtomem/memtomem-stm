@@ -2140,6 +2140,25 @@ class TestSyncGuidanceIsFollowable:
         assert res.exit_code == 0, res.output
         _assert_restamped("x", ["v2"], old_baseline)
 
+    def test_mutated_apply_footer_carries_yes(self, runner, sandbox):
+        """Same as above when the ``--apply --yes`` run does write something
+        (an ADD), so the footer comes from the mutated-outcome render."""
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        _seed_cursor_user(sandbox, {"added": {"command": "uvx"}})
+        old_baseline = state.load_import_state().entries["x"].drift_hash
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+        assert "added" in state.load_registry().servers
+        assert list(state.load_registry().servers["x"].args) == ["v1"]
+        res = _sync(runner, *_footer_command(res.output))
+        assert res.exit_code == 0, res.output
+        _assert_restamped("x", ["v2"], old_baseline)
+
     def _drift_project_local(self, runner, sandbox) -> str:
         _seed_dot_mcp_json(sandbox, {"foo": {"command": "npx", "args": ["v1"]}})
         res = runner.invoke(

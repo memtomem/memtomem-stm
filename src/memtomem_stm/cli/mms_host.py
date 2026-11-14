@@ -782,10 +782,12 @@ def _build_apply_prompt(
 def _sync_apply_command(*, force: bool, yes: bool, allow_project_configs: bool) -> str:
     """The ``mms host sync --apply`` command a text hint tells the user to run.
 
-    Echoes the acknowledgement flags the user already supplied, so copying
-    the hint never drops a flag the run previewed or acknowledged. A flag
-    the user did not supply is never added: the project-config gate and
-    the non-TTY confirmation abort print their own hints for those.
+    ``force`` is the caller's choice: the changed-entry footer always
+    passes ``True``, the plan closing line passes the run's ``--force``.
+    ``--yes`` / ``--allow-project-configs`` are echoed only when the user
+    supplied them, so copying the hint never drops an acknowledgement the
+    run already gave and never adds one it did not; the project-config
+    gate and the non-TTY confirmation abort print their own hints.
     """
     parts = ["mms host sync --apply"]
     if force:
@@ -844,8 +846,8 @@ def _render_sync_text(
     review (``--force`` deliberately doesn't help cross-host).
 
     ``yes`` / ``allow_project_configs`` are the flags the user supplied;
-    every command this renderer prints carries them (see
-    ``_sync_apply_command``).
+    both ``mms host sync --apply`` hints (changed-entry footer, plan
+    closing line) carry them (see ``_sync_apply_command``).
     """
     add_rows = plan_payload["add"]
     remove_rows = plan_payload["remove"]
@@ -1081,10 +1083,11 @@ def sync_cmd(
       - ``--force`` activates the ``changed`` bucket as a mutator
         (without it, ``changed`` stays non-mutating).
       - ``--yes`` bypasses the interactive confirmation prompt.
-      With ``--apply``: ``--force`` alone still prompts; ``--force
-      --yes`` is the non-interactive combination. ``--force --json``
-      without ``--yes`` aborts (exit 2, ``aborted: true``) — same gate
-      REMOVE uses, since mixing prompt text with JSON corrupts parsing.
+      With ``--apply`` and a non-empty REMOVE or RESTAMP bucket:
+      ``--force`` alone still prompts; ``--force --yes`` is the
+      non-interactive combination. ``--force --json`` without ``--yes``
+      aborts (exit 2, ``aborted: true``) — same gate REMOVE uses, since
+      mixing prompt text with JSON corrupts parsing.
       Under the default ``--plan``, ``--force`` only previews the
       RESTAMP section: nothing is written, nothing prompts, and
       ``--plan --force --json`` exits 0.
