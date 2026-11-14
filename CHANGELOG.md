@@ -96,6 +96,20 @@ changes inline only. See the deprecation policy in
   STM's own registration. An entry of this form already imported into
   `~/.mms/registry.toml` now shows as `removed_at_host` in
   `mms host status`.
+- `stm_compression_feedback` no longer stores a `missing` text the privacy
+  screen flags. The text describes what a compressed response dropped, so it
+  often quotes the dropped line, and it was written to
+  `compression_feedback.missing` as given, while writers such as the response
+  cache and the selection log screen first. It is now checked the way the
+  response cache checks a response
+  (credentials and PII, including after decoding JSON string escapes, and
+  text that is still escaped after the last decoding pass); such a text is
+  stored as `[not stored: withheld by the privacy screen]`. The report is
+  still recorded with its server, tool, kind and trace id: the tuner counts
+  reports by server, tool and kind, and nothing reads the text back. (#1380)
+  **Behavior change**: for such a text the stored value is the placeholder,
+  and the tool's reply adds `the description was withheld by the privacy
+  screen and not stored`. Rows written before this change are not rewritten.
 
 ## [0.7.8] — 2026-11-14
 
