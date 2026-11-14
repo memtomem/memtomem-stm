@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -1062,7 +1063,7 @@ class TestCallTimeout:
             reconnect_delay=0.0,
             max_reconnect_delay=0.0,
             call_timeout=0.05,
-            overall_deadline=1.0,
+            overall_deadline=2.0,
             tools=_read_only_tools(),
         )
         session = _get_session(mgr)
@@ -1088,10 +1089,13 @@ class TestCallTimeout:
     async def test_hanging_upstream_without_retries_raises_timeout(self):
         """With ``max_retries=0`` a hanging upstream must surface
         ``TimeoutError`` instead of hanging forever."""
+        # The per-attempt timeout is under test, so the overall deadline only
+        # needs to sit well above it: a tight one let a scheduler stall reach
+        # the deadline path first, which schedules no reconnect (#1363).
         mgr = _make_manager(
             max_retries=0,
             call_timeout=0.05,
-            overall_deadline=0.2,
+            overall_deadline=2.0,
         )
         session = _get_session(mgr)
 
@@ -1119,7 +1123,7 @@ class TestCallTimeout:
             reconnect_delay=0.0,
             max_reconnect_delay=0.0,
             call_timeout=0.05,
-            overall_deadline=1.0,
+            overall_deadline=2.0,
             tools=_read_only_tools(),
         )
         session = _get_session(mgr)
@@ -1182,6 +1186,13 @@ class TestCallTimeout:
         )
 
     async def test_overall_deadline_includes_backoff_sleep(self):
+        """The retry backoff sleep runs under the remaining overall deadline: a
+        0.2 s backoff after 0.03 s of a 0.05 s deadline is given a 0.02 s budget
+        and cut short, never slept in full.
+
+        The deadline clock (``manager._time``) is faked, so a scheduler stall on
+        a loaded runner cannot consume the budget before the backoff is reached;
+        the event-loop clock stays real, so the budget still expires (#1363)."""
         mgr = _make_manager(
             max_retries=3,
             reconnect_delay=0.2,
@@ -1191,16 +1202,53 @@ class TestCallTimeout:
             tools=_read_only_tools(),
         )
         session = _get_session(mgr)
-        session.call_tool.side_effect = ConnectionError("ambiguous reset")
+        fake_now = 100.0
 
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        def reset_after_30ms(*_a, **_kw):
+            nonlocal fake_now
+            fake_now += 0.03
+            raise ConnectionError("ambiguous reset")
+
+        session.call_tool.side_effect = reset_after_30ms
+
+        real_sleep = asyncio.sleep
+        real_timeout = asyncio.timeout
+        budgets: list[float] = []
+        backoffs: list[tuple[float, str]] = []
+
+        def spy_timeout(delay):
+            budgets.append(delay)
+            return real_timeout(delay)
+
+        async def spy_sleep(delay, *args, **kwargs):
+            if delay != 0.2:
+                return await real_sleep(delay, *args, **kwargs)
+            budget = budgets[-1]
+            try:
+                result = await real_sleep(delay, *args, **kwargs)
+            except asyncio.CancelledError:
+                backoffs.append((budget, "cancelled"))
+                raise
+            backoffs.append((budget, "completed"))
+            return result
+
+        fake_time = SimpleNamespace(monotonic=lambda: fake_now, perf_counter=time.perf_counter)
+        with (
+            patch.object(mgr, "_reconnect_server", new_callable=AsyncMock),
+            patch("memtomem_stm.proxy.manager._time", fake_time),
+            patch("memtomem_stm.proxy.manager.asyncio.timeout", side_effect=spy_timeout),
+            patch("memtomem_stm.proxy.manager.asyncio.sleep", side_effect=spy_sleep),
+        ):
             with pytest.raises(asyncio.TimeoutError, match="overall_deadline"):
                 await mgr.call_tool("srv", "tool", {})
             await asyncio.gather(*mgr._background_tasks)
 
-        assert loop.time() - started < 0.15
+        # One backoff, bounded by the 0.02 s left of the deadline (not the full
+        # deadline, not the 0.2 s delay), and interrupted by that bound.
+        assert len(backoffs) == 1
+        budget, outcome = backoffs[0]
+        assert budget == pytest.approx(0.02)
+        assert outcome == "cancelled"
         assert session.call_tool.call_count == 1
         assert mgr._connections["srv"].unavailable_generation == 0
 
