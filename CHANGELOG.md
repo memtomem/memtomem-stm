@@ -55,6 +55,25 @@ changes inline only. See the deprecation policy in
   only with `--apply`.
   **Behavior change**: only the text output of `mms host sync` changes; exit
   codes, the `--json` payload, and what is written are the same.
+- A host entry that starts STM or LTM as `<python> -m <module>` is now
+  recognized as STM's own registration or the LTM companion, like the
+  `mms` / `memtomem-server` forms already were. That is the form STM writes
+  for its own registrations (`-P -m memtomem_stm`) and the one LTM's
+  `mm init` writes (`-m memtomem.server`); only the console-script names
+  were matched, so such an entry under a name other than the defaults was
+  offered as an upstream, which made STM proxy itself or register LTM
+  twice. Only the modules that start those two servers count, and only when
+  the command is a Python interpreter whose own `-m` selects one, read with
+  Python's option rules: the bundled `memtomem_stm.demo_server` upstream is
+  still imported, and a `-m` given to a script or another program is not
+  read. A wrapper that starts Python itself (`uv run python -m …`) is not
+  recognized by its module. (#1383, #1400)
+  **Behavior change**: `mms init`, `mms add --from-clients`, `mms import`
+  and `mms host sync` no longer offer such entries, the plugin and Codex
+  registration reports leave them out, and `mms eject` refuses them as
+  STM's own registration. An entry of this form already imported into
+  `~/.mms/registry.toml` now shows as `removed_at_host` in
+  `mms host status`.
 
 ## [0.7.8] — 2026-11-14
 

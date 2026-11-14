@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 
 import pytest
@@ -86,6 +87,78 @@ class TestHelperReexports:
 
     def test_is_self_reference_passes_normal_entries(self):
         assert not ih._is_self_reference({"command": "npx", "args": ["-y", "@mcp/fs"]})
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            ("/venv/bin/python", ["-P", "-m", "memtomem_stm"]),  # STM since -P
+            ("/venv/bin/python", ["-m", "memtomem_stm"]),  # STM before it
+            ("/venv/bin/python3.12", ["-m", "memtomem_stm.server"]),
+            ("/venv/bin/python", ["-m", "memtomem.server"]),  # LTM's `mm init`
+            ("python3", ["-m", "memtomem.server.__main__"]),
+            ("python", ["-mmemtomem_stm"]),
+            ("python", ["-Im", "memtomem_stm"]),  # grouped flags
+            ("python", ["-Pm", "memtomem_stm"]),
+            ("python", ["-X", "-munrelated", "-m", "memtomem_stm"]),  # -X's value
+            ("python", ["-Xdev", "-W", "ignore", "-m", "memtomem.server"]),
+            ("python", ["--check-hash-based-pycs", "never", "-m", "memtomem_stm"]),
+            ("C:/venv/Scripts/python.exe", ["-m", "memtomem_stm"]),
+            ("/venv/bin/Python", ["-m", "Memtomem_STM"]),
+        ],
+    )
+    def test_is_self_reference_blocks_module_form(self, command, args):
+        assert ih._is_self_reference({"command": command, "args": args})
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            # The bundled demo upstream STM registers itself, in the same form.
+            ("/venv/bin/python", ["-P", "-m", "memtomem_stm.demo_server"]),
+            # Arguments after the selected module belong to that program.
+            ("python", ["-m", "memtomem_stm.demo_server", "-m", "memtomem_stm"]),
+            # A script or -c ends the interpreter's options.
+            ("python", ["server.py", "-m", "memtomem_stm"]),
+            ("python", ["-c", "pass", "-m", "memtomem.server"]),
+            ("python", ["-m", "memtomem_stm_extension"]),
+            ("python", ["-m", "memtomem_notes"]),
+            ("python", ["-m"]),
+            # Not a Python interpreter: its -m means whatever it means there.
+            ("node", ["-m", "memtomem_stm"]),
+            ("uv", ["run", "some_server", "-m", "memtomem_stm"]),
+        ],
+    )
+    def test_is_self_reference_passes_other_modules(self, command, args):
+        assert not ih._is_self_reference({"command": command, "args": args})
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["-m", "{mod}"],
+            ["-P", "-m", "{mod}"],
+            ["-m{mod}"],
+            ["-Im", "{mod}"],
+            ["-Pm", "{mod}"],
+            ["-X", "-munrelated", "-m", "{mod}"],
+            ["-Xdev", "-W", "ignore", "-m", "{mod}"],
+            ["--check-hash-based-pycs", "never", "-m", "{mod}"],
+            ["-c", "pass", "-m", "{mod}"],
+            ["missing_script_for_test.py", "-m", "{mod}"],
+            ["-m", "missing_other_module_for_test", "-m", "{mod}"],
+        ],
+    )
+    def test_python_module_target_matches_the_interpreter(self, args, tmp_path):
+        # The real interpreter decides: asked to run a module that does not
+        # exist, it names that module in its error, and only then.
+        mod = "memtomem_stm_probe_missing_module"
+        argv = [a.format(mod=mod) for a in args]
+        proc = subprocess.run(
+            [sys.executable, *argv], capture_output=True, text=True, timeout=30, cwd=tmp_path
+        )
+        ran = f"No module named {mod}" in proc.stderr
+        assert (ih._python_module_target(argv) == mod) is ran
+
+    def test_is_self_reference_ignores_non_string_module(self):
+        assert not ih._is_self_reference({"command": "python", "args": ["-m", 7]})
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +328,25 @@ class TestScanClaudeCode:
         (sandbox_home / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
         names = {c.name for c in ih.scan_claude_code(tmp_path)}
         assert names == {"fine"}
+
+    def test_module_form_self_reference_filtered(self, sandbox_home, tmp_path):
+        # Under names other than the defaults, so only the argv can tell.
+        cfg = {
+            "mcpServers": {
+                "stm-renamed": {
+                    "command": "/venv/bin/python",
+                    "args": ["-P", "-m", "memtomem_stm"],
+                },
+                "ltm": {"command": "/venv/bin/python", "args": ["-m", "memtomem.server"]},
+                "demo": {
+                    "command": "/venv/bin/python",
+                    "args": ["-P", "-m", "memtomem_stm.demo_server"],
+                },
+            }
+        }
+        (sandbox_home / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
+        names = {c.name for c in ih.scan_claude_code(tmp_path)}
+        assert names == {"demo"}
 
     def test_dangerous_env_filtered(self, sandbox_home, tmp_path):
         cfg = {
