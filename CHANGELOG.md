@@ -13,6 +13,34 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The surfacing query digest is keyed, and the selection log stops writing
+  argument digests. The query digest — written to `surfacing_events.query`
+  when `persist_query_text` is off (always, on the hook daemon path), to
+  `surfacing_opportunities.query_digest`, and to the surface webhook's
+  `query` — was a plain `sha256` of the query, so anyone holding a stored or
+  delivered value could confirm a short or guessable query by hashing
+  candidates. It is now an HMAC under the feedback DB's key, written as
+  `hmac-sha256:<16-hex>`; the proxy and the daemon share that DB, so they
+  agree on a query's digest. The key is stored in that same DB file, so this
+  protects copies that travel without it — `surfacing_stats` output, a
+  webhook payload, an exported row — not someone who has the file. No
+  shipped entry point wires a webhook; an embedder that passes a
+  `webhook_manager` gets the keyed form only under `persist_query_text =
+  false`, and by default still receives a non-sensitive query verbatim.
+  Without a feedback DB (the one-shot
+  hook path) the key is random per engine and nothing is persisted. The
+  selection log stops writing `args_sha256` and
+  `candidate_features.query_sha256`, unkeyed digests of the call arguments
+  and of the ranking query taken from them; no reader used either. Its
+  records are now `schema_version` 2, and every reader accepts 1 and 2
+  (#1381).
+  **Behavior change**: new query digests start with `hmac-sha256:` and are
+  not comparable with the `sha256:` values of rows written earlier, which are
+  left as they are and still render as digests in `surfacing_stats`.
+  Selection-log records lose two fields and carry `schema_version: 2`; an
+  older STM's replay and `mms selection feedback` skip them as unsupported,
+  while its `selection_stats` still counts them.
+
 - The embedding relevance scorer (`relevance_scorer.scorer = "embedding"`) no
   longer sends credential-bearing text to its endpoint. It sends the context
   query and each section's title and first 500 body characters, and nothing

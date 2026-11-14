@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import signal
 import subprocess
 import sys
@@ -1148,7 +1149,7 @@ async def test_build_engine_default_records_surfacing_event_telemetry(tmp_path: 
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] == "builtin"
-        assert rows[0][1].startswith("sha256:")
+        assert re.fullmatch(r"hmac-sha256:[0-9a-f]{16}", rows[0][1])
     finally:
         if server._tracker is not None:
             server._tracker.close()
