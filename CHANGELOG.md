@@ -104,6 +104,17 @@ changes inline only. See the deprecation policy in
   only with `--apply`.
   **Behavior change**: only the text output of `mms host sync` changes; exit
   codes, the `--json` payload, and what is written are the same.
+- `mms import --plan --allow-project-configs` now ends with an apply hint that
+  keeps the flag (#1401). It printed `To apply: mms import --from <host>
+  --apply`, and running that refused the project-local entries the plan had
+  just listed; with the flag given, the plan also leaves out its note that
+  `--apply` needs it, so nothing said the hint was incomplete. The flag is
+  still not added when the plan was not given it: the plan's note and the
+  apply refusal name it, the same rule as `mms host sync`'s hints. The
+  plan's `--show-imported` hint for redacted secrets follows the same rule, so
+  going from it to its own apply hint keeps the flag too.
+  **Behavior change**: only those two hint lines change; exit codes and what
+  is written are the same.
 - A host entry that starts STM or LTM as `<python> -m <module>` is now
   recognized as STM's own registration or the LTM companion, like the
   `mms` / `memtomem-server` forms already were. That is the form STM writes
