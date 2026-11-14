@@ -7,6 +7,7 @@ children; everything about *which* pids get signalled is exercised with fakes.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -84,6 +85,14 @@ def _departed_leader_with_stubborn_child() -> tuple[subprocess.Popen[bytes], int
     while leader.poll() is None and time.monotonic() < deadline:
         time.sleep(0.02)
     return leader, grandchild_pid
+
+
+# The sweep only counts a zombie as gone where ``os.waitid`` exists; without it
+# (macOS before Python 3.13) a dead-but-unreaped child looks alive until the
+# window ends. Tests pinning the zombie-aware answer need the call.
+_needs_waitid = pytest.mark.skipif(
+    not hasattr(os, "waitid"), reason="zombie-aware probe needs os.waitid"
+)
 
 
 def _reap(child: subprocess.Popen[bytes]) -> None:
@@ -165,6 +174,7 @@ def test_terminate_leaked_children_escalates_to_sigkill() -> None:
         _reap(child)
 
 
+@_needs_waitid
 def test_a_child_that_died_on_sigterm_is_not_signalled_again() -> None:
     # Pids are reused, so a late SIGKILL can land on an unrelated process. Uses
     # a real child so the decision goes through the waitid branch that the
@@ -186,6 +196,68 @@ def test_a_child_that_died_on_sigterm_is_not_signalled_again() -> None:
         _reap(child)
 
 
+def test_has_exited_falls_back_without_waitid(monkeypatch: pytest.MonkeyPatch) -> None:
+    # macOS has no os.waitid before Python 3.13; the probe must take the
+    # signal-0 fallback there instead of raising AttributeError (#1384).
+    monkeypatch.delattr(os, "waitid", raising=False)
+    monkeypatch.setattr(child_reaper, "is_pid_alive", lambda _pid: False)
+    assert child_reaper._has_exited(4242) is True
+    monkeypatch.setattr(child_reaper, "is_pid_alive", lambda _pid: True)
+    assert child_reaper._has_exited(4242) is False
+
+
+def test_sweep_terminates_a_real_child_without_waitid(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without waitid the SIGTERM'd child stays a zombie the probe calls alive,
+    # so the sweep runs out the window and SIGKILLs the corpse — slower, but it
+    # returns and the child is gone, where it used to raise into teardown.
+    monkeypatch.delattr(os, "waitid", raising=False)
+    child = _sleeping_child()
+    try:
+        child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=0.2)
+        assert child.wait(timeout=5.0) == -signal.SIGTERM
+    finally:
+        _reap(child)
+
+
+def test_zombie_leaders_group_gets_the_escalation_without_waitid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without waitid an exited-but-unreaped leader never leaves the poll, so
+    its group must still get the SIGKILL at the deadline — that is the only
+    thing that reaches the SIGTERM-ignoring grandchild it left behind."""
+    monkeypatch.delattr(os, "waitid", raising=False)
+    leader = subprocess.Popen(
+        [sys.executable, "-c", _LEADER_CODE, _STUBBORN_CHILD_CODE],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+    )
+    assert leader.stdout is not None
+    try:
+        grandchild_pid = int(leader.stdout.readline())
+        assert leader.stdout.readline() == b"ready\n"
+        # EOF: the leader closed stdout on its way out. Not calling poll() or
+        # wait() leaves it unreaped, so it lingers as a zombie.
+        assert leader.stdout.read() == b""
+
+        # The SIGKILL must come from the poll's deadline, where the zombie
+        # leader is still counted alive. The departed-leader re-check is the
+        # other route to it and would hide a probe that called the leader gone.
+        def _not_this_route(_pid: int) -> bool:
+            raise AssertionError("zombie leader left the poll early")
+
+        monkeypatch.setattr(child_reaper, "_group_has_survivors", _not_this_route)
+        child_reaper.terminate_leaked_children({leader.pid}, escalate_seconds=0.3)
+        deadline = time.monotonic() + 5.0
+        while child_reaper.is_pid_alive(grandchild_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not child_reaper.is_pid_alive(grandchild_pid)
+    finally:
+        # The unreaped leader pins its pid, which is the group id, so this
+        # reaches the grandchild even when the test failed before reading it.
+        child_reaper.signal_pid(leader.pid, signal.SIGKILL)
+        _reap(leader)
+
+
 def test_a_departed_leaders_group_still_gets_the_escalation() -> None:
     """The sweep signals a process *group*, so the escalation has to ask about
     the group. An abandoned wrapper's server keeps running in the group of a
@@ -203,6 +275,7 @@ def test_a_departed_leaders_group_still_gets_the_escalation() -> None:
         _reap(leader)
 
 
+@_needs_waitid
 def test_escalation_does_not_wait_out_a_child_nobody_reaped() -> None:
     # A fire-and-forget child (Popen discarded, as daemon spawn does) that dies
     # on SIGTERM stays a zombie: a signal-0 probe still calls it alive, so the

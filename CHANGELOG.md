@@ -9,6 +9,19 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Fixed
+
+- The daemon's leaked-child sweep no longer raises `AttributeError` on macOS
+  with Python 3.12, which has no `os.waitid` (macOS gained it in 3.13).
+  Teardown there now takes the signal-0 fallback and terminates the leaked
+  LTM child instead of failing. Without `os.waitid` a child that died but was
+  not reaped still looks alive, so on that combination the sweep waits out
+  its 2-second escalation window and then sends the group SIGKILL. Linux,
+  and macOS with Python 3.13 or later, are unchanged. (#1384)
+  **Behavior change**: none external — a teardown that raised now completes.
+
 ## [0.7.8] — 2026-11-14
 
 ### Upgrade notes

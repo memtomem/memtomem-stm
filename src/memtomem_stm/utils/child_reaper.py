@@ -206,14 +206,24 @@ def _has_exited(pid: int) -> bool:
     waitable, so detecting its exit never steals it from an owner still holding
     a ``Popen``. Falls back to the signal probe for a pid that is not ours to
     wait on.
+
+    It also falls back when ``os.waitid`` does not exist, which on macOS is
+    every Python before 3.13. That probe counts a zombie as alive, so there a
+    child that died on SIGTERM but that nobody reaped keeps the sweep polling
+    for the whole escalation window and then gets the group SIGKILL. That costs
+    shutdown time, not correctness: the zombie pins its pid, and the group kill
+    is what reaches a grandchild an exited leader left behind. ``waitpid`` with
+    ``WNOHANG`` would answer, but it consumes the status the owner waits for.
     """
     if sys.platform == "win32":  # pragma: no cover — no waitid; sweep is a no-op
         return not is_pid_alive(pid)
+    waitid = getattr(os, "waitid", None)
+    if waitid is None:  # macOS before Python 3.13
+        return not is_pid_alive(pid)
     try:
-        # The ignores are for typeshed gating waitid to Linux; every POSIX
-        # target here has it (macOS included), and the win32 guard above is the
-        # real platform bound.
-        info = os.waitid(  # type: ignore[attr-defined]
+        # The ignores are for typeshed gating the waitid constants to Linux;
+        # the getattr above is the real bound, since macOS gained them in 3.13.
+        info = waitid(
             os.P_PID,  # type: ignore[attr-defined]
             pid,
             os.WEXITED | os.WNOHANG | os.WNOWAIT,  # type: ignore[attr-defined]
