@@ -1128,17 +1128,20 @@ class TestCodeAwareSignaturesFirst:
         assert "…" not in out
 
     @pytest.mark.parametrize(
-        ("text", "max_chars"),
+        ("text", "max_chars", "remaining"),
         [
-            ("SELECT " + "x," * 130 + "x FROM a;\n\nSELECT " + "y," * 130 + "y FROM b;", 140),
-            ("SELECT " + "a," * 32 + "a FROM t;\n\nSELECT " + "b," * 130 + "b FROM u;", 200),
+            ("SELECT " + "x," * 130 + "x FROM a;\n\nSELECT " + "y," * 130 + "y FROM b;", 140, 2),
+            ("SELECT " + "a," * 32 + "a FROM t;\n\nSELECT " + "b," * 130 + "b FROM u;", 200, 1),
         ],
     )
-    def test_a_block_with_no_room_for_a_cut_signature_is_still_marked(self, text, max_chars):
+    def test_a_block_with_no_room_for_a_cut_signature_is_still_marked(
+        self, text, max_chars, remaining
+    ):
         out = TruncateCompressor().compress(text, max_chars=max_chars)
         assert len(out) <= max_chars
-        assert "more blocks)" in out
-        assert out.rstrip().split("\n(original:")[0].endswith("# SELECT")
+        assert f"... ({remaining} more blocks)" in out
+        # Every remaining block is marked; none is silently left out.
+        assert self._previews(out) == [["# SELECT"]] * remaining
 
     def test_a_marked_block_gets_no_body_lines(self):
         wide = "SELECT " + "w," * 130 + "w FROM a\n" + "  WHERE w > 0\n" * 5

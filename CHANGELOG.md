@@ -31,7 +31,8 @@ changes inline only. See the deprecation policy in
   gets its whole line back before any block gets a body line; a
   block is shown as `# <signature>` only when not even its cut signature
   fits. Blocks are named in order, so a long block early can take the room a
-  later short block used to get.
+  later short block used to get, and a signature still cut at 80 characters
+  hides whatever comes after that point, a name included.
 - On macOS with Python 3.12, the leaked-child sweep that runs when an LTM
   adapter's shutdown fails no longer raises `AttributeError: module 'os' has
   no attribute 'waitid'` instead of terminating the child. CPython has
