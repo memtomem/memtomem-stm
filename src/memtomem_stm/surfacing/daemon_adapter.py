@@ -32,6 +32,8 @@ from memtomem_stm.surfacing.mcp_client import (
     validate_compose_item,
 )
 from memtomem_stm.surfacing.rrf_profile import read_score_ceiling_hint
+from memtomem_stm.utils.display import _disp
+from memtomem_stm.utils.local_key import LocalKeyError
 from memtomem_stm.utils.numeric import safe_float
 from memtomem_stm.utils.json_out import has_lone_surrogate
 
@@ -40,22 +42,71 @@ _SEARCH_OUTCOMES = frozenset(get_args(SearchOutcome))
 
 
 class DaemonLtmAdapter:
-    """Forward LTM operations without owning an LTM process or daemon."""
+    """Forward LTM operations without owning an LTM process or daemon.
+
+    The adapter is what makes a daemon exist for the standalone route, so it
+    creates the discovery key when ``data_dir`` has none, and it freezes the
+    fingerprint it derived. A key that cannot be used does not fail
+    construction — that would disable surfacing for the whole process, with
+    no line saying why. It marks the adapter unavailable instead: every
+    request then reports the same thing as a daemon that was found but did not
+    answer, and nothing asks for a spawn that could never succeed.
+    """
 
     def __init__(self, daemon_config: STMConfig) -> None:
         self._daemon_config = daemon_config
-        self._fingerprint = config_fingerprint(daemon_config)
         self._timeout = daemon_config.surfacing.timeout_seconds
         self._compose_schema: int | None = None
         self._candidate_propose_supported: bool | None = None
+        self._unavailable = False
+        self._fingerprint: str | None = None
+        try:
+            self._fingerprint = config_fingerprint(daemon_config, create_key=True)
+        except LocalKeyError as exc:
+            self._mark_unavailable(exc)
+
+    def _mark_unavailable(self, exc: LocalKeyError) -> None:
+        """Stop using the daemon for this adapter's lifetime, and say why once.
+
+        Runs only on the event loop thread (construction, or an ``except``
+        after an ``await``), so two requests failing together still log one
+        line. The cause goes in the message because the log formatter
+        withholds exception text, and is escaped because it quotes
+        ``data_dir``.
+        """
+        if self._unavailable:
+            return
+        self._unavailable = True
+        logger.warning(
+            "Shared-daemon surfacing is unavailable until STM restarts: %s", _disp(str(exc))
+        )
+
+    async def _ltm(
+        self, op: str, payload: dict[str, Any], *, timeout: float
+    ) -> tuple[client.LtmRequestState, dict[str, Any] | None]:
+        """One LTM request under the frozen fingerprint."""
+        if self._unavailable:
+            return "unavailable", None
+        return await client.ltm_request(
+            self._daemon_config, op, payload, timeout=timeout, fingerprint=self._fingerprint
+        )
 
     async def _spawn_best_effort(self) -> None:
+        if self._unavailable:
+            return
         try:
             await asyncio.to_thread(request_spawn, self._daemon_config)
+        except LocalKeyError as exc:
+            # The key went bad after construction. Swallowed like any other
+            # spawn failure, every later call would report a daemon that is
+            # "starting" and never arrives.
+            self._mark_unavailable(exc)
         except Exception:
             logger.debug("shared daemon auto-spawn failed", exc_info=True)
 
     async def warm_up(self) -> None:
+        if self._unavailable:
+            return
         try:
             if (
                 await client.ping(
@@ -104,8 +155,7 @@ class DaemonLtmAdapter:
         if self._compose_schema == 0:
             return None
         requested_schema = self._compose_schema or MAX_CONTEXT_COMPOSE_SCHEMA
-        state, resp = await client.ltm_request(
-            self._daemon_config,
+        state, resp = await self._ltm(
             OP_LTM_CONTEXT_COMPOSE,
             {
                 "query": query,
@@ -118,7 +168,6 @@ class DaemonLtmAdapter:
                 "trace_id": trace_id,
             },
             timeout=self._timeout,
-            fingerprint=self._fingerprint,
         )
         # Connection states and load-shedding statuses are classified as
         # ``search`` classifies them. Only ``unsupported`` returns ``None``:
@@ -243,8 +292,7 @@ class DaemonLtmAdapter:
     ) -> dict[str, Any] | None:
         if self._candidate_propose_supported is False:
             return None
-        state, resp = await client.ltm_request(
-            self._daemon_config,
+        state, resp = await self._ltm(
             OP_LTM_CANDIDATE_PROPOSE,
             {
                 "content": content,
@@ -254,7 +302,6 @@ class DaemonLtmAdapter:
                 "trace_id": trace_id,
             },
             timeout=self._timeout,
-            fingerprint=self._fingerprint,
         )
         if state != "ok" or resp is None or not resp.get("ok"):
             if resp is not None and resp.get("status") == "unsupported":
@@ -284,13 +331,7 @@ class DaemonLtmAdapter:
             "context_window": context_window,
             "trace_id": trace_id,
         }
-        state, resp = await client.ltm_request(
-            self._daemon_config,
-            OP_LTM_SEARCH,
-            payload,
-            timeout=self._timeout,
-            fingerprint=self._fingerprint,
-        )
+        state, resp = await self._ltm(OP_LTM_SEARCH, payload, timeout=self._timeout)
         if state == "missing":
             self._compose_schema = None
             self._candidate_propose_supported = None
@@ -354,23 +395,15 @@ class DaemonLtmAdapter:
     async def increment_access(self, chunk_ids: list[str], *, trace_id: str | None = None) -> None:
         if not chunk_ids:
             return
-        await client.ltm_request(
-            self._daemon_config,
+        await self._ltm(
             OP_LTM_INCREMENT_ACCESS,
             {"chunk_ids": chunk_ids, "trace_id": trace_id},
             timeout=self._timeout,
-            fingerprint=self._fingerprint,
         )
 
     async def scratch_list(self, *, trace_id: str | None = None) -> list[dict]:
         timeout = max(0.05, min(0.5, self._timeout / 3))
-        state, resp = await client.ltm_request(
-            self._daemon_config,
-            OP_LTM_SCRATCH_LIST,
-            {"trace_id": trace_id},
-            timeout=timeout,
-            fingerprint=self._fingerprint,
-        )
+        state, resp = await self._ltm(OP_LTM_SCRATCH_LIST, {"trace_id": trace_id}, timeout=timeout)
         if state != "ok" or resp is None or not resp.get("ok"):
             return []
         items = resp.get("items")

@@ -271,24 +271,24 @@ def test_configure_logging_foreground_uses_stderr(tmp_path, _restore_root_loggin
 
 
 def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
-    fp = discovery.config_fingerprint(STMConfig())
-    assert fp == discovery.config_fingerprint(STMConfig())  # stable
+    fp = discovery.config_fingerprint(STMConfig(), create_key=True)
+    assert fp == discovery.config_fingerprint(STMConfig(), create_key=True)  # stable
 
     # LTM command (subset of surfacing) moves it.
     c1 = STMConfig()
     c1.surfacing.ltm_mcp_command = "some-other-server"
-    assert discovery.config_fingerprint(c1) != fp
+    assert discovery.config_fingerprint(c1, create_key=True) != fp
 
     # A broad surfacing knob (min_score) must move it too — the old hand-picked
     # subset missed this and would keep using a stale daemon.
     c2 = STMConfig()
     c2.surfacing.min_score = 0.5
-    assert discovery.config_fingerprint(c2) != fp
+    assert discovery.config_fingerprint(c2, create_key=True) != fp
 
     # The flat MEMTOMEM_STM_HOOK_SURFACE_TOOLS env (read directly by the hook,
     # not bound to any model) must also move it.
     monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Read,Custom")
-    assert discovery.config_fingerprint(STMConfig()) != fp
+    assert discovery.config_fingerprint(STMConfig(), create_key=True) != fp
 
 
 def test_config_fingerprint_separates_daemon_concurrency():
@@ -296,20 +296,22 @@ def test_config_fingerprint_separates_daemon_concurrency():
     # Without this a caller that configured the serialized daemon
     # (`max_concurrent_ltm_ops=1`) keys to the same handshake as a running
     # four-way one and silently reuses it (#874).
-    fp = discovery.config_fingerprint(STMConfig())
+    fp = discovery.config_fingerprint(STMConfig(), create_key=True)
 
     serialized = STMConfig()
     serialized.daemon.max_concurrent_ltm_ops = 1
-    assert discovery.config_fingerprint(serialized) != fp
+    assert discovery.config_fingerprint(serialized, create_key=True) != fp
 
     wider = STMConfig()
     wider.daemon.max_concurrent_ltm_ops = 8
-    assert discovery.config_fingerprint(wider) != fp
-    assert discovery.config_fingerprint(wider) != discovery.config_fingerprint(serialized)
+    assert discovery.config_fingerprint(wider, create_key=True) != fp
+    assert discovery.config_fingerprint(wider, create_key=True) != discovery.config_fingerprint(
+        serialized, create_key=True
+    )
 
     admission = STMConfig()
     admission.daemon.max_pending_requests = 8
-    assert discovery.config_fingerprint(admission) != fp
+    assert discovery.config_fingerprint(admission, create_key=True) != fp
 
 
 def test_config_fingerprint_survives_a_hostile_surface_tools_env(
@@ -322,18 +324,18 @@ def test_config_fingerprint_survives_a_hostile_surface_tools_env(
     # involved (#761). Before the fix this raised ``UnicodeEncodeError`` out of
     # ``DaemonServer.__init__`` and out of ``client._live_handshake_candidate``,
     # i.e. no daemon could start and ``mms daemon status`` printed a traceback.
-    clean = discovery.config_fingerprint(STMConfig())
+    clean = discovery.config_fingerprint(STMConfig(), create_key=True)
 
     monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Read,\udcff")
-    hostile = discovery.config_fingerprint(STMConfig())
+    hostile = discovery.config_fingerprint(STMConfig(), create_key=True)
 
     assert len(hostile) == 16 and all(c in "0123456789abcdef" for c in hostile)
     # Still a *fingerprint*: it is stable, and it separates this env from the
     # clean one rather than collapsing every unencodable value onto one digest.
-    assert hostile == discovery.config_fingerprint(STMConfig())
+    assert hostile == discovery.config_fingerprint(STMConfig(), create_key=True)
     assert hostile != clean
     monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Read,\udcfe")
-    assert discovery.config_fingerprint(STMConfig()) != hostile
+    assert discovery.config_fingerprint(STMConfig(), create_key=True) != hostile
 
 
 def test_daemon_server_constructs_under_a_hostile_surface_tools_env(
@@ -359,13 +361,13 @@ def test_config_fingerprint_includes_protocol_version(monkeypatch: pytest.Monkey
     # at different PROTOCOL_VERSIONs key to distinct handshake/lock paths and
     # coexist (the stale one idle-times-out) instead of exchanging frames one
     # side can't parse.
-    fp = discovery.config_fingerprint(STMConfig())
+    fp = discovery.config_fingerprint(STMConfig(), create_key=True)
     monkeypatch.setattr("memtomem_stm.daemon.discovery.PROTOCOL_VERSION", 999)
-    assert discovery.config_fingerprint(STMConfig()) != fp
+    assert discovery.config_fingerprint(STMConfig(), create_key=True) != fp
 
 
 def test_config_fingerprint_excludes_client_only_hook_fields():
-    fp = discovery.config_fingerprint(STMConfig())
+    fp = discovery.config_fingerprint(STMConfig(), create_key=True)
     # Client-only hook fields must NOT move the fingerprint — the daemon's
     # behavior is independent of them, so a live daemon must still match a hook
     # that has opted out (else the hook rejects it and returns {} forever under
@@ -379,23 +381,23 @@ def test_config_fingerprint_excludes_client_only_hook_fields():
     ]:
         c = STMConfig()
         setattr(c.hook, field, value)
-        assert discovery.config_fingerprint(c) == fp, field
+        assert discovery.config_fingerprint(c, create_key=True) == fp, field
     # The whole compression sub-block runs in the hook process, never in the
     # daemon — toggling it must not move the fingerprint either.
     c = STMConfig()
     c.hook.compression.enabled = True
     c.hook.compression.max_chars = 123
-    assert discovery.config_fingerprint(c) == fp
+    assert discovery.config_fingerprint(c, create_key=True) == fp
     # record_feedback_events DOES drive daemon engine wiring → must move it.
     c = STMConfig()
     c.hook.record_feedback_events = True
-    assert discovery.config_fingerprint(c) != fp
+    assert discovery.config_fingerprint(c, create_key=True) != fp
 
     # Standalone route selection is likewise client-only: the daemon's direct
     # adapter and engine behave identically regardless of who discovers it.
     c = STMConfig()
     c.surfacing.use_daemon = True
-    assert discovery.config_fingerprint(c) == fp
+    assert discovery.config_fingerprint(c, create_key=True) == fp
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock re-entrancy semantics")
@@ -416,7 +418,7 @@ def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytes
     def fake_request_spawn(config, *, propagate_errors=False):
         # The real request_spawn probes the (per-config) lock; if start_cmd held
         # it this would see it taken. Assert it's free → start holds nothing.
-        lp = lock_path(config.data_dir, discovery.config_fingerprint(config))
+        lp = lock_path(config.data_dir, discovery.config_fingerprint(config, create_key=True))
         with single_owner_lock(lp) as got:
             state["lock_free_seen"].append(got)
         state["spawns"] += 1
@@ -667,7 +669,9 @@ def test_request_spawn_skips_when_lock_held(tmp_path: Path, monkeypatch: pytest.
     cfg.data_dir = tmp_path
     calls: list[int] = []
     monkeypatch.setattr(spawn, "_spawn_detached", lambda: calls.append(1))
-    with single_owner_lock(lock_path(cfg.data_dir, discovery.config_fingerprint(cfg))) as held:
+    with single_owner_lock(
+        lock_path(cfg.data_dir, discovery.config_fingerprint(cfg, create_key=True))
+    ) as held:
         assert held is True
         assert spawn.request_spawn(cfg) is False  # a live same-config owner → defer
     assert calls == []  # no duplicate spawn launched
@@ -729,7 +733,9 @@ def test_request_spawn_spawns_when_lock_free(tmp_path: Path, monkeypatch: pytest
     assert spawn.request_spawn(cfg) is True
     assert calls == [1]  # spawned exactly once
     # The probe released the lock → the child can still acquire it.
-    with single_owner_lock(lock_path(cfg.data_dir, discovery.config_fingerprint(cfg))) as got:
+    with single_owner_lock(
+        lock_path(cfg.data_dir, discovery.config_fingerprint(cfg, create_key=True))
+    ) as got:
         assert got is True
 
 
@@ -746,7 +752,7 @@ def test_request_spawn_unblocked_by_different_config_lock(
     cfg = STMConfig()
     cfg.data_dir = tmp_path
     other_fp = "different00000fp"
-    assert other_fp != discovery.config_fingerprint(cfg)
+    assert other_fp != discovery.config_fingerprint(cfg, create_key=True)
     calls: list[int] = []
     monkeypatch.setattr(spawn, "_spawn_detached", lambda: calls.append(1))
     with single_owner_lock(lock_path(cfg.data_dir, other_fp)) as held:
@@ -961,10 +967,21 @@ def _write_handshake(payload: dict) -> Path:
     import json
 
     config = STMConfig()
-    p = discovery.handshake_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
+    fp = discovery.config_fingerprint(config, create_key=True)
+    p = discovery.handshake_path(config.data_dir.expanduser(), fp)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(payload), encoding="utf-8")
     return p
+
+
+def _discovery_key() -> None:
+    """A daemon has run under the env-derived ``data_dir``: its discovery key exists.
+
+    Tests that fake the client calls instead of publishing a handshake need
+    this — with no key there is no fingerprint, and ``stop`` / ``restart``
+    conclude "no daemon" before they would reach the faked call.
+    """
+    discovery.config_fingerprint(STMConfig(), create_key=True)
 
 
 def _no_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1103,6 +1120,7 @@ class TestDaemonStopCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _discovery_key()
 
         async def fake_shutdown(config):
             return True
@@ -1903,7 +1921,7 @@ class TestDaemonForeignOrphans:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
-        cur = discovery.config_fingerprint(STMConfig())
+        cur = discovery.config_fingerprint(STMConfig(), create_key=True)
         assert cur != "foreignfp000000"
         self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
         _no_daemon(monkeypatch)
@@ -2113,7 +2131,7 @@ class TestDaemonForeignOrphans:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
-        current = discovery.config_fingerprint(STMConfig())
+        current = discovery.config_fingerprint(STMConfig(), create_key=True)
         discovery.handshake_path(tmp_path, current).write_bytes(b'{"pid": "\xff"}')
         _no_daemon(monkeypatch)
 
@@ -2179,14 +2197,15 @@ class TestDaemonForeignOrphans:
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         foreign_cleanup: list[STMConfig] = []
 
-        def current_timeout(_config: STMConfig) -> None:
+        def current_timeout(_config: STMConfig, _fp: str | None) -> None:
             raise SystemExit(1)
 
         monkeypatch.setattr(
             "memtomem_stm.cli.daemon_cmd._stop_current_config_daemon", current_timeout
         )
         monkeypatch.setattr(
-            "memtomem_stm.cli.daemon_cmd._stop_foreign_daemons", foreign_cleanup.append
+            "memtomem_stm.cli.daemon_cmd._stop_foreign_daemons",
+            lambda config, _current: foreign_cleanup.append(config),
         )
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
@@ -2207,8 +2226,8 @@ class TestDaemonForeignOrphans:
         # then the operator changed it — leaving the old handshake stranded.
         old = STMConfig()
         old.surfacing.min_score = 0.5
-        old_fp = discovery.config_fingerprint(old)
-        assert old_fp != discovery.config_fingerprint(STMConfig())
+        old_fp = discovery.config_fingerprint(old, create_key=True)
+        assert old_fp != discovery.config_fingerprint(STMConfig(), create_key=True)
         self._write_foreign(tmp_path, old_fp, pid=4321)
         _no_daemon(monkeypatch)
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
@@ -2478,11 +2497,12 @@ class TestDaemonForeignOrphans:
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         current: list[STMConfig] = []
 
-        def foreign_timeout(_config: STMConfig) -> None:
+        def foreign_timeout(_config: STMConfig, _current: str | None) -> None:
             raise SystemExit(1)
 
         monkeypatch.setattr(
-            "memtomem_stm.cli.daemon_cmd._stop_current_config_daemon", current.append
+            "memtomem_stm.cli.daemon_cmd._stop_current_config_daemon",
+            lambda config, _fp: current.append(config),
         )
         monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._stop_foreign_daemons", foreign_timeout)
 
@@ -2520,7 +2540,7 @@ class TestDaemonForeignOrphans:
 
         # Endpoint accepting → reported (previously [] on Windows).
         _probe_all(monkeypatch, listening=True)
-        assert daemon_cmd._live_foreign_daemons(STMConfig()) == [
+        assert daemon_cmd._live_foreign_daemons(STMConfig(), None) == [
             {
                 "fingerprint": "foreignfp000000",
                 "pid": 98765,
@@ -2534,7 +2554,7 @@ class TestDaemonForeignOrphans:
         ]
         # Endpoint gone → still nothing (no false positive from the always-True pid).
         _probe_all(monkeypatch, listening=False)
-        assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
+        assert daemon_cmd._live_foreign_daemons(STMConfig(), None) == []
 
     def test_recycled_pid_skipped_by_connect_probe(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2554,7 +2574,7 @@ class TestDaemonForeignOrphans:
         killed: list[tuple[int, int]] = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
-        assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
+        assert daemon_cmd._live_foreign_daemons(STMConfig(), None) == []
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
         assert result.exit_code == 0, result.output
@@ -2608,7 +2628,7 @@ class TestDaemonForeignOrphans:
         # A genuine foreign daemon: alive pid (ours) + a real accepting endpoint.
         self._write_foreign(tmp_path, "foreignfp000000", pid=os.getpid(), port=port)
         try:
-            assert daemon_cmd._live_foreign_daemons(STMConfig()) == [
+            assert daemon_cmd._live_foreign_daemons(STMConfig(), None) == [
                 {
                     "fingerprint": "foreignfp000000",
                     "pid": os.getpid(),
@@ -2623,7 +2643,7 @@ class TestDaemonForeignOrphans:
         finally:
             srv.close()
         # Endpoint now closed → the alive pid alone is not enough to report it.
-        assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
+        assert daemon_cmd._live_foreign_daemons(STMConfig(), None) == []
 
 
 _LISTING_ERRORS = [PermissionError(13, "denied"), NotADirectoryError(20, "not a directory")]
@@ -2731,7 +2751,7 @@ class TestForeignListingFailure:
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
 
-        def current_fails(_config: STMConfig) -> None:
+        def current_fails(_config: STMConfig, _fp: str | None) -> None:
             click.echo("current-config stop not confirmed", err=True)
             raise SystemExit(1)
 
@@ -2831,7 +2851,7 @@ class TestForeignListingFailure:
         monkeypatch.setattr(daemon_cmd, "_probe_lock", probe_lock)
 
         with pytest.raises(OSError, match="probe failed") as excinfo:
-            daemon_cmd._live_foreign_daemons(STMConfig())
+            daemon_cmd._live_foreign_daemons(STMConfig(), None)
         assert not isinstance(excinfo.value, daemon_cmd._ForeignListingError)
 
 
@@ -2854,7 +2874,9 @@ class _LockHolder:
 
 def _current_lock_path() -> Path:
     config = STMConfig()
-    return lock_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
+    return lock_path(
+        config.data_dir.expanduser(), discovery.config_fingerprint(config, create_key=True)
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
@@ -3139,7 +3161,7 @@ class TestStopJudgesByLifetimeLock:
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         _no_daemon(monkeypatch)
-        current = discovery.config_fingerprint(STMConfig())
+        current = discovery.config_fingerprint(STMConfig(), create_key=True)
         discovery.handshake_path(tmp_path, current).write_bytes(b'{"pid": "\xff"}')
 
         def status() -> dict:
@@ -3179,10 +3201,10 @@ class TestForeignStopJudgesByLifetimeLock:
         from memtomem_stm.cli import daemon_cmd
 
         self._foreign(tmp_path, monkeypatch)
-        assert daemon_cmd._live_foreign_daemons(STMConfig()) == []  # lock free → stale
+        assert daemon_cmd._live_foreign_daemons(STMConfig(), None) == []  # lock free → stale
         holder = _LockHolder(lock_path(tmp_path, self.FP))
         try:
-            [entry] = daemon_cmd._live_foreign_daemons(STMConfig())
+            [entry] = daemon_cmd._live_foreign_daemons(STMConfig(), None)
             assert (entry["pid"], entry["listening"], entry["lock"]) == (98765, False, "held")
             info = json.loads(CliRunner().invoke(_cli(), ["daemon", "status", "--json"]).output)
             assert [d["fingerprint"] for d in info["foreign"]] == [self.FP]
@@ -3207,7 +3229,7 @@ class TestForeignStopJudgesByLifetimeLock:
         discovery.handshake_path(tmp_path, self.FP).write_bytes(b'{"pid": "\xff"}')
         holder = _LockHolder(lock_path(tmp_path, self.FP))
         try:
-            [entry] = daemon_cmd._live_foreign_daemons(STMConfig())
+            [entry] = daemon_cmd._live_foreign_daemons(STMConfig(), None)
             text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
         finally:
             holder.release()
@@ -3540,6 +3562,7 @@ class TestDaemonRestartCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _discovery_key()
 
         calls = {"shutdown": 0, "spawns": 0}
 
@@ -3574,6 +3597,7 @@ class TestDaemonRestartCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _discovery_key()
         _fake_stop_clock(monkeypatch)
         spawns: list[object] = []
 
@@ -3608,6 +3632,7 @@ class TestDaemonRestartCli:
         from memtomem_stm.daemon import locking as daemon_locking
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _discovery_key()
         _fake_stop_clock(monkeypatch)
         log: list[str] = []
         real_open = daemon_locking._open_lock_fd
@@ -3676,7 +3701,9 @@ class TestDaemonRestartCli:
         monkeypatch.setattr("memtomem_stm.cli.daemon_cmd.time", _FakeTime())
 
         config = STMConfig()
-        lp = lock_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
+        lp = lock_path(
+            config.data_dir.expanduser(), discovery.config_fingerprint(config, create_key=True)
+        )
         lp.parent.mkdir(parents=True, exist_ok=True)
         spawns: list[object] = []
         monkeypatch.setattr(
@@ -3727,7 +3754,9 @@ class TestDaemonRestartCli:
             lambda config, *, propagate_errors=False: spawns.append(config) or True,
         )
         config = STMConfig()
-        lp = lock_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
+        lp = lock_path(
+            config.data_dir.expanduser(), discovery.config_fingerprint(config, create_key=True)
+        )
         lp.parent.mkdir(parents=True, exist_ok=True)
         with single_owner_lock(lp) as held:
             assert held is True

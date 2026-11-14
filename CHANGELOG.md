@@ -39,6 +39,54 @@ changes inline only. See the deprecation policy in
   process from the previous release that keeps running can write unkeyed
   rows after the purge, so restart running proxies after upgrading.
 
+- The daemon's config fingerprint is keyed. It names the handshake and lock
+  files under `data_dir` (`stm-daemon-<fingerprint>.json` / `.lock`) and is
+  stored in the handshake, and it was a plain SHA-256 over the surfacing
+  settings — the LTM command line and `ltm_mcp_headers` included — so anyone
+  holding a handshake, or just a directory listing, could confirm a guessed
+  header value by recomputing it. It is now an HMAC under a random key in
+  `<data_dir>/stm-discovery.key` (mode `0600`), created by the first process
+  that needs a daemon to exist: `mms daemon start`, a hook's spawn request,
+  the standalone proxy when it starts with `surfacing.use_daemon` on, or the
+  daemon itself. `mms daemon status` and
+  `mms daemon stop` never create it; with no key they report `stopped` /
+  `no running daemon` for this config, and on a `data_dir` with no daemon
+  files they create nothing. The same
+  settings still feed the fingerprint, so a rotated header still gets a new
+  daemon. An existing key that cannot be read or parsed is an error, not a
+  fallback to an unkeyed value: `mms daemon start`, `stop` and `status` exit 1
+  with one line naming the file (`status --json` reports
+  `"state": "unknown"` with an `error` field, and still lists the daemons
+  published under `data_dir`), `mms daemon stop --all` first acts on those
+  daemons as it does on any under a different config (signalling them on
+  macOS and Linux; on Windows, end the processes), the hook takes its
+  configured fallback, standalone surfacing logs one warning and reports the
+  daemon as unavailable until STM restarts (from the moment it reads the
+  key: at startup, or at its next spawn request if the key is damaged later
+  — requests to a daemon it already found go on), and
+  `mms health` / `mms doctor` report it as an unreachable daemon with their
+  usual exit codes. Moving the file aside makes a new one (#1416).
+  **Behavior change**: every daemon started by an earlier build is under a
+  different fingerprint after the upgrade, as after a protocol change:
+  `mms daemon status` lists it as running under a different config,
+  `mms daemon stop` and `restart` do not reach it, and `mms daemon stop --all`
+  does (on Windows, end the process). One with an idle timeout exits on its
+  own; one with `daemon.idle_timeout_seconds = 0` has to be stopped that way.
+  The earlier build's `stm-daemon-*.lock` files are not removed and still
+  carry the old, recomputable fingerprint in their names: after
+  `mms daemon stop --all`, with no STM process running under any environment
+  that uses this `data_dir`, every `stm-daemon-*.json` and `stm-daemon-*.lock`
+  there can be deleted (they are recreated on demand; keep
+  `stm-discovery.key`). Deleting or replacing the key while daemons run
+  leaves them under a fingerprint nothing derives any more — `status` lists
+  them as foreign, `stop --all` signals them (on Windows, end the processes),
+  and a standalone proxy that was
+  already running keeps looking for the old one until it restarts. The key is
+  created with a hard link, so on a `data_dir` whose filesystem has none the
+  daemon cannot be used. `mms daemon status` on a `data_dir` it cannot walk
+  (a dangling symlink above it) with no key now reports `"state": "unknown"`
+  with an `error` field instead of `"stale"` with `handshake_unreadable`.
+
 - The surfacing query digest is keyed, and the selection log stops writing
   argument digests. The query digest — written to `surfacing_events.query`
   when `persist_query_text` is off (always, on the hook daemon path), to

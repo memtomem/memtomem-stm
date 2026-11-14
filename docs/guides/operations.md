@@ -191,6 +191,17 @@ build started.
    before any of them starts again, then run `mms version` and `mms doctor`.
 5. Start the hosts again.
 
+The first release after 0.7.8 also changes the fingerprint itself — it is
+keyed with `<data_dir>/stm-discovery.key` — so the same steps apply to it even
+though the protocol does not change: a daemon the earlier build started is
+under a fingerprint the new build no longer derives. If one is still running
+after the upgrade, `mms daemon status` lists it as running under a different
+config, and step 3 applies to it: `mms daemon stop --all` on macOS and Linux,
+Task Manager on Windows. The earlier build's
+`stm-daemon-*.lock` files stay behind with the old fingerprint in their
+names; [The discovery key](../cli.md#the-discovery-key) says when they can be
+deleted.
+
 Each check covers the data directory of the config and `MEMTOMEM_STM_*`
 environment it runs under; repeat it for any other you use. Do not count on
 idle shutdown instead: a daemon exits after `daemon.idle_timeout_seconds`

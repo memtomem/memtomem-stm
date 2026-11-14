@@ -39,10 +39,26 @@ every foreign-fingerprint daemon, with ``idle_shutdown_seconds`` saying whether
 it can linger (not whether anything still uses it), and ``mms daemon stop
 --all`` terminates them (see :func:`iter_foreign_handshakes`).
 
+The fingerprint is keyed. It covers the whole ``surfacing`` model — the LTM
+command line and ``ltm_mcp_headers`` among it — and it is written into a file
+name and into the handshake, so a plain hash would let anyone holding a
+handshake (attached to a bug report, say) confirm a guessed header by
+recomputing it. It is an HMAC under ``stm-discovery.key``, a random key kept
+beside the handshakes in ``data_dir`` (:func:`discovery_key_path`), which every
+STM process sharing that directory reads. The key is created by whoever first
+needs a daemon to exist — the daemon, a spawn request, the standalone surfacing
+adapter — and never by a command that only looks (``status``, ``stop``, a
+``ping``): with no key there is no fingerprint, so those report no daemon for
+this config without building a handshake or lock path. A daemon can still be
+running in the directory then — one an earlier build started, or one whose key
+was removed while it ran — and is found through its published handshake, as a
+daemon under a different config (:func:`iter_foreign_handshakes`). Losing the
+key loses nothing stored.
+
 File shape::
 
     {"v": 1, "pid": 1234, "host": "127.0.0.1", "port": 53412,
-     "token": "<hex>", "created_at": 1716600000.0, "config_fingerprint": "<sha>",
+     "token": "<hex>", "created_at": 1716600000.0, "config_fingerprint": "<hex>",
      "idle_shutdown_seconds": 900.0}
 
 ``idle_shutdown_seconds`` is ``null`` when the daemon never shuts down on idle,
@@ -54,7 +70,6 @@ daemon's handshake.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -63,8 +78,10 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 
 from memtomem_stm.daemon.protocol import PROTOCOL_VERSION
 from memtomem_stm.utils import child_reaper
+from memtomem_stm.utils.digest import keyed_framed_digest
 from memtomem_stm.utils.fileio import atomic_write_text
 from memtomem_stm.utils.json_out import dumps as _json_dumps
+from memtomem_stm.utils.local_key import load_key, load_or_create_key
 
 if TYPE_CHECKING:
     from memtomem_stm.config import STMConfig
@@ -76,6 +93,10 @@ HANDSHAKE_VERSION = 1
 # ``locking.py`` with the same prefix). The fingerprint is a 16-hex digest, so
 # it is always a filesystem-safe filename component.
 HANDSHAKE_PREFIX = "stm-daemon"
+# Outside the ``stm-daemon-*`` names on purpose: the handshake glob and the
+# lock names must never pick the key up.
+DISCOVERY_KEY_NAME = "stm-discovery.key"
+_FINGERPRINT_DOMAIN = "stm-discovery-v1"
 
 
 def handshake_path(data_dir: Path, fingerprint: str) -> Path:
@@ -88,8 +109,36 @@ def handshake_path(data_dir: Path, fingerprint: str) -> Path:
     return (data_dir / f"{HANDSHAKE_PREFIX}-{fingerprint}.json").expanduser()
 
 
-def config_fingerprint(config: STMConfig) -> str:
-    """Stable digest of the config that determines daemon/engine behavior.
+def discovery_key_path(data_dir: Path) -> Path:
+    """The key every fingerprint under ``data_dir`` is derived with.
+
+    Normalized like :func:`handshake_path`. Not resolved: the key sits inside
+    the directory, so every spelling that reaches the directory reaches the
+    same file.
+    """
+    return (data_dir / DISCOVERY_KEY_NAME).expanduser()
+
+
+@overload
+def config_fingerprint(config: STMConfig, *, create_key: Literal[True]) -> str: ...
+
+
+@overload
+def config_fingerprint(config: STMConfig, *, create_key: bool) -> str | None: ...
+
+
+def config_fingerprint(config: STMConfig, *, create_key: bool) -> str | None:
+    """Stable keyed digest of the config that determines daemon/engine behavior.
+
+    *create_key* has no default, so every caller says which side it is on. A
+    caller that brings a daemon into existence passes ``True`` and always gets
+    a fingerprint. A caller that only looks for one passes ``False`` and gets
+    ``None`` when ``data_dir`` holds no key: there is no fingerprint to look
+    under, and the caller must report "no daemon for this config" without
+    building a handshake or lock path. A key that exists but cannot be used raises
+    :class:`~memtomem_stm.utils.local_key.LocalKeyError` either way — falling
+    back to an unkeyed value would give this process a different identity from
+    every other one sharing the directory.
 
     A running daemon froze its config at start; if a caller's effective config
     differs *in a way that changes daemon behavior*, the daemon would serve
@@ -141,14 +190,18 @@ def config_fingerprint(config: STMConfig) -> str:
     # ``json_out.dumps`` rather than ``json.dumps``: ``surface_tools_env`` is an
     # environment variable, and on POSIX one holding a byte that is not valid
     # UTF-8 is decoded with ``surrogateescape``, so a lone surrogate reaches the
-    # ``.encode`` below with no config file involved. That raise lands in
+    # digest's ``.encode`` with no config file involved. That raise lands in
     # ``DaemonServer.__init__`` and in ``client._live_handshake_candidate``,
     # neither of which guards it — no daemon starts and every daemon-touching
     # CLI command prints a traceback (#761). Escaping keeps the digest total;
     # the escaped form is still distinct per input, so the fingerprint keeps
     # separating configs (#757's "only hashed" is not a clearance).
     blob = _json_dumps(material, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    key_path = discovery_key_path(config.data_dir)
+    key = load_or_create_key(key_path) if create_key else load_key(key_path)
+    if key is None:
+        return None
+    return keyed_framed_digest((blob,), key=key, domain=_FINGERPRINT_DOMAIN)[:16]
 
 
 def write_handshake(
@@ -193,21 +246,24 @@ def read_handshake(path: Path) -> dict[str, Any] | None:
 
 @overload
 def iter_foreign_handshakes(
-    data_dir: Path, current_fingerprint: str, *, include_unreadable: Literal[False] = False
+    data_dir: Path, current_fingerprint: str | None, *, include_unreadable: Literal[False] = False
 ) -> list[tuple[str, dict[str, Any]]]: ...
 
 
 @overload
 def iter_foreign_handshakes(
-    data_dir: Path, current_fingerprint: str, *, include_unreadable: Literal[True]
+    data_dir: Path, current_fingerprint: str | None, *, include_unreadable: Literal[True]
 ) -> list[tuple[str, dict[str, Any] | None]]: ...
 
 
 def iter_foreign_handshakes(
-    data_dir: Path, current_fingerprint: str, *, include_unreadable: bool = False
+    data_dir: Path, current_fingerprint: str | None, *, include_unreadable: bool = False
 ) -> list[tuple[str, dict[str, Any]]] | list[tuple[str, dict[str, Any] | None]]:
     """``(fingerprint, handshake)`` for every published daemon under a config
     fingerprint *other than* ``current_fingerprint``.
+
+    ``None`` for ``current_fingerprint`` means the caller has none — no
+    discovery key, or one it cannot use — and then every handshake is foreign.
 
     Globs the per-config handshake files (``stm-daemon-<fp>.json``) under
     ``data_dir`` and parses each with :func:`read_handshake`, skipping the

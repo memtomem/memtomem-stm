@@ -1340,3 +1340,95 @@ def test_non_integer_schema_version_is_not_schema_one(tmp_path, monkeypatch, sch
     checks = {c["id"]: c for c in data["checks"]}
     assert checks["ltm_runtime_profile"]["status"] == "WARN"
     assert "ltm_retrieval_mode" not in checks
+
+
+# ── an unusable daemon discovery key (#1416) ─────────────────────────────────
+
+
+def _break_discovery_key(data_dir) -> None:
+    from memtomem_stm.daemon import discovery
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    discovery.discovery_key_path(data_dir).write_bytes(b"not a key\n")
+
+
+def test_ltm_daemon_status_names_an_unusable_discovery_key_in_fixed_text(tmp_path):
+    """The key error's own message quotes ``data_dir`` and the OS error; this
+    report carries neither."""
+    from memtomem_stm.cli import proxy as proxy_mod
+    from memtomem_stm.config import STMConfig
+
+    data_dir = tmp_path / "cnryDataDir"
+    _break_discovery_key(data_dir)
+    config = STMConfig(data_dir=data_dir)
+    config.surfacing.enabled = True
+
+    status = proxy_mod._ltm_daemon_status(config, 3.0)
+
+    assert status["error"] == proxy_mod._DISCOVERY_KEY_ERROR
+    assert "stm-discovery.key" in status["error"]
+    assert status["connected"] is False
+    assert status["daemon_reachable"] is False
+    assert "cnryDataDir" not in json.dumps(status)
+
+
+def test_ltm_daemon_status_covers_a_key_error_raised_during_measurement(monkeypatch):
+    from memtomem_stm.cli import proxy as proxy_mod
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.daemon import client as daemon_client
+    from memtomem_stm.utils.local_key import LocalKeyError
+
+    config = STMConfig()
+    config.surfacing.enabled = True
+
+    async def fake_ping(*args, **kwargs):
+        return {"ltm": "warm"}
+
+    async def failing_measure(config, *, initial_state, timeout):
+        raise LocalKeyError("cannot read the key file /cnryKeyPath/stm-discovery.key")
+
+    monkeypatch.setattr(daemon_client, "ping", fake_ping)
+    monkeypatch.setattr(proxy_mod, "_measure_warm_daemon_ltm", failing_measure)
+
+    status = proxy_mod._ltm_daemon_status(config, 3.0, measure_ltm=True)
+
+    assert status["error"] == proxy_mod._DISCOVERY_KEY_ERROR
+    # Not the half-built report of a daemon that had answered the first ping.
+    assert status["connected"] is False
+    assert status["daemon_reachable"] is False
+    assert status["ltm_state"] is None
+    assert "cnryKeyPath" not in json.dumps(status)
+
+
+@pytest.mark.parametrize("command", ["health", "doctor"])
+def test_an_unusable_discovery_key_reads_as_an_unreachable_daemon(tmp_path, monkeypatch, command):
+    """Same exit code and same report as no daemon at all, apart from the
+    error text — these commands' conventions do not change for a key error."""
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "true")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__USE_DAEMON", "true")
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    args = [command, "--config", str(config), "--timeout", "3", "--json"]
+
+    def run(data_dir):
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(data_dir))
+        result = CliRunner().invoke(cli, args)
+        assert result.exception is None or isinstance(result.exception, SystemExit), result.output
+        return result.exit_code, result.output
+
+    unreachable_code, unreachable_out = run(tmp_path / "nodaemon")
+    broken = tmp_path / "cnryDataDir"
+    _break_discovery_key(broken)
+    broken_code, broken_out = run(broken)
+
+    assert broken_code == unreachable_code
+    block, baseline = _ltm_block(broken_out), _ltm_block(unreachable_out)
+    assert block["route"] == baseline["route"] == "daemon"
+    assert block["error"] == proxy_mod._DISCOVERY_KEY_ERROR
+    assert baseline["error"] != block["error"]
+    assert {k: v for k, v in block.items() if k != "error"} == {
+        k: v for k, v in baseline.items() if k != "error"
+    }
+    assert "cnryDataDir" not in broken_out

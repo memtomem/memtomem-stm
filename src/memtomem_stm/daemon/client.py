@@ -5,6 +5,13 @@ helper is failure-tolerant: a missing/stale handshake, a refused connect, a
 fingerprint mismatch, a timeout, or a malformed reply all return ``None`` (or
 ``False``) so the caller degrades cleanly — the hook to ``{}``, the CLI to a
 "not running" report. Nothing here ever raises on an unreachable daemon.
+
+One thing does raise: a discovery key that exists but cannot be used
+(:class:`~memtomem_stm.utils.local_key.LocalKeyError`, from deriving the
+fingerprint). That is not an unreachable daemon — no retry will find one — so
+it is left for the caller to report. A key that is simply absent is the quiet
+case: there is no fingerprint to look under, so the helpers report no daemon
+for this config without building a handshake path.
 """
 
 from __future__ import annotations
@@ -111,8 +118,13 @@ def _live_handshake_candidate(
     ``config_fingerprint`` check is then a belt-and-suspenders guard against a
     corrupted/hand-edited file whose content doesn't match its keyed name; a
     version mismatch likewise means "not the daemon we want".
+
+    A reader, so it never creates the discovery key: without one there is no
+    fingerprint and no handshake to look for.
     """
-    fp = fingerprint if fingerprint is not None else config_fingerprint(config)
+    fp = fingerprint if fingerprint is not None else config_fingerprint(config, create_key=False)
+    if fp is None:
+        return None
     hs = read_handshake(handshake_path(config.data_dir, fp))
     if hs is None:
         return None

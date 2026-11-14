@@ -23,6 +23,7 @@ registers it.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import math
@@ -40,6 +41,8 @@ from memtomem_stm.logging_setup import (
     open_private_log_handler,
     stderr_handler,
 )
+from memtomem_stm.utils.display import _disp
+from memtomem_stm.utils.local_key import LocalKeyError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -157,8 +160,70 @@ def _foreign_unknown(kind: str) -> str:
     return f"could not list data_dir ({kind}) — daemons under a different config are unknown"
 
 
-def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
-    """Daemons running under a *different* config fingerprint than the current one.
+def _current_fingerprint(config: STMConfig) -> str | None:
+    """This config's fingerprint, or ``None`` when ``data_dir`` has no discovery key.
+
+    These commands look for a daemon; none of them creates the key. ``None``
+    means there is no fingerprint to look under, so no current-config daemon
+    to find, and the caller must reach its answer without a handshake or lock
+    path — probing a lock creates the file, and its directory with it. A
+    daemon still running in the directory (an earlier build's, or one whose
+    key was removed under it) shows up among the foreign ones.
+    Raises :class:`LocalKeyError` for a key that is there but unusable.
+    """
+    from memtomem_stm.daemon.discovery import config_fingerprint
+
+    return config_fingerprint(config, create_key=False)
+
+
+def _key_absence_confirmed(config: STMConfig) -> bool:
+    """Whether "no discovery key" really means none, not "could not look".
+
+    The key reads as absent through a broken ancestor of ``data_dir`` too.
+    :func:`_handshake_removed` is the check ``stop`` and ``status`` already
+    apply before calling a handshake gone, so the keyless answer is held to
+    the same standard.
+    """
+    from memtomem_stm.daemon.discovery import discovery_key_path
+
+    return _handshake_removed(discovery_key_path(config.data_dir))
+
+
+_DATA_DIR_UNKNOWN = (
+    "data_dir could not be inspected, so whether a daemon is running cannot be determined"
+)
+
+
+def _key_error_text(exc: LocalKeyError) -> str:
+    """Unescaped: ``--json`` encodes it; text output goes through ``_disp``."""
+    return f"the daemon discovery key cannot be used — {exc}"
+
+
+def _exit_on_key_error[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    """Report an unusable discovery key as one line and exit 1.
+
+    The key error is not an ``OSError``, so no retry loop here absorbs it into
+    a wait; this is where it ends instead of a traceback. The message quotes
+    ``data_dir``, hence the escaping.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return fn(*args, **kwargs)
+        except LocalKeyError as exc:
+            click.echo(_warn(_disp(_key_error_text(exc))), err=True)
+            raise SystemExit(1) from None
+
+    return wrapper
+
+
+def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[str, Any]]:
+    """Daemons running under a *different* config fingerprint than *current*.
+
+    *current* is ``None`` when the caller has no fingerprint — no discovery
+    key, or an unusable one — and then every published daemon is listed: that
+    is what lets ``stop --all`` reach daemons whose key was lost or damaged.
 
     ``stop``/``status`` key to the *current* fingerprint, so these are invisible
     to them otherwise. A foreign daemon is not necessarily stale (#1195):
@@ -208,14 +273,9 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     translated; the per-entry probes report their own failures.
     """
     from memtomem_stm.daemon.client import probe_listening
-    from memtomem_stm.daemon.discovery import (
-        config_fingerprint,
-        is_pid_alive,
-        iter_foreign_handshakes,
-    )
+    from memtomem_stm.daemon.discovery import is_pid_alive, iter_foreign_handshakes
     from memtomem_stm.daemon.locking import lock_path
 
-    current = config_fingerprint(config)
     try:
         handshakes = iter_foreign_handshakes(config.data_dir, current, include_unreadable=True)
     except OSError as exc:
@@ -329,6 +389,7 @@ def _can_force_terminate() -> bool:
 
 
 @daemon_group.command(name="start")
+@_exit_on_key_error
 def start_cmd() -> None:
     """Spawn the daemon detached if one isn't already running for this config.
 
@@ -341,6 +402,10 @@ def start_cmd() -> None:
     *different* config owns a different lock + handshake (config-drift
     coexistence), so it never blocks this spawn and is left untouched — there is
     no cross-config conflict to report.
+
+    The first start under a ``data_dir`` creates its discovery key (in
+    ``request_spawn``). A key that cannot be read or created ends the command
+    at once, naming the file, rather than after the readiness wait.
     """
     from memtomem_stm.daemon import client
     from memtomem_stm.daemon.spawn import request_spawn
@@ -425,19 +490,49 @@ def stop_cmd(stop_all: bool) -> None:
     its lifetime lock without accepting (starting, or shutting down past the
     wait). A record is cleaned up as stale only while that lock is free, so a
     daemon already shutting down on its own is waited for, not reported gone.
+
+    With an unusable discovery key there is no "current config" to act on, and
+    the command exits 1 saying so. ``--all`` still runs first and treats every
+    published daemon as foreign — the way out when a daemon is still running
+    under a key that has since been damaged.
     """
     config = _load_config()
-    current_stop_error: SystemExit | None = None
+    key_error: LocalKeyError | None = None
+    current: str | None = None
     try:
-        _stop_current_config_daemon(config)
-    except SystemExit as exc:
-        current_stop_error = exc
+        current = _current_fingerprint(config)
+    except LocalKeyError as exc:
+        key_error = exc
+    stop_error: SystemExit | None = None
+    if key_error is None:
+        try:
+            _stop_current_config_daemon(config, current)
+        except SystemExit as exc:
+            stop_error = exc
+        except LocalKeyError as exc:
+            # The graceful request derives the fingerprint again, so a key
+            # damaged since the read above shows up here. Whatever this
+            # config's daemon was, it is one of the published ones now.
+            key_error, current = exc, None
     if stop_all:
         # Runs even after a failed current-config stop; either half failing
         # fails the command.
-        _stop_foreign_daemons(config)
-    if current_stop_error is not None:
-        raise current_stop_error
+        try:
+            _stop_foreign_daemons(config, current)
+        except SystemExit as exc:
+            stop_error = exc
+    if key_error is not None:
+        if stop_all:
+            hint = ""
+        elif _can_force_terminate():
+            hint = "; `mms daemon stop --all` signals every daemon published under data_dir"
+        else:
+            # ``stop --all`` refuses to signal by pid on Windows.
+            hint = "; end the daemon processes `mms daemon status` lists from Task Manager"
+        click.echo(_warn(_disp(_key_error_text(key_error)) + hint), err=True)
+        raise SystemExit(1)
+    if stop_error is not None:
+        raise stop_error
 
 
 def _handshake_removed(path: Path) -> bool:
@@ -546,18 +641,22 @@ def _wait_lock_free(path: Path, on_free: Callable[[], None] | None = None) -> Lo
         time.sleep(0.05)
 
 
-def _stop_current_config_daemon(config: STMConfig) -> None:
-    """Stop the daemon for *this* config (graceful, then SIGTERM-by-pid fallback)."""
+def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
+    """Stop the daemon for *this* config (graceful, then SIGTERM-by-pid fallback).
+
+    *fp* is this config's fingerprint; ``None`` (no discovery key) means there
+    is no such daemon, concluded without touching a handshake or lock path.
+    """
     from memtomem_stm.daemon import client
-    from memtomem_stm.daemon.discovery import (
-        config_fingerprint,
-        handshake_path,
-        is_pid_alive,
-        read_handshake,
-    )
+    from memtomem_stm.daemon.discovery import handshake_path, is_pid_alive, read_handshake
     from memtomem_stm.daemon.locking import lock_path
 
-    fp = config_fingerprint(config)
+    if fp is None:
+        if _key_absence_confirmed(config):
+            click.echo("no running daemon")
+            return
+        click.echo(_warn(f"{_DATA_DIR_UNKNOWN} — run `mms daemon status`"), err=True)
+        raise SystemExit(1)
     hs_path = handshake_path(config.data_dir, fp)
     lock = lock_path(config.data_dir, fp)
     raw = read_handshake(hs_path)
@@ -736,7 +835,7 @@ def _foreign_stopped(d: dict[str, Any]) -> str:
     return f"daemon pid={pid} stopped (fp={d['fingerprint']})"
 
 
-def _stop_foreign_daemons(config: STMConfig) -> None:
+def _stop_foreign_daemons(config: STMConfig, current: str | None) -> None:
     """SIGTERM every live daemon under a *different* config fingerprint (``--all``).
 
     SIGTERM (not the socket shutdown op) because a foreign daemon may speak an
@@ -767,7 +866,7 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     from memtomem_stm.daemon.locking import lock_path
 
     try:
-        foreign = _live_foreign_daemons(config)
+        foreign = _live_foreign_daemons(config, current)
     except _ForeignListingError as exc:
         click.echo(
             _warn(f"{_foreign_unknown(exc.kind)}; no foreign daemons were stopped"), err=True
@@ -918,12 +1017,7 @@ _SURFACE_COUNTERS = (
 def status_cmd(as_json: bool) -> None:
     """Report whether a daemon is running, with pid/port/uptime/LTM warmth."""
     from memtomem_stm.daemon import client
-    from memtomem_stm.daemon.discovery import (
-        config_fingerprint,
-        handshake_path,
-        is_pid_alive,
-        read_handshake,
-    )
+    from memtomem_stm.daemon.discovery import handshake_path, is_pid_alive, read_handshake
     from memtomem_stm.daemon.locking import lock_path
 
     config = _load_config()
@@ -932,10 +1026,18 @@ def status_cmd(as_json: bool) -> None:
     surfacing_on = config.surfacing.enabled
     use_daemon = config.hook.use_daemon and surfacing_on
     standalone_use_daemon = config.surfacing.use_daemon and surfacing_on
-    hs = asyncio.run(client.ping(config, timeout=2.0))
+    key_error: LocalKeyError | None = None
+    hs: dict[str, Any] | None = None
+    fp: str | None = None
+    try:
+        hs = asyncio.run(client.ping(config, timeout=2.0))
+        fp = _current_fingerprint(config)
+    except LocalKeyError as exc:
+        key_error, hs, fp = exc, None, None
+    info: dict[str, Any]
     if hs is not None:
         uptime = max(0.0, time.time() - _as_float(hs.get("created_at"), time.time()))
-        info: dict[str, Any] = {
+        info = {
             "state": "running",
             "pid": hs.get("pid"),
             "host": hs.get("host"),
@@ -951,8 +1053,21 @@ def status_cmd(as_json: bool) -> None:
             "hook_will_use_daemon": use_daemon,
             "standalone_will_use_daemon": standalone_use_daemon,
         }
+    elif key_error is not None or fp is None:
+        # No fingerprint, so no handshake or lock path to read or probe. With
+        # no key at all there is no daemon for this config — provided the
+        # directory could really be looked at. An unusable key leaves the
+        # question open; the daemons that are published are listed below
+        # either way.
+        if key_error is not None:
+            info = {"state": "unknown", "error": _key_error_text(key_error)}
+        elif _key_absence_confirmed(config):
+            info = {"state": "stopped"}
+        else:
+            info = {"state": "unknown", "error": _DATA_DIR_UNKNOWN}
+        info["hook_will_use_daemon"] = use_daemon
+        info["standalone_will_use_daemon"] = standalone_use_daemon
     else:
-        fp = config_fingerprint(config)
         hs_path = handshake_path(config.data_dir, fp)
         lp = lock_path(config.data_dir, fp)
         raw = read_handshake(hs_path)
@@ -1003,7 +1118,7 @@ def status_cmd(as_json: bool) -> None:
     foreign: list[dict[str, Any]] | None
     foreign_error: str | None = None
     try:
-        foreign = _live_foreign_daemons(config)
+        foreign = _live_foreign_daemons(config, fp)
     except _ForeignListingError as exc:
         foreign, foreign_error = None, exc.kind
 
@@ -1012,6 +1127,8 @@ def status_cmd(as_json: bool) -> None:
         if foreign_error is not None:
             info["foreign_error"] = foreign_error
         click.echo(json.dumps(info, indent=2))
+        if key_error is not None:
+            raise SystemExit(1)
         return
 
     state = info["state"]
@@ -1094,6 +1211,8 @@ def status_cmd(as_json: bool) -> None:
         )
     elif state == "starting":
         click.echo(_warn("no handshake yet, lock held — a daemon is starting or shutting down"))
+    elif state == "unknown" and "error" in info:
+        click.echo(_warn(_disp(f"{info['error']} — state unknown")))
     elif state == "unknown":
         click.echo(_warn("no handshake, and the daemon lock could not be checked — state unknown"))
     else:
@@ -1117,6 +1236,8 @@ def status_cmd(as_json: bool) -> None:
         click.echo(_warn(_foreign_unknown(foreign_error)))
     elif foreign:
         _render_foreign(foreign)
+    if key_error is not None:
+        raise SystemExit(1)
 
 
 def _foreign_idle_label(daemon: dict[str, Any]) -> str:
@@ -1186,15 +1307,22 @@ def _render_foreign(foreign: list[dict[str, Any]]) -> None:
 
 @daemon_group.command(name="restart")
 @click.pass_context
+@_exit_on_key_error
 def restart_cmd(ctx: click.Context) -> None:
     """Stop this config's running daemon, then start a fresh one once its lock is
     free. Daemons under other configs are left running (config-drift coexistence).
     """
-    from memtomem_stm.daemon.discovery import config_fingerprint
     from memtomem_stm.daemon.locking import lock_path
 
     config = _load_config()
     ctx.invoke(stop_cmd)
+    fp = _current_fingerprint(config)
+    if fp is None:
+        # No discovery key: ``stop`` had no current-config daemon to stop,
+        # so there is no lock to wait on, nor a fingerprint to name one.
+        # ``start`` creates the key.
+        ctx.invoke(start_cmd)
+        return
     # Wait for the old daemon to release its lifetime lock before starting. A
     # fixed sleep could race: _teardown() awaits the warm LTM child's stop and
     # has no hard timeout. Bounded so a wedged teardown reports clearly instead
@@ -1204,7 +1332,7 @@ def restart_cmd(ctx: click.Context) -> None:
     # and it can reach this probe first: a successful ``stop`` need not have
     # opened it (#1247). Retried inside the same deadline, since the error may
     # be transient.
-    lp = lock_path(config.data_dir, config_fingerprint(config))
+    lp = lock_path(config.data_dir, fp)
     deadline = time.time() + 5.0
     state = LockProbe.HELD
     while time.time() < deadline:
