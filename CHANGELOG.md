@@ -31,6 +31,22 @@ changes inline only. See the deprecation policy in
   response or query matches a credential pattern is ranked by BM25 for that
   pass. It is not counted as a `scorer_fallback`.
 
+- `mms host status` and `mms host sync` no longer judge a registry entry by
+  another host, or re-stamp its baseline, while the host config that baseline
+  came from was skipped. Before, a baseline stamped by a different STM hash
+  version read as `no_baseline` even then, and `mms host sync --apply`
+  re-stamped it from a same-name entry at another host, recording that host as
+  its source; with no such entry it was reported as an entry without a
+  baseline. A same-name entry at another host also made the entry `unchanged`
+  or `changed` against that host. (#1403, #1414)
+  **Behavior change**: those entries now read `not_inspected`, with the
+  skipped source's reason, where they read `no_baseline`, `unchanged` or
+  `changed`, and `mms host sync --apply` (with or without `--force`) leaves
+  their baseline as it is. In `mms host sync --json` they are listed under
+  `not_inspected` instead of `backfill`, `orphan_no_baseline` or
+  `skipped_changed`, or instead of being counted in `summary.unchanged`. In
+  `mms host status --json` their `current_hash` is the other host's entry's
+  hash when there is one.
 - TRUNCATE's code-aware output names more of the blocks it cannot keep whole.
   Those blocks are previewed after a `... (N more blocks)` line, and the
   previews used to be built one block at a time, each with its body lines, so

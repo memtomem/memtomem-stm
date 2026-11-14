@@ -1417,16 +1417,19 @@ BACKFILL are not gated, since neither adopts a new registry command.
 A source the scan could not inspect is not read as empty. When STM cannot tell
 which [Claude Code config](#which-claude-code-config-stm-reads) or project
 entry is in use, or that file or `<cwd>/.mcp.json` exists but is not a readable
-JSON object, a registry entry whose baseline came from that source and that no
-scanner found is `not_inspected` rather than `removed_at_host`, and `sync
---apply` never removes it. `status` shows the state with a footer naming the
+JSON object, or when `CODEX_HOME` cannot be placed, a registry entry whose
+baseline came from that source is `not_inspected`. That holds even when another
+host has an entry with the same name, or the baseline was stamped by a
+different STM hash version: the entry is not compared with the other host, and
+`sync --apply`, with or without `--force`, neither removes it nor re-stamps its
+baseline. `status` shows the state with a footer naming the
 reason (`--json`: the row's `reason`, and a `not_inspected` count in
 `summary`); `scan --json` lists the skipped sources as `not_inspected:
 [{"source", "reason"}]`; `sync --json` carries the rows in `plan.not_inspected`
 and their count in `summary.not_inspected`. `reason` is one of `custom_oauth`,
-`config_dir`, `home`, `legacy_config`, `unreadable`, `no_key`,
-`mcp_json_unreadable`. Other hosts' scanners still read an unreadable file as
-an empty one.
+`config_dir`, `home`, `legacy_config`, `unreadable`, `codex_home`, `no_key`,
+`mcp_json_unreadable`. Other scanners still read an unreadable file as an empty
+one, as the Codex scanner does an unreadable `config.toml`.
 
 ## MCP Tools (5 default + 2 opt-in + proxied)
 

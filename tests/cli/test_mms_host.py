@@ -2611,6 +2611,82 @@ class TestNotInspected:
         assert set(state.load_registry().servers) == {"kept-user", "kept-proj"}
         assert state.load_import_state().entries == baselines
 
+    @pytest.mark.parametrize("force", [False, True], ids=["apply", "apply-force"])
+    @pytest.mark.parametrize(
+        ("version_offset", "cursor_shape"),
+        [(0, None), (0, "same"), (0, "different"), (1, None), (1, "different")],
+        ids=["control", "other-host-same", "other-host-different", "version", "version-other-host"],
+    )
+    def test_skipped_source_wins_over_version_and_other_hosts(
+        self, runner, sandbox, monkeypatch, version_offset, cursor_shape, force
+    ):
+        """Neither a baseline of another hash version nor a same-name entry at
+        another host decides the row while its own source is skipped.
+
+        Before, the first read as ``no_baseline`` and ``sync --apply``
+        re-stamped it from the other host; the second compared it with the other
+        host as ``unchanged`` or ``changed``. Cursor always holds an unrelated
+        ``b``, so the sync under test really rewrites the sidecar.
+        """
+        shapes = {
+            "same": {"command": "npx", "args": ["orig"]},
+            "different": {"command": "npx", "args": ["other"]},
+        }
+        _seed_claude_code(sandbox, {"a": shapes["same"]})
+        _apply_claude_code(runner)
+        if version_offset:
+            s = state.load_import_state()
+            old = s.entries["a"]
+            s.entries["a"] = state.ImportStateEntry(
+                drift_hash=old.drift_hash,
+                drift_hash_version=HASH_VERSION + version_offset,
+                last_imported=old.last_imported,
+                source_label=old.source_label,
+            )
+            state.save_import_state(s)
+        cursor: dict = {"b": {"command": "uvx"}}
+        if cursor_shape is not None:
+            cursor["a"] = shapes[cursor_shape]
+        _seed_cursor_user(sandbox, cursor)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/claude")
+        entry = state.load_registry().servers["a"]
+        baseline = state.load_import_state().entries["a"]
+
+        res = _status(runner, "--json")
+        assert res.exit_code == 0, res.output
+        [row] = [r for r in json.loads(res.output)["entries"] if r["name"] == "a"]
+        assert (row["state"], row["reason"], row["source_label"]) == (
+            "not_inspected",
+            "config_dir",
+            "Claude Code (user)",
+        )
+        # ``current_hash`` stays the host's view: the other host's entry, if any.
+        expected_current = (
+            None
+            if cursor_shape is None
+            else compute_drift_hash(
+                state.RegistryServer(
+                    command="npx", args=shapes[cursor_shape]["args"], env={}, prefix="a"
+                )
+            )
+        )
+        assert row["current_hash"] == expected_current
+
+        res = _sync(runner, "--apply", *(["--force"] if force else []), "--yes", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        plan = payload["plan"]
+        assert [r["name"] for r in plan["not_inspected"]] == ["a"]
+        assert [r["name"] for r in plan["add"]] == ["b"]
+        assert plan["backfill"] == []
+        assert plan["remove"] == []
+        assert plan["skipped_changed"] == []
+        assert plan["orphan_no_baseline"] == []
+        assert payload["summary"]["restamped"] == 0
+        assert state.load_registry().servers["a"] == entry
+        assert state.load_import_state().entries["a"] == baseline
+        assert "b" in state.load_import_state().entries
+
     def test_a_readable_config_without_the_entry_still_removes_it(self, runner, sandbox):
         """Control: the new state does not swallow a real removal."""
         _seed_claude_code(sandbox, {"gone": {"command": "npx"}})
