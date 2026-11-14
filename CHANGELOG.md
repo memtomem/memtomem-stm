@@ -38,7 +38,7 @@ changes inline only. See the deprecation policy in
   **Behavior change**: only the hint text of these two errors changes; the
   exit code and the name check are the same.
 - `mms host sync` now points at a command that actually re-stamps a changed
-  entry. The footer for entries whose shape changed at the host said
+  entry (#1399). The footer for entries whose shape changed at the host said
   `Use mms host sync --force to acknowledge.`, but `sync` defaults to
   `--plan`, so `--force` alone only previews. That preview then ended with
   `Run mms host sync --apply to execute.`, which drops `--force`, and the
