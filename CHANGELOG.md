@@ -26,6 +26,17 @@ changes inline only. See the deprecation policy in
   saved in the proxy config or `~/.mms/registry.toml` are not migrated on
   upgrade or load; `mms host sync --apply --force` can still replace such a
   registry entry with the newly derived one when its host shape changed.
+- `mms project enable` with a name that is not in the registry (when the
+  registry has other entries) now suggests `mms import --apply`, which adds
+  MCP definitions from host configs to `~/.mms/registry.toml`. It used to
+  point to `mms list`, which lists the proxy config's upstreams, not the
+  registry names the command checks against. The error still lists the
+  registered names. With an empty registry, the command now suggests
+  `mms import --apply` instead of `mms import --from <host>`: without
+  `--apply`, `mms import` only previews and writes nothing, so re-running
+  `mms project enable` as the message said failed again.
+  **Behavior change**: only the hint text of these two errors changes; the
+  exit code and the name check are the same.
 
 ## [0.7.8] — 2026-11-14
 

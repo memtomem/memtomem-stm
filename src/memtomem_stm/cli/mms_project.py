@@ -33,7 +33,7 @@ from memtomem_stm.mms.detect import Project, Source, detect_project
 
 _REGISTRY_EMPTY_MSG = (
     "Registry is empty.\n"
-    "  Run `mms import --from <host>` to import existing MCP definitions\n"
+    "  Run `mms import --apply` to import existing MCP definitions\n"
     "  from host configs, then re-run this command.\n"
 )
 
@@ -517,7 +517,8 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
         known = ", ".join(sorted(registry.servers))
         raise click.ClickException(
             f"Unknown MCP name(s): {_disp(', '.join(unknown))}. "
-            f"Registered: {_disp(known)}. Run `mms list` to inspect the registry."
+            f"Registered: {_disp(known)}. "
+            "Run `mms import --apply` to add MCP definitions from host configs."
         )
 
     assert proj.config is not None  # _resolve_project_for_mutation guarantees MARKER
