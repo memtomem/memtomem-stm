@@ -1201,6 +1201,60 @@ Foreign daemon detection combines process liveness with a protocol-neutral TCP
 connect-probe, so older protocol generations are reported on supported POSIX
 and Windows hosts without sending them an incompatible frame.
 
+### The discovery key
+
+A daemon is found through its config fingerprint, which names its handshake
+and lock files (`stm-daemon-<fingerprint>.json` / `.lock` under `data_dir`).
+The fingerprint covers the LTM command line and `ltm_mcp_headers`, so it is an
+HMAC under a random key, `<data_dir>/stm-discovery.key` (mode `0600`), rather
+than a hash anyone could recompute from a guess. Every STM process that shares
+the `data_dir` reads the same key.
+
+The key is created by whatever first needs a daemon to exist — `mms daemon
+start`, a hook's or the standalone proxy's spawn request, the daemon itself.
+`status` and `stop` only look, and never create the key. With no key there is
+no fingerprint to look under, so `status` reports `stopped` and `stop` reports
+"no running daemon" for this config; on a `data_dir` that holds no daemon
+files — or does not exist — they create nothing at all. A daemon can still be
+running there: one an earlier build started, or one whose key was removed
+while it ran. `status` lists those as running under a different config,
+through the handshakes they published, and checking one that does not accept
+connections opens its lock file as it always has. Both commands still check
+that the directory could be walked; if it could not (a dangling symlink above
+it), `status` reports `unknown` (`--json`: an `error` field) and `stop` exits
+1. `restart` with no key skips the lock wait and goes straight to `start`.
+
+A key that exists but cannot be read, or does not hold a key, is an error:
+
+- `start`, `stop`, `status` and `restart` exit 1 with one line naming the file.
+  `status --json` reports `"state": "unknown"` with an `error` field, and
+  still lists every daemon published under `data_dir` as `foreign`.
+- `stop --all` treats every published daemon as foreign — this config's own
+  included — and acts on them before it reports the key and exits 1: the way
+  to stop daemons started under a key that has since been damaged. On macOS
+  and Linux it signals them as described above; on Windows it cannot signal by
+  pid, so end those processes from Task Manager. It reaches daemons that have
+  a handshake; one that holds its lock without one (starting, or finishing its
+  teardown) is not listed.
+- `mms hook` takes its configured `hook.fallback`; standalone surfacing logs
+  one warning naming the file and reports the daemon as unavailable until STM
+  restarts; `mms health` and `mms doctor` report an unreachable daemon, with
+  their usual exit codes, and point here.
+
+Moving the file aside lets the next `start` create a new one. A new key means
+new fingerprints: daemons still running under the old one are listed as
+running under a different config and stopped by `stop --all`, and a standalone
+proxy that was already running keeps looking for the old fingerprint until it
+restarts — so replace the key only with STM stopped. The key is created with a
+hard link (two processes creating it at once must end up with one key), so a
+`data_dir` on a filesystem without hard links cannot use the daemon.
+
+Files from a build before the fingerprint was keyed are not cleaned up, and
+the lock files keep the old, recomputable fingerprint in their names. After
+`mms daemon stop --all`, and with no STM process running under any environment
+that uses this `data_dir`, every `stm-daemon-*.json` and `stm-daemon-*.lock`
+in it can be deleted; they are recreated on demand. Keep `stm-discovery.key`.
+
 ## `mms project` — project-scoped MCP management
 
 `mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap).

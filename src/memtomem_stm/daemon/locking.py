@@ -60,7 +60,9 @@ def lock_path(data_dir: Path, fingerprint: str) -> Path:
     Keyed by the config fingerprint so daemons under different configs hold
     different locks and coexist (see the module docstring). Callers pass
     :func:`~memtomem_stm.daemon.discovery.config_fingerprint` of their own
-    effective config — the same value used to derive the handshake path.
+    effective config — the same value used to derive the handshake path. A
+    caller that only looks for a daemon and got no fingerprint (no discovery
+    key) has no lock path to build: probing one would create the file.
     """
     return (data_dir / f"{LOCK_PREFIX}-{fingerprint}.lock").expanduser()
 

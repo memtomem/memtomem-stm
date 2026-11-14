@@ -9690,12 +9690,34 @@ def _known_ltm_state(value: object) -> str:
     return value if isinstance(value, str) and value in _KNOWN_LTM_STATES else "unknown"
 
 
-def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False) -> dict[str, Any]:
-    """Shared-daemon readiness and telemetry; active only with ``measure_ltm``."""
-    from memtomem_stm.daemon import client as daemon_client
+# Fixed text, not the exception's message: that one quotes ``data_dir`` and
+# the OS error, and this report carries no config-derived values (#1079).
+# ``mms daemon status`` is where the file is named.
+_DISCOVERY_KEY_ERROR = (
+    "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
+    "(LocalKeyError); run `mms daemon status`"
+)
 
+
+def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False) -> dict[str, Any]:
+    """Shared-daemon readiness and telemetry; active only with ``measure_ltm``.
+
+    An unusable discovery key reads as an unreachable daemon with its own
+    error text, wherever in the probe or the measurement it surfaces.
+    """
+    from memtomem_stm.utils.local_key import LocalKeyError
+
+    try:
+        return _ltm_daemon_probe(config, timeout, measure_ltm=measure_ltm)
+    except LocalKeyError:
+        status = _ltm_daemon_status_base(config)
+        status["error"] = _DISCOVERY_KEY_ERROR
+        return status
+
+
+def _ltm_daemon_status_base(config: Any) -> dict[str, Any]:
     surfacing = config.surfacing
-    status: dict[str, Any] = {
+    return {
         "route": "daemon",
         "transport": surfacing.ltm_mcp_transport,
         "command": surfacing.ltm_mcp_command,
@@ -9711,6 +9733,13 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
         "latency": None,
         "measurement": None,
     }
+
+
+def _ltm_daemon_probe(config: Any, timeout: float, *, measure_ltm: bool) -> dict[str, Any]:
+    from memtomem_stm.daemon import client as daemon_client
+
+    surfacing = config.surfacing
+    status = _ltm_daemon_status_base(config)
     if not surfacing.enabled:
         status["skipped"] = "surfacing_disabled"
         return status
