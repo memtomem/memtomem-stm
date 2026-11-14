@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import re
 import sqlite3
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -3085,18 +3086,18 @@ class TestLifespan:
                 assert captured_pm_kwargs.get("cache") is None
                 mock_pm_instance.start.assert_awaited_once()
 
-    async def test_unusable_cache_key_file_is_named_in_the_production_log(self, tmp_path):
-        """The warning names the key file under the formatter the server
-        installs, which withholds exception text — so the name must be in the
-        message itself, not only in the traceback (#1416)."""
+    async def _log_of_an_unusable_cache_key(self, cache_dir: Path) -> tuple[str, Path]:
+        """Run the lifespan with a cache whose key file is not a key; return
+        what the production formatter wrote, and the key file."""
         import io
         import logging
 
-        from memtomem_stm.logging_setup import DisplayEscapingFormatter
+        from memtomem_stm.logging_setup import FILE_FORMAT, DisplayEscapingFormatter
         from memtomem_stm.server import app_lifespan, mcp
         from memtomem_stm.utils.local_key import key_path_for
 
-        db_path = tmp_path / "proxy_cache.db"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        db_path = cache_dir / "proxy_cache.db"
         key_file = key_path_for(db_path)
         key_file.write_bytes(b"not a key\n")
 
@@ -3112,7 +3113,7 @@ class TestLifespan:
 
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
-        handler.setFormatter(DisplayEscapingFormatter("%(levelname)s %(message)s"))
+        handler.setFormatter(DisplayEscapingFormatter(FILE_FORMAT))
         server_logger = logging.getLogger("memtomem_stm.server")
         server_logger.addHandler(handler)
         try:
@@ -3144,10 +3145,32 @@ class TestLifespan:
                     assert captured_pm_kwargs.get("cache") is None
         finally:
             server_logger.removeHandler(handler)
-        output = stream.getvalue()
+        assert key_file.read_bytes() == b"not a key\n"
+        return stream.getvalue(), key_file
+
+    async def test_unusable_cache_key_file_is_named_in_the_production_log(self, tmp_path):
+        """The warning names the key file under the formatter the server
+        installs, which withholds exception text — so the name must be in the
+        message itself, not only in the traceback (#1416)."""
+        output, key_file = await self._log_of_an_unusable_cache_key(tmp_path)
+
         assert "Response cache disabled" in output
         assert str(key_file) in output
-        assert key_file.read_bytes() == b"not a key\n"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="a newline is not a valid Windows file name character"
+    )
+    async def test_unusable_cache_key_warning_escapes_a_hostile_path(self, tmp_path):
+        """The message quotes the configured cache path, and the formatter
+        escapes only exception text: a newline or a bidi control in that path
+        must not reach the log as itself (#1422)."""
+        output, _ = await self._log_of_an_unusable_cache_key(
+            tmp_path / "x\nWARNING forged\u202e"
+        )
+
+        assert "Response cache disabled" in output
+        assert len(output.splitlines()) == 1
+        assert "x\\u000AWARNING forged\\u202E" in output
 
     async def test_init_failure_after_mcp_adapter_runs_cleanup(self):
         """If a post-mcp_adapter init step raises (e.g. proxy_manager.start()),

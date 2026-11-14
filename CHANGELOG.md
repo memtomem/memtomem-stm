@@ -13,6 +13,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- Three warnings about a cache that could not be opened now escape the path
+  they quote. "Response cache disabled" and "Tool-graph consult cache disabled
+  this session" print a key-file error whose text names the configured cache
+  path, and "Tool-graph consult cache could not be opened at" prints that path
+  directly; the log formatter escapes exception text only, so a newline or a
+  bidirectional control in `proxy.cache.db_path` or the consult cache path
+  reached the terminal and the log file as itself — a path with a newline
+  split the first two warnings across two lines. Each is now rendered with a
+  `\uXXXX` escape in place of such a character. The wording is unchanged for
+  a path without one (#1422).
+
 - The response cache's row keys and the tool-graph consult cache's backend
   fingerprint are keyed. A response-cache key was a plain SHA-256 of the
   server, tool, call arguments and context query, and the consult cache's
