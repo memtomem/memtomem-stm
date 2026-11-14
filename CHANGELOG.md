@@ -20,7 +20,7 @@ changes inline only. See the deprecation policy in
   re-stamped it from a same-name entry at another host, recording that host as
   its source; with no such entry it was reported as an entry without a
   baseline. A same-name entry at another host also made the entry `unchanged`
-  or `changed` against that host. (#1403)
+  or `changed` against that host. (#1403, #1414)
   **Behavior change**: those entries now read `not_inspected`, with the
   skipped source's reason, where they read `no_baseline`, `unchanged` or
   `changed`, and `mms host sync --apply` (with or without `--force`) leaves
