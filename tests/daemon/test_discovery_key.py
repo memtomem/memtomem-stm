@@ -601,9 +601,10 @@ def test_stop_acts_on_the_fingerprint_it_started_with_when_the_key_changes_under
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, then: str, stop_all: bool
 ) -> None:
     """``stop`` hands the fingerprint it derived to the graceful request. When
-    that request derived it again, a key changed in between turned this
-    config's own daemon into one ``stop`` could not find — and ``--all`` then
-    signalled it by pid as a foreign one."""
+    that request derived it again, a key removed in between left it with no
+    daemon to ask, and ``stop`` fell back to signalling its own daemon by pid;
+    a key corrupted in between ended the run with the key error — with
+    ``--all``, after trying to signal that daemon as a foreign one."""
     monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
     _answering_daemon(monkeypatch, tmp_path, pid=4321)
     foreign = _put_foreign(tmp_path, "0ldunkeyedfp0000", pid=98765)

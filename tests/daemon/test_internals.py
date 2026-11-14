@@ -1685,6 +1685,8 @@ class TestDaemonStatusCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
 
         async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
@@ -1709,6 +1711,9 @@ class TestDaemonStatusCli:
         text = CliRunner().invoke(_cli(), ["daemon", "status"])
 
         assert text.exit_code == 0, text.output
+        # The daemon was reached: without this, a report that never got as far
+        # as a running daemon would satisfy the line below just as well.
+        assert "running  pid=11" in text.output
         assert "surface latency" not in text.output
 
     @pytest.mark.parametrize(
