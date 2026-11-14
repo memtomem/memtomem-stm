@@ -19,9 +19,15 @@ from memtomem_stm.proxy.compression_feedback_store import (
     valid_kinds,
 )
 from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.proxy.privacy import contains_sensitive_content_decoded
 from memtomem_stm.utils.json_out import require_utf8_identifier
 
 logger = logging.getLogger(__name__)
+
+# Stored in place of a ``missing`` text the privacy screen withholds. The row
+# itself is kept: the tuner counts reports by server, tool and kind, trace_id
+# stays for correlation, and nothing reads the text back.
+MISSING_WITHHELD = "[not stored: withheld by the privacy screen]"
 
 
 class CompressionFeedbackTracker:
@@ -95,15 +101,26 @@ class CompressionFeedbackTracker:
                 logger.debug("trace_id lookup failed", exc_info=True)
                 resolved_trace = None
 
+        # The agent describes what a compressed response dropped, so quoting
+        # the dropped line — a credential included — is the natural thing to
+        # send. Screened like the other on-disk writers, with the decoded
+        # variant because such a quote is often a JSON-escaped fragment.
+        withheld = contains_sensitive_content_decoded(missing)
+        stored_missing = MISSING_WITHHELD if withheld else missing
+
         try:
             require_utf8_identifier(resolved_trace, "trace_id")
-            self._store.record(server, tool, kind, missing, resolved_trace)
+            self._store.record(server, tool, kind, stored_missing, resolved_trace)
         except ValueError as exc:
             return f"Error: {exc}"
 
-        if resolved_trace is not None:
-            return f"Compression feedback recorded ({kind}, trace_id={resolved_trace})"
-        return f"Compression feedback recorded ({kind}, trace_id unresolved)"
+        trace = (
+            f"trace_id={resolved_trace}" if resolved_trace is not None else "trace_id unresolved"
+        )
+        status = f"Compression feedback recorded ({kind}, {trace})"
+        if withheld:
+            status += "; the description was withheld by the privacy screen and not stored"
+        return status
 
     def get_stats(self, tool: str | None = None) -> dict:
         return self._store.get_stats(tool)

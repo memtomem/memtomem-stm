@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
+from memtomem_stm.proxy import privacy
+from memtomem_stm.proxy.compression_feedback import (
+    MISSING_WITHHELD,
+    CompressionFeedbackTracker,
+)
 from memtomem_stm.proxy.compression_feedback_store import (
     TRACE_LOOKUP_WINDOW_SECONDS,
     CompressionFeedbackStore,
@@ -429,6 +433,84 @@ class TestCompressionFeedbackTracker:
             assert tracker.get_stats()["total_feedback"] == 0
         finally:
             tracker.close()
+
+    @staticmethod
+    def _stored_rows(db: Path) -> list[tuple[str, str, str, str | None, str]]:
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT server, tool, kind, trace_id, missing FROM compression_feedback"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize(
+        ("missing", "plain_scan_hits"),
+        [
+            pytest.param("the line AKIAIOSFODNN7EXAMPLE was cut", True, id="credential"),
+            pytest.param("author jane.doe@example.com dropped", True, id="email"),
+            # Only visible once the JSON string escapes are decoded.
+            pytest.param(
+                'dropped {\\"pass\\u0077ord\\": \\"hunter2hunter2\\"}', False, id="escaped"
+            ),
+            # Still escaped after the decoder's last pass: withheld unmatched.
+            pytest.param("x " + "\\" * 16 + "u0041 y", False, id="decode-limit"),
+        ],
+    )
+    def test_sensitive_missing_is_withheld_and_the_row_kept(
+        self, tmp_path: Path, missing: str, plain_scan_hits: bool
+    ):
+        # The escaped and decode-limit rows pin the decoded scan: the plain one
+        # passes them.
+        assert privacy.contains_sensitive_content(missing) is plain_scan_hits
+        assert privacy.contains_sensitive_content_decoded(missing)
+        db = tmp_path / "cfb.db"
+        tracker = CompressionFeedbackTracker(db, retention_days=0)
+        try:
+            result = tracker.record(
+                server="docfix",
+                tool="get_document",
+                missing=missing,
+                kind="truncated",
+                trace_id="t1",
+            )
+        finally:
+            tracker.close()
+        assert result == (
+            "Compression feedback recorded (truncated, trace_id=t1); "
+            "the description was withheld by the privacy screen and not stored"
+        )
+        assert self._stored_rows(db) == [
+            ("docfix", "get_document", "truncated", "t1", MISSING_WITHHELD)
+        ]
+
+    def test_clean_missing_is_stored_verbatim(self, tmp_path: Path):
+        missing = "the code example after line 40"
+        assert not privacy.contains_sensitive_content_decoded(missing)
+        db = tmp_path / "cfb.db"
+        tracker = CompressionFeedbackTracker(db, retention_days=0)
+        try:
+            result = tracker.record(
+                server="docfix", tool="get_document", missing=missing, trace_id="t1"
+            )
+        finally:
+            tracker.close()
+        assert result == "Compression feedback recorded (other, trace_id=t1)"
+        assert self._stored_rows(db) == [("docfix", "get_document", "other", "t1", missing)]
+
+    def test_withheld_status_with_unresolved_trace(self, tmp_path: Path):
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
+        try:
+            result = tracker.record(
+                server="docfix", tool="get_document", missing="AKIAIOSFODNN7EXAMPLE"
+            )
+        finally:
+            tracker.close()
+        assert result == (
+            "Compression feedback recorded (other, trace_id unresolved); "
+            "the description was withheld by the privacy screen and not stored"
+        )
+        assert "AKIA" not in result
 
     def test_explicit_trace_id_persisted(self, tmp_path: Path):
         tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)

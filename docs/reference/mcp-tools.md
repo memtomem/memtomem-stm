@@ -13,7 +13,7 @@ All connected upstream tools are added as `{prefix}__{tool}`.
 | `stm_proxy_select_chunks` | `key`, `sections[]`, `response_format?` | Retrieve selected TOC sections |
 | `stm_proxy_read_more` | `key`, `offset?=0`, `limit?`, `response_format?` | Continue a progressive response |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories. Use either the legacy `rating`/`memory_id` shape or batched `ratings`, never both. |
-| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind="other"`, `trace_id?` | Report missing compressed information. `server` and `tool` are the upstream names (not `prefix__tool`) of a tool this proxy serves; other reports are refused. |
+| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind="other"`, `trace_id?` | Report missing compressed information. `server` and `tool` are the upstream names (not `prefix__tool`) of a tool this proxy serves; other reports are refused. A `missing` text the privacy screen flags is stored as a placeholder; the report itself is kept. |
 
 The continuation tools keep their required `result: string` output contract.
 Legacy replies have `structuredContent = {"result": text}`. Structured replies
