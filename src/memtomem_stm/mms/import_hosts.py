@@ -40,6 +40,11 @@ from memtomem_stm.mms.claude_config import (
     claude_project_key,
     read_claude_global_config,
 )
+from memtomem_stm.mms.host_homes import (
+    HOST_HOME_UNKNOWN_REASONS,
+    HostHomeUnknown,
+    host_home_override,
+)
 from memtomem_stm.mms.secrets import Classification, classify_env
 
 if TYPE_CHECKING:
@@ -356,6 +361,7 @@ def _mcp_servers(config: dict[str, Any]) -> dict[str, Any]:
 # nothing may read its missing entries as removed at the host.
 SOURCE_GAP_REASONS: dict[str, str] = {
     **CLAUDE_CONFIG_UNKNOWN_REASONS,
+    "codex_home": HOST_HOME_UNKNOWN_REASONS["codex_home"],
     "no_key": (
         "STM cannot tell which project entry Claude Code uses here "
         "(e.g. a linked worktree, a submodule or a symlinked .git)"
@@ -459,11 +465,30 @@ def scan_cursor(cwd: Path) -> list[ImportCandidate]:
     return candidates
 
 
-def _codex_config_sources(cwd: Path) -> list[tuple[dict[str, Any], str, bool]]:
-    """Share the file scan's layers and trust boundary with advisory reports."""
-    codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+_CODEX_USER_LABEL = "Codex CLI"
+_CODEX_PROJECT_LABEL = "Codex CLI (project)"
+
+
+def _codex_config_sources(
+    cwd: Path, gaps: dict[str, str] | None = None
+) -> list[tuple[dict[str, Any], str, bool]]:
+    """Share the file scan's layers and trust boundary with advisory reports.
+
+    When STM cannot tell where ``CODEX_HOME`` points, neither layer is read:
+    the project layer is admitted by a trust entry in the user layer. Both
+    labels then go in ``gaps``, so no entry imported from either is read as
+    removed at the host.
+    """
+    codex_home = host_home_override("codex")
+    if codex_home is None:
+        codex_home = Path("~/.codex").expanduser()
+    elif isinstance(codex_home, HostHomeUnknown):
+        if gaps is not None:
+            gaps[_CODEX_USER_LABEL] = codex_home.code
+            gaps[_CODEX_PROJECT_LABEL] = codex_home.code
+        return []
     config = _read_toml_safely(codex_home / "config.toml") or {}
-    sources = [(config, "Codex CLI", False)]
+    sources = [(config, _CODEX_USER_LABEL, False)]
     projects = config.get("projects") or {}
     project = projects.get(str(cwd.resolve()), {}) if isinstance(projects, dict) else {}
     trusted = isinstance(project, dict) and project.get("trust_level") == "trusted"
@@ -471,7 +496,7 @@ def _codex_config_sources(cwd: Path) -> list[tuple[dict[str, Any], str, bool]]:
         sources.append(
             (
                 _read_toml_safely(cwd / ".codex" / "config.toml") or {},
-                "Codex CLI (project)",
+                _CODEX_PROJECT_LABEL,
                 True,
             )
         )
@@ -488,10 +513,14 @@ def codex_declared_names(cwd: Path) -> set[str]:
     return names
 
 
-def scan_codex(cwd: Path) -> list[ImportCandidate]:
-    """Scan CODEX_HOME and the current project's config when it is trusted."""
+def scan_codex(cwd: Path, gaps: dict[str, str] | None = None) -> list[ImportCandidate]:
+    """Scan CODEX_HOME and the current project's config when it is trusted.
+
+    Sources skipped because ``CODEX_HOME`` cannot be placed are recorded in
+    ``gaps`` (see :func:`_codex_config_sources`).
+    """
     out: list[ImportCandidate] = []
-    for source, label, repo_local in _codex_config_sources(cwd):
+    for source, label, repo_local in _codex_config_sources(cwd, gaps):
         servers = source.get("mcp_servers") or {}
         if not isinstance(servers, dict):
             continue
@@ -555,8 +584,9 @@ def discover_with_gaps(
 ) -> tuple[list[ImportCandidate], dict[str, str]]:
     """:func:`discover`, plus ``{source_label: reason}`` for sources not inspected.
 
-    Only the Claude Code scanner reports gaps so far (#1271); the others
-    still read an unreadable file as an empty one.
+    The Claude Code scanner (#1271) and the Codex scanner (an unplaceable
+    ``CODEX_HOME``) report gaps; the others still read an unreadable file as
+    an empty one.
     """
     hosts = list(ALL_HOSTS) if host == "all" else [host]
     gaps: dict[str, str] = {}
@@ -567,6 +597,8 @@ def discover_with_gaps(
             raise ValueError(f"Unknown host '{host}'. Valid: {', '.join(ALL_HOSTS)}, all")
         if scanner is scan_claude_code:
             out.extend(scan_claude_code(cwd, gaps))
+        elif scanner is scan_codex:
+            out.extend(scan_codex(cwd, gaps))
         else:
             out.extend(scanner(cwd))
     return out, gaps

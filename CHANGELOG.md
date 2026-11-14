@@ -20,6 +20,28 @@ changes inline only. See the deprecation policy in
   `os.getpgid`, which the macOS kernel answers with "no such process" for an
   exited child nobody reaped yet, so the sweep still does not wait out its
   escalation window for a child that already died.
+- An empty or relative host home variable no longer points STM at files in the
+  current directory. Before, `CODEX_HOME=""` made `mms import` and
+  `mms host sync` read `./config.toml` as the Codex user config, outside
+  `--allow-project-configs`, and let a trust entry in that same file admit
+  `./.codex/config.toml`; a relative `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or
+  `KIMI_CODE_HOME` made `mms hook install` and `mms hook uninstall` read and
+  write a file under the current directory. Each value is now read the way the
+  host reads it, measured on Codex CLI 0.167.2 and Kimi Code 0.39.0: Codex
+  treats an empty `CODEX_HOME` as unset, while Claude Code and Kimi Code
+  resolve an empty or relative value against their own working directory,
+  which STM does not know.
+  **Behavior change**: `CODEX_HOME=""` now means `~/.codex`. A `CODEX_HOME`
+  that is relative or contains a `.` or `..` component makes Codex discovery
+  skip both Codex configs: `mms import` imports nothing from Codex, and
+  `mms host status` and `mms host sync` show entries imported from them as
+  `not_inspected` instead of removing them. `mms hook install` and
+  `mms hook uninstall` exit with an error naming the variable when
+  `CLAUDE_CONFIG_DIR` or `KIMI_CODE_HOME` is empty, relative or contains `.`
+  or `..`, and when `CODEX_HOME` is relative or contains `.` or `..`. A value
+  starting with a literal `~` counts as relative. Before, the hook commands
+  expanded a literal `~` and fell back to the default file for an empty
+  value.
 - A new upstream prefix can no longer end in a newline. The prefix rule is now
   checked against the whole value: before, `"fs\n"` passed (`$` also matches
   just before a final newline) while `"fs\n\n"` was refused. This applies to
@@ -81,6 +103,20 @@ changes inline only. See the deprecation policy in
   STM's own registration. An entry of this form already imported into
   `~/.mms/registry.toml` now shows as `removed_at_host` in
   `mms host status`.
+- `stm_compression_feedback` no longer stores a `missing` text the privacy
+  screen flags. The text describes what a compressed response dropped, so it
+  often quotes the dropped line, and it was written to
+  `compression_feedback.missing` as given, while writers such as the response
+  cache and the selection log screen first. It is now checked the way the
+  response cache checks a response
+  (credentials and PII, including after decoding JSON string escapes, and
+  text that is still escaped after the last decoding pass); such a text is
+  stored as `[not stored: withheld by the privacy screen]`. The report is
+  still recorded with its server, tool, kind and trace id: the tuner counts
+  reports by server, tool and kind, and nothing reads the text back. (#1380)
+  **Behavior change**: for such a text the stored value is the placeholder,
+  and the tool's reply adds `the description was withheld by the privacy
+  screen and not stored`. Rows written before this change are not rewritten.
 
 ## [0.7.8] — 2026-11-14
 
