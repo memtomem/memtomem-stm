@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import tomli_w
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from memtomem_stm.proxy.config import validation_error_summary
 from memtomem_stm.utils.fileio import atomic_write_text
@@ -44,10 +44,15 @@ per-project config). Bump in lockstep when any of those shapes change.
 The W2 sidecar has its own :data:`IMPORT_STATE_SCHEMA_VERSION` so a drift-hash
 algorithm change can roll forward without forcing a registry migration."""
 
-IMPORT_STATE_SCHEMA_VERSION = 1
+IMPORT_STATE_SCHEMA_VERSION = 2
 """Version constant for ``~/.mms/import_state.toml`` only. Bump when the
 sidecar shape (entry fields, hash format) changes — does **not** force a
-registry version bump."""
+registry version bump. Every save writes this version."""
+
+_IMPORT_STATE_READABLE_VERSIONS = (1,)
+"""Older sidecar versions the loader still accepts. Version 1 has no
+``drift_key_id`` and only unkeyed ``sha256:`` hashes; its rows stay comparable
+(:mod:`memtomem_stm.mms.drift`), so an upgrade must not reject the file."""
 
 # Mode bits — registry holds secrets, projects index holds paths only,
 # per-project file is committed and intentionally world-readable.
@@ -358,18 +363,40 @@ class ImportStateEntry(BaseModel):
     the ``--plan`` output. PR3 reads this row to classify the next scan's
     candidate as idempotent / drift / removed.
 
-    The ``drift_hash`` regex is locked to the format
-    :func:`memtomem_stm.mms.drift.compute_drift_hash` produces, so a typo
-    or hand-edit that breaks the format surfaces as ``CorruptedConfig``
-    on load instead of a confusing comparison failure later.
+    The ``drift_hash`` regex is locked to the two formats
+    :mod:`memtomem_stm.mms.drift` knows — the keyed ``hmac-sha256:`` of hash
+    version 2 and the unkeyed ``sha256:`` of version 1 — so a typo or
+    hand-edit that breaks the format surfaces as ``CorruptedConfig`` on load
+    instead of a confusing comparison failure later. ``drift_key_id`` names
+    the key a version 2 row was stamped under.
+
+    The three fields must agree. An unkeyed ``sha256:`` hash is version 1
+    only: under any other version it would be a value this mms cannot re-key
+    and must not print, kept in the sidecar by every later write. Version 2
+    needs its key id. A row of a later version is otherwise loaded as written,
+    since a newer mms may have its own rule for it.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    drift_hash: str = Field(pattern=r"^sha256:[0-9a-f]{16}$")
+    drift_hash: str = Field(pattern=r"^(sha256|hmac-sha256):[0-9a-f]{16}$")
     drift_hash_version: int = Field(ge=1)
+    drift_key_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
     last_imported: str  # ISO 8601 UTC, same shape as ProjectIndexEntry.last_seen
     source_label: str  # e.g. "Claude Code (user)", "Codex CLI"
+
+    @model_validator(mode="after")
+    def _known_versions_agree(self) -> ImportStateEntry:
+        # Literals rather than the constants in ``mms.drift``, which imports
+        # this module; a test holds the two in step.
+        keyed = self.drift_hash.startswith("hmac-sha256:")
+        if self.drift_hash_version == 1 and (keyed or self.drift_key_id is not None):
+            raise ValueError("a version 1 drift hash is `sha256:` with no drift_key_id")
+        if self.drift_hash_version != 1 and not keyed:
+            raise ValueError("only a version 1 drift hash is an unkeyed `sha256:`")
+        if self.drift_hash_version == 2 and self.drift_key_id is None:
+            raise ValueError("a version 2 drift hash has a drift_key_id")
+        return self
 
 
 class ImportState(BaseModel):
@@ -427,13 +454,16 @@ def is_regular_file(path: Path) -> bool:
     return stat.S_ISREG(mode)
 
 
-def _check_schema_version(path: Path, raw: dict, expected: int) -> None:
+def _check_schema_version(
+    path: Path, raw: dict, expected: int, *, readable: tuple[int, ...] = ()
+) -> None:
+    """Reject a file whose version is neither ``expected`` nor in ``readable``."""
     found = raw.get("schema_version")
     if found is None:
         raise CorruptedConfig(path, "missing top-level `schema_version`")
     if not isinstance(found, int):
         raise CorruptedConfig(path, f"`schema_version` must be int, got {type(found).__name__}")
-    if found != expected:
+    if found != expected and found not in readable:
         try:
             str(found)
         except ValueError:
@@ -497,8 +527,10 @@ def load_import_state(path: Path | None = None) -> ImportState:
     """Load the import-state sidecar. Returns empty state if file is missing.
 
     Uses :data:`IMPORT_STATE_SCHEMA_VERSION` — independent of registry's
-    :data:`SCHEMA_VERSION` so a future drift-hash algorithm bump doesn't
-    invalidate registries written under the same mms version.
+    :data:`SCHEMA_VERSION` so a drift-hash algorithm bump doesn't invalidate
+    registries written under the same mms version. A version 1 sidecar is
+    read too; the returned ``schema_version`` is the file's, and
+    :func:`save_import_state` writes the current one whatever it is given.
 
     Sidecar absence is the normal "no baseline yet" case (e.g. brand-new
     install, or pre-W2 user upgrading) — same idiom as :func:`load_registry`.
@@ -507,7 +539,9 @@ def load_import_state(path: Path | None = None) -> ImportState:
     if not is_regular_file(p):
         return ImportState()
     raw = _load_toml_dict(p)
-    _check_schema_version(p, raw, IMPORT_STATE_SCHEMA_VERSION)
+    _check_schema_version(
+        p, raw, IMPORT_STATE_SCHEMA_VERSION, readable=_IMPORT_STATE_READABLE_VERSIONS
+    )
     try:
         return ImportState.model_validate(raw)
     except ValidationError as e:
@@ -552,9 +586,14 @@ def save_project_config(config: ProjectConfig, path: Path) -> None:
 
 
 def save_import_state(state: ImportState, path: Path | None = None) -> None:
-    """Atomically write ``import_state.toml`` with mode 0o600."""
+    """Atomically write ``import_state.toml`` with mode 0o600.
+
+    Always at :data:`IMPORT_STATE_SCHEMA_VERSION`, also for a state loaded from
+    an older file. ``None`` fields are left out: TOML has no null.
+    """
     p = path or import_state_path()
-    _write_state(p, tomli_w.dumps(state.model_dump()), mode=_IMPORT_STATE_MODE)
+    current = state.model_copy(update={"schema_version": IMPORT_STATE_SCHEMA_VERSION})
+    _write_state(p, tomli_w.dumps(current.model_dump(exclude_none=True)), mode=_IMPORT_STATE_MODE)
 
 
 # ---------------------------------------------------------------------------

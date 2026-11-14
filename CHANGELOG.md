@@ -284,6 +284,55 @@ changes inline only. See the deprecation policy in
   and the tool's reply adds `the description was withheld by the privacy
   screen and not stored`. Rows written before this change are not rewritten.
 
+- `mms host status` named a command that could not stamp some of the entries
+  it reported. Its "missing baseline hash" footer said to run `mms import
+  --apply`, which stamps only an entry with no sidecar row; for a row that
+  exists but cannot be compared (a hash version this STM does not know, or a
+  lost drift-hash key) it answered "Already up to date" and the entry stayed
+  `no_baseline`. The footer now names `mms host sync --apply`, which stamps
+  both, for any entry a host scan still finds.
+
+### Security
+
+- `mms host status --json` and `mms host sync --json` no longer print a hash
+  that confirms a guessed credential. The drift hash covers a server's
+  `command`, `args` and `env` values. It was the first 16 hex characters of a
+  plain SHA-256 of them, printed as `baseline_hash` / `current_hash` and
+  stored in `~/.mms/import_state.toml`, so someone who saw a report and knew
+  the rest of the entry could confirm a guessed `env` value by recomputing
+  it. The hash is now an HMAC under a random key kept in
+  `~/.mms/import_state.toml.key` (mode `0600`, created by the first
+  `mms import --apply` or `mms host sync --apply` that writes), and no
+  unkeyed value is printed. A report made by an earlier version still
+  confirms guesses: rotate a credential whose entry appeared in one that left
+  the machine. The key sits beside `registry.toml`, which holds the same
+  values in plain text, so this covers reports and copies of the sidecar, not
+  a copy of the whole directory. (GHSA-8xcm-66jc-qmfr)
+  **Behavior change**: `baseline_hash` and `current_hash` are now
+  `hmac-sha256:<16 hex>`, differ between installations, and cannot be
+  recomputed from a host config. While no key file exists — after upgrading,
+  until the first `--apply` that writes — `current_hash` is `null`, and so is
+  the `baseline_hash` of a row an earlier version wrote. `state` does not
+  depend on either field. A sidecar row that pairs an unkeyed `sha256:` hash
+  with a `drift_hash_version` other than 1 is now refused on load like any
+  other malformed row; no release wrote one. Baselines written by an earlier
+  version keep their state: they are compared as before, and
+  `mms host sync --apply`, or an `mms import --apply` that finds at least
+  one host definition, re-keys them in place (`REKEY` in the plan,
+  `summary.rekeyed` in `--json`); until then the sidecar still holds the
+  unkeyed values. That write also moves the sidecar to `schema_version = 2`
+  with a `drift_key_id` on each row, which an earlier STM refuses to read: to
+  go back, delete `~/.mms/import_state.toml` and run `mms host sync --apply`
+  there, which stamps every entry from the host's current config.
+  If the key file is lost or replaced, the rows it stamped read `no_baseline`
+  and `mms host sync --apply` stamps them again from the host's current
+  config, so an edit made there in between is not reported. An unreadable or
+  malformed key file is an error (exit 1, naming the file) for `mms host
+  status`, `mms host sync` and an `--apply` that writes, and is left as it
+  is; moving it aside counts as losing it. The key file is created with a
+  hard link, so with `~/.mms` on a filesystem without hard links `--apply`
+  exits 1 before writing anything.
+
 ## [0.7.8] — 2026-11-14
 
 ### Upgrade notes

@@ -9,9 +9,12 @@ only if the secret does not travel with the file. So the key lives in its own
 file beside the store (``<store>.key``), never inside it: a copied database, a
 single-file backup or a file attached to a bug report arrives without its key.
 
-The key is created on first use and never rewritten. Losing it is harmless for
-the stores using it today — every identifier it keyed becomes unreachable, which
-for a cache is a miss — and each store notices the change and purges its rows.
+The key is created on first use and never rewritten. Losing it makes every
+identifier it keyed unreachable. For the two caches that is a miss: each notices
+the change and purges its rows. For the mms drift sidecar
+(:mod:`memtomem_stm.mms.drift`) it costs more: the baselines stamped under the
+lost key can no longer be compared, and stamping them again takes the host's
+current config, so an edit made there in between goes unreported.
 
 Creation is exclusive. The key is written in full to a temporary file and then
 hard-linked into place, which fails if the name already exists, so two processes
@@ -62,7 +65,7 @@ def key_path_for(store_path: Path) -> Path:
     return resolved.with_name(resolved.name + ".key")
 
 
-def load_key(path: Path) -> bytes | None:
+def load_key(path: Path, *, tighten_mode: bool = True) -> bytes | None:
     """Read the key at *path*; ``None`` only if no file exists there.
 
     Anything else that prevents using the file raises :class:`LocalKeyError` and
@@ -70,6 +73,10 @@ def load_key(path: Path) -> bytes | None:
     is not exactly one key. "Absent" and "unusable" are kept apart because
     folding them would let a caller overwrite a key that some other process is
     using.
+
+    A usable key readable by group or other has those bits dropped, unless
+    *tighten_mode* is false. A command that promises to change nothing passes
+    false: the chmod is a write to the file's metadata.
     """
     try:
         os.lstat(path)
@@ -91,7 +98,8 @@ def load_key(path: Path) -> bytes | None:
         key = _parse(raw, path)
         # Only once the content is known to be a key: a name that points at
         # some other file must not have that file's mode changed.
-        _tighten_mode(fd)
+        if tighten_mode:
+            _tighten_mode(fd)
     except OSError as exc:
         raise LocalKeyError(f"cannot read the key file {path}: {exc}") from exc
     finally:

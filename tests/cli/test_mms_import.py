@@ -34,6 +34,13 @@ def sandbox(tmp_path, monkeypatch):
     return {"home": tmp_path, "cwd": cwd}
 
 
+def _key() -> bytes:
+    """The sandbox's drift-hash key (``HOME`` is pinned to it)."""
+    key = drift.load_drift_key()
+    assert key is not None, "no drift key yet: nothing has written the sidecar"
+    return key
+
+
 def _seed_claude_code(sandbox, mcps: dict) -> None:
     cfg = {"mcpServers": mcps}
     (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
@@ -251,9 +258,10 @@ class TestApply:
 
         for name, entry in loaded.entries.items():
             # 3. format
-            assert re.fullmatch(r"sha256:[0-9a-f]{16}", entry.drift_hash), entry.drift_hash
+            assert re.fullmatch(r"hmac-sha256:[0-9a-f]{16}", entry.drift_hash), entry.drift_hash
+            assert entry.drift_key_id == drift.drift_key_id(_key())
             # 4. oracle (kill-switch): hash matches canonical implementation
-            assert entry.drift_hash == compute_drift_hash(cfg.servers[name])
+            assert entry.drift_hash == compute_drift_hash(cfg.servers[name], _key())
             # 5. version pinned to module constant
             assert entry.drift_hash_version == drift.HASH_VERSION
             # 6. source_label exact match (claude-code at user scope)
@@ -315,7 +323,7 @@ class TestApply:
         loaded = state.load_import_state()
         assert set(loaded.entries.keys()) == set(cfg.servers.keys())
         for name, entry in loaded.entries.items():
-            assert entry.drift_hash == compute_drift_hash(cfg.servers[name])
+            assert entry.drift_hash == compute_drift_hash(cfg.servers[name], _key())
             assert entry.drift_hash_version == drift.HASH_VERSION
             assert entry.source_label == "Claude Code (user)"
         # Backfill rows share the recovery-moment timestamp.
@@ -383,7 +391,7 @@ class TestApply:
         assert set(loaded.entries.keys()) == {"existing", "newcomer"}
         assert set(cfg.servers.keys()) == {"existing", "newcomer"}
         for name, entry in loaded.entries.items():
-            assert entry.drift_hash == compute_drift_hash(cfg.servers[name])
+            assert entry.drift_hash == compute_drift_hash(cfg.servers[name], _key())
             assert entry.drift_hash_version == drift.HASH_VERSION
             assert entry.source_label == "Claude Code (user)"
 
@@ -451,8 +459,146 @@ class TestApply:
 
         loaded = state.load_import_state()
         assert set(loaded.entries.keys()) == {"old", "newcomer"}
-        # `old` row preserved byte-equal — including its older timestamp.
-        assert loaded.entries["old"] == prior.entries["old"]
+        # `old` keeps its source and its older timestamp. Its unkeyed
+        # version 1 hash is re-keyed by this write: the same baseline under
+        # the installation's key, not a new stamp.
+        old = loaded.entries["old"]
+        assert old == drift.promote(prior.entries["old"], _key())
+        assert (old.last_imported, old.source_label) == ("2026-04-01T00:00:00Z", "Cursor (user)")
+        assert old.drift_hash == drift.keyed_from_legacy("sha256:dead0000beef0000", _key())
+        assert "Re-keyed 1 sidecar baseline in" in res.output
+
+        # A second apply leaves the now-keyed row byte-equal.
+        _seed_claude_code(sandbox, {"newcomer": {"command": "echo"}, "third": {"command": "echo"}})
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res.exit_code == 0, res.output
+        assert state.load_import_state().entries["old"] == old
+        assert "Re-keyed" not in res.output
+
+
+# ---------------------------------------------------------------------------
+# Drift-hash key: created by a write, and the unkeyed rows it re-keys
+# ---------------------------------------------------------------------------
+
+
+def _v1_row(server: state.RegistryServer) -> state.ImportStateEntry:
+    """The row the last unkeyed release stamped for ``server``."""
+    return state.ImportStateEntry(
+        drift_hash=drift.legacy_v1_hash(server),
+        drift_hash_version=1,
+        last_imported="2026-04-01T00:00:00Z",
+        source_label="Claude Code (user)",
+    )
+
+
+def _mms_files() -> dict[str, bytes]:
+    """Name → bytes of the ``~/.mms`` state files (the write lock's own file aside)."""
+    return {
+        p.name: p.read_bytes()
+        for p in sorted(state.mms_home().iterdir())
+        if p.is_file() and p.name != ".lock"
+    }
+
+
+class TestDriftKey:
+    def _upgraded_with_one_idempotent_entry(self, sandbox) -> state.RegistryServer:
+        """Registry and host agree on ``foo``; its sidecar row is version 1
+        and no key file exists — an install the unkeyed release left behind."""
+        server = state.RegistryServer(command="npx", env={"API_TOKEN": "tok"}, prefix="foo")
+        state.save_registry(state.RegistryConfig(servers={"foo": server}))
+        state.save_import_state(state.ImportState(entries={"foo": _v1_row(server)}))
+        _seed_claude_code(sandbox, {"foo": {"command": "npx", "env": {"API_TOKEN": "tok"}}})
+        return server
+
+    def test_apply_rekeys_when_that_is_the_only_thing_to_write(self, runner, sandbox):
+        server = self._upgraded_with_one_idempotent_entry(sandbox)
+        registry_before = state.registry_path().read_bytes()
+
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert res.exit_code == 0, res.output
+        assert "Re-keyed 1 sidecar baseline in" in res.output
+        assert "Already up to date" not in res.output
+        assert state.registry_path().read_bytes() == registry_before
+        row = state.load_import_state().entries["foo"]
+        assert row.drift_hash == compute_drift_hash(server, _key())
+        assert (row.last_imported, row.source_label) == (
+            "2026-04-01T00:00:00Z",
+            "Claude Code (user)",
+        )
+        assert "sha256:" not in state.import_state_path().read_text(encoding="utf-8").replace(
+            "hmac-sha256:", ""
+        )
+
+        # Nothing left to write: the next run says so and touches nothing.
+        files = _mms_files()
+        again = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert "Already up to date. Registry unchanged." in again.output
+        assert _mms_files() == files
+
+    def test_a_row_replaced_by_a_new_import_is_not_reported_as_rekeyed(self, runner, sandbox):
+        """An orphan version 1 row whose name is imported again gets a fresh
+        stamp; calling that a re-key would claim the old baseline survived."""
+        stale = state.RegistryServer(command="old", prefix="foo")
+        state.save_import_state(state.ImportState(entries={"foo": _v1_row(stale)}))
+        _seed_claude_code(sandbox, {"foo": {"command": "npx"}})
+
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert res.exit_code == 0, res.output
+        assert "Wrote 1 new entry" in res.output
+        assert "Re-keyed" not in res.output
+        row = state.load_import_state().entries["foo"]
+        assert row.drift_hash == compute_drift_hash(state.load_registry().servers["foo"], _key())
+        assert row.last_imported != "2026-04-01T00:00:00Z"
+
+    def test_plan_creates_no_key_and_writes_nothing(self, runner, sandbox):
+        self._upgraded_with_one_idempotent_entry(sandbox)
+        files = _mms_files()
+
+        res = runner.invoke(import_command, ["--from", "claude-code"])
+
+        assert res.exit_code == 0, res.output
+        assert not drift.drift_key_path().exists()
+        assert _mms_files() == files
+
+    def test_apply_with_no_host_definitions_leaves_sidecar_and_key_alone(self, runner, sandbox):
+        """The run ends before it reads the sidecar, as it always has:
+        ``mms host sync --apply`` is the command that re-keys regardless of
+        what the hosts hold."""
+        server = self._upgraded_with_one_idempotent_entry(sandbox)
+        (sandbox["home"] / ".claude.json").unlink()
+        files = _mms_files()
+
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert res.exit_code == 0, res.output
+        assert "No MCP definitions found" in res.output
+        assert not drift.drift_key_path().exists()
+        assert _mms_files() == files
+        assert state.load_import_state().entries["foo"] == _v1_row(server)
+
+    def test_apply_stopped_at_the_project_config_gate_creates_no_key(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"local": {"command": "npx"}})
+
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert res.exit_code == 2, res.output
+        assert not drift.drift_key_path().exists()
+
+    def test_apply_with_an_unusable_key_file_writes_nothing(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"foo": {"command": "npx"}})
+        state.mms_home().mkdir(parents=True, exist_ok=True)
+        drift.drift_key_path().write_text("not a key\n", encoding="ascii")
+
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert res.exit_code == 1, res.output
+        assert "import_state.toml.key" in res.output
+        assert "Traceback" not in res.output
+        assert not state.registry_path().exists()
+        assert not state.import_state_path().exists()
+        assert drift.drift_key_path().read_text(encoding="ascii") == "not a key\n"
 
 
 # ---------------------------------------------------------------------------

@@ -1264,7 +1264,8 @@ in it can be deleted; they are recreated on demand. Keep `stm-discovery.key`.
 `mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap).
 
 The group ships six subcommands. State lives in three TOML files, a
-drift-detection sidecar and a lock file, plus the explicit route target:
+drift-detection sidecar with its key file and a lock file, plus the explicit
+route target:
 
 | Path | Purpose | Commit? |
 |------|---------|---------|
@@ -1272,6 +1273,7 @@ drift-detection sidecar and a lock file, plus the explicit route target:
 | `~/.mms/projects.toml` | Auto-managed projects index (path + last_seen) | **No** — gitignore |
 | `<project>/.mms/project.toml` | Per-project enabled MCP names | **Yes** |
 | `~/.mms/import_state.toml` | Drift-detection sidecar: the per-server baseline `mms import` records and `mms host` compares against; one per machine, with its own schema version | **No** — gitignore |
+| `~/.mms/import_state.toml.key` | Random key the sidecar's drift hashes are computed under (mode `0600`); created by the first `mms import --apply` or `mms host sync --apply` that writes. Not a credential for anything else, but keep it out of bug reports along with the sidecar | **No** — gitignore |
 | `~/.mms/.lock` | Advisory cross-process lock taken while the registry or the sidecar is written | **No** |
 
 ```
@@ -1460,8 +1462,9 @@ Commands:
 
 `scan` is host-anchored and read-only; it can be limited with
 `--from claude-code|cursor|codex|claude-desktop|all` and supports `--json`.
-`status` is registry-anchored, read-only, and always exits `0`; drift is an
-observation rather than a CI failure signal. `sync` is the ongoing
+`status` is registry-anchored and read-only, and exits `0` whatever it finds;
+drift is an observation rather than a CI failure signal. (A `~/.mms` state
+file it cannot read is exit `1`.) `sync` is the ongoing
 reconciliation path: `--plan` previews, `--apply` writes, `--apply --force`
 adopts entries marked changed (under `--plan`, `--force` only previews that),
 and `--yes` bypasses confirmation prompts for scripts.
@@ -1472,15 +1475,36 @@ discovered in project-local config files under the current directory are
 refused unless `--allow-project-configs` is passed. REMOVE and sidecar
 BACKFILL are not gated, since neither adopts a new registry command.
 
+The baseline is a drift hash of each entry's `command`, `args` and `env`,
+values included. Because `env` values are often credentials, the hash is an
+HMAC under a random per-installation key (`~/.mms/import_state.toml.key`):
+`baseline_hash` and `current_hash` in `--json` output are
+`hmac-sha256:<16 hex>`, differ from one installation to the next, and cannot
+be recomputed from a host config, so a pasted report does not let a reader
+check a guessed value. Compare entries by `state`, not by these fields: while
+no key file exists `current_hash` is `null`, and so is the `baseline_hash` of
+a row written by a release that stored unkeyed hashes.
+
+A sidecar written by a release that stored unkeyed hashes keeps working: its
+rows are compared as before, so every entry keeps its state across the
+upgrade. `sync --apply` re-keys those rows in place — the `REKEY` line in the
+plan, `summary.rekeyed` in `--json` — without re-stamping them, so an entry
+that was `changed` stays `changed`; an `mms import --apply` that finds at
+least one host definition does the same. If the key file is lost or replaced,
+the rows it stamped read `no_baseline` (a comparison under another key would
+call every one of them `changed`), and `sync --apply` stamps them again from
+the host's current config. A key file that exists but cannot be read, or does
+not hold a key, is an error naming the file; it is never overwritten.
+
 A source the scan could not inspect is not read as empty. When STM cannot tell
 which [Claude Code config](#which-claude-code-config-stm-reads) or project
 entry is in use, or that file or `<cwd>/.mcp.json` exists but is not a readable
 JSON object, or when `CODEX_HOME` cannot be placed, a registry entry whose
 baseline came from that source is `not_inspected`. That holds even when another
-host has an entry with the same name, or the baseline was stamped by a
-different STM hash version: the entry is not compared with the other host, and
-`sync --apply`, with or without `--force`, neither removes it nor re-stamps its
-baseline. `status` shows the state with a footer naming the
+host has an entry with the same name, or the baseline cannot be compared (an
+unknown hash version, or a drift-hash key that was lost): the entry is not
+compared with the other host, and `sync --apply`, with or without `--force`,
+neither removes it nor re-stamps its baseline. `status` shows the state with a footer naming the
 reason (`--json`: the row's `reason`, and a `not_inspected` count in
 `summary`); `scan --json` lists the skipped sources as `not_inspected:
 [{"source", "reason"}]`; `sync --json` carries the rows in `plan.not_inspected`
