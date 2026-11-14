@@ -126,6 +126,7 @@ export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__SCORER=bm25           # "bm25" or "
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_PROVIDER=ollama
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_MODEL=nomic-embed-text
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_BASE_URL=http://localhost:11434
+export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__PRIVACY_SCAN_ENABLED=true  # credential screen before sending
 
 # Required when embedding_provider="openai" — the scorer reads this from the
 # environment and falls back to BM25 with an HTTP 401 if missing.
@@ -415,7 +416,8 @@ Representative configuration (see the linked reference for omitted fields):
     "embedding_model": "nomic-embed-text",
     "embedding_base_url": null,
     "embedding_timeout": 10.0,
-    "embedding_cache_size": 256
+    "embedding_cache_size": 256,
+    "privacy_scan_enabled": true
   },
   "metrics": {
     "enabled": true,
@@ -837,7 +839,7 @@ The config file is **hot-reloaded** — changes take effect on the next tool cal
 | Per-server compression, cleaning, response-path `tool_overrides` | Yes | `compression`, `delivery_format`, `max_result_chars`, `retention_floor`, `cleaning.*`, and the per-tool budget/cache/compression fields take effect on the next tool call — for how a **response** is compressed. The `tool_overrides` fields that shape what is **advertised** instead (`description_override`, `hidden`, `expose_in_profiles`, and the `compression`/`hybrid` values that decide the convention suffix) are covered by the row below, not this one. |
 | Per-server retry/timeout/cache knobs | Yes | `max_retries`, `call_timeout_seconds`, `overall_deadline_seconds`, `reconnect_delay_seconds`, `max_reconnect_delay_seconds`, `cache`, `cache_ttl_seconds` are read per call |
 | Connection-affecting fields (`transport`, `url`, `headers`, `command`, `args`, `env`; `connect_timeout_seconds` on `sse`/`streamable_http`) | Yes (live reconnect) | Applied on the next call that misses the requested connection identity's cache: a connection edit isolates prior entries, and the replacement connection is prepared first, then swapped in. If it can't connect, the old connection keeps serving without caching its replies under the new identity, and the failed edit isn't retried until the config changes again. |
-| `relevance_scorer.*` | Yes | All six fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`, `embedding_cache_size`). A change in any field rebuilds the scorer instance in place, which discards the embedding cache with it. SELECTIVE and HYBRID build their compressor per call, so a scorer edit reaches the next SELECTIVE/HYBRID call too. |
+| `relevance_scorer.*` | Yes | All seven fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`, `embedding_cache_size`, `privacy_scan_enabled`). A change in any field rebuilds the scorer instance in place, which discards the embedding cache with it. A rebuild into `scorer: embedding` with `privacy_scan_enabled: false` and a non-loopback `embedding_base_url` logs the same WARNING as startup. SELECTIVE and HYBRID build their compressor per call, so a scorer edit reaches the next SELECTIVE/HYBRID call too. |
 | `llm.*` compressor config | Yes | Changing any field closes the old `LLMCompressor` and constructs a new one lazily on the next tool call. |
 | Per-server `prefix` | **No** (restart) | Part of the tool names registered with the client; only an upstream catalogue change re-derives the advertisement (#917), and a `prefix` edit is not one. |
 | Anything shaping **advertised tool metadata** (`max_description_chars`, `host_description_cap`, `description_override`, `recover_upstream_description`, suffix-driving `compression`/`hybrid`, `strip_schema_descriptions`, `advertise_context_query`, `hidden`, `expose_in_profiles`, `exposure.profile`) | **No** (next registration) | Applied where a tool is advertised, so an edit reaches a client only when the advertisement is rebuilt — a restart or an upstream catalogue change. Global values (`max_description_chars`, `host_description_cap`, `strip_schema_descriptions`, `advertise_context_query`, `recover_upstream_description`, `exposure.profile`) are read live but still only at that rebuild, as are the suffix-driving `compression`/`hybrid` values at every level — the suffix predicts what a **call** will do, and calls read those live, so a rebuild resolves them the same way (#924). The remaining per-server and per-tool values (`description_override`, `hidden`, `expose_in_profiles`, per-server `max_description_chars`, `strip_schema_descriptions`) come from the connect-time snapshot, so they need a reconnect on top of the rebuild. `exposure.health_window_hours`, `health_min_calls`, and `health_error_rate_threshold` are **restart-bound**: the health flags they produce are computed once at startup and reused by every later rebuild. Description limits compose as `min(server, global, host_description_cap)` with the host term omitted when unset and `strip_schema_descriptions` as `server or global`, neither as an override — see [Advertised tool descriptions](reference/proxy-config.md#advertised-tool-descriptions). |

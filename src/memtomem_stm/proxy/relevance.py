@@ -17,6 +17,7 @@ import re
 import threading
 from typing import Any, Protocol
 
+from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.redact import ResponseShapeError, exception_summary
 
@@ -51,6 +52,56 @@ def scorer_fallback_scope() -> Iterator[list[bool]]:
         yield cell
     finally:
         _SCORER_FALLBACK_CELL.reset(token)
+
+
+class _ScoringSource:
+    """One text a compressor is scoring sections of, with a lazy verdict.
+
+    The verdict is computed on first read only: the BM25 default never asks,
+    so binding a source costs a context-variable write and nothing else.
+    """
+
+    __slots__ = ("text", "_sensitive")
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self._sensitive: bool | None = None
+
+    def has_credentials(self) -> bool:
+        if self._sensitive is None:
+            self._sensitive = contains_sensitive_content(self.text, CREDENTIAL_PATTERNS)
+        return self._sensitive
+
+
+# The texts the active compression is scoring sections of. A compressor
+# rebuilds its sections from the response, and the rebuild can take a match
+# apart: SELECTIVE scores a JSON key and its value as a title and a separate
+# body, so ``{"password": "hunter2"}`` reaches the scorer as ``password`` and
+# ``"hunter2"``, which no credential pattern matches. The response itself
+# does, so an egress-capable scorer screens these as well as the sections
+# (#1382). Nested scopes add to the outer ones rather than replacing them:
+# HYBRID binds the whole response, then hands only its tail to a
+# sub-compressor, and a label left in the head is visible only in the whole.
+_SCORING_SOURCES: contextvars.ContextVar[tuple[_ScoringSource, ...]] = contextvars.ContextVar(
+    "_SCORING_SOURCES", default=()
+)
+
+
+@contextlib.contextmanager
+def scoring_source(*texts: str | None) -> Iterator[None]:
+    """Bind the text(s) the sections scored in this block were derived from."""
+    added = tuple(_ScoringSource(text) for text in texts if text)
+    token = _SCORING_SOURCES.set(_SCORING_SOURCES.get() + added)
+    try:
+        yield
+    finally:
+        _SCORING_SOURCES.reset(token)
+
+
+def scoring_sources_have_credentials() -> bool:
+    """Whether any text bound by an enclosing :func:`scoring_source` matches
+    a credential pattern."""
+    return any(source.has_credentials() for source in _SCORING_SOURCES.get())
 
 
 def _fifo_prune(d: dict[str, Any], cap: int) -> None:
@@ -318,6 +369,15 @@ def _require_uniform_dimensions(vectors: list[list[float]], *, provider: str) ->
         )
 
 
+# Body characters a section sends to the embedding endpoint, to limit cost.
+_OUTBOUND_BODY_CHARS = 500
+
+
+def _outbound_section_text(title: str, body: str) -> str:
+    """The text one section is embedded as — and so the text that leaves."""
+    return f"{title}\n{body[:_OUTBOUND_BODY_CHARS]}"
+
+
 class EmbeddingScorer:
     """Semantic relevance scoring via embedding cosine similarity.
 
@@ -337,6 +397,7 @@ class EmbeddingScorer:
         base_url: str = "http://localhost:11434",
         timeout: float = 10.0,
         cache_size: int = 256,
+        privacy_scan: bool = True,
     ) -> None:
         api_key = ""
         if provider == "openai":
@@ -351,6 +412,7 @@ class EmbeddingScorer:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._api_key = api_key
+        self._privacy_scan = privacy_scan
         self._fallback = BM25Scorer()
         self.fallback_count: int = 0
         # With uses_blocking_io=True the scorer runs on worker threads while
@@ -388,6 +450,20 @@ class EmbeddingScorer:
         if not query or not sections:
             return [0.0] * len(sections)
 
+        if self._privacy_scan and self._withhold_from_endpoint(query, sections):
+            # The LLM compressor's rule (#289) applied to this egress path
+            # (#1382). The whole pass goes to BM25, not just the matching
+            # sections: BM25 scores are unbounded and cosine similarities are
+            # not, so one pass scored on both scales would rank by scale. Not
+            # a ``fallback_count`` / ``scorer_fallback``: those count an
+            # endpoint that failed, and this one was never asked.
+            logger.info(
+                "Credential pattern in the text to score; scoring with BM25 instead "
+                "of sending it to the %s embedding endpoint",
+                self._provider,
+            )
+            return self._fallback.score_sections(query, sections)
+
         try:
             return self._score_via_embedding(query, sections)
         except Exception as exc:
@@ -404,13 +480,31 @@ class EmbeddingScorer:
             )
             return self._fallback.score_sections(query, sections)
 
-    def _score_via_embedding(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
-        # Build texts: query + each section (title + body truncated)
+    @staticmethod
+    def _withhold_from_endpoint(query: str, sections: list[tuple[str, str]]) -> bool:
+        """Whether anything this pass would send, or was derived from, matches
+        a credential pattern.
+
+        Three views, because each catches what the others cannot: the exact
+        text sent (a cut can create a match — a token whose end the full body
+        extends past a pattern's boundary ends exactly at the cut), the whole
+        section (a credential that straddles the cut leaves part of itself in
+        what is sent), and the compressor's source text (a section rebuilt
+        from it can split a label from its value; see ``scoring_source``).
+        Real text only, as for the compressor's other credential verdicts.
+        """
         texts = [query]
         for title, body in sections:
-            # Truncate body to ~500 chars to limit embedding cost
-            section_text = f"{title}\n{body[:500]}"
-            texts.append(section_text)
+            texts.append(_outbound_section_text(title, body))
+            if len(body) > _OUTBOUND_BODY_CHARS:
+                texts.append(f"{title}\n{body}")
+        if any(contains_sensitive_content(text, CREDENTIAL_PATTERNS) for text in texts):
+            return True
+        return scoring_sources_have_credentials()
+
+    def _score_via_embedding(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
+        texts = [query]
+        texts.extend(_outbound_section_text(title, body) for title, body in sections)
 
         embeddings = self._embed_cached(texts)
         query_emb = embeddings[0]
@@ -623,6 +717,7 @@ def create_scorer(
     base_url: str = "http://localhost:11434",
     timeout: float = 10.0,
     cache_size: int = 256,
+    privacy_scan: bool = True,
 ) -> RelevanceScorer:
     """Create a relevance scorer from config.
 
@@ -633,6 +728,8 @@ def create_scorer(
         base_url: embedding API base URL
         timeout: embedding API timeout in seconds
         cache_size: embeddings held per scorer instance; 0 disables the cache
+        privacy_scan: score a pass whose text matches a credential pattern
+            with BM25 instead of sending it to the embedding endpoint
     """
     if scorer_type == "embedding":
         return EmbeddingScorer(
@@ -641,5 +738,6 @@ def create_scorer(
             base_url=base_url,
             timeout=timeout,
             cache_size=cache_size,
+            privacy_scan=privacy_scan,
         )
     return BM25Scorer()

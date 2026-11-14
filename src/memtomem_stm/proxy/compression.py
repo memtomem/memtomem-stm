@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, Self, cast
+from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, Self, TypeVar, cast
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.pending_store import PendingStore
@@ -55,7 +55,7 @@ from memtomem_stm.proxy.markdown_structure import (
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.utils.json_out import dumps as surrogate_safe_dumps
-from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
+from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer, scoring_source
 from memtomem_stm.utils.anyio_shutdown import (
     InFlightGate,
     drain_or_warn,
@@ -256,6 +256,32 @@ class NoopCompressor:
         return text
 
 
+_S = TypeVar("_S")
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _binds_scoring_source(
+    method: Callable[Concatenate[_S, _P], _R],
+) -> Callable[Concatenate[_S, _P], _R]:
+    """Bind a ``compress`` method's input text as the scoring source (#1382).
+
+    Sections are rebuilt from that text, and an embedding scorer screens it
+    before sending any of them off the machine: see
+    ``relevance.scoring_source`` for what the rebuild can hide. The text is
+    read as the method itself would receive it, positionally or as ``text=``,
+    so the decorator leaves the call signature as it was.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: _S, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        text = args[0] if args else kwargs.get("text")
+        with scoring_source(text if isinstance(text, str) else None):
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 def _scores_or_none(
     scorer: RelevanceScorer, query: str, sections: list[tuple[str, str]]
 ) -> list[float] | None:
@@ -331,6 +357,7 @@ class TruncateCompressor(_PlainTextRetention):
     # Comment-section boundaries (-- Section Header)
     _COMMENT_SECTION_RE = re.compile(r"(?:^|\n)(--\s+\S.+)")
 
+    @_binds_scoring_source
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         if not text or len(text) <= max_chars:
             return text
@@ -1272,7 +1299,8 @@ class SelectiveCompressor:
         # race the write barrier exists to close.
         items = list(chunks.items())
         if context_query and context_query.strip():
-            scores = _scores_or_none(self._scorer, context_query, items)
+            with scoring_source(*sources):
+                scores = _scores_or_none(self._scorer, context_query, items)
             if scores is not None:
                 order = sorted(range(len(items)), key=lambda i: -scores[i])
                 items = [items[i] for i in order]
@@ -2390,6 +2418,7 @@ class SchemaPruningCompressor(_PlainTextRetention):
         self._max_array = max_array_items
         self._scorer = scorer or BM25Scorer()
 
+    @_binds_scoring_source
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         if not text or len(text) <= max_chars:
             return text
@@ -2658,6 +2687,7 @@ class SkeletonCompressor(_PlainTextRetention):
         self._min_chars = min_chars
         self._scorer = scorer or BM25Scorer()
 
+    @_binds_scoring_source
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         """Keep all headings + first content line per section.
 
@@ -3252,6 +3282,7 @@ class HybridCompressor:
     # re-scores the tail, so the count stays small.
     _HEAD_FIT_ATTEMPTS = 3
 
+    @_binds_scoring_source
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         # Only a TOC tail publishes a key; a truncate tail is ordinary lossy
         # compression and keeps its character budget in both delivery modes.
