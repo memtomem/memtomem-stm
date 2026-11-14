@@ -11,6 +11,8 @@ each gets a dedicated test.
 from __future__ import annotations
 
 import json
+import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -964,10 +966,14 @@ class TestSyncPlan:
 
         res = _sync(runner, "--plan")
         assert res.exit_code == 0, res.output
-        # The pointer footer fires when ``changed`` count > 0 and now
-        # references a real flag (W3 shipped ``--force``).
-        assert "differ in shape at host" in res.output
-        assert "mms host sync --force" in res.output
+        # The pointer footer fires when ``changed`` count > 0 and names a
+        # command that writes: ``--force`` alone only previews under the
+        # default ``--plan``, so the pointer must carry ``--apply`` too.
+        assert (
+            "  1 entry differ in shape at host. "
+            "Use `mms host sync --apply --force` to adopt the host shape."
+        ) in res.output.splitlines(), res.output
+        assert "Use `mms host sync --force`" not in res.output
         # The ``(W3+)`` qualifier is gone — `--force` is now a real
         # working flag, not a future promise.
         assert "(W3+)" not in res.output
@@ -2000,7 +2006,8 @@ class TestSyncForceCrossHostLockdown6:
         # The standard "differ" pointer footer must NOT fire — the
         # only entry in changed bucket got re-stamped.
         assert "differ in shape at host" not in res.output
-        assert "use `mms host sync --force` to acknowledge" not in res.output.lower()
+        assert "to adopt the host shape" not in res.output
+        assert "mms host sync --apply --force" not in res.output
 
     def test_apply_force_prints_cross_host_only_footer_when_only_cross_host_left(
         self, runner, sandbox
@@ -2022,6 +2029,199 @@ class TestSyncForceCrossHostLockdown6:
         # Cross-host manual-review footer fires instead.
         assert "shape-relocated to a different host than baseline source" in res.output
         assert "manual review" in res.output
+
+
+_CLOSING_LINE_RE = re.compile(r"^Run `([^`]+)` to execute\.$")
+
+
+def _hint_argv(command: str) -> list[str]:
+    """``sync`` arguments of a printed ``mms host sync ...`` hint."""
+    argv = shlex.split(command)
+    assert argv[:3] == ["mms", "host", "sync"], argv
+    return argv[3:]
+
+
+def _footer_command(output: str) -> list[str]:
+    """The command the "differ in shape at host" footer tells the user to run."""
+    lines = [ln for ln in output.splitlines() if "differ in shape at host" in ln]
+    assert len(lines) == 1, output
+    commands = re.findall(r"`([^`]+)`", lines[0])
+    assert len(commands) == 1, lines[0]
+    return _hint_argv(commands[0])
+
+
+def _closing_command(output: str) -> list[str]:
+    """The command the plan's ``Run `...` to execute.`` line tells the user to run.
+
+    Matched by its anchored form, not as the last line: orphan and
+    not-inspected footers can follow it.
+    """
+    matches = [m for ln in output.splitlines() if (m := _CLOSING_LINE_RE.match(ln))]
+    assert len(matches) == 1, output
+    return _hint_argv(matches[0].group(1))
+
+
+def _assert_restamped(name: str, args: list[str], old_baseline: str) -> None:
+    server = state.load_registry().servers[name]
+    assert list(server.args) == args
+    baseline = state.load_import_state().entries[name].drift_hash
+    assert baseline != old_baseline
+    assert baseline == compute_drift_hash(server)
+
+
+class TestSyncGuidanceIsFollowable:
+    """Every command ``sync`` prints as the next step must do what it says
+    when typed back literally. ``sync`` defaults to ``--plan`` and ``--force``
+    only changes what a run would adopt, so a hint that names ``--force``
+    without ``--apply`` (or drops a flag the run previewed or acknowledged)
+    sends the user round in a loop that writes nothing."""
+
+    def test_plain_plan_closing_line_unchanged(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        res = _sync(runner)
+        assert res.exit_code == 0, res.output
+        assert "Run `mms host sync --apply` to execute." in res.output.splitlines()
+
+    def test_plan_force_closing_line_keeps_force(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        res = _sync(runner, "--plan", "--force")
+        assert res.exit_code == 0, res.output
+        assert _closing_command(res.output) == ["--apply", "--force"]
+
+    def test_following_plan_footer_restamps(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        old_baseline = state.load_import_state().entries["x"].drift_hash
+        res = _sync(runner)
+        assert res.exit_code == 0, res.output
+        # CliRunner is non-TTY, so the RESTAMP confirmation needs ``--yes``;
+        # the footer itself correctly omits a flag the user did not give.
+        res = _sync(runner, *_footer_command(res.output), "--yes")
+        assert res.exit_code == 0, res.output
+        _assert_restamped("x", ["v2"], old_baseline)
+
+    def test_following_plan_force_closing_line_restamps(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        old_baseline = state.load_import_state().entries["x"].drift_hash
+        res = _sync(runner, "--plan", "--force")
+        assert res.exit_code == 0, res.output
+        res = _sync(runner, *_closing_command(res.output), "--yes")
+        assert res.exit_code == 0, res.output
+        _assert_restamped("x", ["v2"], old_baseline)
+
+    def test_apply_footer_carries_yes(self, runner, sandbox):
+        """Non-TTY ``--apply --yes`` skips the changed entry and prints the
+        footer; its command must keep ``--yes`` or following it aborts."""
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        old_baseline = state.load_import_state().entries["x"].drift_hash
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+        assert list(state.load_registry().servers["x"].args) == ["v1"]
+        res = _sync(runner, *_footer_command(res.output))
+        assert res.exit_code == 0, res.output
+        _assert_restamped("x", ["v2"], old_baseline)
+
+    def test_mutated_apply_footer_carries_yes(self, runner, sandbox):
+        """Same as above when the ``--apply --yes`` run does write something
+        (an ADD), so the footer comes from the mutated-outcome render."""
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        _seed_cursor_user(sandbox, {"added": {"command": "uvx"}})
+        old_baseline = state.load_import_state().entries["x"].drift_hash
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+        assert "added" in state.load_registry().servers
+        assert list(state.load_registry().servers["x"].args) == ["v1"]
+        res = _sync(runner, *_footer_command(res.output))
+        assert res.exit_code == 0, res.output
+        _assert_restamped("x", ["v2"], old_baseline)
+
+    def _drift_project_local(self, runner, sandbox) -> str:
+        _seed_dot_mcp_json(sandbox, {"foo": {"command": "npx", "args": ["v1"]}})
+        res = runner.invoke(
+            import_command, ["--from", "claude-code", "--apply", "--allow-project-configs"]
+        )
+        assert res.exit_code == 0, res.output
+        _seed_dot_mcp_json(sandbox, {"foo": {"command": "npx", "args": ["v2"]}})
+        return state.load_import_state().entries["foo"].drift_hash
+
+    def test_plan_force_closing_line_carries_project_configs_ack(self, runner, sandbox):
+        """A project-local RESTAMP previewed with ``--allow-project-configs``:
+        dropping the flag from the closing line would hit the project-config
+        gate (or, without ``--force``, restamp nothing)."""
+        old_baseline = self._drift_project_local(runner, sandbox)
+        res = _sync(runner, "--plan", "--force", "--yes", "--allow-project-configs")
+        assert res.exit_code == 0, res.output
+        res = _sync(runner, *_closing_command(res.output))
+        assert res.exit_code == 0, res.output
+        _assert_restamped("foo", ["v2"], old_baseline)
+
+    def test_plan_footer_carries_project_configs_ack(self, runner, sandbox):
+        old_baseline = self._drift_project_local(runner, sandbox)
+        res = _sync(runner, "--yes", "--allow-project-configs")
+        assert res.exit_code == 0, res.output
+        res = _sync(runner, *_footer_command(res.output))
+        assert res.exit_code == 0, res.output
+        _assert_restamped("foo", ["v2"], old_baseline)
+
+    def test_missing_yes_is_named_by_the_confirmation_gate(self, runner, sandbox):
+        """The footer never adds ``--yes`` the user did not give. Copied
+        without a terminal, it stops at the confirmation gate, which names
+        the missing flag, and writes nothing."""
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        res = _sync(runner)
+        assert res.exit_code == 0, res.output
+        res = _sync(runner, *_footer_command(res.output))
+        assert res.exit_code == 2, res.output
+        assert "Pass --yes to confirm." in res.output
+        assert list(state.load_registry().servers["x"].args) == ["v1"]
+
+    def test_missing_project_configs_ack_is_named_by_the_gate(self, runner, sandbox):
+        """Nor does it add ``--allow-project-configs``: copied for a
+        project-local entry, it stops at the project-config gate, which
+        names the missing flag, and writes nothing."""
+        self._drift_project_local(runner, sandbox)
+        res = _sync(runner, "--yes")
+        assert res.exit_code == 0, res.output
+        res = _sync(runner, *_footer_command(res.output))
+        assert res.exit_code == 2, res.output
+        assert "Pass --allow-project-configs to acknowledge" in " ".join(res.output.split())
+        assert list(state.load_registry().servers["foo"].args) == ["v1"]
+
+    def test_force_help_says_it_needs_apply(self, runner, sandbox):
+        res = _sync(runner, "--help")
+        assert res.exit_code == 0, res.output
+        assert (
+            "Takes effect only with --apply; under the default --plan it previews the re-stamp."
+        ) in " ".join(res.output.split())
 
 
 class TestDisplayEscaping:

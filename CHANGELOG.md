@@ -37,6 +37,24 @@ changes inline only. See the deprecation policy in
   `mms project enable` as the message said failed again.
   **Behavior change**: only the hint text of these two errors changes; the
   exit code and the name check are the same.
+- `mms host sync` now points at a command that actually re-stamps a changed
+  entry (#1399). The footer for entries whose shape changed at the host said
+  `Use mms host sync --force to acknowledge.`, but `sync` defaults to
+  `--plan`, so `--force` alone only previews. That preview then ended with
+  `Run mms host sync --apply to execute.`, which drops `--force`, and the
+  `--apply` run printed the same `--force` footer and `Already synchronized.
+  No changes.` Following the hints went round in a loop without writing
+  anything. The footer now says `Use mms host sync --apply --force to adopt
+  the host shape.`, the plan's closing line keeps `--force` when the preview
+  had it, and both carry `--yes` and `--allow-project-configs` when the run
+  was given them. Neither of those two is added when the run was not given
+  it: the copied command still asks for confirmation (and, without a
+  terminal, stops until `--yes` is added), and an entry from a project-local
+  config still needs `--allow-project-configs`; both refusals name the flag.
+  The `sync` help and `--force` option help now say `--force` takes effect
+  only with `--apply`.
+  **Behavior change**: only the text output of `mms host sync` changes; exit
+  codes, the `--json` payload, and what is written are the same.
 
 ## [0.7.8] — 2026-11-14
 
