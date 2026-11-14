@@ -3085,6 +3085,70 @@ class TestLifespan:
                 assert captured_pm_kwargs.get("cache") is None
                 mock_pm_instance.start.assert_awaited_once()
 
+    async def test_unusable_cache_key_file_is_named_in_the_production_log(self, tmp_path):
+        """The warning names the key file under the formatter the server
+        installs, which withholds exception text — so the name must be in the
+        message itself, not only in the traceback (#1416)."""
+        import io
+        import logging
+
+        from memtomem_stm.logging_setup import DisplayEscapingFormatter
+        from memtomem_stm.server import app_lifespan, mcp
+        from memtomem_stm.utils.local_key import key_path_for
+
+        db_path = tmp_path / "proxy_cache.db"
+        key_file = key_path_for(db_path)
+        key_file.write_bytes(b"not a key\n")
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = []
+        captured_pm_kwargs: dict = {}
+
+        def _capture_pm(*_args, **kwargs):
+            captured_pm_kwargs.update(kwargs)
+            return mock_pm_instance
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(DisplayEscapingFormatter("%(levelname)s %(message)s"))
+        server_logger = logging.getLogger("memtomem_stm.server")
+        server_logger.addHandler(handler)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", side_effect=_capture_pm),
+            ):
+                mock_cfg = MockConfig.return_value
+                mock_cfg.proxy = MagicMock()
+                mock_cfg.proxy.enabled = True
+                mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+                mock_cfg.proxy.metrics.enabled = False
+                mock_cfg.proxy.compression_feedback.enabled = False
+                mock_cfg.proxy.progressive_reads.enabled = False
+                mock_cfg.proxy.selection_telemetry.enabled = False
+                mock_cfg.proxy.cache.enabled = True
+                mock_cfg.proxy.cache.db_path = db_path
+                mock_cfg.proxy.cache.max_entries = 10
+                mock_cfg.surfacing = MagicMock()
+                mock_cfg.surfacing.enabled = False
+                mock_cfg.langfuse = MagicMock()
+                mock_cfg.langfuse.enabled = False
+                mock_cfg.otlp = MagicMock()
+                mock_cfg.otlp.enabled = False
+                mock_cfg.parent_liveness_poll_seconds = 0.0
+                mock_cfg.parent_liveness_grace_seconds = 900.0
+
+                async with app_lifespan(mcp) as _ctx:
+                    assert captured_pm_kwargs.get("cache") is None
+        finally:
+            server_logger.removeHandler(handler)
+        output = stream.getvalue()
+        assert "Response cache disabled" in output
+        assert str(key_file) in output
+        assert key_file.read_bytes() == b"not a key\n"
+
     async def test_init_failure_after_mcp_adapter_runs_cleanup(self):
         """If a post-mcp_adapter init step raises (e.g. proxy_manager.start()),
         the mcp_adapter stdio subprocess must still be stopped. Without the

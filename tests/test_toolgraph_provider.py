@@ -653,7 +653,7 @@ class TestToolgraphConsultWiring:
         cache.initialize()
         try:
             cache.put(
-                GraphConsultCache.provider_fingerprint(cfg),
+                cache.provider_fingerprint(cfg),
                 cfg.agent_id,
                 cfg.query_profile,
                 GraphConsultCache.candidate_hash([bad_ref]),
@@ -673,7 +673,7 @@ class TestToolgraphConsultWiring:
             # a passing assertion below cannot be an accidental miss.
             assert (
                 seeded.get(
-                    GraphConsultCache.provider_fingerprint(cfg),
+                    seeded.provider_fingerprint(cfg),
                     cfg.agent_id,
                     cfg.query_profile,
                     GraphConsultCache.candidate_hash([bad_ref]),
@@ -1553,3 +1553,31 @@ class TestToolgraphHealthRendering:
         body = "\n".join(lines)
         assert "not consulted" in body
         assert "active" not in body
+
+
+def test_unusable_consult_key_file_is_named_in_the_production_log(tmp_path):
+    """The warning names ``<consult_cache_path>.key`` under the formatter the
+    server installs, which withholds exception text (#1416)."""
+    import io
+    import logging
+
+    from memtomem_stm.logging_setup import DisplayEscapingFormatter
+    from memtomem_stm.utils.local_key import key_path_for
+
+    mgr, _ = _tg_manager(tmp_path)
+    cfg = mgr._config.toolgraph
+    key_file = key_path_for(cfg.consult_cache_path)
+    key_file.write_bytes(b"not a key\n")
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(DisplayEscapingFormatter("%(levelname)s %(message)s"))
+    manager_logger = logging.getLogger("memtomem_stm.proxy.manager")
+    manager_logger.addHandler(handler)
+    try:
+        assert mgr._open_consult_cache(cfg) is None
+    finally:
+        manager_logger.removeHandler(handler)
+    output = stream.getvalue()
+    assert "consult cache disabled" in output
+    assert str(key_file) in output

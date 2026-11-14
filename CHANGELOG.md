@@ -13,6 +13,32 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The response cache's row keys and the tool-graph consult cache's backend
+  fingerprint are keyed. A response-cache key was a plain SHA-256 of the
+  server, tool, call arguments and context query, and the consult cache's
+  `provider_fingerprint` a plain SHA-256 of the backend's command and
+  arguments, stored in every row. A cached body does not always reveal its
+  arguments, so anyone holding a copy of either database could confirm a
+  guessed call or command line by recomputing the value. Both are now an
+  HMAC under a random key kept in a separate file beside the database
+  (`proxy_cache.db.key`, `toolgraph_consult.db.key`, mode `0600`, created on
+  first open), so the database file alone no longer serves as that check.
+  Server and tool names and cached bodies are stored as before and are not
+  covered. The one-time purge of old rows is logical: their bytes can remain
+  in the file's free pages, so before sharing a copy, stop STM and delete the
+  cache database (it is recreated empty), unless another store shares that
+  file (#1416).
+  **Behavior change**: the response cache and the consult cache start empty
+  after the upgrade (response-cache key schema 8, consult scope key 2). A
+  deleted or replaced key file empties its cache on the next open; replace
+  one only while no STM process has that cache open. An
+  unreadable or malformed key file disables that cache for the run, with a
+  warning that names the file; moving it aside makes a new one. The key file
+  is created with a hard link, so a cache directory on a filesystem without
+  hard links (FAT, exFAT, some network mounts) runs without that cache. A
+  process from the previous release that keeps running can write unkeyed
+  rows after the purge, so restart running proxies after upgrading.
+
 - The surfacing query digest is keyed, and the selection log stops writing
   argument digests. The query digest — written to `surfacing_events.query`
   when `persist_query_text` is off (always, on the hook daemon path), to

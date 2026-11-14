@@ -44,7 +44,6 @@ from pydantic import BaseModel
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.proxy._locks import LockTimeoutError, bounded_lock
-from memtomem_stm.proxy.cache import _make_key as _cache_key
 from memtomem_stm.proxy.cache import response_carries_transient_key
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 from memtomem_stm.proxy.compression import (
@@ -205,6 +204,7 @@ from memtomem_stm.proxy.toolgraph_provider import (
     validate_toolgraph_identifier,
 )
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.local_key import LocalKeyError
 from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
 from memtomem_stm.utils.json_size import json_utf8_size_async
 from memtomem_stm.utils.keyed_locks import KeyedLocks
@@ -2089,6 +2089,15 @@ class ProxyManager:
                     max_scopes=cfg.consult_cache_max_scopes,
                 )
                 cache.initialize()
+            except LocalKeyError as exc:
+                # In the message, not the traceback: the default log formatter
+                # withholds exception text, and the file name is what to fix.
+                logger.warning(
+                    "Tool-graph consult cache disabled this session: %s — consulting "
+                    "without the disk cache.",
+                    exc,
+                )
+                return None
             except Exception:
                 logger.warning(
                     "Tool-graph consult cache could not be opened at %s — consulting "
@@ -2155,7 +2164,7 @@ class ProxyManager:
             return probe, {}, {}
 
         cand_hash = GraphConsultCache.candidate_hash(refs)
-        prov_fp = GraphConsultCache.provider_fingerprint(cfg)
+        prov_fp = cache.provider_fingerprint(cfg)
         row = cache.get(prov_fp, cfg.agent_id, cfg.query_profile, cand_hash, probe.graph_generation)
         if row is not None and (row["had_risk_scores"] or not want_features):
             self._toolgraph_from_cache = True
@@ -6094,7 +6103,7 @@ class ProxyManager:
         # calls that differ only in query context store DIFFERENT rows, so
         # collapsing them would serve one caller a body compressed for the
         # other's query — the collision the key exists to prevent.
-        cache_key = _cache_key(
+        cache_key = self._cache.key_for(
             server, tool, upstream_args, context_query=context_query, config_fingerprint=config_fp
         )
         async with self._key_locks.hold(cache_key):
