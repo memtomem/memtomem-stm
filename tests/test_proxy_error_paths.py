@@ -899,6 +899,7 @@ class TestCacheWithErrors:
             return f"{srv}|{tl}|{a}|{kw.get('context_query')}|{kw.get('config_fingerprint')}"
 
         cache.get.side_effect = lambda srv, tl, a, **kw: cache_store.get(_fake_key(srv, tl, a, kw))
+        cache.key_for.side_effect = lambda srv, tl, a, **kw: _fake_key(srv, tl, a, kw)
 
         def _set(srv, tl, a, result, ttl_seconds=None, **kw):
             cache_store[_fake_key(srv, tl, a, kw)] = result
@@ -960,6 +961,7 @@ class TestCacheWithErrors:
             cache.get.side_effect = lambda srv, tl, a, **kw: cache_store.get(
                 _fake_key(srv, tl, a, kw)
             )
+            cache.key_for.side_effect = lambda srv, tl, a, **kw: _fake_key(srv, tl, a, kw)
 
             writes = 0
 

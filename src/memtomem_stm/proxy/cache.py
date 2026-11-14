@@ -15,13 +15,14 @@ from uuid import uuid4
 from mcp.types import TextContent
 
 from memtomem_stm.proxy import privacy
-from memtomem_stm.utils.digest import framed_digest
+from memtomem_stm.utils.digest import framed_digest, keyed_framed_digest
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
     scrub_lone_surrogates,
 )
+from memtomem_stm.utils.local_key import key_path_for, load_or_create_key
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -528,7 +529,14 @@ class CachedResponse(str):
 # budget; older releases could store one over it under the same key (an empty
 # text block with large upstream metadata, or one within a Unicode token
 # budget), and a hit is served before any fit check (#1359).
-_KEY_SCHEMA_VERSION = 7
+# v8: keys are an HMAC under the store's sidecar key instead of a plain SHA-256,
+# so a copy of the database cannot confirm a guessed argument set (#1416).
+_KEY_SCHEMA_VERSION = 8
+
+# HMAC domain for row keys, and the ``proxy_cache_meta`` slot recording which
+# sidecar key wrote the rows (see ``ProxyCache.initialize``).
+_ROW_KEY_DOMAIN = "stm-cache-key-v1"
+_ROW_KEY_ID_META_KEY = "row_key_id"
 
 
 def _make_key(
@@ -538,7 +546,16 @@ def _make_key(
     *,
     context_query: str | None = None,
     config_fingerprint: str = "",
+    key: bytes,
 ) -> str:
+    # The digest is keyed with the store's sidecar key (``key``). The key
+    # material includes the call arguments and the context query, and a cached
+    # body does not always reveal them (a "No matches" response, say). A plain
+    # hash stored next to the row would let anyone holding the database
+    # confirm a guessed argument set by recomputing it; without the key they
+    # cannot. The key lives outside the database for the same reason — see
+    # ``utils/local_key``.
+    #
     # ``context_query`` and ``config_fingerprint`` are part of the key because
     # the stored body is the COMPRESSED response: compression is query-aware
     # (BM25 relevance budgets) and config-dependent, so the same tool+args can
@@ -570,9 +587,10 @@ def _make_key(
     #   so deriving the key through it let one identifier's row answer for a
     #   different one.
     #
-    # All three derivations — ``get``, ``set`` and ``invalidate`` — come
-    # through here, so they cannot disagree.
-    return framed_digest(
+    # Every derivation — ``get``, ``set``, ``invalidate`` and the manager's
+    # stampede lock via ``ProxyCache.key_for`` — comes through here, so they
+    # cannot disagree.
+    return keyed_framed_digest(
         (
             str(_KEY_SCHEMA_VERSION),
             server,
@@ -580,8 +598,15 @@ def _make_key(
             json.dumps(args, sort_keys=True, ensure_ascii=False),
             config_fingerprint,
             json.dumps(context_query, ensure_ascii=False),
-        )
+        ),
+        key=key,
+        domain=_ROW_KEY_DOMAIN,
     )
+
+
+def _row_key_id(key: bytes) -> str:
+    """Identify *key* without revealing it or anything it keyed."""
+    return keyed_framed_digest(("row-key-id",), key=key, domain=_ROW_KEY_DOMAIN)
 
 
 # Substrings that flag a response embedding a TRANSIENT retrieval key pointing
@@ -660,6 +685,7 @@ class ProxyCache:
         self._db_path = db_path
         self._max_entries = max_entries
         self._db: sqlite3.Connection | None = None
+        self._key: bytes | None = None
         self._lock = threading.Lock()
         # Process-lifetime count of rows dropped by ``_trim`` (max_entries
         # overflow). Surfaced via ``stats()`` so an operator can see the cache
@@ -667,28 +693,51 @@ class ProxyCache:
         self._evictions = 0
 
     def initialize(self) -> None:
+        # The row-key secret, from ``<db>.key`` beside the database. A
+        # ``LocalKeyError`` propagates: the caller treats any initialize()
+        # failure as "run without the cache".
+        key = load_or_create_key(key_path_for(self._db_path))
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
         try:
             ensure_private_db_files(self._db_path)
             tune_connection(db)
-            # One-time purge on schema change, run BEFORE table creation: rows
-            # keyed under an older ``_make_key`` shape are opaque hashes no
-            # current lookup can ever produce, so they would sit as dead
-            # weight — forever, for ``ttl_seconds NULL`` rows — while still
-            # counting against ``max_entries``. DROP (not DELETE) so the
-            # recreate below also picks up column additions without a separate
-            # ALTER migration.
-            # ``user_version`` is 0 for both fresh and pre-versioning
-            # databases; the DROP on a fresh database is a no-op.
+            # One reservation decides both purges, so two first openers cannot
+            # both see "needs purge" and have the second delete what the first
+            # wrote after committing.
             db.execute("BEGIN IMMEDIATE")
             (schema_version,) = db.execute("PRAGMA user_version").fetchone()
-            if schema_version < _KEY_SCHEMA_VERSION:
+            db.execute(_CREATE_META_TABLE)
+            key_id = _row_key_id(key)
+            stamp = db.execute(
+                "SELECT value FROM proxy_cache_meta WHERE key = ?", (_ROW_KEY_ID_META_KEY,)
+            ).fetchone()
+            # Purge when the key derivation changed shape (``user_version``) or
+            # the rows were written under a different sidecar key (the file was
+            # deleted or replaced while the database stayed). Either way no
+            # current lookup can produce their keys again, so they would sit as
+            # dead weight — forever, for ``ttl_seconds NULL`` rows — while still
+            # counting against ``max_entries``. ``user_version`` is 0 for both
+            # fresh and pre-versioning databases; the DROP on a fresh database
+            # is a no-op.
+            #
+            # DROP, not DELETE: the recreate below also picks up column
+            # additions without a separate ALTER migration, and the table's
+            # triggers go with it unfired — a DELETE would run whatever trigger
+            # text an older build left, before the repair below can replace it.
+            # The privacy queue holds row keys too, so the old ones go with
+            # their rows.
+            if schema_version < _KEY_SCHEMA_VERSION or stamp is None or stamp[0] != key_id:
                 db.execute("DROP TABLE IF EXISTS proxy_cache")
+                db.execute("DROP TABLE IF EXISTS proxy_cache_privacy_unverified")
                 db.execute(f"PRAGMA user_version = {_KEY_SCHEMA_VERSION}")
+                db.execute(
+                    "INSERT INTO proxy_cache_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_ROW_KEY_ID_META_KEY, key_id),
+                )
             db.execute(_CREATE_TABLE)
             db.execute(_CREATE_INDEX)
-            db.execute(_CREATE_META_TABLE)
             db.execute(_CREATE_PRIVACY_UNVERIFIED_TABLE)
             # The triggers themselves are installed by the repair below, under
             # the reservation that publishes the stamp — see
@@ -699,7 +748,29 @@ class ProxyCache:
         except Exception:
             db.close()
             raise
+        self._key = key
         self._db = db
+
+    def key_for(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        context_query: str | None = None,
+        config_fingerprint: str = "",
+    ) -> str:
+        """The row key ``get``/``set`` use for this call. Requires ``initialize()``."""
+        if self._key is None:
+            raise RuntimeError("ProxyCache.key_for() called before initialize()")
+        return _make_key(
+            server,
+            tool,
+            args,
+            context_query=context_query,
+            config_fingerprint=config_fingerprint,
+            key=self._key,
+        )
 
     def close(self) -> None:
         if self._db:
@@ -717,7 +788,7 @@ class ProxyCache:
     ) -> CachedResponse | None:
         if self._db is None:
             return None
-        key = _make_key(
+        key = self.key_for(
             server, tool, args, context_query=context_query, config_fingerprint=config_fingerprint
         )
         try:
@@ -859,7 +930,7 @@ class ProxyCache:
         for the same key (#541)."""
         if self._db is None:
             return
-        key = _make_key(
+        key = self.key_for(
             server, tool, args, context_query=context_query, config_fingerprint=config_fingerprint
         )
         with self._lock:
@@ -951,7 +1022,7 @@ class ProxyCache:
                 tool,
             )
             return
-        key = _make_key(
+        key = self.key_for(
             server, tool, args, context_query=context_query, config_fingerprint=config_fingerprint
         )
         now = time.time()

@@ -36,7 +36,8 @@ from typing import TYPE_CHECKING, Any
 
 from memtomem_stm.proxy.tool_eligibility import finite_risk_score, sanitize_graph_facts_row
 from memtomem_stm.utils.json_out import has_lone_surrogate
-from memtomem_stm.utils.digest import framed_digest
+from memtomem_stm.utils.digest import framed_digest, keyed_framed_digest
+from memtomem_stm.utils.local_key import key_path_for, load_or_create_key
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -84,6 +85,10 @@ CREATE TABLE IF NOT EXISTS toolgraph_meta (
 """
 
 _SCOPE_KEY_VERSION_KEY = "scope_key_version"
+_PROVIDER_KEY_ID_META_KEY = "provider_key_id"
+
+# HMAC domain for ``provider_fingerprint`` under the sidecar key.
+_PROVIDER_FP_DOMAIN = "stm-toolgraph-provider-v1"
 
 IDENTITY_POLICY = 2
 """Version of the identity-validation policy the stored facts were written under.
@@ -117,7 +122,8 @@ upgrade, exactly like every other policy bump.
 # ``max_scopes`` until ``_trim`` aged them out. Stored in ``toolgraph_meta``,
 # NOT in ``PRAGMA user_version`` — see ``_CREATE_META_TABLE``.
 # v1: framed scope-key derivation (#794).
-_SCOPE_KEY_SCHEMA_VERSION = 1
+# v2: ``provider_fingerprint`` is an HMAC under the sidecar key (#1416).
+_SCOPE_KEY_SCHEMA_VERSION = 2
 
 
 def _scope_key(
@@ -170,6 +176,7 @@ class GraphConsultCache:
         self._db_path = db_path
         self._max_scopes = max_scopes
         self._db: sqlite3.Connection | None = None
+        self._key: bytes | None = None
         self._lock = threading.Lock()
 
     @staticmethod
@@ -178,51 +185,88 @@ class GraphConsultCache:
         raw = json.dumps(sorted(refs), separators=(",", ":"))
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    @staticmethod
-    def provider_fingerprint(config: ToolgraphConfig) -> str:
+    def provider_fingerprint(self, config: ToolgraphConfig) -> str:
         """Backend identity: ``command`` + ``args`` + sorted env *keys*.
 
-        Keys only — never env *values* (``NEO4J_PASSWORD`` etc.) — so the
-        fingerprint stays non-secret. Distinguishes a different graph
-        binary/args/backend-shape on the shared user-wide DB so two backends
-        cannot collide on the same ``(agent, profile, refs, generation)``. Two
-        backends with identical command/args/env-keys but different env *values*
-        (e.g. only ``NEO4J_URI`` differs) still collide — such setups should use
-        a distinct ``consult_cache_path``.
+        Keys only — never env *values* (``NEO4J_PASSWORD`` etc.). Distinguishes
+        a different graph binary/args/backend-shape on the shared user-wide DB
+        so two backends cannot collide on the same ``(agent, profile, refs,
+        generation)``. Two backends with identical command/args/env-keys but
+        different env *values* (e.g. only ``NEO4J_URI`` differs) still collide —
+        such setups should use a distinct ``consult_cache_path``.
+
+        Keyed with the store's sidecar key, because ``args`` can carry a
+        credential or a private host on the command line, and the value is
+        stored in every row: a plain hash would let anyone holding the database
+        confirm a guessed command line. The args and the env keys stay two
+        framed components (each a JSON list), so no element can move across
+        the boundary between them — ``args=["serve", "API_KEY"]`` with no env
+        is not ``args=["serve"]`` with ``API_KEY`` set. Requires ``initialize()``.
         """
+        if self._key is None:
+            raise RuntimeError("GraphConsultCache.provider_fingerprint() before initialize()")
         env_keys = sorted((config.env or {}).keys())
-        raw = json.dumps([config.command, list(config.args), env_keys], separators=(",", ":"))
-        return hashlib.sha256(raw.encode()).hexdigest()
+        return keyed_framed_digest(
+            (
+                config.command,
+                json.dumps(list(config.args), separators=(",", ":")),
+                json.dumps(env_keys, separators=(",", ":")),
+            ),
+            key=self._key,
+            domain=_PROVIDER_FP_DOMAIN,
+        )
 
     def initialize(self) -> None:
+        # ``<db>.key`` beside the database keys ``provider_fingerprint``. A
+        # ``LocalKeyError`` propagates; the manager then consults without the
+        # disk cache.
+        key = load_or_create_key(key_path_for(self._db_path))
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
         try:
             ensure_private_db_files(self._db_path)
             tune_connection(db)
+            # One reservation for the whole decision. Read outside a write
+            # transaction, two first openers could both see "needs purge" and
+            # the second would delete rows the first wrote after committing.
+            db.execute("BEGIN IMMEDIATE")
             db.execute(_CREATE_TABLE)
             db.execute(_CREATE_INDEX)
             db.execute(_CREATE_META_TABLE)
-            # One-time purge on a scope-key shape change. The tables are
-            # created first because the purge reads and writes both; on a fresh
-            # database the version reads as 0 and the DELETE is a no-op. DELETE
-            # rather than DROP: the row shape is unchanged, only the derivation
-            # moved, so there is nothing to recreate.
+            # Purge on a scope-key shape change, and when the rows were written
+            # under a different sidecar key (the file was deleted or replaced
+            # while the database stayed): either way no lookup can reach them
+            # again. The tables are created first because the purge reads and
+            # writes both; on a fresh database the version reads as 0 and the
+            # DELETE is a no-op. DELETE rather than DROP: the row shape is
+            # unchanged, only the derivation moved, so there is nothing to
+            # recreate.
             row = db.execute(
                 "SELECT value FROM toolgraph_meta WHERE key = ?", (_SCOPE_KEY_VERSION_KEY,)
             ).fetchone()
             scope_key_version = row[0] if row is not None else 0
-            if scope_key_version < _SCOPE_KEY_SCHEMA_VERSION:
+            # ``toolgraph_meta.value`` has INTEGER affinity, so the key id is
+            # stored with a non-numeric prefix: SQLite would otherwise convert
+            # an id that happens to read as a number, and it would never match.
+            key_id = "id:" + keyed_framed_digest(("key-id",), key=key, domain=_PROVIDER_FP_DOMAIN)
+            stamp = db.execute(
+                "SELECT value FROM toolgraph_meta WHERE key = ?", (_PROVIDER_KEY_ID_META_KEY,)
+            ).fetchone()
+            if scope_key_version < _SCOPE_KEY_SCHEMA_VERSION or stamp is None or stamp[0] != key_id:
                 db.execute("DELETE FROM toolgraph_consult")
-                db.execute(
+                db.executemany(
                     "INSERT INTO toolgraph_meta (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (_SCOPE_KEY_VERSION_KEY, _SCOPE_KEY_SCHEMA_VERSION),
+                    [
+                        (_SCOPE_KEY_VERSION_KEY, _SCOPE_KEY_SCHEMA_VERSION),
+                        (_PROVIDER_KEY_ID_META_KEY, key_id),
+                    ],
                 )
             db.commit()
         except Exception:
             db.close()
             raise
+        self._key = key
         self._db = db
 
     def close(self) -> None:

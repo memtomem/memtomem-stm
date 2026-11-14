@@ -653,7 +653,7 @@ class TestToolgraphConsultWiring:
         cache.initialize()
         try:
             cache.put(
-                GraphConsultCache.provider_fingerprint(cfg),
+                cache.provider_fingerprint(cfg),
                 cfg.agent_id,
                 cfg.query_profile,
                 GraphConsultCache.candidate_hash([bad_ref]),
@@ -673,7 +673,7 @@ class TestToolgraphConsultWiring:
             # a passing assertion below cannot be an accidental miss.
             assert (
                 seeded.get(
-                    GraphConsultCache.provider_fingerprint(cfg),
+                    seeded.provider_fingerprint(cfg),
                     cfg.agent_id,
                     cfg.query_profile,
                     GraphConsultCache.candidate_hash([bad_ref]),

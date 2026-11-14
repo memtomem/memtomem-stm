@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -19,6 +20,8 @@ from memtomem_stm.proxy.cache import (
     _privacy_policy_fingerprint,
     response_carries_transient_key,
 )
+from memtomem_stm.utils.digest import framed_digest
+from memtomem_stm.utils.local_key import LocalKeyError, key_path_for, load_key
 from memtomem_stm.proxy.compression import HybridCompressor, SelectiveCompressor
 from memtomem_stm.proxy.progressive import PROGRESSIVE_FOOTER_TOKEN, ProgressiveChunker
 
@@ -31,6 +34,14 @@ _TOC_TEXT = "# Doc\n\n" + "\n\n".join(
 
 _PROGRESSIVE_TEXT = "paragraph sentence here. " * 200  # 5000 chars
 _QUOTED_FOOTER = f"doc quoting{PROGRESSIVE_FOOTER_TOKEN}0-1/2]\na normal response line\n"
+
+
+_TEST_KEY = bytes(range(32))
+
+
+def _mk(*args, **kwargs):
+    """``_make_key`` under a fixed key, for tests of the derivation itself."""
+    return _make_key(*args, key=_TEST_KEY, **kwargs)
 
 
 def _read_privacy_policy_stamp(db_path: Path) -> str | None:
@@ -526,7 +537,7 @@ class TestLegacyTransientPurge:
                 "INSERT INTO proxy_cache "
                 "(cache_key, server, tool, result, created_at, ttl_seconds, envelope_safe) "
                 "VALUES (?, 's', 'sel', ?, ?, NULL, 1)",
-                (_make_key("s", "sel", {}), transient_body, time.time()),
+                (seed.key_for("s", "sel", {}), transient_body, time.time()),
             )
             raw.commit()
         finally:
@@ -759,14 +770,14 @@ class TestPrivacyGate:
                 "envelope_json, envelope_safe) VALUES (?, 's', ?, ?, ?, NULL, ?, 1)",
                 [
                     (
-                        _make_key("s", "result-secret", {}),
+                        seed.key_for("s", "result-secret", {}),
                         "result-secret",
                         "login password=hunter2",
                         time.time(),
                         None,
                     ),
                     (
-                        _make_key("s", "envelope-secret", {}),
+                        seed.key_for("s", "envelope-secret", {}),
                         "envelope-secret",
                         "ordinary body",
                         time.time(),
@@ -839,7 +850,7 @@ class TestPrivacyGate:
                 "INSERT INTO proxy_cache "
                 "(cache_key, server, tool, result, created_at, ttl_seconds) "
                 "VALUES (?, 's', 'secret', 'password=hunter2', ?, NULL)",
-                (_make_key("s", "secret", {}), time.time()),
+                (seed.key_for("s", "secret", {}), time.time()),
             )
             raw.execute(
                 "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
@@ -1115,7 +1126,7 @@ class TestPrivacyGate:
             seed.set("s", "target", {}, "harmless body", ttl_seconds=None)
         finally:
             seed.close()
-        target_key = _make_key("s", "target", {})
+        target_key = seed.key_for("s", "target", {})
 
         raw = sqlite3.connect(str(db_path))
         try:
@@ -1799,7 +1810,7 @@ class TestPrivacyGate:
         reopened.initialize()
         try:
             reopened.set("s", "t", {}, "ordinary cached response", ttl_seconds=None)
-            key = _make_key("s", "t", {})
+            key = reopened.key_for("s", "t", {})
             assert (
                 reopened._db.execute(
                     "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
@@ -1891,6 +1902,7 @@ class TestPrivacyGate:
             # path is under test, so it opens the store directly.
             writer = ProxyCache(db_path, max_entries=100)
             writer._db = sqlite3.connect(str(db_path), check_same_thread=False, timeout=5.0)
+            writer._key = load_key(key_path_for(db_path))
             try:
                 writer.set("s", "racy", {}, "password=hunter2", ttl_seconds=None)
                 writer_done.set()
@@ -1939,7 +1951,7 @@ class TestPrivacyGate:
             cache.set("s", "t", {}, "ordinary cached response", ttl_seconds=None)
         finally:
             cache.close()
-        key = _make_key("s", "t", {})
+        key = cache.key_for("s", "t", {})
 
         raw = sqlite3.connect(str(db_path))
         try:
@@ -1992,7 +2004,7 @@ class TestPrivacyGate:
                     "(cache_key, server, tool, result, created_at, ttl_seconds) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (
-                        _make_key("s", "sec", {}),
+                        cache.key_for("s", "sec", {}),
                         "s",
                         "sec",
                         "login password=hunter2",
@@ -2031,7 +2043,7 @@ class TestPrivacyGate:
                     "(cache_key, server, tool, result, created_at, ttl_seconds) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (
-                        _make_key("s", "sec", {}),
+                        cache.key_for("s", "sec", {}),
                         "s",
                         "sec",
                         "login password=hunter2",
@@ -2075,7 +2087,7 @@ class TestPrivacyGate:
                     "(cache_key, server, tool, result, created_at, ttl_seconds) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (
-                        _make_key("s", "sec", {}),
+                        cache.key_for("s", "sec", {}),
                         "s",
                         "sec",
                         "login password=hunter2",
@@ -2106,46 +2118,46 @@ class TestPrivacyGate:
 
 class TestMakeKey:
     def test_deterministic(self):
-        k1 = _make_key("s", "t", {"a": 1, "b": 2})
-        k2 = _make_key("s", "t", {"a": 1, "b": 2})
+        k1 = _mk("s", "t", {"a": 1, "b": 2})
+        k2 = _mk("s", "t", {"a": 1, "b": 2})
         assert k1 == k2
 
     def test_arg_order_independent(self):
-        k1 = _make_key("s", "t", {"a": 1, "b": 2})
-        k2 = _make_key("s", "t", {"b": 2, "a": 1})
+        k1 = _mk("s", "t", {"a": 1, "b": 2})
+        k2 = _mk("s", "t", {"b": 2, "a": 1})
         assert k1 == k2
 
     def test_different_args_different_keys(self):
-        k1 = _make_key("s", "t", {"a": 1})
-        k2 = _make_key("s", "t", {"a": 2})
+        k1 = _mk("s", "t", {"a": 1})
+        k2 = _mk("s", "t", {"a": 2})
         assert k1 != k2
 
     def test_context_query_changes_key(self):
         # The stored body is the COMPRESSED response and compression is
         # query-aware (BM25 budgets), so two calls that differ only in query
         # context must never share a row.
-        base = _make_key("s", "t", {"a": 1})
-        q1 = _make_key("s", "t", {"a": 1}, context_query="find auth code")
-        q2 = _make_key("s", "t", {"a": 1}, context_query="billing systems")
+        base = _mk("s", "t", {"a": 1})
+        q1 = _mk("s", "t", {"a": 1}, context_query="find auth code")
+        q2 = _mk("s", "t", {"a": 1}, context_query="billing systems")
         assert len({base, q1, q2}) == 3
 
     def test_context_query_none_empty_and_null_string_distinct(self):
         # JSON-encoding the query keeps the "no query" sentinel distinct from
         # both the empty string and the literal string "null".
-        absent = _make_key("s", "t", {})
-        empty = _make_key("s", "t", {}, context_query="")
-        null_str = _make_key("s", "t", {}, context_query="null")
+        absent = _mk("s", "t", {})
+        empty = _mk("s", "t", {}, context_query="")
+        null_str = _mk("s", "t", {}, context_query="null")
         assert len({absent, empty, null_str}) == 3
 
     def test_config_fingerprint_changes_key(self):
-        fp_a = _make_key("s", "t", {"a": 1}, config_fingerprint="aaa")
-        fp_b = _make_key("s", "t", {"a": 1}, config_fingerprint="bbb")
-        default = _make_key("s", "t", {"a": 1})
+        fp_a = _mk("s", "t", {"a": 1}, config_fingerprint="aaa")
+        fp_b = _mk("s", "t", {"a": 1}, config_fingerprint="bbb")
+        default = _mk("s", "t", {"a": 1})
         assert len({fp_a, fp_b, default}) == 3
 
     def test_same_components_same_key(self):
-        k1 = _make_key("s", "t", {"a": 1}, context_query="q", config_fingerprint="fp")
-        k2 = _make_key("s", "t", {"a": 1}, context_query="q", config_fingerprint="fp")
+        k1 = _mk("s", "t", {"a": 1}, context_query="q", config_fingerprint="fp")
+        k2 = _mk("s", "t", {"a": 1}, context_query="q", config_fingerprint="fp")
         assert k1 == k2
 
     def test_identically_serialized_args_share_a_row_on_purpose(self):
@@ -2164,14 +2176,14 @@ class TestMakeKey:
         ]
         for left, right in pairs:
             assert json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
-            assert _make_key("s", "t", left) == _make_key("s", "t", right)
+            assert _mk("s", "t", left) == _mk("s", "t", right)
 
     def test_component_boundaries_are_framed(self):
         # An unframed join lets a NUL inside one component shift the boundary:
         # ("a\0b", "c") and ("a", "b\0c") joined with "\0" are the same string,
         # so one call's cached row answered the other's (#784 case 1). Nothing
         # on the path rejects a NUL in an upstream server or tool name.
-        assert _make_key("a\0b", "c", {}) != _make_key("a", "b\0c", {})
+        assert _mk("a\0b", "c", {}) != _mk("a", "b\0c", {})
 
     def test_nul_cannot_shift_across_distant_boundaries(self):
         # The framing property must hold across EVERY boundary, not just the
@@ -2179,8 +2191,8 @@ class TestMakeKey:
         # its own, so before framing, tool and config_fingerprint could trade
         # content straight across the args serialization sitting between them:
         # both of these joined to ``4\0s\0t\0{}\0{}\0f\0null``.
-        k1 = _make_key("s", "t\0{}", {}, config_fingerprint="f")
-        k2 = _make_key("s", "t", {}, config_fingerprint="{}\0f")
+        k1 = _mk("s", "t\0{}", {}, config_fingerprint="f")
+        k2 = _mk("s", "t", {}, config_fingerprint="{}\0f")
         assert k1 != k2
 
     def test_astral_scalar_does_not_alias_a_lone_surrogate_pair(self):
@@ -2194,10 +2206,8 @@ class TestMakeKey:
         pair = chr(0xD800) + chr(0xDC00)
         scalar = chr(0x10000)
         assert pair != scalar
-        assert _make_key("s", "t", {"x": pair}) != _make_key("s", "t", {"x": scalar})
-        assert _make_key("s", "t", {}, context_query=pair) != _make_key(
-            "s", "t", {}, context_query=scalar
-        )
+        assert _mk("s", "t", {"x": pair}) != _mk("s", "t", {"x": scalar})
+        assert _mk("s", "t", {}, context_query=pair) != _mk("s", "t", {}, context_query=scalar)
 
 
 class TestKeyComponentsRoundtrip:
@@ -2256,14 +2266,17 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0  # legacy rows wiped
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 7
+            assert version == 8
         finally:
             reopened.close()
 
     # v6 rows may hold a structured SELECTIVE/HYBRID success over its
-    # serialized budget, served on a hit before any fit check (#1359).
-    @pytest.mark.parametrize("old_version", [4, 5, 6])
-    def test_prior_rows_are_purged_by_v7_without_touching_other_tables(self, tmp_path, old_version):
+    # serialized budget, served on a hit before any fit check (#1359); v7 rows
+    # are keyed by a plain SHA-256 of the call (#1416).
+    @pytest.mark.parametrize("old_version", [4, 5, 6, 7])
+    def test_prior_rows_are_purged_by_current_version_without_touching_other_tables(
+        self, tmp_path, old_version
+    ):
         """Old rows lack identity/size/metadata/budget guarantees; other stores survive."""
         db_path = tmp_path / "c.db"
         cache = ProxyCache(db_path, max_entries=10)
@@ -2280,7 +2293,7 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 7
+            assert version == 8
             assert (
                 reopened._db.execute("SELECT value FROM unrelated_metrics").fetchone()[0] == "keep"
             )
@@ -2337,7 +2350,7 @@ class TestKeySchemaVersionPurge:
             assert "envelope_safe" in columns
             assert "envelope_json" in columns
             (version,) = cache._db.execute("PRAGMA user_version").fetchone()
-            assert version == 7
+            assert version == 8
         finally:
             cache.close()
 
@@ -2362,7 +2375,7 @@ class TestEnvelopeSafeMarker:
         assert flag == 1
 
     def test_unmarked_row_is_a_miss(self, proxy_cache: ProxyCache):
-        key = _make_key("s", "t", {"a": 1})
+        key = proxy_cache.key_for("s", "t", {"a": 1})
         self._insert_unmarked_row(proxy_cache, key, "unmarked")
         assert proxy_cache.get("s", "t", {"a": 1}) is None
 
@@ -2370,7 +2383,7 @@ class TestEnvelopeSafeMarker:
         """The UPSERT's conflict branch must re-mark the row: without
         ``envelope_safe = excluded.envelope_safe`` an unmarked row upserted by
         ``set()`` would keep the 0 marker and miss forever."""
-        key = _make_key("s", "t", {"a": 1})
+        key = proxy_cache.key_for("s", "t", {"a": 1})
         self._insert_unmarked_row(proxy_cache, key, "unmarked")
         proxy_cache.set("s", "t", {"a": 1}, "re-marked", ttl_seconds=60.0)
         assert proxy_cache.get("s", "t", {"a": 1}) == "re-marked"
@@ -2447,7 +2460,7 @@ class TestSurrogateRoundTrip:
         it let one identifier's row answer for the other.
         """
         literal = f"srv\\u{ord(surrogate):04x}"
-        assert _make_key(f"srv{surrogate}", "t", {}) != _make_key(literal, "t", {})
+        assert _mk(f"srv{surrogate}", "t", {}) != _mk(literal, "t", {})
 
         proxy_cache.set(literal, "t", {}, "literal-body", ttl_seconds=60.0)
         assert proxy_cache.get(literal, "t", {}) == "literal-body"
@@ -2476,7 +2489,7 @@ class TestSurrogateRoundTrip:
         args = {"k": "\u4e2d"}
         fingerprint = "fp\ud800"
         parts = [
-            "7",
+            "8",
             server,
             tool,
             json.dumps(args, sort_keys=True, ensure_ascii=False),
@@ -2491,7 +2504,269 @@ class TestSurrogateRoundTrip:
         assert any(
             len(part.encode("utf-8", errors="surrogatepass")) != len(part) for part in parts
         ), "fixtures must make byte length differ from character length"
+        # Keyed (#1416): HMAC-SHA256 under a subkey of the store key for the
+        # row-key domain, over the same framed bytes.
+        key = bytes(range(32))
+        subkey = hmac.new(key, b"stm-cache-key-v1", hashlib.sha256).digest()
         assert (
-            _make_key(server, tool, args, config_fingerprint=fingerprint)
-            == hashlib.sha256(raw).hexdigest()
+            _make_key(server, tool, args, config_fingerprint=fingerprint, key=key)
+            == hmac.new(subkey, raw, hashlib.sha256).hexdigest()
         )
+
+
+def _unkeyed_v7_key(server: str, tool: str, args: dict, context_query: str | None = None) -> str:
+    """The row key the previous release stored: a plain framed SHA-256."""
+    return framed_digest(
+        (
+            "7",
+            server,
+            tool,
+            json.dumps(args, sort_keys=True, ensure_ascii=False),
+            "",
+            json.dumps(context_query, ensure_ascii=False),
+        )
+    )
+
+
+def _stored_keys(cache: ProxyCache) -> set[str]:
+    assert cache._db is not None
+    return {row[0] for row in cache._db.execute("SELECT cache_key FROM proxy_cache")}
+
+
+class TestKeyedRowKeys:
+    """Row keys are an HMAC under ``<db>.key``, which lives outside the DB (#1416)."""
+
+    ARGS = {"query": "acme merger codename", "limit": 5}
+    QUERY = "what did legal say about acme"
+
+    def test_copied_db_cannot_confirm_a_guessed_call(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "c.db"
+        cache = ProxyCache(db_path, max_entries=10)
+        cache.initialize()
+        try:
+            cache.set(
+                "s", "search", self.ARGS, "No matches", ttl_seconds=None, context_query=self.QUERY
+            )
+            stored = _stored_keys(cache)
+            assert stored == {cache.key_for("s", "search", self.ARGS, context_query=self.QUERY)}
+        finally:
+            cache.close()
+        # Someone with only the DB file and a correct guess of the inputs
+        # recomputes every unkeyed derivation and matches nothing.
+        guesses = {
+            _unkeyed_v7_key("s", "search", self.ARGS, self.QUERY),
+            framed_digest(
+                (
+                    "8",
+                    "s",
+                    "search",
+                    json.dumps(self.ARGS, sort_keys=True, ensure_ascii=False),
+                    "",
+                    json.dumps(self.QUERY, ensure_ascii=False),
+                )
+            ),
+        }
+        assert stored.isdisjoint(guesses)
+        # The key really is outside the database file.
+        key = load_key(key_path_for(db_path))
+        assert key is not None
+        for name in ("c.db", "c.db-wal"):
+            path = tmp_path / name
+            if path.exists():
+                data = path.read_bytes()
+                assert key not in data
+                assert key.hex().encode() not in data
+
+    def test_plaintext_columns_and_echoing_bodies_are_out_of_scope(self, tmp_path: Path) -> None:
+        """Boundary of the guarantee: only the key column stops being an oracle.
+
+        Server and tool names are stored as columns, and a body that echoes its
+        arguments reveals them regardless of how the row is keyed.
+        """
+        cache = ProxyCache(tmp_path / "c.db", max_entries=10)
+        cache.initialize()
+        try:
+            cache.set(
+                "s",
+                "search",
+                self.ARGS,
+                json.dumps({"query": self.ARGS["query"]}),
+                ttl_seconds=None,
+            )
+            assert cache._db is not None
+            server, tool, result = cache._db.execute(
+                "SELECT server, tool, result FROM proxy_cache"
+            ).fetchone()
+            assert (server, tool) == ("s", "search")
+            assert self.ARGS["query"] in result
+        finally:
+            cache.close()
+
+    def test_two_stores_key_the_same_call_differently(self, tmp_path: Path) -> None:
+        a = ProxyCache(tmp_path / "a.db", max_entries=10)
+        b = ProxyCache(tmp_path / "b.db", max_entries=10)
+        a.initialize()
+        b.initialize()
+        try:
+            assert a.key_for("s", "t", self.ARGS) != b.key_for("s", "t", self.ARGS)
+        finally:
+            a.close()
+            b.close()
+
+    def test_rows_survive_a_reopen_with_the_same_key(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "c.db"
+        first = ProxyCache(db_path, max_entries=10)
+        first.initialize()
+        first.set("s", "t", self.ARGS, "row", ttl_seconds=None)
+        # A second opener while the first is still live finds the stamp it
+        # wrote and keeps its rows.
+        second = ProxyCache(db_path, max_entries=10)
+        second.initialize()
+        try:
+            assert second.get("s", "t", self.ARGS) == "row"
+            first.set("s", "t2", self.ARGS, "row2", ttl_seconds=None)
+        finally:
+            first.close()
+            second.close()
+        third = ProxyCache(db_path, max_entries=10)
+        third.initialize()
+        try:
+            assert third.get("s", "t", self.ARGS) == "row"
+            assert third.get("s", "t2", self.ARGS) == "row2"
+        finally:
+            third.close()
+
+    @pytest.mark.parametrize("action", ["deleted", "replaced"])
+    def test_rows_under_another_key_are_purged(self, tmp_path: Path, action: str) -> None:
+        db_path = tmp_path / "c.db"
+        cache = ProxyCache(db_path, max_entries=10)
+        cache.initialize()
+        cache.set("s", "t", self.ARGS, "row", ttl_seconds=None)
+        cache.close()
+        key_file = key_path_for(db_path)
+        if action == "deleted":
+            key_file.unlink()
+        else:
+            key_file.write_bytes(b"cd" * 32 + b"\n")
+
+        reopened = ProxyCache(db_path, max_entries=10)
+        reopened.initialize()
+        try:
+            assert reopened.stats()["total_entries"] == 0
+            assert reopened.get("s", "t", self.ARGS) is None
+            assert reopened._db is not None
+            queued = reopened._db.execute(
+                "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+            ).fetchone()[0]
+            assert queued == 0
+        finally:
+            reopened.close()
+
+    def test_unusable_key_file_fails_initialize_before_opening_the_db(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "c.db"
+        key_path_for(db_path).write_text("not a key\n")
+        cache = ProxyCache(db_path, max_entries=10)
+        with pytest.raises(LocalKeyError):
+            cache.initialize()
+        assert cache._db is None
+        assert not db_path.exists()
+        assert cache.get("s", "t", {}) is None  # uninitialized cache is a miss
+
+
+class TestKeyedPurgeMechanics:
+    """How the #1416 purge treats the file, the triggers and a racing opener."""
+
+    def test_a_stale_delete_trigger_does_not_block_the_purge(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "c.db"
+        cache = ProxyCache(db_path, max_entries=10)
+        cache.initialize()
+        cache.set("s", "t", {}, "row", ttl_seconds=None)
+        assert cache._db is not None
+        # Trigger text some other build left behind, which fails when it fires.
+        cache._db.execute("DROP TRIGGER proxy_cache_privacy_track_delete")
+        cache._db.execute(
+            "CREATE TRIGGER proxy_cache_privacy_track_delete AFTER DELETE ON proxy_cache "
+            "BEGIN SELECT RAISE(ABORT, 'stale trigger'); END"
+        )
+        cache._db.commit()
+        cache.close()
+        key_path_for(db_path).unlink()
+
+        reopened = ProxyCache(db_path, max_entries=10)
+        reopened.initialize()
+        try:
+            assert reopened.stats()["total_entries"] == 0
+            assert reopened._db is not None
+            triggers = {
+                name: sql
+                for name, sql in reopened._db.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+            assert len(triggers) == 3
+            assert all("RAISE" not in sql for sql in triggers.values())
+            # The current triggers work: a write is queued and a delete clears it.
+            reopened.set("s", "t", {}, "row", ttl_seconds=None)
+            reopened.invalidate("s", "t", {})
+        finally:
+            reopened.close()
+
+    def test_the_purge_decision_holds_the_write_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The stamp is read and acted on under one write reservation.
+
+        Read outside it, a second opener could see "no stamp" before the first
+        publishes one and then purge a row the first has written since. Checked
+        directly: while an opener is paused right after reading the stamp, no
+        other connection can start a write.
+        """
+        db_path = tmp_path / "c.db"
+        paused = threading.Event()
+        resume = threading.Event()
+        racer_name = "paused-opener"
+        real_connect = sqlite3.connect
+
+        class _PausingConnection(sqlite3.Connection):
+            def execute(self, sql, *args):  # type: ignore[override]
+                cursor = super().execute(sql, *args)
+                if (
+                    threading.current_thread().name == racer_name
+                    and "FROM proxy_cache_meta WHERE key" in sql
+                    and args
+                    and args[0] == (cache_module._ROW_KEY_ID_META_KEY,)
+                ):
+                    paused.set()
+                    assert resume.wait(timeout=10.0)
+                return cursor
+
+        def _connect(*args, **kwargs):
+            if threading.current_thread().name == racer_name:
+                kwargs["factory"] = _PausingConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(cache_module.sqlite3, "connect", _connect)
+        errors: list[BaseException] = []
+        racer_cache = ProxyCache(db_path, max_entries=10)
+
+        def _racer() -> None:
+            try:
+                racer_cache.initialize()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        racer = threading.Thread(target=_racer, name=racer_name)
+        racer.start()
+        try:
+            assert paused.wait(timeout=10.0)
+            probe = real_connect(str(db_path), timeout=0, isolation_level=None)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    probe.execute("BEGIN IMMEDIATE")
+            finally:
+                probe.close()
+        finally:
+            resume.set()
+            racer.join(timeout=10.0)
+            racer_cache.close()
+        assert errors == []

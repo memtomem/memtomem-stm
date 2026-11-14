@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     sanitize_graph_facts_row,
 )
 from memtomem_stm.proxy.toolgraph_cache import IDENTITY_POLICY, GraphConsultCache
+from memtomem_stm.utils.local_key import LocalKeyError, key_path_for
 
 _PROV = "prov-fp"
 _AGENT = "stm-proxy"
@@ -168,7 +171,7 @@ class TestScopeKeySchemaPurge:
             (version,) = reopened._db.execute(
                 "SELECT value FROM toolgraph_meta WHERE key = 'scope_key_version'"
             ).fetchone()
-            assert version == 1
+            assert version == 2
         finally:
             reopened.close()
 
@@ -193,6 +196,38 @@ class TestScopeKeySchemaPurge:
             # The foreign stamp is left exactly as found — not ours to rewrite.
             (pragma,) = reopened._db.execute("PRAGMA user_version").fetchone()
             assert pragma == 5
+        finally:
+            reopened.close()
+
+    def test_older_scope_version_alone_purges_under_the_current_key(self, tmp_path):
+        """The scope-version check works on its own, not only through a
+        missing key-id stamp: the key file and its stamp are current, only the
+        version is old, and the file carries a higher foreign ``user_version``."""
+        db_path = tmp_path / "tg.db"
+        c = GraphConsultCache(db_path)
+        c.initialize()
+        _put(c)
+        c._db.execute("UPDATE toolgraph_meta SET value = 1 WHERE key = 'scope_key_version'")
+        c._db.execute("PRAGMA user_version = 99")
+        c._db.commit()
+        (stamp_before,) = c._db.execute(
+            "SELECT value FROM toolgraph_meta WHERE key = 'provider_key_id'"
+        ).fetchone()
+        c.close()
+
+        reopened = GraphConsultCache(db_path)
+        reopened.initialize()
+        try:
+            count = reopened._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0]
+            assert count == 0
+            (version,) = reopened._db.execute(
+                "SELECT value FROM toolgraph_meta WHERE key = 'scope_key_version'"
+            ).fetchone()
+            assert version == 2
+            (stamp_after,) = reopened._db.execute(
+                "SELECT value FROM toolgraph_meta WHERE key = 'provider_key_id'"
+            ).fetchone()
+            assert stamp_after == stamp_before  # same key: only the version drove it
         finally:
             reopened.close()
 
@@ -427,29 +462,27 @@ class TestProviderFingerprint:
     def _cfg(command="toolgraph", args=("serve",), env=None):
         return SimpleNamespace(command=command, args=list(args), env=env)
 
-    def test_deterministic(self):
-        assert GraphConsultCache.provider_fingerprint(
-            self._cfg()
-        ) == GraphConsultCache.provider_fingerprint(self._cfg())
+    def test_deterministic(self, cache):
+        assert cache.provider_fingerprint(self._cfg()) == cache.provider_fingerprint(self._cfg())
 
-    def test_env_values_ignored_keys_matter(self):
-        base = GraphConsultCache.provider_fingerprint(self._cfg(env={"NEO4J_URI": "bolt://a"}))
-        same_keys = GraphConsultCache.provider_fingerprint(self._cfg(env={"NEO4J_URI": "bolt://b"}))
-        added_key = GraphConsultCache.provider_fingerprint(
+    def test_env_values_ignored_keys_matter(self, cache):
+        base = cache.provider_fingerprint(self._cfg(env={"NEO4J_URI": "bolt://a"}))
+        same_keys = cache.provider_fingerprint(self._cfg(env={"NEO4J_URI": "bolt://b"}))
+        added_key = cache.provider_fingerprint(
             self._cfg(env={"NEO4J_URI": "bolt://a", "EXTRA": "1"})
         )
         assert base == same_keys  # value change with same keys → same fingerprint
         assert base != added_key  # new key → different fingerprint
 
-    def test_command_and_args_matter(self):
-        base = GraphConsultCache.provider_fingerprint(self._cfg())
-        assert base != GraphConsultCache.provider_fingerprint(self._cfg(command="other"))
-        assert base != GraphConsultCache.provider_fingerprint(self._cfg(args=("serve", "--x")))
+    def test_command_and_args_matter(self, cache):
+        base = cache.provider_fingerprint(self._cfg())
+        assert base != cache.provider_fingerprint(self._cfg(command="other"))
+        assert base != cache.provider_fingerprint(self._cfg(args=("serve", "--x")))
 
-    def test_none_env_equals_empty_env(self):
-        assert GraphConsultCache.provider_fingerprint(
-            self._cfg(env=None)
-        ) == GraphConsultCache.provider_fingerprint(self._cfg(env={}))
+    def test_none_env_equals_empty_env(self, cache):
+        assert cache.provider_fingerprint(self._cfg(env=None)) == cache.provider_fingerprint(
+            self._cfg(env={})
+        )
 
 
 class TestCorruptRow:
@@ -724,3 +757,175 @@ class TestSqliteFaultIsBestEffort:
         # Same load-bearing-substring pin as the get() test above (#716 sweep / #717).
         degrades = [r for r in caplog.records if "consult cache" in r.message]
         assert degrades and degrades[0].exc_info
+
+
+class TestKeyedProviderFingerprint:
+    """``provider_fingerprint`` is an HMAC under ``<db>.key`` (#1416)."""
+
+    @staticmethod
+    def _cfg(command="toolgraph", args=("serve", "--password=hunter2"), env=None):
+        return SimpleNamespace(command=command, args=list(args), env=env)
+
+    def test_stored_fingerprint_cannot_be_recomputed_without_the_key(self, cache):
+        cfg = self._cfg(env={"NEO4J_PASSWORD": "x"})
+        fp = cache.provider_fingerprint(cfg)
+        # The previous release's derivation over the same, guessed, config.
+        unkeyed = hashlib.sha256(
+            json.dumps(
+                [cfg.command, list(cfg.args), ["NEO4J_PASSWORD"]], separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        assert fp != unkeyed
+        assert len(fp) == 64
+
+    def test_two_stores_fingerprint_the_same_backend_differently(self, cache, tmp_path):
+        other = GraphConsultCache(tmp_path / "other.db")
+        other.initialize()
+        try:
+            assert other.provider_fingerprint(self._cfg()) != cache.provider_fingerprint(
+                self._cfg()
+            )
+        finally:
+            other.close()
+
+    def test_args_and_env_keys_keep_their_boundary(self, cache):
+        moved_into_args = cache.provider_fingerprint(self._cfg(args=("serve", "API_KEY"), env={}))
+        moved_into_env = cache.provider_fingerprint(
+            self._cfg(args=("serve",), env={"API_KEY": "x"})
+        )
+        assert moved_into_args != moved_into_env
+
+    def test_requires_initialize(self, tmp_path):
+        with pytest.raises(RuntimeError):
+            GraphConsultCache(tmp_path / "tg.db").provider_fingerprint(self._cfg())
+
+
+class TestProviderKeyIdPurge:
+    @pytest.mark.parametrize("action", ["deleted", "replaced"])
+    def test_rows_under_another_key_are_purged(self, tmp_path, action):
+        db_path = tmp_path / "tg.db"
+        c = GraphConsultCache(db_path)
+        c.initialize()
+        _put(c)
+        c.close()
+        key_file = key_path_for(db_path)
+        if action == "deleted":
+            key_file.unlink()
+        else:
+            key_file.write_bytes(b"ef" * 32 + b"\n")
+        reopened = GraphConsultCache(db_path)
+        reopened.initialize()
+        try:
+            assert reopened._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+        finally:
+            reopened.close()
+
+    def test_rows_survive_a_reopen_with_the_same_key(self, tmp_path):
+        db_path = tmp_path / "tg.db"
+        first = GraphConsultCache(db_path)
+        first.initialize()
+        _put(first)
+        second = GraphConsultCache(db_path)
+        second.initialize()
+        try:
+            assert second.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is not None
+        finally:
+            first.close()
+            second.close()
+
+    def test_key_id_is_stored_as_text(self, cache):
+        (value, kind) = cache._db.execute(
+            "SELECT value, typeof(value) FROM toolgraph_meta WHERE key = 'provider_key_id'"
+        ).fetchone()
+        assert kind == "text"
+        assert value.startswith("id:")
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+    def test_symlinked_path_shares_the_key_and_keeps_rows(self, tmp_path):
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        alias_dir = tmp_path / "alias"
+        alias_dir.symlink_to(real_dir, target_is_directory=True)
+        via_real = GraphConsultCache(real_dir / "tg.db")
+        via_real.initialize()
+        _put(via_real)
+        fp_real = via_real.provider_fingerprint(TestKeyedProviderFingerprint._cfg())
+        via_real.close()
+        via_alias = GraphConsultCache(alias_dir / "tg.db")
+        via_alias.initialize()
+        try:
+            assert via_alias.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is not None
+            assert via_alias.provider_fingerprint(TestKeyedProviderFingerprint._cfg()) == fp_real
+        finally:
+            via_alias.close()
+        assert not (alias_dir / "tg.db.key").is_symlink()
+        assert sorted(p.name for p in real_dir.iterdir() if p.name.endswith(".key")) == [
+            "tg.db.key"
+        ]
+
+    def test_unusable_key_file_fails_initialize(self, tmp_path):
+        db_path = tmp_path / "tg.db"
+        key_path_for(db_path).write_text("nope\n")
+        c = GraphConsultCache(db_path)
+        with pytest.raises(LocalKeyError):
+            c.initialize()
+        assert not db_path.exists()
+
+
+class TestConsultPurgeMechanics:
+    def test_the_purge_decision_holds_the_write_lock(self, tmp_path, monkeypatch):
+        """While an opener is paused right after reading the key-id stamp, no
+        other connection can start a write (see the ProxyCache twin)."""
+        import threading
+
+        from memtomem_stm.proxy import toolgraph_cache as tg_module
+
+        db_path = tmp_path / "tg.db"
+        paused = threading.Event()
+        resume = threading.Event()
+        racer_name = "paused-opener"
+        real_connect = sqlite3.connect
+
+        class _PausingConnection(sqlite3.Connection):
+            def execute(self, sql, *args):  # type: ignore[override]
+                cursor = super().execute(sql, *args)
+                if (
+                    threading.current_thread().name == racer_name
+                    and "FROM toolgraph_meta WHERE key" in sql
+                    and args
+                    and args[0] == ("provider_key_id",)
+                ):
+                    paused.set()
+                    assert resume.wait(timeout=10.0)
+                return cursor
+
+        def _connect(*args, **kwargs):
+            if threading.current_thread().name == racer_name:
+                kwargs["factory"] = _PausingConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(tg_module.sqlite3, "connect", _connect)
+        errors = []
+        racer_cache = GraphConsultCache(db_path)
+
+        def _racer():
+            try:
+                racer_cache.initialize()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        racer = threading.Thread(target=_racer, name=racer_name)
+        racer.start()
+        try:
+            assert paused.wait(timeout=10.0)
+            probe = real_connect(str(db_path), timeout=0, isolation_level=None)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    probe.execute("BEGIN IMMEDIATE")
+            finally:
+                probe.close()
+        finally:
+            resume.set()
+            racer.join(timeout=10.0)
+            racer_cache.close()
+        assert errors == []

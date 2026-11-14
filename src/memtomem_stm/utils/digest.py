@@ -16,8 +16,10 @@ cache should get this for free instead of re-deriving it.
 from __future__ import annotations
 
 import hashlib
+import hmac
+from typing import Protocol
 
-__all__ = ["framed_digest"]
+__all__ = ["framed_digest", "keyed_framed_digest"]
 
 
 def framed_digest(components: tuple[str, ...]) -> str:
@@ -43,8 +45,32 @@ def framed_digest(components: tuple[str, ...]) -> str:
     wants.
     """
     digest = hashlib.sha256()
+    _feed(digest, components)
+    return digest.hexdigest()
+
+
+def keyed_framed_digest(components: tuple[str, ...], *, key: bytes, domain: str) -> str:
+    """Hex HMAC-SHA256 over *components*, framed exactly as :func:`framed_digest`.
+
+    For identifiers derived from input that can hold user or credential text:
+    without *key*, nobody can recompute the value to confirm a guessed input.
+
+    *domain* names the use. The HMAC runs under a subkey derived from *key* and
+    *domain*, so one key shared between two uses, or a file moved next to a
+    different store, cannot make a value from one use match the other's.
+    """
+    subkey = hmac.new(key, domain.encode("utf-8"), hashlib.sha256).digest()
+    mac = hmac.new(subkey, digestmod=hashlib.sha256)
+    _feed(mac, components)
+    return mac.hexdigest()
+
+
+class _Updatable(Protocol):
+    def update(self, data: bytes, /) -> None: ...
+
+
+def _feed(digest: _Updatable, components: tuple[str, ...]) -> None:
     for component in components:
         data = component.encode("utf-8", errors="surrogatepass")
         digest.update(f"{len(data)}:".encode())
         digest.update(data)
-    return digest.hexdigest()
