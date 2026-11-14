@@ -2187,6 +2187,35 @@ class TestSyncGuidanceIsFollowable:
         assert res.exit_code == 0, res.output
         _assert_restamped("foo", ["v2"], old_baseline)
 
+    def test_missing_yes_is_named_by_the_confirmation_gate(self, runner, sandbox):
+        """The footer never adds ``--yes`` the user did not give. Copied
+        without a terminal, it stops at the confirmation gate, which names
+        the missing flag, and writes nothing."""
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        res = _sync(runner)
+        assert res.exit_code == 0, res.output
+        res = _sync(runner, *_footer_command(res.output))
+        assert res.exit_code == 2, res.output
+        assert "Pass --yes to confirm." in res.output
+        assert list(state.load_registry().servers["x"].args) == ["v1"]
+
+    def test_missing_project_configs_ack_is_named_by_the_gate(self, runner, sandbox):
+        """Nor does it add ``--allow-project-configs``: copied for a
+        project-local entry, it stops at the project-config gate, which
+        names the missing flag, and writes nothing."""
+        self._drift_project_local(runner, sandbox)
+        res = _sync(runner, "--yes")
+        assert res.exit_code == 0, res.output
+        res = _sync(runner, *_footer_command(res.output))
+        assert res.exit_code == 2, res.output
+        assert "Pass --allow-project-configs to acknowledge" in " ".join(res.output.split())
+        assert list(state.load_registry().servers["foo"].args) == ["v1"]
+
     def test_force_help_says_it_needs_apply(self, runner, sandbox):
         res = _sync(runner, "--help")
         assert res.exit_code == 0, res.output

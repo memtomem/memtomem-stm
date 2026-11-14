@@ -47,8 +47,12 @@ changes inline only. See the deprecation policy in
   anything. The footer now says `Use mms host sync --apply --force to adopt
   the host shape.`, the plan's closing line keeps `--force` when the preview
   had it, and both carry `--yes` and `--allow-project-configs` when the run
-  was given them. The `sync` help and
-  `--force` option help now say `--force` takes effect only with `--apply`.
+  was given them. Neither of those two is added when the run was not given
+  it: the copied command still asks for confirmation (and, without a
+  terminal, stops until `--yes` is added), and an entry from a project-local
+  config still needs `--allow-project-configs`; both refusals name the flag.
+  The `sync` help and `--force` option help now say `--force` takes effect
+  only with `--apply`.
   **Behavior change**: only the text output of `mms host sync` changes; exit
   codes, the `--json` payload, and what is written are the same.
 
