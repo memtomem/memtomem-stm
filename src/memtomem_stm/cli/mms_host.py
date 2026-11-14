@@ -39,17 +39,24 @@ The four buckets:
      v2 binary — comparing them silently would always read as
      ``changed``, which is worse than asking for a re-stamp.
 
-A fifth state, ``not_inspected`` (#1271), splits off what used to read as
-``removed_at_host``: the entry's baseline source is one the scan skipped —
-STM could not tell which Claude Code config or project entry is in use, or
-the file was unreadable — so a missing candidate says nothing about the host.
-Rows carry a ``reason``; sync never removes them.
+  A baseline whose source the scan skipped is ``not_inspected`` instead,
+  whatever its version.
+
+A fifth state, ``not_inspected`` (#1271), covers every entry whose baseline
+source is one the scan skipped — STM could not tell which host config or
+project entry is in use, or the file was unreadable — so the scan says
+nothing about the entry's own host. It is checked before every other state:
+a baseline of another hash version, or a same-name entry at another host,
+does not decide the row (#1403). Rows carry a ``reason``; sync never removes,
+backfills or re-stamps them.
 
 When candidates with the same name appear in multiple host configs,
 the comparison candidate is chosen by ``baseline.source_label`` match
 first, falling back to first-seen across :data:`ALL_HOSTS`. This keeps
 ``unchanged``/``changed`` stable when the user later mirrors an entry
 into a second host — the import-time host stays the comparison axis.
+The fallback is never compared against a skipped baseline source; it only
+supplies that row's ``current_hash``.
 
 PR6 added ``mms host sync`` as the write-back counterpart to status's
 read-only inspection. Sync's JSON shape (``mode``/``aborted``/``plan``
@@ -245,10 +252,11 @@ def _classify(
 
     ``gaps`` maps source labels the scan could not inspect to a reason
     (:func:`~memtomem_stm.mms.import_hosts.discover_with_gaps`). A baselined
-    entry no scanner returned whose baseline source is one of them is
-    ``not_inspected`` — with a ``reason`` key — not ``removed_at_host``:
-    its host config was skipped, not found without it, so nothing may
-    remove it on that evidence (#1271).
+    entry whose baseline source is one of them is ``not_inspected`` — with a
+    ``reason`` key — whatever else the scan found: not ``removed_at_host``,
+    since its host config was skipped rather than read without it (#1271),
+    and not ``no_baseline``, ``unchanged`` or ``changed`` on the strength of
+    another hash version or of a same-name entry at another host (#1403).
     """
     gaps = gaps or {}
     cand_by_name = _select_candidate_by_name(candidates, import_state)
@@ -265,6 +273,23 @@ def _classify(
         # baseline.
         current_hash = compute_drift_hash(cand.server) if cand is not None else None
 
+        # Checked first: while the baseline's own source is skipped, neither a
+        # same-name entry at another host nor a baseline of another hash
+        # version may decide the row — sync would re-stamp or compare it
+        # against a host that is not its own (#1403).
+        if baseline is not None and baseline.source_label in gaps:
+            rows.append(
+                {
+                    "name": name,
+                    "state": "not_inspected",
+                    "source_label": baseline.source_label,
+                    "baseline_hash": baseline.drift_hash,
+                    "current_hash": current_hash,
+                    "last_imported": baseline.last_imported,
+                    "reason": gaps[baseline.source_label],
+                }
+            )
+            continue
         if baseline is None or baseline.drift_hash_version != HASH_VERSION:
             # ``no_baseline`` covers both the missing-row case and the
             # version-mismatch case — they both mean "the comparison
@@ -278,19 +303,6 @@ def _classify(
                     "baseline_hash": baseline.drift_hash if baseline else None,
                     "current_hash": current_hash,
                     "last_imported": baseline.last_imported if baseline else None,
-                }
-            )
-            continue
-        if cand is None and baseline.source_label in gaps:
-            rows.append(
-                {
-                    "name": name,
-                    "state": "not_inspected",
-                    "source_label": baseline.source_label,
-                    "baseline_hash": baseline.drift_hash,
-                    "current_hash": None,
-                    "last_imported": baseline.last_imported,
-                    "reason": gaps[baseline.source_label],
                 }
             )
             continue
@@ -1123,8 +1135,9 @@ def sync_cmd(
     removed_at_host_rows = [r for r in classified if r["state"] == "removed_at_host"]
     changed_rows_classified = [r for r in classified if r["state"] == "changed"]
     no_baseline_rows = [r for r in classified if r["state"] == "no_baseline"]
-    # Never mutated: their host config was skipped, so a missing candidate
-    # says nothing about the host (#1271).
+    # Never mutated: their host config was skipped, so the scan says nothing
+    # about their host — neither a missing candidate (#1271) nor a same-name
+    # one at another host (#1403).
     not_inspected_rows = [r for r in classified if r["state"] == "not_inspected"]
     n_unchanged = sum(1 for r in classified if r["state"] == "unchanged")
 
