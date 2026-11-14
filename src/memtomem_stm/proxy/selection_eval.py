@@ -1,8 +1,8 @@
 """Deterministic offline evaluation for tool selection telemetry (#468).
 
-Production telemetry is intentionally observational: it contains query hashes,
-not raw queries or candidate metadata, so it cannot honestly replay a lexical
-ranker.  Counterfactual ranking and weight tuning therefore run against a
+Production telemetry is intentionally observational: it records a query's
+length and source, not the raw query or candidate metadata, so it cannot
+honestly replay a lexical ranker.  Counterfactual ranking and weight tuning therefore run against a
 shipped, sanitized, labelled corpus while production JSONL contributes schema,
 join, cohort, and execution-quality diagnostics only.
 """
