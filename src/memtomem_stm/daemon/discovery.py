@@ -53,7 +53,10 @@ this config without building a handshake or lock path. A daemon can still be
 running in the directory then — one an earlier build started, or one whose key
 was removed while it ran — and is found through its published handshake, as a
 daemon under a different config (:func:`iter_foreign_handshakes`). Losing the
-key loses nothing stored.
+key loses nothing stored. A command that only looks does not change the key's
+mode either: for a key someone left readable by group or other, dropping those
+bits is left to the next process that creates or starts a daemon (best effort,
+POSIX only — see ``local_key._tighten_mode``), not done by ``status``.
 
 File shape::
 
@@ -198,7 +201,10 @@ def config_fingerprint(config: STMConfig, *, create_key: bool) -> str | None:
     # separating configs (#757's "only hashed" is not a clearance).
     blob = _json_dumps(material, sort_keys=True, ensure_ascii=False)
     key_path = discovery_key_path(config.data_dir)
-    key = load_or_create_key(key_path) if create_key else load_key(key_path)
+    # A reader leaves the file exactly as it found it, mode included: dropping
+    # group/other bits is a write to its metadata. The creating side still
+    # tries to (``load_or_create_key`` keeps the default).
+    key = load_or_create_key(key_path) if create_key else load_key(key_path, tighten_mode=False)
     if key is None:
         return None
     return keyed_framed_digest((blob,), key=key, domain=_FINGERPRINT_DOMAIN)[:16]

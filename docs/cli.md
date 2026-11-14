@@ -1214,7 +1214,10 @@ The key is created by whatever first needs a daemon to exist — `mms daemon
 start`, a hook's spawn request, the standalone proxy when it starts with
 `surfacing.use_daemon` on (before it has asked for any daemon), the daemon
 itself.
-`status` and `stop` only look, and never create the key. With no key there is
+`status` and `stop` only look: they never create the key and never change its
+mode. For a key left readable by group or other, the next command that creates
+or starts a daemon tries to tighten it to `0600` (on macOS and Linux, and only
+if the file can be chmod-ed); these two do not. With no key there is
 no fingerprint to look under, so `status` reports `stopped` and `stop` reports
 "no running daemon" for this config; on a `data_dir` that holds no daemon
 files — or does not exist — they create nothing at all. A daemon can still be
