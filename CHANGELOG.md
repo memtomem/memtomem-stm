@@ -13,6 +13,28 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- An empty or relative host home variable no longer points STM at files in the
+  current directory. Before, `CODEX_HOME=""` made `mms import` and
+  `mms host sync` read `./config.toml` as the Codex user config, outside
+  `--allow-project-configs`, and let a trust entry in that same file admit
+  `./.codex/config.toml`; a relative `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or
+  `KIMI_CODE_HOME` made `mms hook install` and `mms hook uninstall` read and
+  write a file under the current directory. Each value is now read the way the
+  host reads it, measured on Codex CLI 0.167.2 and Kimi Code 0.39.0: Codex
+  treats an empty `CODEX_HOME` as unset, while Claude Code and Kimi Code
+  resolve an empty or relative value against their own working directory,
+  which STM does not know.
+  **Behavior change**: `CODEX_HOME=""` now means `~/.codex`. A `CODEX_HOME`
+  that is relative or contains a `.` or `..` component makes Codex discovery
+  skip both Codex configs: `mms import` imports nothing from Codex, and
+  `mms host status` and `mms host sync` show entries imported from them as
+  `not_inspected` instead of removing them. `mms hook install` and
+  `mms hook uninstall` exit with an error naming the variable when
+  `CLAUDE_CONFIG_DIR` or `KIMI_CODE_HOME` is empty, relative or contains `.`
+  or `..`, and when `CODEX_HOME` is relative or contains `.` or `..`. A value
+  starting with a literal `~` counts as relative. Before, the hook commands
+  expanded a literal `~` and fell back to the default file for an empty
+  value.
 - A new upstream prefix can no longer end in a newline. The prefix rule is now
   checked against the whole value: before, `"fs\n"` passed (`$` also matches
   just before a final newline) while `"fs\n\n"` was refused. This applies to

@@ -580,6 +580,62 @@ class TestScanCodex:
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
         assert [c.name for c in ih.scan_codex(tmp_path)] == ["portable"]
 
+    @staticmethod
+    def _seed_cwd_codex_files(cwd, subdir: str = "") -> None:
+        """A repository that ships a Codex user config of its own: a server,
+        and a trust entry vouching for its own ``.codex/config.toml``."""
+        home = cwd / subdir if subdir else cwd
+        home.mkdir(parents=True, exist_ok=True)
+        escaped = str(cwd.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+        (home / "config.toml").write_text(
+            f'[mcp_servers.from_cwd]\ncommand = "echo"\n'
+            f'[projects."{escaped}"]\ntrust_level = "trusted"\n',
+            encoding="utf-8",
+        )
+        (cwd / ".codex").mkdir(exist_ok=True)
+        (cwd / ".codex" / "config.toml").write_text(
+            '[mcp_servers.from_project]\ncommand = "echo"\n', encoding="utf-8"
+        )
+
+    def test_empty_codex_home_reads_the_default_not_the_cwd(
+        self, sandbox_home, tmp_path, monkeypatch
+    ):
+        # Codex reads ~/.codex when CODEX_HOME is empty (measured on 0.167.2).
+        # Path("") is the current directory, so the old scan took the cwd's
+        # config.toml as the user layer, outside --allow-project-configs.
+        (sandbox_home / ".codex").mkdir()
+        (sandbox_home / ".codex" / "config.toml").write_text(
+            '[mcp_servers.from_default]\ncommand = "echo"\n', encoding="utf-8"
+        )
+        cwd = tmp_path / "repo"
+        self._seed_cwd_codex_files(cwd)
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("CODEX_HOME", "")
+
+        candidates = ih.scan_codex(cwd)
+        assert [(c.name, c.source_label, c.is_repo_local) for c in candidates] == [
+            ("from_default", "Codex CLI", False)
+        ]
+
+    @pytest.mark.parametrize("form", ["relative", "dotdot"])
+    def test_unplaceable_codex_home_reads_neither_layer(
+        self, sandbox_home, tmp_path, monkeypatch, form
+    ):
+        cwd = tmp_path / "repo"
+        self._seed_cwd_codex_files(cwd, "rel")
+        monkeypatch.chdir(cwd)
+        value = "rel" if form == "relative" else str(cwd / "rel" / ".." / "rel")
+        monkeypatch.setenv("CODEX_HOME", value)
+
+        candidates, gaps = ih.discover_with_gaps("codex", cwd)
+        assert candidates == []
+        assert gaps == {"Codex CLI": "codex_home", "Codex CLI (project)": "codex_home"}
+        assert ih.SOURCE_GAP_REASONS["codex_home"] == (
+            "CODEX_HOME is relative or contains '.' or '..'"
+        )
+        assert ih.scan_codex(cwd) == []
+        assert ih.codex_declared_names(cwd) == set()
+
     def test_trusted_project_config_is_repo_local(self, sandbox_home, tmp_path):
         codex_dir = sandbox_home / ".codex"
         codex_dir.mkdir()

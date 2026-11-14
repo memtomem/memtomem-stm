@@ -105,7 +105,8 @@ For other JSON-based clients:
 }
 ```
 
-Codex discovery honors `CODEX_HOME`. A project-local `.codex/config.toml` is
+Codex discovery honors `CODEX_HOME` when it is an absolute path with no `.` or
+`..` component (an empty one means `~/.codex`). A project-local `.codex/config.toml` is
 read only when the project is marked trusted in the user Codex config and the
 caller acknowledges project configs. `mms import --from codex` populates the
 separate project registry at
