@@ -215,6 +215,67 @@ def test_escalation_does_not_wait_out_a_child_nobody_reaped() -> None:
     assert child.wait(timeout=5.0) == -signal.SIGTERM
 
 
+# CPython on macOS has no os.waitid before 3.13. Removing the attribute puts any
+# host on the path that interpreter takes.
+
+
+def test_without_waitid_a_live_child_has_not_exited_and_a_reaped_one_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(child_reaper.os, "waitid", raising=False)
+    child = _sleeping_child()
+    try:
+        assert not child_reaper._has_exited(child.pid)
+    finally:
+        _reap(child)
+    assert child_reaper._has_exited(child.pid)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="getpgid answers ESRCH for a zombie on macOS")
+def test_without_waitid_a_zombie_counts_as_exited_and_keeps_its_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(child_reaper.os, "waitid", raising=False)
+    child = _sleeping_child()
+    try:
+        child.send_signal(signal.SIGTERM)
+
+        def _ps_state() -> str:
+            # Reads the kernel's process state without reaping, so whether the
+            # child is a zombie is settled independently of the probe under test.
+            return subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child.pid)],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            ).stdout.strip()
+
+        deadline = time.monotonic() + 5.0
+        while not _ps_state().startswith("Z") and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _ps_state().startswith("Z")
+        assert child_reaper._has_exited(child.pid)
+        # The signal-0 probe calls that zombie alive, which is the answer the
+        # fallback must not give.
+        assert child_reaper.is_pid_alive(child.pid)
+        # The probe did not consume the exit status the Popen owner waits for.
+        assert child.wait(timeout=5.0) == -signal.SIGTERM
+    finally:
+        _reap(child)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="getpgid answers ESRCH for a zombie on macOS")
+def test_without_waitid_escalation_does_not_wait_out_a_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(child_reaper.os, "waitid", raising=False)
+    child = _sleeping_child()
+    started = time.monotonic()
+    child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=5.0)
+    assert time.monotonic() - started < 2.0
+    assert child.wait(timeout=5.0) == -signal.SIGTERM
+
+
 def test_sweep_spares_a_child_meant_to_outlive_us(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

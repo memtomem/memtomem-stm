@@ -13,6 +13,13 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- On macOS with Python 3.12, the leaked-child sweep that runs when an LTM
+  adapter's shutdown fails no longer raises `AttributeError: module 'os' has
+  no attribute 'waitid'` instead of terminating the child. CPython has
+  `os.waitid` on macOS only from 3.13; without it the sweep now asks
+  `os.getpgid`, which the macOS kernel answers with "no such process" for an
+  exited child nobody reaped yet, so the sweep still does not wait out its
+  escalation window for a child that already died.
 - An empty or relative host home variable no longer points STM at files in the
   current directory. Before, `CODEX_HOME=""` made `mms import` and
   `mms host sync` read `./config.toml` as the Codex user config, outside
