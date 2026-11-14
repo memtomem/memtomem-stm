@@ -78,6 +78,65 @@ _BLOCKED_IMPORT_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# The same two programs started as ``<python> -m <module>`` — the form STM
+# writes for its own registrations and LTM's ``mm init`` writes for LTM. Only
+# modules that start those servers: ``memtomem_stm.demo_server`` is a bundled
+# upstream STM itself registers, so a whole-package match would hide it.
+_BLOCKED_IMPORT_MODULES: frozenset[str] = frozenset(
+    {
+        "memtomem_stm",
+        "memtomem_stm.__main__",
+        "memtomem_stm.server",
+        "memtomem.server",
+        "memtomem.server.__main__",
+    }
+)
+
+
+# ``python``, ``python3``, ``python3.12``, ``pythonw``, each with ``.exe``.
+_PYTHON_COMMAND_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?w?(?:\.exe)?")
+
+# CPython's short options that take a value, attached (``-Xdev``) or as the
+# next argument (``-X dev``); the others are single-letter flags that can be
+# grouped (``-Pm``). Its only long option with a value is below.
+_PYTHON_VALUE_OPTIONS = frozenset("cmWX")
+_PYTHON_LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs"})
+
+
+def _python_module_target(args: list[Any]) -> str | None:
+    """The module a Python command line runs with ``-m``, read as CPython does.
+
+    Options end at the first argument that is not one, so a script's own
+    ``-m`` (``server.py -m x``) is not the interpreter's; ``-c`` ends them too.
+    Returns ``None`` when no module is selected or an argument is not a string.
+    """
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if not isinstance(tok, str) or not tok.startswith("-") or tok in ("-", "--"):
+            return None
+        if tok.startswith("--"):
+            i += 2 if tok in _PYTHON_LONG_VALUE_OPTIONS else 1
+            continue
+        for j in range(1, len(tok)):
+            opt = tok[j]
+            if opt not in _PYTHON_VALUE_OPTIONS:
+                continue
+            if j + 1 < len(tok):
+                value: Any = tok[j + 1 :]
+                i += 1
+            else:
+                value = args[i + 1] if i + 1 < len(args) else None
+                i += 2
+            if opt == "m":
+                return value if isinstance(value, str) else None
+            if opt == "c":
+                return None
+            break
+        else:
+            i += 1
+    return None
+
 
 def _desktop_config_path() -> Path:
     """Claude Desktop config path for the current platform."""
@@ -121,7 +180,11 @@ def _is_self_reference(entry: dict[str, Any]) -> bool:
 
     Examines both the command basename and every argv token (exact
     match, not substring) because wrappers like ``uvx --from memtomem
-    memtomem-server`` carry the blocked name only in ``args``.
+    memtomem-server`` carry the blocked name only in ``args``. A Python
+    interpreter command names a module instead of a program, so the module
+    its ``-m`` selects is checked against ``_BLOCKED_IMPORT_MODULES``. That
+    covers what STM and LTM register; a wrapper that starts Python itself
+    (``uv run python -m …``) is not read.
     """
     cmd = (entry.get("command") or "").lower()
     if cmd and Path(cmd).name in _BLOCKED_IMPORT_NAMES:
@@ -130,6 +193,10 @@ def _is_self_reference(entry: dict[str, Any]) -> bool:
     if isinstance(args, list):
         for tok in args:
             if isinstance(tok, str) and tok.lower() in _BLOCKED_IMPORT_NAMES:
+                return True
+        if cmd and _PYTHON_COMMAND_RE.fullmatch(Path(cmd).name):
+            module = _python_module_target(args)
+            if module is not None and module.lower() in _BLOCKED_IMPORT_MODULES:
                 return True
     return False
 

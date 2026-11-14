@@ -13892,6 +13892,26 @@ class TestEjectCommand:
         assert result.exit_code == 1
         assert "STM's own registration" in result.output
 
+    def test_module_form_self_reference_refused(self, runner, config):
+        args = ["-P", "-m", "memtomem_stm"]
+        entry = _eject_entry(command="/venv/bin/python", args=args)
+        self._seed_config(config, {"renamed": entry})
+
+        result = runner.invoke(cli, ["eject", "renamed", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "STM's own registration" in result.output
+
+    def test_bundled_demo_server_is_not_a_self_reference(self, runner, config):
+        from memtomem_stm.cli.proxy import _resolve_eject_plan
+
+        args = ["-P", "-m", "memtomem_stm.demo_server"]
+        entry = _eject_entry(command="/venv/bin/python", args=args)
+        plan = _resolve_eject_plan(
+            "demo", entry, None, force=False, allow_argv_secrets=False, interactive=False
+        )
+        assert plan.error != "refusing to eject STM's own registration"
+
     def test_unknown_name_errors(self, runner, config):
         self._seed_config(config, {"demo": _eject_entry()})
 
