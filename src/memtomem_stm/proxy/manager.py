@@ -1127,6 +1127,7 @@ class ProxyManager:
         self._llm_compressor_lock = asyncio.Lock()
         self._relevance_scorer_instance = self._create_scorer(config)
         self._relevance_scorer_cfg = config.relevance_scorer
+        self._warn_if_scorer_unscanned(config.relevance_scorer)
         self._background_tasks: set[asyncio.Task] = set()
         # #868 shed bookkeeping. The latch keeps a sustained overload to one
         # warning, and re-arms once the set drains well below the cap so a
@@ -3464,6 +3465,7 @@ class ProxyManager:
             return self._create_scorer(cfg)
         self._relevance_scorer_instance = self._create_scorer(cfg)
         self._relevance_scorer_cfg = current_cfg
+        self._warn_if_scorer_unscanned(current_cfg)
         return self._relevance_scorer_instance
 
     @property
@@ -3933,14 +3935,39 @@ class ProxyManager:
         # provider default (Ollama / OpenAI) whenever the field is omitted,
         # so by this point it is always populated.
         assert sc.embedding_base_url is not None
-        return create_scorer(
+        scorer = create_scorer(
             scorer_type=sc.scorer,
             provider=sc.embedding_provider,
             model=sc.embedding_model,
             base_url=sc.embedding_base_url,
             timeout=sc.embedding_timeout,
             cache_size=sc.embedding_cache_size,
+            privacy_scan=sc.privacy_scan_enabled,
         )
+        return scorer
+
+    @staticmethod
+    def _warn_if_scorer_unscanned(sc: RelevanceScorerConfig) -> None:
+        """The #610 warning for the embedding egress path (#1382).
+
+        Called where the SHARED scorer is built — at construction and when the
+        live generation rebuilds it on a ``relevance_scorer`` edit — rather than
+        in ``start()``, so a hot reload into the unscanned state is not silent.
+        Not from ``_create_scorer``: a stale-pinned request builds a scorer of
+        its own on every call, and would repeat the warning per request.
+        """
+        if (
+            sc.scorer == "embedding"
+            and not sc.privacy_scan_enabled
+            and sc.is_external_destination()
+        ):
+            logger.warning(
+                "Embedding relevance scorer enabled with "
+                "relevance_scorer.privacy_scan_enabled=false — context queries and "
+                "section text will be sent UNSCANNED to %s (%s)",
+                sc.embedding_provider,
+                diagnostic_url(sc.embedding_base_url or ""),
+            )
 
     def _distinct_sqlite_selective_cfgs(
         self, cfg: ProxyConfig | None = None

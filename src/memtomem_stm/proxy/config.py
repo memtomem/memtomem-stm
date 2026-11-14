@@ -2066,6 +2066,32 @@ class RelevanceScorerConfig(BaseModel):
     caches the scorer it was built with, and that compressor is keyed on
     ``selective``, so a scorer-only edit reaches them at the next selective
     rebuild. Only used when scorer="embedding"."""
+    privacy_scan_enabled: bool = True
+    """Screen what the embedding scorer would send — the context query, each
+    section's title and first 500 body characters, and the response they came
+    from — for API keys, passwords, provider tokens, JWTs and private keys. On
+    a match the pass is scored with BM25 and nothing is sent (#1382), the same
+    rule ``LLMCompressorConfig.privacy_scan_enabled`` applies to LLM
+    summaries. Set to false only for an endpoint you trust with that text;
+    for a non-loopback ``embedding_base_url`` the proxy then logs a WARNING
+    when it builds its shared scorer — at startup and on a config edit that
+    rebuilds it. Only used when scorer="embedding"."""
+
+    def is_external_destination(self) -> bool:
+        """True when ``embedding_base_url`` is not a loopback host.
+
+        Judged by host alone, unlike ``LLMCompressorConfig``: an
+        OpenAI-compatible embedding server on localhost keeps the text on the
+        machine whatever ``embedding_provider`` says. A URL that does not parse
+        counts as external: the answer only decides whether to warn, and the
+        manager asks it while building the scorer, where raising would turn a
+        bad URL — today a BM25 fallback per call — into a startup failure.
+        """
+        try:
+            host = urlparse(self.embedding_base_url or "").hostname or ""
+        except ValueError:
+            return True
+        return host not in _LOCAL_LLM_HOSTS
 
     @model_validator(mode="after")
     def _apply_provider_default_url(self) -> "RelevanceScorerConfig":

@@ -13,6 +13,24 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The embedding relevance scorer (`relevance_scorer.scorer = "embedding"`) no
+  longer sends credential-bearing text to its endpoint. It sends the context
+  query and each section's title and first 500 body characters, and nothing
+  screened them, while the LLM compressor's credential scan (#289) kept the
+  same responses away from a hosted summarizer. A pass now goes to BM25
+  instead when the query, a section as sent, a whole section, or the response
+  the sections came from matches a credential pattern. The response counts
+  because SELECTIVE and SCHEMA_PRUNING score a JSON key and its value as
+  separate pieces, which a per-section check cannot see as one pair; it is
+  read with JSON string escapes decoded, so `\u0070assword` counts. The new
+  `relevance_scorer.privacy_scan_enabled` (default `true`) turns the screen
+  off, and with it off for a non-loopback `embedding_base_url` the proxy logs
+  a WARNING at startup and again when a config edit rebuilds the scorer
+  (#1382).
+  **Behavior change**: with the embedding scorer configured, a call whose
+  response or query matches a credential pattern is ranked by BM25 for that
+  pass. It is not counted as a `scorer_fallback`.
+
 - TRUNCATE's code-aware output names more of the blocks it cannot keep whole.
   Those blocks are previewed after a `... (N more blocks)` line, and the
   previews used to be built one block at a time, each with its body lines, so
