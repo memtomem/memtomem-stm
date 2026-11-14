@@ -46,8 +46,9 @@ changes inline only. See the deprecation policy in
   holding a handshake, or just a directory listing, could confirm a guessed
   header value by recomputing it. It is now an HMAC under a random key in
   `<data_dir>/stm-discovery.key` (mode `0600`), created by the first process
-  that needs a daemon to exist: `mms daemon start`, a hook's or the standalone
-  proxy's spawn request, or the daemon itself. `mms daemon status` and
+  that needs a daemon to exist: `mms daemon start`, a hook's spawn request,
+  the standalone proxy when it starts with `surfacing.use_daemon` on, or the
+  daemon itself. `mms daemon status` and
   `mms daemon stop` never create it; with no key they report `stopped` /
   `no running daemon` for this config, and on a `data_dir` with no daemon
   files they create nothing. The same

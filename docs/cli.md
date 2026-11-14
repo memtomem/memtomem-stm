@@ -1211,7 +1211,9 @@ than a hash anyone could recompute from a guess. Every STM process that shares
 the `data_dir` reads the same key.
 
 The key is created by whatever first needs a daemon to exist — `mms daemon
-start`, a hook's or the standalone proxy's spawn request, the daemon itself.
+start`, a hook's spawn request, the standalone proxy when it starts with
+`surfacing.use_daemon` on (before it has asked for any daemon), the daemon
+itself.
 `status` and `stop` only look, and never create the key. With no key there is
 no fingerprint to look under, so `status` reports `stopped` and `stop` reports
 "no running daemon" for this config; on a `data_dir` that holds no daemon
@@ -1242,7 +1244,7 @@ A key that exists but cannot be read, or does not hold a key, is an error:
   file and reports the daemon as unavailable until STM restarts. A key damaged
   while its daemon keeps answering changes nothing until that daemon is gone.
   `mms health` and `mms doctor` report an unreachable daemon, with their usual
-  exit codes, and point here.
+  exit codes, and point to `mms daemon status`.
 
 Moving the file aside lets the next `start` create a new one. A new key means
 new fingerprints: daemons still running under the old one are listed as
