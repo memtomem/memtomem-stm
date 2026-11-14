@@ -26,7 +26,7 @@ PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
 def prefix_format_error(prefix: str) -> str | None:
     """Format-rule violation message for ``prefix``, or ``None`` if valid."""
-    if not PREFIX_RE.match(prefix) or "__" in prefix:
+    if not PREFIX_RE.fullmatch(prefix) or "__" in prefix:
         return (
             f"invalid prefix '{prefix}'. "
             "Must start with a letter, contain only letters/digits/underscores, "

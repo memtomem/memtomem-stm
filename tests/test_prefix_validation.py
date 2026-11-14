@@ -30,6 +30,12 @@ class TestPrefixFormatError:
         assert error is not None
         assert f"'{prefix}'" in error
 
+    @pytest.mark.parametrize("prefix", ["fs\n", "fs\n\n", "fs\r\n", "\nfs"])
+    def test_surrounding_newline_rejected(self, prefix: str) -> None:
+        # ``$`` also matches just before a trailing newline, so ``match`` let
+        # ``"fs\n"`` through while ``"fs\n\n"`` was refused.
+        assert prefixes.prefix_format_error(prefix) is not None
+
 
 class TestEmptyPrefixKeys:
     def test_empty_and_whitespace_flagged_sorted(self) -> None:
