@@ -105,6 +105,22 @@ def _partition_encodable(
     return ok, refused
 
 
+def _import_hint_command(from_host: str, mode: str, *, allow_project_configs: bool) -> str:
+    """An ``mms import`` command a plan hint tells the user to run.
+
+    ``mode`` is what the hint is for: ``--apply``, or ``--plan --show-imported``
+    to reveal the redacted values first. ``--allow-project-configs`` is echoed
+    only when the plan run was given it, so copying a hint (or following one
+    hint to the next) never drops an acknowledgement the run already gave and
+    never adds one it did not; without it, the plan's note and the apply gate
+    name the flag themselves. The same rule as ``mms host sync``'s hints.
+    """
+    parts = [f"mms import --from {from_host} {mode}"]
+    if allow_project_configs:
+        parts.append("--allow-project-configs")
+    return " ".join(parts)
+
+
 def _format_env_summary(
     server: RegistryServer, env_classification: dict, *, show_imported: bool
 ) -> str:
@@ -316,7 +332,10 @@ def import_command(
                 click.echo(
                     "Secrets above were REDACTED. To see actual values that would be imported:"
                 )
-                click.echo(f"  mms import --from {from_host} --plan --show-imported")
+                reveal_command = _import_hint_command(
+                    from_host, "--plan --show-imported", allow_project_configs=allow_project_configs
+                )
+                click.echo(f"  {reveal_command}")
                 click.echo("")
         if repo_local_new and not allow_project_configs:
             n = len(repo_local_new)
@@ -325,7 +344,10 @@ def import_command(
                 "cwd; --apply will require --allow-project-configs."
             )
             click.echo("")
-        click.echo(f"To apply: mms import --from {from_host} --apply")
+        apply_command = _import_hint_command(
+            from_host, "--apply", allow_project_configs=allow_project_configs
+        )
+        click.echo(f"To apply: {apply_command}")
         return
 
     # --apply
