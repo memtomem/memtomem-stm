@@ -12,6 +12,12 @@ fingerprint). That is not an unreachable daemon — no retry will find one — s
 it is left for the caller to report. A key that is simply absent is the quiet
 case: there is no fingerprint to look under, so the helpers report no daemon
 for this config without building a handshake path.
+
+``ping``, ``shutdown`` and ``ltm_request`` take the fingerprint from a caller
+that has already derived it, and then do not read the key at all. A command
+that looks a daemon up and then acts on it passes the one value through, so the
+key changing under it cannot make the two steps disagree about which daemon
+is this config's.
 """
 
 from __future__ import annotations
@@ -227,9 +233,11 @@ async def ltm_request(
     return ("ok", resp) if resp is not None else ("unavailable", None)
 
 
-async def shutdown(config: STMConfig, *, timeout: float = 5.0) -> bool:
+async def shutdown(
+    config: STMConfig, *, timeout: float = 5.0, fingerprint: str | None = None
+) -> bool:
     """Ask a running daemon to shut down gracefully. ``True`` if it acked."""
-    hs = _live_handshake_candidate(config)
+    hs = _live_handshake_candidate(config, fingerprint=fingerprint)
     if hs is None:
         return False
     resp = await _request(hs, OP_SHUTDOWN, None, timeout=timeout)

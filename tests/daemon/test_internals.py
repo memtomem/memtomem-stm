@@ -424,7 +424,7 @@ def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytes
         state["spawns"] += 1
         return state["spawns"] >= 3  # declined twice (lock "held"), then spawns
 
-    async def fake_ping(config, *, timeout=2.0):
+    async def fake_ping(config, *, timeout=2.0, fingerprint=None):
         # Answers only once the (faked) shutdown finished and we spawned.
         return {"pid": 123, "port": 4567} if state["spawns"] >= 3 else None
 
@@ -643,7 +643,7 @@ def test_start_coexists_with_different_config_daemon(
         state["spawns"] += 1
         return True  # our config's lock is free → spawn proceeds
 
-    async def fake_ping(config, *, timeout=2.0):
+    async def fake_ping(config, *, timeout=2.0, fingerprint=None):
         # Our config has no daemon until we've spawned one.
         return {"pid": 99, "port": 4567} if state["spawns"] >= 1 else None
 
@@ -987,10 +987,10 @@ def _discovery_key() -> None:
 def _no_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the graceful client paths report 'no responsive daemon'."""
 
-    async def fake_shutdown(config):
+    async def fake_shutdown(config, *, fingerprint=None):
         return False
 
-    async def fake_ping(config, *, timeout=2.0):
+    async def fake_ping(config, *, timeout=2.0, fingerprint=None):
         return None
 
     monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
@@ -1122,7 +1122,7 @@ class TestDaemonStopCli:
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         _discovery_key()
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             return True
 
         monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
@@ -1147,7 +1147,7 @@ class TestDaemonStopCli:
             }
         )
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             return True
 
         monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
@@ -1178,7 +1178,7 @@ class TestDaemonStopCli:
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             # Teardown completes: the handshake, removed last, is gone.
             hs_path.unlink()
             return True
@@ -1210,7 +1210,7 @@ class TestDaemonStopCli:
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             # Accepted, and the record is now unparseable but still present.
             hs_path.write_text("{ truncated", encoding="utf-8")
             return True
@@ -1245,7 +1245,7 @@ class TestDaemonStopCli:
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             hs_path.unlink()
             try:
                 hs_path.symlink_to(tmp_path / "gone.json")
@@ -1511,8 +1511,10 @@ class TestDaemonStatusCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
                 "pid": 11,
                 "host": "127.0.0.1",
@@ -1543,6 +1545,8 @@ class TestDaemonStatusCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
         latency = {
             "surface": {
                 "samples": 12,
@@ -1553,7 +1557,7 @@ class TestDaemonStatusCli:
             }
         }
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
                 "pid": 11,
                 "host": "127.0.0.1",
@@ -1588,8 +1592,10 @@ class TestDaemonStatusCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
                 "pid": 11,
                 "host": "127.0.0.1",
@@ -1633,8 +1639,10 @@ class TestDaemonStatusCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
                 "pid": 11,
                 "host": "127.0.0.1",
@@ -1678,7 +1686,7 @@ class TestDaemonStatusCli:
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
                 "pid": 11,
                 "host": "127.0.0.1",
@@ -1726,8 +1734,10 @@ class TestDaemonStatusCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
                 "pid": 11,
                 "host": "127.0.0.1",
@@ -1764,8 +1774,10 @@ class TestDaemonStatusCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
                 "pid": 11,
                 "host": "127.0.0.1",
@@ -1832,8 +1844,10 @@ class TestDaemonStatusCli:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {"pid": 11, "host": "h", "port": 1, "ltm": "warm", "created_at": "garbage"}
 
         monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
@@ -2330,8 +2344,10 @@ class TestDaemonForeignOrphans:
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # A daemon answers under a fingerprint, and there is none without a key.
+        _discovery_key()
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {
                 "pid": 11,
                 "host": "127.0.0.1",
@@ -3566,11 +3582,11 @@ class TestDaemonRestartCli:
 
         calls = {"shutdown": 0, "spawns": 0}
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             calls["shutdown"] += 1
             return True
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {"pid": 7, "port": 9} if calls["spawns"] else None
 
         def fake_request_spawn(config, *, propagate_errors=False):
@@ -3601,7 +3617,7 @@ class TestDaemonRestartCli:
         _fake_stop_clock(monkeypatch)
         spawns: list[object] = []
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             return True  # graceful ack, no handshake: stop confirms without a probe
 
         def refuse(path):
@@ -3650,10 +3666,10 @@ class TestDaemonRestartCli:
             log.append(state.value)
             return state
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             return True
 
-        async def fake_ping(config, *, timeout=2.0):
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
             return {"pid": 7, "port": 9} if "spawn" in log else None
 
         def fake_request_spawn(config, *, propagate_errors=False):
@@ -3715,7 +3731,7 @@ class TestDaemonRestartCli:
         # wait that follows is restart's own.
         held_fd: list[int] = []
 
-        async def fake_shutdown(config):
+        async def fake_shutdown(config, *, fingerprint=None):
             fd = open_lock_fd(lp)
             assert try_lock(fd) is True
             held_fd.append(fd)

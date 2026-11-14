@@ -495,6 +495,9 @@ def stop_cmd(stop_all: bool) -> None:
     the command exits 1 saying so. ``--all`` still runs first and treats every
     published daemon as foreign — the way out when a daemon is still running
     under a key that has since been damaged.
+
+    The key is read once, when the command starts. One damaged or removed after
+    that does not change which daemon this run treats as the current config's.
     """
     config = _load_config()
     key_error: LocalKeyError | None = None
@@ -505,15 +508,13 @@ def stop_cmd(stop_all: bool) -> None:
         key_error = exc
     stop_error: SystemExit | None = None
     if key_error is None:
+        # Nothing below reads the key again: the graceful request is given
+        # the fingerprint derived above, so the whole command acts on that
+        # one value even if the key is damaged or removed while it runs.
         try:
             _stop_current_config_daemon(config, current)
         except SystemExit as exc:
             stop_error = exc
-        except LocalKeyError as exc:
-            # The graceful request derives the fingerprint again, so a key
-            # damaged since the read above shows up here. Whatever this
-            # config's daemon was, it is one of the published ones now.
-            key_error, current = exc, None
     if stop_all:
         # Runs even after a failed current-config stop; either half failing
         # fails the command.
@@ -660,7 +661,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
     hs_path = handshake_path(config.data_dir, fp)
     lock = lock_path(config.data_dir, fp)
     raw = read_handshake(hs_path)
-    if asyncio.run(client.shutdown(config)):
+    if asyncio.run(client.shutdown(config, fingerprint=fp)):
         # The wire response means only "shutdown accepted". Teardown still has
         # to stop the engine/LTM child before it removes the handshake, so do
         # not tell scripts the daemon is stopped until that record is gone.
@@ -1030,10 +1031,14 @@ def status_cmd(as_json: bool) -> None:
     hs: dict[str, Any] | None = None
     fp: str | None = None
     try:
-        hs = asyncio.run(client.ping(config, timeout=2.0))
         fp = _current_fingerprint(config)
     except LocalKeyError as exc:
-        key_error, hs, fp = exc, None, None
+        key_error = exc
+    if fp is not None:
+        # The one fingerprint derived above, passed in rather than derived
+        # again by the ping: read twice, a key removed in between reported the
+        # daemon that had just answered as a foreign one too (#1423).
+        hs = asyncio.run(client.ping(config, timeout=2.0, fingerprint=fp))
     info: dict[str, Any]
     if hs is not None:
         uptime = max(0.0, time.time() - _as_float(hs.get("created_at"), time.time()))
