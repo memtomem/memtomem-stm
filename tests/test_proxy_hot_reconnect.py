@@ -302,11 +302,17 @@ class TestConfigChangeDetection:
         old_stack.aclose.assert_not_awaited()
         assert conn.last_failed_connection_fp == _connection_fingerprint(cfg_b)
 
-    async def test_config_reconnect_deadline_damps_edit_and_old_session_serves(self, tmp_path):
+    async def test_config_reconnect_deadline_damps_edit_and_old_session_serves(
+        self, tmp_path, deadline_clock
+    ):
         """The call-wide deadline cancels a hanging config reconnect from
         outside its ordinary ``except Exception`` guard. Record that exact
         fingerprint before propagating the timeout, so the following call
         uses the still-healthy old session instead of retrying the edit.
+
+        ``deadline_clock`` holds the deadline clock still, so the 0.02 s budget
+        expires inside the reconnect rather than being spent by a stall before
+        it starts, which would skip the reconnect entirely (#1408).
         """
         cfg_a = _sse_cfg("https://old.example/sse")
         cfg_b = UpstreamServerConfig(
