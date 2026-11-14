@@ -204,6 +204,7 @@ from memtomem_stm.proxy.toolgraph_provider import (
     validate_toolgraph_identifier,
 )
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.local_key import LocalKeyError
 from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
 from memtomem_stm.utils.json_size import json_utf8_size_async
 from memtomem_stm.utils.keyed_locks import KeyedLocks
@@ -2088,6 +2089,15 @@ class ProxyManager:
                     max_scopes=cfg.consult_cache_max_scopes,
                 )
                 cache.initialize()
+            except LocalKeyError as exc:
+                # In the message, not the traceback: the default log formatter
+                # withholds exception text, and the file name is what to fix.
+                logger.warning(
+                    "Tool-graph consult cache disabled this session: %s — consulting "
+                    "without the disk cache.",
+                    exc,
+                )
+                return None
             except Exception:
                 logger.warning(
                     "Tool-graph consult cache could not be opened at %s — consulting "

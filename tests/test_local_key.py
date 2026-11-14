@@ -280,3 +280,35 @@ def test_a_fifo_at_the_key_path_fails_instead_of_hanging(tmp_path: Path) -> None
     assert not worker.is_alive(), "load_or_create_key blocked on a FIFO"
     assert len(outcome) == 1 and isinstance(outcome[0], LocalKeyError)
     assert "regular file" in str(outcome[0])
+
+
+class TestPermissionHandling:
+    def test_crlf_line_ending_is_accepted(self, tmp_path: Path) -> None:
+        path = tmp_path / "s.db.key"
+        path.write_bytes(b"ab" * 32 + b"\r\n")
+        assert load_key(path) == bytes.fromhex("ab" * 32)
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX permission bits")
+    def test_a_non_key_file_keeps_its_mode(self, tmp_path: Path) -> None:
+        other = tmp_path / "notes.txt"
+        other.write_text("my notes\n")
+        other.chmod(0o644)
+        path = tmp_path / "s.db.key"
+        path.symlink_to(other)
+        with pytest.raises(LocalKeyError):
+            load_key(path)
+        assert stat.S_IMODE(other.stat().st_mode) == 0o644
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX permission bits")
+    def test_a_key_that_cannot_be_chmodded_still_loads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "s.db.key"
+        key = load_or_create_key(path)
+        path.chmod(0o644)
+
+        def _read_only_mount(fd: int, mode: int) -> None:
+            raise OSError(errno.EROFS, "Read-only file system")
+
+        monkeypatch.setattr(local_key.os, "fchmod", _read_only_mount)
+        assert load_key(path) == key

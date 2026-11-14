@@ -87,13 +87,16 @@ def load_key(path: Path) -> bytes | None:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise LocalKeyError(f"the key file {path} is not a regular file")
-        _tighten_mode(fd)
         raw = _read_all(fd, _KEY_HEX_CHARS + 2)
+        key = _parse(raw, path)
+        # Only once the content is known to be a key: a name that points at
+        # some other file must not have that file's mode changed.
+        _tighten_mode(fd)
     except OSError as exc:
         raise LocalKeyError(f"cannot read the key file {path}: {exc}") from exc
     finally:
         os.close(fd)
-    return _parse(raw, path)
+    return key
 
 
 def load_or_create_key(path: Path) -> bytes:
@@ -127,8 +130,7 @@ def _publish_new_key(path: Path) -> None:
         raise LocalKeyError(f"cannot create the key file {path}: {exc}") from exc
     try:
         try:
-            if sys.platform != "win32":
-                os.fchmod(fd, 0o600)
+            # ``mkstemp`` already created it ``0o600``.
             view = memoryview(content)
             while view:
                 written = os.write(fd, view)
@@ -155,15 +157,19 @@ def _publish_new_key(path: Path) -> None:
 
 
 def _tighten_mode(fd: int) -> None:
-    """Drop group/other permission bits if present. POSIX only.
+    """Drop group/other permission bits if present. POSIX only, best effort.
 
     Checked before changing, so the common read leaves the file's ctime alone.
+    A file the reader cannot chmod (a read-only mount, a filesystem without
+    modes) is still a usable key, as ``ensure_private_db_files`` treats DBs.
     """
     if sys.platform == "win32":  # pragma: no cover - POSIX permission model
         return
-    mode = os.fstat(fd).st_mode
-    if stat.S_IMODE(mode) & 0o077:
-        os.fchmod(fd, 0o600)
+    try:
+        if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+    except OSError:
+        pass
 
 
 def _read_all(fd: int, limit: int) -> bytes:
@@ -181,7 +187,9 @@ def _read_all(fd: int, limit: int) -> bytes:
 
 def _parse(raw: bytes, path: Path) -> bytes:
     text = raw.decode("ascii", errors="replace")
-    if text.endswith("\n"):
+    if text.endswith("\r\n"):
+        text = text[:-2]
+    elif text.endswith("\n"):
         text = text[:-1]
     if len(text) != _KEY_HEX_CHARS or not set(text) <= _HEX_DIGITS:
         raise LocalKeyError(

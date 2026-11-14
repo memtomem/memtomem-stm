@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import sqlite3
 import threading
 import time
@@ -573,8 +574,9 @@ def _make_key(
     # them the same response. Widening the key past what the upstream sees
     # would only split rows that must not be split.
     #
-    # - ``framed_digest`` length-prefixes each component instead of joining
-    #   them, so no boundary can shift — nothing on the path rejects a NUL in
+    # - ``keyed_framed_digest`` (framed exactly as ``framed_digest``)
+    #   length-prefixes each component instead of joining them, so no boundary
+    #   can shift — nothing on the path rejects a NUL in
     #   an upstream server or tool name. It also owns the ``surrogatepass``
     #   encode; see its docstring for why neither is optional.
     # - ``ensure_ascii=False``: the default ASCII escaping renders an astral
@@ -686,6 +688,11 @@ class ProxyCache:
         self._max_entries = max_entries
         self._db: sqlite3.Connection | None = None
         self._key: bytes | None = None
+        # Keys ``key_for`` before ``initialize()`` (or after a failed one). Such
+        # a cache stores and serves nothing, so any key consistent within this
+        # object will do for the manager's stampede lock; raising instead would
+        # fail every cache-eligible call on a cache that was never opened.
+        self._unopened_key = secrets.token_bytes(32)
         self._lock = threading.Lock()
         # Process-lifetime count of rows dropped by ``_trim`` (max_entries
         # overflow). Surfaced via ``stats()`` so an operator can see the cache
@@ -760,16 +767,14 @@ class ProxyCache:
         context_query: str | None = None,
         config_fingerprint: str = "",
     ) -> str:
-        """The row key ``get``/``set`` use for this call. Requires ``initialize()``."""
-        if self._key is None:
-            raise RuntimeError("ProxyCache.key_for() called before initialize()")
+        """The row key ``get``/``set`` use for this call."""
         return _make_key(
             server,
             tool,
             args,
             context_query=context_query,
             config_fingerprint=config_fingerprint,
-            key=self._key,
+            key=self._key if self._key is not None else self._unopened_key,
         )
 
     def close(self) -> None:

@@ -346,6 +346,7 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
 
     # Shared state — populated only when proxy is enabled
     from memtomem_stm.proxy.cache import ProxyCache
+    from memtomem_stm.utils.local_key import LocalKeyError
     from memtomem_stm.proxy.metrics_store import MetricsStore
     from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 
@@ -536,6 +537,12 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                         max_entries=config.proxy.cache.max_entries,
                     )
                     proxy_cache.initialize()
+                except LocalKeyError as exc:
+                    # Stated in the message rather than left to the traceback:
+                    # the default log formatter withholds exception text, and
+                    # the operator needs the file name to act on it.
+                    logger.warning("Response cache disabled: %s", exc)
+                    proxy_cache = None
                 except Exception:
                     # A corrupt/locked cache DB must not take down every
                     # proxied call — the cache is an optional optimization.

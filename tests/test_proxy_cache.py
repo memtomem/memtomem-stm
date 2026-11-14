@@ -2770,3 +2770,15 @@ class TestKeyedPurgeMechanics:
             racer.join(timeout=10.0)
             racer_cache.close()
         assert errors == []
+
+
+def test_key_for_on_an_unopened_cache_is_stable_and_does_not_raise(tmp_path: Path) -> None:
+    """The manager derives its stampede-lock key from ``key_for`` after a miss;
+    an unopened cache misses, so ``key_for`` must not raise there either."""
+    cache = ProxyCache(tmp_path / "never_opened.db", max_entries=10)
+    assert cache.get("s", "t", {"a": 1}) is None
+    first = cache.key_for("s", "t", {"a": 1})
+    assert first == cache.key_for("s", "t", {"a": 1})
+    assert first != cache.key_for("s", "t", {"a": 2})
+    assert not (tmp_path / "never_opened.db").exists()
+    assert not key_path_for(tmp_path / "never_opened.db").exists()
