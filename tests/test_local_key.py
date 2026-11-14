@@ -60,6 +60,17 @@ class TestLoadOrCreate:
         assert load_key(path) == key
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
+    @pytest.mark.skipif(not POSIX, reason="POSIX permission bits")
+    def test_a_read_that_asks_for_no_chmod_leaves_the_mode(self, tmp_path: Path) -> None:
+        path = tmp_path / "s.db.key"
+        key = load_or_create_key(path)
+        path.chmod(0o644)
+        before = path.stat()
+        assert load_key(path, tighten_mode=False) == key
+        after = path.stat()
+        assert stat.S_IMODE(after.st_mode) == 0o644
+        assert after.st_ctime_ns == before.st_ctime_ns
+
     def test_concurrent_creators_in_threads_agree(self, tmp_path: Path) -> None:
         path = tmp_path / "s.db.key"
         barrier = threading.Barrier(8)

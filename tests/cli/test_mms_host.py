@@ -13,15 +13,19 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import stat
+import sys
+import tomllib
 from pathlib import Path
 
 import pytest
+import tomli_w
 from click.testing import CliRunner
 
 from memtomem_stm.cli.mms_host import host_group
 from memtomem_stm.cli.mms_import import import_command
-from memtomem_stm.mms import state
-from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
+from memtomem_stm.mms import drift, state
+from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash, legacy_v1_hash
 from helpers import claude_key, set_home
 
 
@@ -59,6 +63,13 @@ def _seed_dot_mcp_json(sandbox, mcps: dict) -> None:
 def _apply_claude_code(runner) -> None:
     res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
     assert res.exit_code == 0, res.output
+
+
+def _keyed_hash(server: state.RegistryServer) -> str:
+    """The drift hash under the sandbox's key (``HOME`` is pinned to it)."""
+    key = drift.load_drift_key()
+    assert key is not None, "no drift key yet: nothing has written the sidecar"
+    return compute_drift_hash(server, key)
 
 
 def _status(runner, *args: str):
@@ -231,7 +242,7 @@ class TestStates:
         assert "1 unchanged" in res.output
         assert "0 changed at host" in res.output
         assert "1 entry missing baseline hash" in res.output
-        assert "run `mms import --apply` to stamp" in res.output
+        assert "run `mms host sync --apply` to stamp" in res.output
 
         json_res = _status(runner, "--json")
         payload = json.loads(json_res.output)
@@ -521,9 +532,8 @@ class TestJsonShape:
 
 class TestPlumbing:
     def test_baseline_hash_matches_canonical(self, runner, sandbox):
-        """The JSON ``baseline_hash`` is exactly what the canonical
-        compute_drift_hash() returns for the registry entry — so
-        downstream tooling can recompute and match without surprises.
+        """The JSON ``baseline_hash`` is exactly the drift hash of the
+        registry entry under this installation's key.
         """
         _seed_claude_code(sandbox, {"x": {"command": "npx", "args": ["a", "b"]}})
         _apply_claude_code(runner)
@@ -531,17 +541,16 @@ class TestPlumbing:
         json_res = _status(runner, "--json")
         payload = json.loads(json_res.output)
         registry = state.load_registry()
-        assert payload["entries"][0]["baseline_hash"] == compute_drift_hash(registry.servers["x"])
-        assert payload["entries"][0]["current_hash"] == compute_drift_hash(registry.servers["x"])
+        assert payload["entries"][0]["baseline_hash"] == _keyed_hash(registry.servers["x"])
+        assert payload["entries"][0]["current_hash"] == _keyed_hash(registry.servers["x"])
 
     def test_current_hash_is_host_view_across_buckets(self, runner, sandbox):
         """``current_hash`` means "the host's canonical hash, or null
         if no host has the entry" in every bucket — including
-        ``no_baseline``. Without this, a script that recomputes
-        compute_drift_hash() against the live host config would match
-        for unchanged/changed but diverge for no_baseline whenever
-        registry and host differ (which is the most likely state when
-        the sidecar is stale).
+        ``no_baseline``. Without this, the field would describe the
+        host for unchanged/changed but the registry for no_baseline
+        whenever registry and host differ (which is the most likely state
+        when the sidecar is stale).
         """
         # Apply with the canonical shape, then mutate the host to a
         # different shape *and* drop the sidecar baseline. The registry
@@ -561,7 +570,7 @@ class TestPlumbing:
         # current_hash must reflect the *host's* current canonical form
         # (the edited shape), not the registry entry. Recomputing
         # against the host wire gives the same value back.
-        host_view = compute_drift_hash(
+        host_view = _keyed_hash(
             state.RegistryServer(
                 command="npx",
                 args=["edited"],
@@ -569,7 +578,7 @@ class TestPlumbing:
                 prefix="x",
             )
         )
-        registry_view = compute_drift_hash(state.load_registry().servers["x"])
+        registry_view = _keyed_hash(state.load_registry().servers["x"])
         assert row["current_hash"] == host_view
         assert row["current_hash"] != registry_view  # the asymmetry the reviewer flagged
 
@@ -923,6 +932,7 @@ class TestSyncPlan:
             "skipped_changed": 0,
             "orphan_no_baseline": 0,
             "restamped": 0,
+            "rekeyed": 0,
             "unchanged": 1,
             "conflicts": 0,
             "not_inspected": 0,
@@ -1042,7 +1052,7 @@ class TestSyncApply:
 
         sidecar = state.load_import_state()
         assert "alpha" in sidecar.entries
-        assert sidecar.entries["alpha"].drift_hash == compute_drift_hash(registry.servers["alpha"])
+        assert sidecar.entries["alpha"].drift_hash == _keyed_hash(registry.servers["alpha"])
 
     def test_apply_remove_drops_registry_and_sidecar(self, runner, sandbox):
         """removed_at_host → REMOVE registry + sidecar entry (orphan cleanup
@@ -1187,7 +1197,7 @@ class TestSyncApply:
         s = state.load_import_state()
         s.entries["ghost"] = state.ImportStateEntry(
             drift_hash="sha256:" + "f" * 16,
-            drift_hash_version=HASH_VERSION,
+            drift_hash_version=1,
             last_imported="2026-01-01T00:00:00Z",
             source_label="Claude Code (user)",
         )
@@ -1208,7 +1218,7 @@ class TestSyncApply:
         s = state.load_import_state()
         s.entries["ghost"] = state.ImportStateEntry(
             drift_hash="sha256:" + "f" * 16,
-            drift_hash_version=HASH_VERSION,
+            drift_hash_version=1,
             last_imported="2026-01-01T00:00:00Z",
             source_label="Claude Code (user)",
         )
@@ -1403,6 +1413,7 @@ class TestSyncJsonShape:
         "skipped_changed",
         "orphan_no_baseline",
         "restamped",
+        "rekeyed",
         "unchanged",
         "conflicts",
         "not_inspected",
@@ -1636,9 +1647,7 @@ class TestSyncForceApply:
         new_baseline = state.load_import_state().entries["x"].drift_hash
         assert new_baseline != original_baseline
         # And matches current canonical hash.
-        from memtomem_stm.mms.drift import compute_drift_hash
-
-        assert new_baseline == compute_drift_hash(state.load_registry().servers["x"])
+        assert new_baseline == _keyed_hash(state.load_registry().servers["x"])
 
     def test_apply_no_force_does_not_mutate_changed(self, runner, sandbox):
         """Lock-down 3 sibling: without ``--force``, ``changed`` stays
@@ -2066,7 +2075,70 @@ def _assert_restamped(name: str, args: list[str], old_baseline: str) -> None:
     assert list(server.args) == args
     baseline = state.load_import_state().entries[name].drift_hash
     assert baseline != old_baseline
-    assert baseline == compute_drift_hash(server)
+    assert baseline == _keyed_hash(server)
+
+
+def _no_baseline_footer_command(output: str) -> list[str]:
+    """The command the "missing baseline hash" footer tells the user to run."""
+    lines = [ln for ln in output.splitlines() if "missing baseline hash" in ln]
+    assert len(lines) == 1, output
+    commands = re.findall(r"`([^`]+)`", lines[0])
+    assert len(commands) == 1, lines[0]
+    return _hint_argv(commands[0])
+
+
+class TestNoBaselineGuidanceIsFollowable:
+    """The command ``status`` names for a ``no_baseline`` entry must stamp it.
+
+    ``mms import --apply`` stamps only an entry with no sidecar row at all,
+    so for a row that exists but cannot be compared it reported "Already up
+    to date" and the entry stayed ``no_baseline``.
+    """
+
+    def _row_missing(self) -> None:
+        s = state.load_import_state()
+        s.entries.pop("a")
+        state.save_import_state(s)
+
+    def _row_of_unknown_version(self) -> None:
+        s = state.load_import_state()
+        old = s.entries["a"]
+        s.entries["a"] = state.ImportStateEntry(
+            drift_hash=old.drift_hash,
+            drift_hash_version=HASH_VERSION + 1,
+            last_imported=old.last_imported,
+            source_label=old.source_label,
+        )
+        state.save_import_state(s)
+
+    def _key_lost(self) -> None:
+        drift.drift_key_path().unlink()
+
+    @pytest.mark.parametrize("breakage", ["_row_missing", "_row_of_unknown_version", "_key_lost"])
+    def test_following_the_footer_stamps_the_entry(self, runner, sandbox, breakage):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        getattr(self, breakage)()
+        assert _states(runner) == {"a": "no_baseline"}
+
+        argv = _no_baseline_footer_command(_status(runner).output)
+        res = _sync(runner, *argv)
+
+        assert res.exit_code == 0, res.output
+        assert _states(runner) == {"a": "unchanged"}
+        assert "missing baseline hash" not in _status(runner).output
+
+    @pytest.mark.parametrize("breakage", ["_row_of_unknown_version", "_key_lost"])
+    def test_import_apply_does_not_stamp_a_row_it_cannot_compare(self, runner, sandbox, breakage):
+        """Why the footer cannot name ``mms import --apply`` (control)."""
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        getattr(self, breakage)()
+
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert "Already up to date" in res.output
+        assert _states(runner) == {"a": "no_baseline"}
 
 
 class TestSyncGuidanceIsFollowable:
@@ -2313,6 +2385,7 @@ def _empty_summary() -> dict:
         "backfilled": 0,
         "cleanup": 0,
         "restamped": 0,
+        "rekeyed": 0,
         "unchanged": 0,
         "skipped_changed": 0,
     }
@@ -2388,15 +2461,15 @@ class TestRemainingRawRendersEscape:
 
     @pytest.mark.parametrize(
         "summary_key",
-        ["added", "removed", "backfilled", "cleanup", "restamped"],
+        ["added", "removed", "backfilled", "cleanup", "restamped", "rekeyed"],
     )
     def test_post_apply_summary_escapes_the_written_paths(
         self, capsys, monkeypatch, summary_key: str
     ):
-        """Every one of the five mutated-outcome lines, not just the first.
+        """Every one of the six mutated-outcome lines, not just the first.
 
         Parametrized per line because they interpolate different path helpers
-        in different combinations, and a sweep that fixed four of five would
+        in different combinations, and a sweep that fixed five of six would
         otherwise pass.
         """
         from memtomem_stm.cli import mms_host
@@ -2664,7 +2737,7 @@ class TestNotInspected:
         expected_current = (
             None
             if cursor_shape is None
-            else compute_drift_hash(
+            else _keyed_hash(
                 state.RegistryServer(
                     command="npx", args=shapes[cursor_shape]["args"], env={}, prefix="a"
                 )
@@ -2762,3 +2835,579 @@ class TestClaudeConfigLocation:
         res = _scan(runner, "--json")
         assert res.exit_code == 0, res.output
         assert [r["name"] for r in json.loads(res.output)["entries"]] == ["root-slot"]
+
+
+# ---------------------------------------------------------------------------
+# Keyed drift hash: nothing unkeyed is printed, and an upgrade keeps each
+# entry's state
+# ---------------------------------------------------------------------------
+
+POSIX = sys.platform != "win32"
+
+# ``hmac-sha256:`` is the keyed form; a bare ``sha256:`` is the digest anyone
+# can recompute from a guessed env value.
+_UNKEYED = re.compile(r"(?<!hmac-)sha256:")
+
+_SAME = {"command": "npx", "env": {"API_TOKEN": "tok-same"}}
+_EDITED_OLD = {"command": "npx", "args": ["v1"], "env": {"API_TOKEN": "tok-old"}}
+_EDITED_NEW = {"command": "npx", "args": ["v2"], "env": {"API_TOKEN": "tok-new"}}
+_GONE = {"command": "npx", "env": {"API_TOKEN": "tok-gone"}}
+_GHOST = state.RegistryServer(command="npx", env={"API_TOKEN": "tok-ghost"}, prefix="ghost")
+
+
+def _server(name: str, raw: dict) -> state.RegistryServer:
+    return state.RegistryServer(
+        command=raw["command"], args=raw.get("args", []), env=raw.get("env", {}), prefix=name
+    )
+
+
+def _write_v1_sidecar(extra: dict[str, state.RegistryServer] | None = None) -> None:
+    """Rewrite the sidecar as the last unkeyed release left it.
+
+    A ``schema_version = 1`` file whose every row is the version 1 hash of
+    the shape the registry holds — what that release stamped at import.
+    Written as raw TOML: ``save_import_state`` only writes the current schema.
+    """
+    registry = state.load_registry()
+    current = state.load_import_state()
+    entries = {
+        name: {
+            "drift_hash": legacy_v1_hash(registry.servers[name]),
+            "drift_hash_version": 1,
+            "last_imported": entry.last_imported,
+            "source_label": entry.source_label,
+        }
+        for name, entry in current.entries.items()
+    }
+    for name, server in (extra or {}).items():
+        entries[name] = {
+            "drift_hash": legacy_v1_hash(server),
+            "drift_hash_version": 1,
+            "last_imported": "2026-01-01T00:00:00Z",
+            "source_label": "Claude Code (user)",
+        }
+    state.import_state_path().write_text(
+        tomli_w.dumps({"schema_version": 1, "entries": entries}), encoding="utf-8"
+    )
+
+
+def _upgraded(runner, sandbox, *, drop_key: bool) -> list[state.RegistryServer]:
+    """An install the unkeyed release left behind, with one entry per state.
+
+    ``same`` is unchanged at the host, ``edited`` was edited there, ``gone``
+    was removed, and ``ghost`` is a sidecar row without a registry entry.
+    Returns every server shape whose unkeyed digest must stay out of output.
+    """
+    _seed_claude_code(sandbox, {"same": _SAME, "edited": _EDITED_OLD, "gone": _GONE})
+    _apply_claude_code(runner)
+    _write_v1_sidecar({"ghost": _GHOST})
+    if drop_key:
+        drift.drift_key_path().unlink()
+    _seed_claude_code(sandbox, {"same": _SAME, "edited": _EDITED_NEW})
+    return [
+        _server("same", _SAME),
+        _server("edited", _EDITED_OLD),
+        _server("edited", _EDITED_NEW),
+        _server("gone", _GONE),
+        _GHOST,
+    ]
+
+
+def _assert_no_unkeyed_digest(output: str, servers: list[state.RegistryServer]) -> None:
+    assert not _UNKEYED.search(output), output
+    for server in servers:
+        assert legacy_v1_hash(server).split(":", 1)[1] not in output, output
+
+
+def _mms_files() -> dict[str, tuple[bytes, int]]:
+    """Name → (bytes, mode) of every file under ``~/.mms``."""
+    return {
+        p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode))
+        for p in sorted(state.mms_home().iterdir())
+        if p.is_file()
+    }
+
+
+def _states(runner) -> dict[str, str]:
+    res = _status(runner, "--json")
+    assert res.exit_code == 0, res.output
+    return {row["name"]: row["state"] for row in json.loads(res.stdout)["entries"]}
+
+
+class TestNoUnkeyedDigestInOutput:
+    """The drift hash covers env values, so a printed hash that anyone can
+    recompute confirms a guessed credential to whoever reads the report."""
+
+    @pytest.mark.parametrize("drop_key", [True, False], ids=["no-key", "key"])
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["status", "--json"],
+            ["status"],
+            ["sync", "--plan", "--json"],
+            ["sync", "--plan", "--force", "--json"],
+            ["sync", "--plan"],
+            ["sync", "--apply", "--yes", "--json"],
+            ["sync", "--apply", "--force", "--yes", "--json"],
+            ["sync", "--apply", "--yes"],
+        ],
+        ids=lambda argv: " ".join(argv),
+    )
+    def test_every_command_over_an_upgraded_install(self, runner, sandbox, argv, drop_key):
+        servers = _upgraded(runner, sandbox, drop_key=drop_key)
+        # Control: the digests the check looks for are really there to leak —
+        # the version 1 sidecar holds them.
+        sidecar_text = state.import_state_path().read_text(encoding="utf-8")
+        assert legacy_v1_hash(servers[0]).split(":", 1)[1] in sidecar_text
+
+        res = runner.invoke(host_group, argv)
+
+        assert res.exit_code == 0, res.output
+        _assert_no_unkeyed_digest(res.output, servers)
+
+    def test_the_scenario_reaches_every_bucket_that_prints_a_hash(self, runner, sandbox):
+        """Control for the test above: each hash-carrying list is non-empty."""
+        _upgraded(runner, sandbox, drop_key=False)
+
+        status = json.loads(_status(runner, "--json").stdout)
+        plan = json.loads(_sync(runner, "--plan", "--json").stdout)["plan"]
+
+        assert {r["name"]: r["state"] for r in status["entries"]} == {
+            "same": "unchanged",
+            "edited": "changed",
+            "gone": "removed_at_host",
+        }
+        assert [r["name"] for r in plan["remove"]] == ["gone"]
+        assert [r["name"] for r in plan["cleanup"]] == ["ghost"]
+        assert [r["name"] for r in plan["skipped_changed"]] == ["edited"]
+        hashes = [r["baseline_hash"] for r in status["entries"]]
+        hashes += [
+            r["baseline_hash"] for k in ("remove", "cleanup", "skipped_changed") for r in plan[k]
+        ]
+        hashes += [r["current_hash"] for r in plan["skipped_changed"]]
+        assert all(re.fullmatch(r"hmac-sha256:[0-9a-f]{16}", h) for h in hashes), hashes
+
+    def test_a_fresh_install_prints_keyed_hashes_only(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+
+        res = _status(runner, "--json")
+
+        [row] = json.loads(res.stdout)["entries"]
+        assert row["baseline_hash"] == row["current_hash"] == _keyed_hash(_server("same", _SAME))
+        _assert_no_unkeyed_digest(res.output, [_server("same", _SAME)])
+        sidecar_text = state.import_state_path().read_text(encoding="utf-8")
+        _assert_no_unkeyed_digest(sidecar_text, [_server("same", _SAME)])
+
+    def test_another_installation_prints_another_hash_for_the_same_entry(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        [first] = json.loads(_status(runner, "--json").stdout)["entries"]
+
+        # A second installation: same host config, its own key.
+        drift.drift_key_path().unlink()
+        state.import_state_path().unlink()
+        _apply_claude_code(runner)
+        [second] = json.loads(_status(runner, "--json").stdout)["entries"]
+
+        assert second["state"] == first["state"] == "unchanged"
+        assert second["current_hash"] != first["current_hash"]
+        assert second["baseline_hash"] != first["baseline_hash"]
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["status", "--json"],
+            ["sync", "--plan", "--json"],
+            ["sync", "--apply", "--yes", "--json"],
+        ],
+        ids=lambda argv: " ".join(argv),
+    )
+    def test_an_unkeyed_hash_under_another_version_is_refused_not_carried_along(
+        self, runner, sandbox, argv
+    ):
+        """Only a version 1 row may hold ``sha256:``. Under any other version
+        this mms could neither re-key the value nor print it, and every write
+        would copy it into the new sidecar — so the row does not load."""
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        server = _server("same", _SAME)
+        raw = tomllib.loads(state.import_state_path().read_text(encoding="utf-8"))
+        raw["entries"]["same"] = {
+            "drift_hash": legacy_v1_hash(server),
+            "drift_hash_version": 3,
+            "last_imported": "2026-01-01T00:00:00Z",
+            "source_label": "Claude Code (user)",
+        }
+        state.import_state_path().write_text(tomli_w.dumps(raw), encoding="utf-8")
+        # Something for ``--apply`` to write.
+        _seed_claude_code(sandbox, {"same": _SAME, "late": {"command": "uvx"}})
+        before = _mms_files()
+
+        res = runner.invoke(host_group, argv)
+
+        assert res.exit_code == 1, res.output
+        doc = json.loads(res.stdout)
+        assert (doc["ok"], doc["error"]) == (False, "mms_state_invalid")
+        assert "import_state.toml" in doc["message"]
+        _assert_no_unkeyed_digest(res.output, [server])
+        assert _mms_files() == before
+
+
+class TestUpgradeKeepsDriftState:
+    """A version 1 baseline is still compared, so the first run after an
+    upgrade reports what the last run before it did."""
+
+    @pytest.mark.parametrize("drop_key", [True, False], ids=["no-key", "key"])
+    def test_each_entry_keeps_its_state(self, runner, sandbox, drop_key):
+        _upgraded(runner, sandbox, drop_key=drop_key)
+
+        res = _status(runner, "--json")
+
+        assert res.exit_code == 0, res.output
+        rows = {r["name"]: r for r in json.loads(res.stdout)["entries"]}
+        assert {n: r["state"] for n, r in rows.items()} == {
+            "same": "unchanged",
+            "edited": "changed",
+            "gone": "removed_at_host",
+        }
+        if drop_key:
+            # No key to print a hash under; the states above did not need one.
+            assert all(
+                r["baseline_hash"] is None and r["current_hash"] is None for r in rows.values()
+            )
+        else:
+            key = drift.load_drift_key()
+            assert rows["same"]["baseline_hash"] == rows["same"]["current_hash"]
+            assert rows["same"]["current_hash"] == _keyed_hash(_server("same", _SAME))
+            assert rows["edited"]["baseline_hash"] == drift.keyed_from_legacy(
+                legacy_v1_hash(_server("edited", _EDITED_OLD)), key
+            )
+            assert rows["edited"]["current_hash"] == _keyed_hash(_server("edited", _EDITED_NEW))
+            assert rows["gone"]["current_hash"] is None
+
+    @pytest.mark.parametrize("drop_key", [True, False], ids=["no-key", "key"])
+    def test_a_skipped_source_still_wins(self, runner, sandbox, monkeypatch, drop_key):
+        _upgraded(runner, sandbox, drop_key=drop_key)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/claude")
+
+        assert _states(runner) == {
+            "same": "not_inspected",
+            "edited": "not_inspected",
+            "gone": "not_inspected",
+        }
+
+    def test_text_status_counts_are_those_of_the_states(self, runner, sandbox):
+        _upgraded(runner, sandbox, drop_key=True)
+
+        res = _status(runner)
+
+        assert "1 unchanged, 1 changed at host" in res.output
+        assert "missing baseline" not in res.output
+
+
+class TestRekey:
+    """The first write after an upgrade re-keys every kept version 1 row."""
+
+    @pytest.mark.parametrize("drop_key", [True, False], ids=["no-key", "key"])
+    def test_sync_apply_rekeys_kept_rows_without_changing_what_they_say(
+        self, runner, sandbox, drop_key
+    ):
+        _upgraded(runner, sandbox, drop_key=drop_key)
+        before = state.load_import_state().entries
+        states_before = _states(runner)
+
+        res = _sync(runner, "--apply", "--yes", "--json")
+
+        assert res.exit_code == 0, res.output
+        summary = json.loads(res.stdout)["summary"]
+        assert (summary["rekeyed"], summary["removed"], summary["cleanup"]) == (2, 1, 1)
+        assert summary["restamped"] == summary["backfilled"] == 0
+        key = drift.load_drift_key()
+        assert key is not None
+        after = state.load_import_state().entries
+        assert set(after) == {"same", "edited"}
+        for name in ("same", "edited"):
+            assert after[name] == drift.promote(before[name], key)
+            assert after[name].drift_hash_version == HASH_VERSION
+            assert after[name].drift_key_id == drift.drift_key_id(key)
+            assert after[name].last_imported == before[name].last_imported
+            assert after[name].source_label == before[name].source_label
+        # The file itself holds no unkeyed digest any more.
+        sidecar_text = state.import_state_path().read_text(encoding="utf-8")
+        assert not _UNKEYED.search(sidecar_text), sidecar_text
+        assert tomllib.loads(sidecar_text)["schema_version"] == state.IMPORT_STATE_SCHEMA_VERSION
+        # ``edited`` was not re-stamped to the host's shape: it is still changed.
+        assert _states(runner) == {"same": states_before["same"], "edited": "changed"}
+
+    def test_sync_apply_force_restamps_the_changed_row_and_rekeys_the_rest(self, runner, sandbox):
+        _upgraded(runner, sandbox, drop_key=True)
+
+        res = _sync(runner, "--apply", "--force", "--yes", "--json")
+
+        assert res.exit_code == 0, res.output
+        summary = json.loads(res.stdout)["summary"]
+        assert (summary["rekeyed"], summary["restamped"]) == (1, 1)
+        assert _states(runner) == {"same": "unchanged", "edited": "unchanged"}
+        assert state.load_import_state().entries["edited"].drift_hash == _keyed_hash(
+            _server("edited", _EDITED_NEW)
+        )
+
+    def test_a_rekey_is_a_write_even_when_nothing_else_is_pending(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        _write_v1_sidecar()
+        drift.drift_key_path().unlink()
+
+        plan = _sync(runner, "--plan")
+        assert "REKEY     1 sidecar baseline" in plan.output
+        assert not drift.drift_key_path().exists()
+
+        res = _sync(runner, "--apply")
+
+        assert res.exit_code == 0, res.output
+        assert "Already synchronized" not in res.output
+        assert "Re-keyed 1 sidecar baseline in" in res.output
+        assert state.load_import_state().entries["same"].drift_hash == _keyed_hash(
+            _server("same", _SAME)
+        )
+        # And then there is nothing left to do.
+        files = _mms_files()
+        again = _sync(runner, "--apply", "--json")
+        assert json.loads(again.stdout)["summary"]["rekeyed"] == 0
+        assert "Already synchronized" in _sync(runner, "--apply").output
+        assert _mms_files() == files
+
+    def test_the_plan_counts_what_the_apply_rekeys(self, runner, sandbox):
+        _upgraded(runner, sandbox, drop_key=True)
+
+        plan = json.loads(_sync(runner, "--plan", "--json").stdout)["summary"]
+        forced = json.loads(_sync(runner, "--plan", "--force", "--json").stdout)["summary"]
+
+        assert (plan["rekeyed"], plan["restamped"]) == (2, 0)
+        assert (forced["rekeyed"], forced["restamped"]) == (1, 1)
+
+    def test_a_row_whose_source_is_skipped_is_rekeyed_and_stays_not_inspected(
+        self, runner, sandbox, monkeypatch
+    ):
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        _write_v1_sidecar()
+        before = state.load_import_state().entries["same"]
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/claude")
+
+        res = _sync(runner, "--apply", "--yes", "--json")
+
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.stdout)
+        assert [r["name"] for r in payload["plan"]["not_inspected"]] == ["same"]
+        assert payload["summary"]["rekeyed"] == 1
+        assert state.load_import_state().entries["same"] == drift.promote(
+            before, drift.load_drift_key()
+        )
+        assert _states(runner) == {"same": "not_inspected"}
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        assert _states(runner) == {"same": "unchanged"}
+
+
+class TestDriftKeyFile:
+    """Created by the first write that passed its gates, read by everything
+    else, and never guessed at when it is missing or unusable."""
+
+    def _replace_key(self) -> None:
+        path = drift.drift_key_path()
+        path.unlink()
+        path.write_text("ab" * 32 + "\n", encoding="ascii")
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX permission bits")
+    def test_the_first_apply_creates_a_private_key(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"same": _SAME})
+        assert not drift.drift_key_path().exists()
+
+        assert _sync(runner, "--apply").exit_code == 0
+
+        path = drift.drift_key_path()
+        assert path == state.mms_home().resolve() / "import_state.toml.key"
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_an_apply_with_nothing_to_write_creates_no_key(self, runner, sandbox):
+        res = _sync(runner, "--apply")
+
+        assert res.exit_code == 0, res.output
+        assert not drift.drift_key_path().exists()
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["status"],
+            ["status", "--json"],
+            ["sync", "--plan"],
+            ["sync", "--plan", "--force", "--json"],
+        ],
+        ids=lambda argv: " ".join(argv),
+    )
+    def test_read_only_commands_create_no_key_and_change_no_file(self, runner, sandbox, argv):
+        _upgraded(runner, sandbox, drop_key=True)
+        # ``sync`` takes the write lock; let its lock file exist beforehand.
+        assert _sync(runner, "--plan").exit_code == 0
+        before = _mms_files()
+
+        res = runner.invoke(host_group, argv)
+
+        assert res.exit_code == 0, res.output
+        assert not drift.drift_key_path().exists()
+        assert _mms_files() == before
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX permission bits")
+    @pytest.mark.parametrize(
+        "argv",
+        [["status", "--json"], ["sync", "--plan", "--json"]],
+        ids=lambda argv: " ".join(argv),
+    )
+    def test_read_only_commands_leave_a_permissive_key_as_it_is(self, runner, sandbox, argv):
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        path = drift.drift_key_path()
+        path.chmod(0o644)
+        before = path.stat()
+
+        res = runner.invoke(host_group, argv)
+
+        assert res.exit_code == 0, res.output
+        after = path.stat()
+        assert stat.S_IMODE(after.st_mode) == 0o644
+        assert after.st_ctime_ns == before.st_ctime_ns
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["sync", "--apply", "--json"], ["sync", "--apply"]],
+        ids=lambda argv: " ".join(argv),
+    )
+    def test_an_apply_stopped_at_the_confirmation_creates_no_key(self, runner, sandbox, argv):
+        _upgraded(runner, sandbox, drop_key=True)
+        assert _sync(runner, "--plan").exit_code == 0
+        before = _mms_files()
+
+        res = runner.invoke(host_group, argv)  # ``gone`` needs --yes
+
+        assert res.exit_code == 2, res.output
+        assert not drift.drift_key_path().exists()
+        assert _mms_files() == before
+
+    def test_an_apply_stopped_at_the_project_config_gate_creates_no_key(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"local": {"command": "npx"}})
+
+        res = _sync(runner, "--apply", "--yes")
+
+        assert res.exit_code == 2, res.output
+        assert not drift.drift_key_path().exists()
+
+    @pytest.mark.parametrize("gone", [True, False], ids=["key-lost", "key-replaced"])
+    def test_rows_stamped_under_another_key_have_no_baseline(self, runner, sandbox, gone):
+        """Not ``changed``: under another key every keyed hash differs, which
+        says nothing about the host config."""
+        _seed_claude_code(sandbox, {"same": _SAME, "edited": _EDITED_OLD})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {"same": _SAME, "edited": _EDITED_NEW})
+        assert _states(runner) == {"same": "unchanged", "edited": "changed"}
+        if gone:
+            drift.drift_key_path().unlink()
+        else:
+            self._replace_key()
+
+        assert _states(runner) == {"same": "no_baseline", "edited": "no_baseline"}
+        assert drift.drift_key_path().exists() is not gone
+
+    def test_a_skipped_source_wins_over_a_replaced_key(self, runner, sandbox, monkeypatch):
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        self._replace_key()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/claude")
+
+        assert _states(runner) == {"same": "not_inspected"}
+
+    def test_an_import_under_a_new_key_does_not_turn_older_rows_into_changed(self, runner, sandbox):
+        """Losing the key and importing one more entry creates a new key. The
+        rows the old key stamped must not be compared under the new one."""
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        old_row = state.load_import_state().entries["same"]
+        drift.drift_key_path().unlink()
+        _seed_claude_code(sandbox, {"same": _SAME, "late": {"command": "uvx"}})
+
+        _apply_claude_code(runner)
+
+        assert state.load_import_state().entries["same"] == old_row
+        assert _states(runner) == {"same": "no_baseline", "late": "unchanged"}
+
+        # ``sync --apply`` backfills the stranded row under the current key.
+        res = _sync(runner, "--apply", "--json")
+        assert json.loads(res.stdout)["summary"]["backfilled"] == 1
+        assert _states(runner) == {"same": "unchanged", "late": "unchanged"}
+        assert state.load_import_state().entries["same"].drift_hash == _keyed_hash(
+            _server("same", _SAME)
+        )
+
+    @pytest.mark.parametrize(
+        ("argv", "action"),
+        [
+            (["status", "--json"], "status"),
+            (["sync", "--plan", "--json"], "sync"),
+            (["sync", "--apply", "--yes", "--json"], "sync"),
+        ],
+        ids=["status", "sync --plan", "sync --apply"],
+    )
+    def test_an_unusable_key_file_is_an_error_and_is_left_alone(
+        self, runner, sandbox, argv, action
+    ):
+        """Not treated as absent: that would let ``--apply`` replace a key
+        another row was stamped under, and would report keyed rows as changed."""
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        drift.drift_key_path().write_text("not a key\n", encoding="ascii")
+        # Something for ``--apply`` to write, so it reaches for the key.
+        _seed_claude_code(sandbox, {"same": _SAME, "late": {"command": "uvx"}})
+        before = _mms_files()
+
+        res = runner.invoke(host_group, argv)
+
+        assert res.exit_code == 1, res.output
+        doc = json.loads(res.stdout)
+        assert (doc["action"], doc["ok"], doc["error"]) == (action, False, "mms_state_invalid")
+        assert "import_state.toml.key" in doc["message"]
+        assert "not a key" not in res.output
+        assert _mms_files() == before
+
+    def test_a_key_that_cannot_be_created_stops_the_apply_before_any_write(
+        self, runner, sandbox, monkeypatch
+    ):
+        """The key is published with a hard link; a filesystem without them
+        must not leave a registry written and a sidecar that is not."""
+        import errno
+
+        from memtomem_stm.utils import local_key
+
+        def _no_hard_links(src, dst):
+            raise OSError(errno.EPERM, "Operation not permitted")
+
+        _seed_claude_code(sandbox, {"same": _SAME})
+        monkeypatch.setattr(local_key.os, "link", _no_hard_links)
+
+        res = _sync(runner, "--apply")
+
+        assert res.exit_code == 1, res.output
+        assert "import_state.toml.key" in res.output
+        assert not state.registry_path().exists()
+        assert not state.import_state_path().exists()
+        assert not drift.drift_key_path().exists()
+
+    def test_an_unusable_key_file_text_error(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"same": _SAME})
+        _apply_claude_code(runner)
+        drift.drift_key_path().write_text("not a key\n", encoding="ascii")
+
+        res = _status(runner)
+
+        assert res.exit_code == 1, res.output
+        assert "Error:" in res.output and "import_state.toml.key" in res.output
+        assert "Traceback" not in res.output

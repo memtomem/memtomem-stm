@@ -31,7 +31,10 @@ Backfill timestamps reflect the recovery moment, not the original
 import — the sidecar's ``last_imported`` is "first observation by a
 wired apply", which is the only moment the hash can be authoritatively
 computed. Backfill row hashes are byte-equal to what a fresh
-``--apply`` would compute against the same canonical_form.
+``--apply`` would compute against the same canonical_form under the same
+drift-hash key (``~/.mms/import_state.toml.key``, created by the first
+``--apply`` that writes; see ``mms/drift.py``). The same write re-keys any
+existing row that still carries an unkeyed version 1 hash.
 
 Backfill row attribution (``source_label``) reflects the apply that
 observed the entry, not the original import — the host scanner only
@@ -62,8 +65,7 @@ import click
 from memtomem_stm.cli._display import _disp
 from memtomem_stm.cli._mms_errors import surface_mms_state_errors
 from memtomem_stm.cli._write_lock import with_write_lock
-from memtomem_stm.mms import state
-from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
+from memtomem_stm.mms import drift, state
 from memtomem_stm.mms.import_hosts import (
     ALL_HOSTS,
     ImportCandidate,
@@ -370,31 +372,39 @@ def import_command(
     # with timestamp T were observed in the same --apply".
     now = state.utc_now_iso()
 
-    backfill_entries: dict[str, state.ImportStateEntry] = {}
-    for cand in idempotent:
-        if cand.name not in existing_state.entries:
-            backfill_entries[cand.name] = state.ImportStateEntry(
-                drift_hash=compute_drift_hash(cand.server),
-                drift_hash_version=HASH_VERSION,
-                last_imported=now,
-                source_label=cand.source_label,
-            )
+    backfill_cands = [cand for cand in idempotent if cand.name not in existing_state.entries]
+    # Existing rows with an unkeyed (version 1) hash: this write re-keys them
+    # (same baseline, keyed digest; see ``drift.promote``).
+    # A row this run stamps afresh (an orphan row whose name is imported again)
+    # is replaced, not re-keyed.
+    new_names = {cand.name for cand in new}
+    rekey_names = [
+        name
+        for name, entry in existing_state.entries.items()
+        if drift.is_legacy(entry) and name not in new_names
+    ]
 
-    if not new and not backfill_entries:
+    if not new and not backfill_cands and not rekey_names:
         click.echo("")
         click.echo("Already up to date. Registry unchanged.")
         return
+
+    # Something will be written, so the drift-hash key may be created now —
+    # before the registry write, so an unusable key file changes nothing.
+    key = drift.load_or_create_drift_key()
+
+    backfill_entries = {
+        cand.name: drift.stamp(cand.server, key, last_imported=now, source_label=cand.source_label)
+        for cand in backfill_cands
+    }
 
     new_entries: dict[str, state.ImportStateEntry] = {}
     if new:
         new_servers = {**registry.servers}
         for cand in new:
             new_servers[cand.name] = cand.server
-            new_entries[cand.name] = state.ImportStateEntry(
-                drift_hash=compute_drift_hash(cand.server),
-                drift_hash_version=HASH_VERSION,
-                last_imported=now,
-                source_label=cand.source_label,
+            new_entries[cand.name] = drift.stamp(
+                cand.server, key, last_imported=now, source_label=cand.source_label
             )
         new_registry = state.RegistryConfig(
             schema_version=registry.schema_version, servers=new_servers
@@ -402,8 +412,11 @@ def import_command(
         state.save_registry(new_registry)
 
     merged_state = state.ImportState(
-        schema_version=existing_state.schema_version,
-        entries={**existing_state.entries, **new_entries, **backfill_entries},
+        entries={
+            **{name: drift.promote(entry, key) for name, entry in existing_state.entries.items()},
+            **new_entries,
+            **backfill_entries,
+        },
     )
     try:
         state.save_import_state(merged_state)
@@ -422,4 +435,10 @@ def import_command(
         click.echo(
             f"Backfilled {len(backfill_entries)} sidecar "
             f"row{'' if len(backfill_entries) == 1 else 's'} to {state.import_state_path()}"
+        )
+    if rekey_names:
+        click.echo(
+            f"Re-keyed {len(rekey_names)} sidecar "
+            f"baseline{'' if len(rekey_names) == 1 else 's'} "
+            f"in {_disp(str(state.import_state_path()))}"
         )
