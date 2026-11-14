@@ -239,12 +239,24 @@ def test_without_waitid_a_zombie_counts_as_exited_and_keeps_its_status(
     child = _sleeping_child()
     try:
         child.send_signal(signal.SIGTERM)
+
+        def _ps_state() -> str:
+            # Reads the kernel's process state without reaping, so whether the
+            # child is a zombie is settled independently of the probe under test.
+            return subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child.pid)],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            ).stdout.strip()
+
         deadline = time.monotonic() + 5.0
-        while not child_reaper._has_exited(child.pid) and time.monotonic() < deadline:
+        while not _ps_state().startswith("Z") and time.monotonic() < deadline:
             time.sleep(0.02)
+        assert _ps_state().startswith("Z")
         assert child_reaper._has_exited(child.pid)
-        # Still an unreaped zombie: the signal-0 probe calls it alive, which is
-        # the answer the fallback must not give.
+        # The signal-0 probe calls that zombie alive, which is the answer the
+        # fallback must not give.
         assert child_reaper.is_pid_alive(child.pid)
         # The probe did not consume the exit status the Popen owner waits for.
         assert child.wait(timeout=5.0) == -signal.SIGTERM
