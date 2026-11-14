@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import stat
 import sys
 from datetime import datetime, timezone
@@ -531,6 +532,57 @@ class TestProjectConfigGate:
         assert "--allow-project-configs" in res.output
         # Plan never mutates.
         assert not state.registry_path().exists()
+
+    @staticmethod
+    def _apply_hint_args(output: str) -> list[str]:
+        """The arguments of the plan's ``To apply: mms import …`` line, as printed."""
+        [line] = [ln for ln in output.splitlines() if ln.startswith("To apply: ")]
+        argv = shlex.split(line.removeprefix("To apply: "))
+        assert argv[:2] == ["mms", "import"], line
+        return argv[2:]
+
+    def test_plan_hint_keeps_the_flag_the_plan_was_given(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"loc": {"command": "echo"}})
+        plan = runner.invoke(import_command, ["--from", "claude-code", "--allow-project-configs"])
+        assert plan.exit_code == 0, plan.output
+        args = self._apply_hint_args(plan.output)
+        assert args == ["--from", "claude-code", "--apply", "--allow-project-configs"]
+        # Following the hint literally registers the entry.
+        res = runner.invoke(import_command, args)
+        assert res.exit_code == 0, res.output
+        assert "loc" in state.load_registry().servers
+
+    def test_plan_hint_does_not_add_the_flag_the_plan_was_not_given(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"loc": {"command": "echo"}})
+        plan = runner.invoke(import_command, ["--from", "claude-code"])
+        assert plan.exit_code == 0, plan.output
+        args = self._apply_hint_args(plan.output)
+        assert args == ["--from", "claude-code", "--apply"]
+        # The gate stops the copied hint and names the flag it needs.
+        res = runner.invoke(import_command, args)
+        assert res.exit_code == 2, res.output
+        assert "--allow-project-configs" in res.output
+        assert not state.registry_path().exists()
+
+    def test_reveal_hint_keeps_the_flag_through_to_apply(self, runner, sandbox):
+        # Redacted plan -> its reveal hint -> that run's apply hint -> apply: the
+        # acknowledgement given to the first plan survives every printed step.
+        _seed_dot_mcp_json(
+            sandbox, {"loc": {"command": "echo", "env": {"GITHUB_TOKEN": "ghp_realsecret"}}}
+        )
+        plan = runner.invoke(import_command, ["--from", "claude-code", "--allow-project-configs"])
+        assert plan.exit_code == 0, plan.output
+        [reveal] = [shlex.split(ln) for ln in plan.output.splitlines() if "--show-imported" in ln]
+        assert reveal == [
+            "mms", "import", "--from", "claude-code", "--plan", "--show-imported",
+            "--allow-project-configs",
+        ]  # fmt: skip
+        revealed = runner.invoke(import_command, reveal[2:])
+        assert revealed.exit_code == 0, revealed.output
+        assert "ghp_realsecret" in revealed.output
+        res = runner.invoke(import_command, self._apply_hint_args(revealed.output))
+        assert res.exit_code == 0, res.output
+        assert "loc" in state.load_registry().servers
 
 
 # ---------------------------------------------------------------------------
