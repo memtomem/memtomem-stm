@@ -26,7 +26,8 @@ changes inline only. See the deprecation policy in
   Server and tool names and cached bodies are stored as before and are not
   covered. The one-time purge of old rows is logical: their bytes can remain
   in the file's free pages, so before sharing a copy, stop STM and delete the
-  cache database (it is recreated empty) (#1416).
+  cache database (it is recreated empty), unless another store shares that
+  file (#1416).
   **Behavior change**: the response cache and the consult cache start empty
   after the upgrade (response-cache key schema 8, consult scope key 2). A
   deleted or replaced key file empties its cache on the next open; replace

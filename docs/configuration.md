@@ -693,7 +693,8 @@ env *names* (never values), and is an HMAC under a random key kept in
 cannot confirm a guessed command line. Deleting that key file empties the
 consult cache on the next start; an unreadable one makes STM consult without
 the disk cache for that run. Purged rows can stay readable in the file's free
-pages; deleting `toolgraph_consult.db` while STM is stopped removes them. A cheap `eligible_tools([])` generation probe still runs
+pages; deleting `toolgraph_consult.db` while STM is stopped removes them, provided
+no other store shares that file (a shared file loses that store's data too). A cheap `eligible_tools([])` generation probe still runs
 on every start, so a degraded, unreachable, or rolled-back graph is always
 re-detected (the `on_*` knobs and `DEGRADED` health line stay loud) and is
 never masked by a stale cache hit. Only an agent-found full consult is written.
