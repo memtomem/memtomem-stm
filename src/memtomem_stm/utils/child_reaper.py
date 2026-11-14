@@ -209,10 +209,12 @@ def _has_exited(pid: int) -> bool:
     """
     if sys.platform == "win32":  # pragma: no cover — no waitid; sweep is a no-op
         return not is_pid_alive(pid)
+    if not hasattr(os, "waitid"):
+        return _has_exited_without_waitid(pid)
     try:
-        # The ignores are for typeshed gating waitid to Linux; every POSIX
-        # target here has it (macOS included), and the win32 guard above is the
-        # real platform bound.
+        # The ignores are for typeshed gating waitid by platform and version.
+        # CPython on macOS only has it from 3.13, so the hasattr check above is
+        # the real bound, not the platform.
         info = os.waitid(  # type: ignore[attr-defined]
             os.P_PID,  # type: ignore[attr-defined]
             pid,
@@ -223,6 +225,29 @@ def _has_exited(pid: int) -> bool:
     except OSError:  # pragma: no cover — EINVAL/EPERM are not "it exited"
         return False
     return info is not None
+
+
+def _has_exited_without_waitid(pid: int) -> bool:
+    """The :func:`_has_exited` answer for a Python built without ``os.waitid``.
+
+    That is CPython before 3.13 on macOS. The signal-0 probe would count the
+    zombie of a child nobody reaped as alive, which is the window-burning case
+    ``waitid`` is there to avoid. ``getpgid`` is the probe instead: the macOS
+    kernel answers ``ESRCH`` for a zombie, and asking does not consume the exit
+    status, so an owner still holding a ``Popen`` keeps it. A kernel that
+    answers ``getpgid`` for a zombie only makes this as blind as signal 0,
+    which is the safe direction — it waits the window out, and never reports a
+    live process as gone.
+    """
+    if sys.platform == "win32":  # pragma: no cover — no getpgid; the caller returned
+        return not is_pid_alive(pid)
+    try:
+        os.getpgid(pid)
+    except ProcessLookupError:
+        return True
+    except (OSError, OverflowError):  # EPERM is not "it exited"
+        return False
+    return False
 
 
 def _group_has_survivors(pid: int) -> bool:

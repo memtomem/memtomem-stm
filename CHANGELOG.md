@@ -13,6 +13,13 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- On macOS with Python 3.12, the leaked-child sweep that runs when an LTM
+  adapter's shutdown fails no longer raises `AttributeError: module 'os' has
+  no attribute 'waitid'` instead of terminating the child. CPython has
+  `os.waitid` on macOS only from 3.13; without it the sweep now asks
+  `os.getpgid`, which the macOS kernel answers with "no such process" for an
+  exited child nobody reaped yet, so the sweep still does not wait out its
+  escalation window for a child that already died.
 - A new upstream prefix can no longer end in a newline. The prefix rule is now
   checked against the whole value: before, `"fs\n"` passed (`$` also matches
   just before a final newline) while `"fs\n\n"` was refused. This applies to
