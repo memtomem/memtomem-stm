@@ -68,6 +68,7 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_BASE_URL` | URL or `null` | — | Optional embedding-provider base URL. | Bundled |
 | `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_TIMEOUT` | positive float | `10.0` | Embedding request timeout in seconds. | Bundled |
 | `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_CACHE_SIZE` | non-negative integer | `256` | Embeddings held per scorer instance, keyed on provider, model and text; `0` disables the cache. | Bundled |
+| `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__PRIVACY_SCAN_ENABLED` | boolean | `true` | Score a pass with BM25 instead of sending it to the embedding endpoint when its text matches a credential pattern. | Bundled |
 | `MEMTOMEM_STM_PROXY__MAX_DESCRIPTION_CHARS` | integer `>= 32` | `4000` | Exact cap on the advertised tool-description length, `[proxied] ` prefix included. | Bundled |
 | `MEMTOMEM_STM_PROXY__HOST_DESCRIPTION_CAP` | integer `>= 32` or null | — | Declared host tool-description limit, including prefix and hints; unset means unknown. | Bundled |
 | `MEMTOMEM_STM_PROXY__STRIP_SCHEMA_DESCRIPTIONS` | boolean | `false` | Remove nested schema descriptions from proxied tools. | Bundled |

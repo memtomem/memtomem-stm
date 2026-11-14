@@ -218,7 +218,9 @@ class CallMetrics:
     #               or a branch settled the strategy without consulting it.
     strategy_auto_selected: bool | None = None
     ratio_violation: bool = False
-    # Scorer fallback: True when EmbeddingScorer fell back to BM25 during this call.
+    # Scorer fallback: True when EmbeddingScorer fell back to BM25 during this call
+    # because its endpoint failed. A pass routed to BM25 by the credential screen
+    # (``relevance_scorer.privacy_scan_enabled``) asked no endpoint and is not one.
     scorer_fallback: bool = False
     # Memory-pipeline status — populated by Stage 4 (INDEX) and Stage 4b (EXTRACT).
     #
