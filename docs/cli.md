@@ -1370,7 +1370,7 @@ When the same name shows up in two places (two hosts in `--from all`, or already
 * If the entry is **identical** (same `command`, `args`, `env`), it's an idempotent no-op and `--apply` reports `Already up to date.`
 * If the entry **differs**, **first-import-wins** — the existing registry entry is kept, the new one is reported as a conflict and skipped. The scanner order for `--from all` is `claude-code → cursor → codex → claude-desktop`.
 
-`mms import` itself has no refresh-on-rerun flag; for an acknowledged restamp of a changed entry, use `mms host sync --force` (below).
+`mms import` itself has no refresh-on-rerun flag; for an acknowledged restamp of a changed entry, use `mms host sync --apply --force` (below).
 
 ### Dangerous env keys
 
@@ -1394,8 +1394,9 @@ Commands:
 `--from claude-code|cursor|codex|claude-desktop|all` and supports `--json`.
 `status` is registry-anchored, read-only, and always exits `0`; drift is an
 observation rather than a CI failure signal. `sync` is the ongoing
-reconciliation path: `--plan` previews, `--apply` writes, `--force` adopts
-entries marked changed, and `--yes` bypasses confirmation prompts for scripts.
+reconciliation path: `--plan` previews, `--apply` writes, `--apply --force`
+adopts entries marked changed (under `--plan`, `--force` only previews that),
+and `--yes` bypasses confirmation prompts for scripts.
 
 `sync --apply` shares the same project-local config gate as `mms import`: new
 (ADD-bucket) entries, and — only under `--force` — RESTAMP-bucket entries,

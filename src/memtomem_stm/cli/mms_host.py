@@ -109,9 +109,13 @@ _SCAN_HOST_CHOICES = click.Choice([*ALL_HOSTS, "all"], case_sensitive=False)
 
 _SYNC_NO_OP_MSG = "Already synchronized. No changes."
 
+# ``{command}`` comes from ``_sync_apply_command(force=True, ...)``: ``--force``
+# alone only previews, so the pointer must carry ``--apply`` too.
 _SYNC_CHANGED_FOOTER_TEMPLATE = (
-    "{n} entr{ies_or_y} differ in shape at host. Use `mms host sync --force` to acknowledge."
+    "{n} entr{ies_or_y} differ in shape at host. Use `{command}` to adopt the host shape."
 )
+
+_SYNC_PLAN_CLOSING_TEMPLATE = "Run `{command}` to execute."
 
 # Cross-host drift footer (Lock-down 6). Used in two contexts:
 #   - Sub-line under ``_SYNC_CHANGED_FOOTER_TEMPLATE`` when ``--force``
@@ -775,6 +779,24 @@ def _build_apply_prompt(
     return "\n".join(lines)
 
 
+def _sync_apply_command(*, force: bool, yes: bool, allow_project_configs: bool) -> str:
+    """The ``mms host sync --apply`` command a text hint tells the user to run.
+
+    Echoes the acknowledgement flags the user already supplied, so copying
+    the hint never drops a flag the run previewed or acknowledged. A flag
+    the user did not supply is never added: the project-config gate and
+    the non-TTY confirmation abort print their own hints for those.
+    """
+    parts = ["mms host sync --apply"]
+    if force:
+        parts.append("--force")
+    if yes:
+        parts.append("--yes")
+    if allow_project_configs:
+        parts.append("--allow-project-configs")
+    return " ".join(parts)
+
+
 def _render_sync_json(mode: str, plan_payload: dict, summary: dict, *, aborted: bool) -> None:
     """Emit the locked JSON shape — all keys always present.
 
@@ -803,6 +825,8 @@ def _render_sync_text(
     cross_host_count: int = 0,
     force_active: bool = False,
     apply_outcome: str | None = None,
+    yes: bool = False,
+    allow_project_configs: bool = False,
 ) -> None:
     """Default human-readable sync renderer.
 
@@ -816,8 +840,12 @@ def _render_sync_text(
     skips the section. ``cross_host_count`` is the size of the
     Lock-down 6 cross-host partition; ``force_active`` flips the
     changed-bucket footer wording — without ``--force`` we point at
-    ``--force`` as the remedy, with ``--force`` we point at manual
+    ``--apply --force`` as the remedy, with ``--force`` we point at manual
     review (``--force`` deliberately doesn't help cross-host).
+
+    ``yes`` / ``allow_project_configs`` are the flags the user supplied;
+    every command this renderer prints carries them (see
+    ``_sync_apply_command``).
     """
     add_rows = plan_payload["add"]
     remove_rows = plan_payload["remove"]
@@ -904,11 +932,17 @@ def _render_sync_text(
             )
         else:
             # Mixed (some in-place that --force could help). Standard
-            # "use --force" pointer + cross-host sub-line so users
+            # "use --apply --force" pointer + cross-host sub-line so users
             # know --force won't help that subset.
             w(
                 "  "
-                + _SYNC_CHANGED_FOOTER_TEMPLATE.format(n=n_skipped, ies_or_y=_ies_or_y(n_skipped))
+                + _SYNC_CHANGED_FOOTER_TEMPLATE.format(
+                    n=n_skipped,
+                    ies_or_y=_ies_or_y(n_skipped),
+                    command=_sync_apply_command(
+                        force=True, yes=yes, allow_project_configs=allow_project_configs
+                    ),
+                )
             )
             if cross_host_count:
                 w(
@@ -920,7 +954,13 @@ def _render_sync_text(
 
     if mode == "plan":
         w("")
-        w("Run `mms host sync --apply` to execute.")
+        w(
+            _SYNC_PLAN_CLOSING_TEMPLATE.format(
+                command=_sync_apply_command(
+                    force=force_active, yes=yes, allow_project_configs=allow_project_configs
+                )
+            )
+        )
     elif apply_outcome == "no_op":
         w("")
         w(_SYNC_NO_OP_MSG)
@@ -987,6 +1027,8 @@ def _render_orphan_no_baseline_footer(n: int) -> None:
     is_flag=True,
     help=(
         "Adopt host shape for entries flagged 'changed' (registry + sidecar). "
+        "Takes effect only with --apply; under the default --plan it previews "
+        "the re-stamp. "
         "Skips entries that have shape-relocated to a different host than the "
         "baseline source. Orthogonal to --yes (which bypasses the confirmation "
         "prompt)."
@@ -1019,8 +1061,8 @@ def sync_cmd(
     Read-only buckets (see ``mms host status`` for definitions):
       - ``unchanged``: silent no-op (most common case).
       - ``changed``: non-mutating without ``--force``; user must
-        acknowledge via ``--force`` to adopt the host shape. Surfaces
-        as footer note + ``summary.skipped_changed``.
+        acknowledge via ``--apply --force`` to adopt the host shape.
+        Surfaces as footer note + ``summary.skipped_changed``.
 
     Mutating buckets:
       - ``new`` (host candidate not in registry) → ADD.
@@ -1039,21 +1081,25 @@ def sync_cmd(
       - ``--force`` activates the ``changed`` bucket as a mutator
         (without it, ``changed`` stays non-mutating).
       - ``--yes`` bypasses the interactive confirmation prompt.
-      ``--force`` alone still prompts; ``--force --yes`` is the
-      non-interactive combination. ``--force --json`` without
-      ``--yes`` aborts (exit 2, ``aborted: true``) — same gate REMOVE
-      uses, since mixing prompt text with JSON corrupts parsing.
+      With ``--apply``: ``--force`` alone still prompts; ``--force
+      --yes`` is the non-interactive combination. ``--force --json``
+      without ``--yes`` aborts (exit 2, ``aborted: true``) — same gate
+      REMOVE uses, since mixing prompt text with JSON corrupts parsing.
+      Under the default ``--plan``, ``--force`` only previews the
+      RESTAMP section: nothing is written, nothing prompts, and
+      ``--plan --force --json`` exits 0.
 
     Atomicity: registry write first, sidecar write second. The
     sidecar is filtered to ``set(import_state.entries) ⊆
     set(registry.servers)`` so a crash between writes self-heals on
     the next run (orphan baselines drop; missing baselines BACKFILL).
 
-    With ``--json``, REMOVE and RESTAMP both require ``--yes`` — a TTY
-    confirmation prompt cannot be answered programmatically by a JSON
-    consumer, and mixing prompt text with JSON output corrupts machine
-    parsing. Without ``--yes``, ``--json`` aborts (exit 2) with
-    ``aborted: true`` in the payload.
+    With ``--apply --json``, REMOVE and RESTAMP both require ``--yes`` —
+    a TTY confirmation prompt cannot be answered programmatically by a
+    JSON consumer, and mixing prompt text with JSON output corrupts
+    machine parsing. When either bucket is non-empty and ``--yes`` is
+    absent, ``--apply --json`` aborts (exit 2) with ``aborted: true`` in
+    the payload. ``--plan --json`` never prompts and exits 0.
 
     See ``mms_import.py`` for the matching docstring at
     ``import_command``.
@@ -1135,8 +1181,8 @@ def sync_cmd(
         # entry (the bucket stays non-mutating per W2 PR6). With
         # ``--force``, only the cross-host slice remains skipped — the
         # eligible subset moves to RESTAMP. Counting both would
-        # double-report and make the "use ``--force`` to acknowledge"
-        # footer fire even after we just re-stamped them.
+        # double-report and make the "differ in shape at host" footer
+        # fire even after we just re-stamped them.
         #
         # Gains 5 fields in W3 (was minimal ``{"name": ...}`` in PR6).
         # Existing downstream parsers reading ``[i]["name"]`` keep
@@ -1210,6 +1256,8 @@ def sync_cmd(
                 restamp_rows=restamp_eligible_rows if force else [],
                 cross_host_count=len(cross_host_changed_rows),
                 force_active=force,
+                yes=yes,
+                allow_project_configs=allow_project_configs,
             )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
             _render_not_inspected_footer(not_inspected_rows, indent="  ")
@@ -1291,6 +1339,8 @@ def sync_cmd(
                 restamp_rows=restamp_rows,
                 cross_host_count=len(cross_host_changed_rows),
                 force_active=force,
+                yes=yes,
+                allow_project_configs=allow_project_configs,
                 apply_outcome="no_op",
             )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
@@ -1377,6 +1427,8 @@ def sync_cmd(
             restamp_rows=restamp_rows,
             cross_host_count=len(cross_host_changed_rows),
             force_active=force,
+            yes=yes,
+            allow_project_configs=allow_project_configs,
             apply_outcome="mutated",
         )
         _render_orphan_no_baseline_footer(len(no_baseline_orphans))

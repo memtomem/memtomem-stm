@@ -40,7 +40,7 @@ anywhere we can recover from.
 
 Registry write still precedes sidecar write within a single apply;
 no transaction. To re-stamp existing sidecar rows (after a host edit
-you've already acknowledged), use ``mms host sync --force`` — the
+you've already acknowledged), use ``mms host sync --apply --force`` — the
 ongoing-reconciliation entry point, not ``mms import``.
 
 vs ``mms host sync``:
