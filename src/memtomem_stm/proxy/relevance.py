@@ -17,7 +17,11 @@ import re
 import threading
 from typing import Any, Protocol
 
-from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
+from memtomem_stm.proxy.privacy import (
+    CREDENTIAL_PATTERNS,
+    contains_sensitive_content,
+    contains_sensitive_content_decoded,
+)
 from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.redact import ResponseShapeError, exception_summary
 
@@ -59,6 +63,13 @@ class _ScoringSource:
 
     The verdict is computed on first read only: the BM25 default never asks,
     so binding a source costs a context-variable write and nothing else.
+
+    It sees through JSON string escapes, unlike the checks on the sections.
+    The compressor parses the source before splitting it, so a key written as
+    ``"\\u0070assword"`` reaches the endpoint decoded, as ``password``, while
+    the raw source hides it from the patterns. The decoded view can also match
+    where the source means something else; here that costs one pass scored
+    with BM25, not a changed or dropped response.
     """
 
     __slots__ = ("text", "_sensitive")
@@ -69,7 +80,7 @@ class _ScoringSource:
 
     def has_credentials(self) -> bool:
         if self._sensitive is None:
-            self._sensitive = contains_sensitive_content(self.text, CREDENTIAL_PATTERNS)
+            self._sensitive = contains_sensitive_content_decoded(self.text, CREDENTIAL_PATTERNS)
         return self._sensitive
 
 
@@ -79,9 +90,9 @@ class _ScoringSource:
 # body, so ``{"password": "hunter2"}`` reaches the scorer as ``password`` and
 # ``"hunter2"``, which no credential pattern matches. The response itself
 # does, so an egress-capable scorer screens these as well as the sections
-# (#1382). Nested scopes add to the outer ones rather than replacing them:
-# HYBRID binds the whole response, then hands only its tail to a
-# sub-compressor, and a label left in the head is visible only in the whole.
+# (#1382). Nested scopes add to the outer ones rather than replacing them, so
+# a sub-compressor handed a derived or partial text (SKELETON and
+# SCHEMA_PRUNING delegate to TRUNCATE) never narrows what its caller bound.
 _SCORING_SOURCES: contextvars.ContextVar[tuple[_ScoringSource, ...]] = contextvars.ContextVar(
     "_SCORING_SOURCES", default=()
 )

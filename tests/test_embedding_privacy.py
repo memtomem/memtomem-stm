@@ -204,6 +204,28 @@ class TestCompressorsBindTheirSource:
             )
         assert post.call_count == 0
 
+    @pytest.mark.parametrize("kind", ["selective", "schema_pruning"])
+    @pytest.mark.parametrize(
+        "doc",
+        [
+            '{"\\u0070assword": "hunter2", "notes": "%s", "other": "%s"}',
+            '{"db": {"\\u0070assword": "hunter2"}, "notes": "%s", "other": "%s"}',
+        ],
+        ids=["top-level", "nested"],
+    )
+    def test_a_json_escaped_label_is_seen_decoded(self, kind, doc):
+        """The parser decodes the key before splitting it from its value, so
+        the endpoint would get ``password`` and ``hunter2`` while the raw
+        response matches no pattern; the source is screened decoded."""
+        from memtomem_stm.proxy.compression import SchemaPruningCompressor, SelectiveCompressor
+
+        text = doc % ("alpha " * 60, "beta " * 60)
+        assert not contains_sensitive_content(text, CREDENTIAL_PATTERNS)
+        cls = SelectiveCompressor if kind == "selective" else SchemaPruningCompressor
+        with _post() as post:
+            cls(scorer=_scorer()).compress(text, max_chars=200, context_query="alpha")
+        assert post.call_count == 0
+
     def test_schema_pruning_withholds_a_top_level_secret(self):
         from memtomem_stm.proxy.compression import SchemaPruningCompressor
 

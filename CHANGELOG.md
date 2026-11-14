@@ -21,7 +21,8 @@ changes inline only. See the deprecation policy in
   instead when the query, a section as sent, a whole section, or the response
   the sections came from matches a credential pattern. The response counts
   because SELECTIVE and SCHEMA_PRUNING score a JSON key and its value as
-  separate pieces, which a per-section check cannot see as one pair. The new
+  separate pieces, which a per-section check cannot see as one pair; it is
+  read with JSON string escapes decoded, so `\u0070assword` counts. The new
   `relevance_scorer.privacy_scan_enabled` (default `true`) turns the screen
   off, and with it off for a non-loopback `embedding_base_url` the proxy logs
   a WARNING at startup and again when a config edit rebuilds the scorer

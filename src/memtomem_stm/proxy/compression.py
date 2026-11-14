@@ -3282,7 +3282,6 @@ class HybridCompressor:
     # re-scores the tail, so the count stays small.
     _HEAD_FIT_ATTEMPTS = 3
 
-    @_binds_scoring_source
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         # Only a TOC tail publishes a key; a truncate tail is ordinary lossy
         # compression and keeps its character budget in both delivery modes.
