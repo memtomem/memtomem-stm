@@ -235,8 +235,9 @@ class SurfacingConfig(BaseModel):
     """#352 part 3 — when ``True`` (default, backward-compatible),
     ``FeedbackStore`` stores the verbatim extracted query in
     ``surfacing_events.query``. When ``False``, the engine substitutes
-    ``"sha256:" + sha256(query)[:16]`` before handing the value to the
-    store, so the persisted column never contains user-derived text.
+    ``"hmac-sha256:"`` + 16 hex of an HMAC keyed by the feedback DB's
+    ``stm_meta`` key (#1381) before handing the value to the store, so the
+    persisted column never contains user-derived text.
     The hashed value still survives ``stm_surfacing_stats`` rendering
     (``query_preview`` returns it verbatim) and the server formatter
     emits a one-line legend explaining the substitution. Part 2's

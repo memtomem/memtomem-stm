@@ -398,7 +398,7 @@ class HookConfig(BaseModel):
     return a rating) and skips the durable-demotion read; the daemon also
     forces auto-tune off in this mode. Surfacing telemetry is recorded either
     way whenever the dedup tracker exists: ``surfacing_events`` rows with
-    ``server='builtin'`` and a ``sha256:`` digest query (the daemon forces
+    ``server='builtin'`` and an ``hmac-sha256:`` digest query (the daemon forces
     ``persist_query_text=False``, so raw query text — e.g. a ``Bash`` command
     carrying secrets — never persists), so ``stm_surfacing_stats`` /
     ``mms stats`` / ``mms doctor`` reflect hook-path activity. See

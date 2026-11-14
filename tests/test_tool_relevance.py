@@ -38,7 +38,7 @@ from memtomem_stm.proxy.tool_relevance import (
     penalty_source,
 )
 
-FEATURES_KEYS = {"query_source", "query_sha256", "query_chars", "ranked_candidates"}
+FEATURES_KEYS = {"query_source", "query_chars", "ranked_candidates"}
 RANKED_ENTRY_KEYS = {
     "tool",
     "rank",
@@ -226,27 +226,22 @@ class TestPenaltySource:
 
 
 class TestFeatures:
-    def test_shape_and_hash(self):
+    def test_shape_carries_no_query_digest(self):
+        """#1381: an unkeyed digest of a short query can be confirmed offline
+        by hashing guesses, so the features carry only its length."""
         ranked = ToolRelevanceRanker().rank("slack", CANDIDATES)
         feats = build_candidate_features("send to slack", "context_query", ranked)
         assert set(feats) == FEATURES_KEYS
-        assert feats["query_sha256"] == hashlib.sha256(b"send to slack").hexdigest()
+        assert hashlib.sha256(b"send to slack").hexdigest() not in json.dumps(feats)
         assert feats["query_chars"] == len("send to slack")
 
     def test_raw_query_never_in_features(self):
         feats = build_candidate_features("hunter2 secret task", "context_query", [])
         assert "hunter2" not in json.dumps(feats)
 
-    def test_lone_surrogate_hashes_with_surrogatepass_without_aliasing_literal(self):
+    def test_lone_surrogate_query_builds(self):
         raw = "task\udfff"
-        literal = r"task\udfff"
-        raw_features = build_candidate_features(raw, "context_query", [])
-        literal_features = build_candidate_features(literal, "context_query", [])
-        assert (
-            raw_features["query_sha256"]
-            == hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()
-        )
-        assert raw_features["query_sha256"] != literal_features["query_sha256"]
+        assert build_candidate_features(raw, "context_query", [])["query_chars"] == len(raw)
 
 
 # ── ProxyManager wire-in ─────────────────────────────────────────────────
@@ -311,7 +306,8 @@ class TestManagerWireIn:
         feats = selection["candidate_features"]
         assert set(feats) == FEATURES_KEYS
         assert feats["query_source"] == "context_query"
-        assert feats["query_sha256"] == hashlib.sha256(query.encode()).hexdigest()
+        assert feats["query_chars"] == len(query)
+        assert hashlib.sha256(query.encode()).hexdigest() not in log.path.read_text("utf-8")
         assert feats["ranked_candidates"][0]["tool"] == "test__send_message"
         assert {r["tool"] for r in feats["ranked_candidates"]} == {
             "test__send_message",
