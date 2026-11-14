@@ -48,11 +48,11 @@ changes inline only. See the deprecation policy in
   `<data_dir>/stm-discovery.key` (mode `0600`), created by the first process
   that needs a daemon to exist: `mms daemon start`, a hook's spawn request,
   the standalone proxy when it starts with `surfacing.use_daemon` on, or the
-  daemon itself. `mms daemon status` and
-  `mms daemon stop` never create it; with no key they report `stopped` /
+  daemon itself. `mms daemon status` and `mms daemon stop` never create it or
+  change its mode (#1420); with no key they report `stopped` /
   `no running daemon` for this config, and on a `data_dir` with no daemon
-  files they create nothing. The same
-  settings still feed the fingerprint, so a rotated header still gets a new
+  files they create nothing. The same settings still feed the fingerprint,
+  so a rotated header still gets a new
   daemon. An existing key that cannot be read or parsed is an error, not a
   fallback to an unkeyed value: `mms daemon start`, `stop` and `status` exit 1
   with one line naming the file (`status --json` reports

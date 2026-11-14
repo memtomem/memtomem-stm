@@ -14,7 +14,10 @@ identifier it keyed unreachable. For the two caches that is a miss: each notices
 the change and purges its rows. For the mms drift sidecar
 (:mod:`memtomem_stm.mms.drift`) it costs more: the baselines stamped under the
 lost key can no longer be compared, and stamping them again takes the host's
-current config, so an edit made there in between goes unreported.
+current config, so an edit made there in between goes unreported. For the
+daemon discovery key (:mod:`memtomem_stm.daemon.discovery`) nothing stored is
+lost, but daemons still running under the lost key are no longer this config's:
+they are listed as running under a different config until stopped.
 
 Creation is exclusive. The key is written in full to a temporary file and then
 hard-linked into place, which fails if the name already exists, so two processes

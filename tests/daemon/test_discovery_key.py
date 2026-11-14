@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import signal
+import stat
 import sys
 import threading
 from collections.abc import Iterator
@@ -47,6 +48,7 @@ _HOOK_CALL = ClaudeHookAdapter().parse(
 posix_names = pytest.mark.skipif(
     sys.platform == "win32", reason="a newline is not a valid Windows file name character"
 )
+posix_modes = pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 
 
 def _cli():
@@ -66,6 +68,21 @@ def _break_key(data_dir: Path) -> Path:
     path = discovery.discovery_key_path(data_dir)
     path.write_bytes(b"not a key\n")
     return path
+
+
+def _loosen_key(data_dir: Path) -> os.stat_result:
+    """Make the key readable by group and other, as a restore or a manual
+    ``chmod`` would leave it; returns its stat from just after."""
+    path = discovery.discovery_key_path(data_dir)
+    path.chmod(0o644)
+    return path.stat()
+
+
+def _assert_key_untouched(data_dir: Path, before: os.stat_result) -> None:
+    after = discovery.discovery_key_path(data_dir).stat()
+    assert stat.S_IMODE(after.st_mode) == 0o644
+    # The mode alone would also pass for a chmod that set the same bits.
+    assert after.st_ctime_ns == before.st_ctime_ns
 
 
 def _config(data_dir: Path) -> STMConfig:
@@ -220,6 +237,24 @@ def test_an_unusable_key_raises_instead_of_falling_back(tmp_path: Path, create_k
     assert key_path.read_bytes() == b"not a key\n"  # never overwritten
 
 
+@posix_modes
+def test_a_reader_leaves_a_permissive_key_as_it_is_and_a_creator_tightens_it(
+    tmp_path: Path,
+) -> None:
+    """Dropping group/other bits is a write to the file's metadata, so it
+    belongs to the side that is allowed to write (#1420)."""
+    config = _config(tmp_path)
+    fingerprint = discovery.config_fingerprint(config, create_key=True)
+    before = _loosen_key(tmp_path)
+
+    assert discovery.config_fingerprint(config, create_key=False) == fingerprint
+    _assert_key_untouched(tmp_path, before)
+
+    assert discovery.config_fingerprint(config, create_key=True) == fingerprint
+    mode = stat.S_IMODE(discovery.discovery_key_path(tmp_path).stat().st_mode)
+    assert mode == 0o600
+
+
 @pytest.mark.asyncio
 async def test_daemon_adapter_and_reader_agree_on_a_fresh_data_dir(tmp_path: Path) -> None:
     """The adapter runs first on the standalone route, so it creates the key —
@@ -264,6 +299,20 @@ def test_client_readers_find_nothing_without_a_key_and_build_no_path(
 
     assert asyncio.run(call(_config(data_dir))) == not_found
     assert not data_dir.exists()
+
+
+@posix_modes
+@pytest.mark.parametrize("name", sorted(_READERS))
+def test_client_readers_leave_a_permissive_key_as_it_is(tmp_path: Path, name: str) -> None:
+    """The hook's ``surface`` runs on every eligible tool call; it must not be
+    the thing that rewrites the key's mode."""
+    call, not_found = _READERS[name]
+    config = _config(tmp_path)
+    discovery.config_fingerprint(config, create_key=True)
+    before = _loosen_key(tmp_path)
+
+    assert asyncio.run(call(config)) == not_found  # a key, but no daemon
+    _assert_key_untouched(tmp_path, before)
 
 
 @pytest.mark.parametrize("name", sorted(_READERS))
@@ -377,6 +426,25 @@ def test_looking_at_a_fresh_data_dir_creates_nothing(
     assert result.exit_code == 0, result.output
     assert expected in result.output
     assert not data_dir.exists()
+
+
+@posix_modes
+@pytest.mark.parametrize(
+    "args",
+    [["daemon", "status"], ["daemon", "status", "--json"], ["daemon", "stop"]],
+    ids=["status", "status-json", "stop"],
+)
+def test_commands_that_only_look_leave_a_permissive_key_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    discovery.config_fingerprint(STMConfig(), create_key=True)
+    before = _loosen_key(tmp_path)
+
+    result = CliRunner().invoke(_cli(), args)
+
+    assert result.exit_code == 0, result.output
+    _assert_key_untouched(tmp_path, before)
 
 
 def test_status_lists_a_previous_builds_daemon_as_foreign_without_creating_a_key(
