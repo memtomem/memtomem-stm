@@ -13,6 +13,34 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms daemon status` and `mms daemon stop --all` find a daemon under another
+  config fingerprint that holds its lifetime lock without a handshake. A
+  daemon holds the lock from before it publishes its handshake until after
+  its teardown has removed it, and daemons under other fingerprints were
+  found through handshakes only, so for those two stretches one was not
+  listed: `status` reported `stopped` with an empty `foreign` list and
+  `stop --all` reported nothing to stop, both with exit 0. That also covered
+  this config's own daemon once its discovery key had been removed. Such a
+  daemon is now found by its lock file and listed as `pid=?` with `no
+  handshake; lock held — starting or shutting down`; in `status --json` its
+  `foreign` entry has `handshake_absent: true`, `listening: false` and
+  `"lock": "held"`. `stop --all` waits for its lock to be released and never
+  signals it, as for any listed daemon that is not accepting. Lock files left
+  by daemons that have exited are not listed: only a lock that is held, or
+  that could not be checked, is. For a lock file with no handshake, "held"
+  is judged over up to three further rounds, each after a 20 ms pause,
+  because testing a lock takes it for an instant and two commands
+  looking at the same file would otherwise report each other; a lock file on
+  a filesystem without file-lock support is listed as one that could not be
+  checked rather than as held. The state reported for this config is
+  unchanged — with no discovery key it is still `stopped`, with the daemon
+  listed beside it (#1421).
+  Looking at another fingerprint's lock no longer creates anything. `status`
+  and `stop --all` used to create the lock file of a fingerprint whose
+  handshake was stale and whose lock file was gone, and to create the target
+  of a lock file that was a dangling link and then read that lock as free;
+  they now open only a lock file that already exists.
+
 - `mms daemon status` and `mms daemon stop` derive the config fingerprint
   once per run. Each read the discovery key twice — once to find this config's
   daemon and again to decide which daemons are foreign, or to send the

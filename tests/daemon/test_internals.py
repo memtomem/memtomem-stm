@@ -13,6 +13,7 @@ import pytest
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import discovery, protocol
 from memtomem_stm.daemon.locking import (
+    LockProbe,
     lock_path,
     open_lock_fd,
     release_lock,
@@ -2869,7 +2870,7 @@ class TestForeignListingFailure:
         def probe_lock(_path: Path):
             raise OSError("probe failed")
 
-        monkeypatch.setattr(daemon_cmd, "_probe_lock", probe_lock)
+        monkeypatch.setattr(daemon_cmd, "_probe_foreign_lock", probe_lock)
 
         with pytest.raises(OSError, match="probe failed") as excinfo:
             daemon_cmd._live_foreign_daemons(STMConfig(), None)
@@ -3050,7 +3051,7 @@ class TestStopJudgesByLifetimeLock:
         hs = self._stale_current(tmp_path, monkeypatch)
         _fake_stop_clock(monkeypatch)
 
-        def refuse(path):
+        def refuse(path, **kwargs):
             raise PermissionError(13, "Permission denied")
 
         monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", refuse)
@@ -3264,7 +3265,7 @@ class TestForeignStopJudgesByLifetimeLock:
 
         self._foreign(tmp_path, monkeypatch)
 
-        def refuse(path):
+        def refuse(path, **kwargs):
             raise PermissionError(13, "Permission denied")
 
         monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", refuse)
@@ -3499,7 +3500,7 @@ class TestForeignStopJudgesByLifetimeLock:
         monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
         _fake_stop_clock(monkeypatch)
 
-        def refuse(path):
+        def refuse(path, **kwargs):
             raise PermissionError(13, "Permission denied")
 
         monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", refuse)
@@ -3577,6 +3578,498 @@ class TestForeignStopJudgesByLifetimeLock:
         assert "pid=11111 stopped" not in result.output
 
 
+def test_iter_foreign_lock_fingerprints_lists_lock_files_only(tmp_path: Path):
+    """Names, not states: every ``stm-daemon-<fp>.lock`` but the current one,
+    sorted, and nothing else that lives in ``data_dir``."""
+    for name in (
+        "stm-daemon-bbbb.lock",
+        "stm-daemon-aaaa.lock",
+        "stm-daemon-cccc.lock",
+        "stm-daemon-dddd.json",  # a handshake
+        "stm-daemon.log.rotate.lock",  # the log's rotation lock
+        "stm-discovery.key",
+    ):
+        (tmp_path / name).touch()
+
+    assert discovery.iter_foreign_lock_fingerprints(tmp_path, "bbbb") == ["aaaa", "cccc"]
+    assert discovery.iter_foreign_lock_fingerprints(tmp_path, None) == ["aaaa", "bbbb", "cccc"]
+
+
+def test_iter_foreign_lock_fingerprints_keeps_missing_apart_from_unlistable(tmp_path: Path):
+    assert discovery.iter_foreign_lock_fingerprints(tmp_path / "absent", None) == []
+    not_a_dir = tmp_path / "file"
+    not_a_dir.touch()
+    with pytest.raises(OSError):
+        discovery.iter_foreign_lock_fingerprints(not_a_dir, None)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
+class TestForeignDaemonWithoutAHandshake:
+    """#1421 — a daemon holds its lifetime lock from before it publishes a
+    handshake until after its teardown has removed it. Under a fingerprint
+    other than this config's, the lock file is then the only trace of it, and
+    ``status`` / ``stop --all`` must find it there — by probing lock files
+    that already exist, without creating anything."""
+
+    FP = "foreignfp000000"
+
+    def _data_dir(self, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(data_dir))
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+
+    @staticmethod
+    def _status() -> dict:
+        import json
+
+        from click.testing import CliRunner
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        return json.loads(result.output)
+
+    def _absent_entry(self, lock: str) -> dict:
+        return {
+            "fingerprint": self.FP,
+            "pid": None,
+            "host": None,
+            "port": None,
+            "idle_shutdown_seconds": None,
+            "exits_when_idle": None,
+            "listening": False,
+            "lock": lock,
+            "handshake_absent": True,
+        }
+
+    def test_held_lock_is_listed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from click.testing import CliRunner
+
+        self._data_dir(tmp_path, monkeypatch)
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        try:
+            info = self._status()
+            text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+        finally:
+            holder.release()
+
+        # No discovery key, so no daemon for *this* config; the one holding
+        # the lock is reported beside that answer, not instead of it.
+        assert info["state"] == "stopped"
+        assert info["foreign"] == [self._absent_entry("held")]
+        assert text.splitlines()[0] == "stopped"
+        assert (
+            f"1 daemon(s) under a different config: pid=? fp={self.FP} "
+            "(no handshake; lock held — starting or shutting down)"
+        ) in text
+        assert "running under a different config" not in text
+        assert "nothing to stop" not in text
+
+    def test_the_probe_decides_not_the_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Lock files are never removed, so a ``data_dir`` in use is full of
+        free ones. Only the held one is a daemon."""
+        self._data_dir(tmp_path, monkeypatch)
+        for leftover in ("aaaa000000000000", "bbbb000000000000", "cccc000000000000"):
+            lock_path(tmp_path, leftover).touch()
+        assert self._status()["foreign"] == []
+
+        holder = _LockHolder(lock_path(tmp_path, "bbbb000000000000"))
+        try:
+            assert [d["fingerprint"] for d in self._status()["foreign"]] == ["bbbb000000000000"]
+        finally:
+            holder.release()
+        assert self._status()["foreign"] == []
+
+    def test_this_configs_own_daemon_once_its_key_is_gone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """With the key, the lock is this config's and reads ``starting``.
+        Without it the same lock belongs to a fingerprint nothing derives any
+        more, and it is listed with the foreign ones."""
+        self._data_dir(tmp_path, monkeypatch)
+        lp = _current_lock_path()  # creates the key
+        current = lp.name.removeprefix("stm-daemon-").removesuffix(".lock")
+        holder = _LockHolder(lp)
+        try:
+            with_key = self._status()
+            discovery.discovery_key_path(tmp_path).unlink()
+            without_key = self._status()
+        finally:
+            holder.release()
+
+        assert (with_key["state"], with_key["foreign"]) == ("starting", [])
+        assert without_key["state"] == "stopped"
+        assert [(d["fingerprint"], d["lock"]) for d in without_key["foreign"]] == [
+            (current, "held")
+        ]
+
+    @pytest.mark.parametrize("record", ["readable", "unreadable"])
+    def test_a_fingerprint_with_a_record_is_listed_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record: str
+    ):
+        """It has a lock file too. The record's path judges it; the lock
+        listing must not add a second entry for the same daemon."""
+        self._data_dir(tmp_path, monkeypatch)
+        if record == "readable":
+            _put_handshake(tmp_path, self.FP, pid=98765)
+            _probe_all(monkeypatch, listening=False)
+            monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        else:
+            discovery.handshake_path(tmp_path, self.FP).write_bytes(b'{"pid": "\xff"}')
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        try:
+            foreign = self._status()["foreign"]
+        finally:
+            holder.release()
+
+        assert [(d["fingerprint"], d["lock"]) for d in foreign] == [(self.FP, "held")]
+        assert "handshake_absent" not in foreign[0]
+
+    def test_a_lock_that_cannot_be_opened_is_listed_as_unchecked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        self._data_dir(tmp_path, monkeypatch)
+        lock_path(tmp_path, self.FP).touch()
+
+        def refuse(path, **kwargs):
+            raise PermissionError(13, "denied")
+
+        monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", refuse)
+
+        assert self._status()["foreign"] == [self._absent_entry("unknown")]
+        text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+        assert f"pid=? fp={self.FP} (no handshake; lock could not be checked)" in text
+
+    def test_stop_all_waits_for_it_without_a_signal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        self._data_dir(tmp_path, monkeypatch)
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert "waiting for it without a signal" in result.output
+        assert f"daemon pid=? stopped (fp={self.FP})" in result.output
+
+    def test_stop_all_fails_when_it_keeps_the_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """One that was starting rather than stopping: never signalled, so
+        the wait runs out and the command says so."""
+        from click.testing import CliRunner
+
+        self._data_dir(tmp_path, monkeypatch)
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        _fake_stop_clock(monkeypatch)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert f"daemon pid=? (fp={self.FP}) still holds its lock" in result.output
+        assert "stopped (fp=" not in result.output
+
+    @pytest.mark.parametrize(
+        "args", [["status"], ["status", "--json"], ["stop", "--all"]], ids=" ".join
+    )
+    def test_free_lock_files_are_left_exactly_as_they_were(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+    ):
+        from click.testing import CliRunner
+
+        self._data_dir(tmp_path, monkeypatch)
+        for leftover in ("aaaa000000000000", "bbbb000000000000"):
+            lock_path(tmp_path, leftover).touch()
+        before = {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in tmp_path.iterdir()}
+
+        result = CliRunner().invoke(_cli(), ["daemon", *args])
+
+        assert result.exit_code == 0, result.output
+        assert "different config: pid" not in result.output
+        after = {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in tmp_path.iterdir()}
+        assert after == before
+
+    def test_a_stale_record_does_not_get_a_lock_file_made_for_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The probes of a published fingerprint follow the same rule: a
+        record left by a daemon whose lock file is gone is stale, and finding
+        that out creates nothing."""
+        self._data_dir(tmp_path, monkeypatch)
+        _put_handshake(tmp_path, self.FP, pid=98765)
+        _probe_all(monkeypatch, listening=False)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+
+        assert self._status()["foreign"] == []
+        assert not os.path.lexists(lock_path(tmp_path, self.FP))
+
+    @pytest.mark.parametrize("gone", ["lock-file", "data-dir"])
+    def test_a_lock_removed_after_the_listing_is_not_recreated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gone: str
+    ):
+        """Between the listing and the probe the file can be deleted — the
+        docs tell operators these may be. No file is no holder, and the probe
+        must not put the file, or the directory, back."""
+        from memtomem_stm.cli import daemon_cmd
+
+        data_dir = tmp_path / "data"
+        self._data_dir(data_dir, monkeypatch)
+        monkeypatch.setattr(
+            discovery, "iter_foreign_lock_fingerprints", lambda data_dir, current: [self.FP]
+        )
+        if gone == "data-dir":
+            data_dir.rmdir()
+
+        assert daemon_cmd._live_foreign_daemons(STMConfig(), None) == []
+        if gone == "data-dir":
+            assert not data_dir.exists()
+        else:
+            assert list(data_dir.iterdir()) == []
+
+    def test_a_dangling_lock_link_is_unchecked_and_its_target_stays_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An opener that creates would follow the link, make the target, and
+        report the lock free: a file where there was none, and "stopped" for
+        a fingerprint nobody could look at."""
+        from click.testing import CliRunner
+
+        data_dir = tmp_path / "data"
+        target = tmp_path / "target"  # its directory exists; only the file does not
+        self._data_dir(data_dir, monkeypatch)
+        lock_path(data_dir, self.FP).symlink_to(target)
+
+        assert self._status()["foreign"] == [self._absent_entry("unknown")]
+        assert not target.exists()
+
+        _fake_stop_clock(monkeypatch)
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1, result.output
+        assert f"daemon pid=? (fp={self.FP}) is not accepting and its lock could not be" in (
+            result.output
+        )
+        assert "stopped (fp=" not in result.output
+        assert not target.exists()
+
+    def test_a_lock_held_only_for_a_moment_is_not_a_daemon(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Any process looking at the file takes the lock for an instant —
+        another ``status``, a spawn check. Two ``status`` runs started
+        together over the same leftover lock files each reported the other's
+        probes as daemons starting up. Here the other prober is a real lock,
+        gone by the second look."""
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        pauses: list[float] = []
+
+        def other_prober_moves_on(seconds: float) -> None:
+            pauses.append(seconds)
+            holder.release()
+
+        monkeypatch.setattr(daemon_cmd, "_confirm_pause", other_prober_moves_on)
+
+        assert self._status()["foreign"] == []
+        assert len(pauses) == 1  # looked again once, found it free, stopped
+
+    def test_a_lock_held_on_every_look_is_listed_after_the_confirmations(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        pauses: list[float] = []
+        monkeypatch.setattr(daemon_cmd, "_confirm_pause", pauses.append)
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        try:
+            foreign = self._status()["foreign"]
+        finally:
+            holder.release()
+
+        assert foreign == [self._absent_entry("held")]
+        # Four looks, 20 ms apart — written out, so that changing either
+        # number in the code has to be said here too.
+        assert pauses == [0.02, 0.02, 0.02]
+
+    def test_held_locks_share_the_pauses(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """One pause per round for all of them. Pausing for each lock in turn
+        would make the wait grow with the number of candidates, and
+        ``stop --all`` signals nothing until the listing returns."""
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        pauses: list[float] = []
+        monkeypatch.setattr(daemon_cmd, "_confirm_pause", pauses.append)
+        fingerprints = ["aaaa000000000000", "bbbb000000000000", "cccc000000000000"]
+        holders = [_LockHolder(lock_path(tmp_path, fp)) for fp in fingerprints]
+        try:
+            foreign = self._status()["foreign"]
+        finally:
+            for holder in holders:
+                holder.release()
+
+        assert [(d["fingerprint"], d["lock"]) for d in foreign] == [
+            (fp, "held") for fp in fingerprints
+        ]
+        assert pauses == [0.02, 0.02, 0.02]
+
+    def test_a_passing_holder_among_daemons_is_dropped_and_the_daemons_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        daemon = _LockHolder(lock_path(tmp_path, "aaaa000000000000"))
+        passing = _LockHolder(lock_path(tmp_path, "bbbb000000000000"))
+        pauses: list[float] = []
+
+        def pause(seconds: float) -> None:
+            pauses.append(seconds)
+            passing.release()
+
+        monkeypatch.setattr(daemon_cmd, "_confirm_pause", pause)
+        try:
+            foreign = self._status()["foreign"]
+        finally:
+            daemon.release()
+
+        assert [(d["fingerprint"], d["lock"]) for d in foreign] == [("aaaa000000000000", "held")]
+        assert pauses == [0.02, 0.02, 0.02]  # the daemon is still confirmed in full
+
+    def test_free_and_unchecked_locks_are_answered_on_the_first_look(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Only "held" can be someone else's probe. Pausing on the others
+        would add the confirmation delay for every leftover lock file."""
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            daemon_cmd, "_confirm_pause", lambda seconds: pytest.fail("no second look needed")
+        )
+        lock_path(tmp_path, "aaaa000000000000").touch()
+        lock_path(tmp_path, self.FP).symlink_to(tmp_path / "target")  # cannot be checked
+
+        assert self._status()["foreign"] == [self._absent_entry("unknown")]
+
+    def test_leftover_locks_where_locking_is_unsupported_are_unchecked_not_held(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On a filesystem with no lock support every attempt fails. That is
+        not a daemon holding each file."""
+        import errno
+        import fcntl
+
+        from click.testing import CliRunner
+
+        self._data_dir(tmp_path, monkeypatch)
+        lock_path(tmp_path, self.FP).touch()
+
+        def unsupported(fd: int, operation: int) -> None:
+            raise OSError(errno.ENOTSUP, "Operation not supported")
+
+        monkeypatch.setattr(fcntl, "flock", unsupported)
+
+        assert self._status()["foreign"] == [self._absent_entry("unknown")]
+        text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+        assert f"pid=? fp={self.FP} (no handshake; lock could not be checked)" in text
+        assert "lock held" not in text
+
+    def _held_behind_a_link(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """``data_dir`` is a link to the real directory, and the lock in it
+        is held. Returns the holder and a function that breaks the link."""
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        self._data_dir(link, monkeypatch)
+        holder = _LockHolder(lock_path(real, self.FP))
+
+        def break_link() -> None:
+            link.unlink()
+            link.symlink_to(tmp_path / "nowhere")
+
+        return holder, break_link
+
+    def test_a_held_lock_behind_a_path_that_breaks_is_unchecked_not_free(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Nothing opens at the path any more, but not because the lock file
+        is gone: the directory above it stopped resolving. That is "could not
+        look", and reading it as "no file, so free" would drop a daemon that
+        still holds its lock."""
+        from memtomem_stm.cli import daemon_cmd
+
+        holder, break_link = self._held_behind_a_link(tmp_path, monkeypatch)
+        real_listing = discovery.iter_foreign_lock_fingerprints
+
+        def list_then_break(data_dir: Path, current: str | None) -> list[str]:
+            listed = real_listing(data_dir, current)
+            break_link()
+            return listed
+
+        monkeypatch.setattr(discovery, "iter_foreign_lock_fingerprints", list_then_break)
+        try:
+            foreign = daemon_cmd._live_foreign_daemons(STMConfig(), None)
+        finally:
+            holder.release()
+
+        assert foreign == [self._absent_entry("unknown")]
+
+    def test_stop_all_does_not_report_stopped_when_the_path_breaks_mid_wait(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        holder, break_link = self._held_behind_a_link(tmp_path, monkeypatch)
+
+        def on_sleep(polls: int) -> None:
+            if polls == 1:
+                break_link()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert "its lock could not be checked" in result.output
+        assert "stopped (fp=" not in result.output
+
+    def test_probe_tells_a_missing_lock_from_one_it_could_not_reach(self, tmp_path: Path):
+        from memtomem_stm.cli import daemon_cmd
+
+        (tmp_path / "data").mkdir()
+        missing = lock_path(tmp_path / "data", self.FP)
+        dangling = lock_path(tmp_path / "data", "danglingfp000000")
+        dangling.symlink_to(tmp_path / "target")
+        broken = tmp_path / "broken"
+        broken.symlink_to(tmp_path / "nowhere")
+
+        assert daemon_cmd._probe_foreign_lock(missing) is LockProbe.FREE
+        assert daemon_cmd._probe_foreign_lock(dangling) is LockProbe.UNKNOWN
+        assert daemon_cmd._probe_foreign_lock(lock_path(broken, self.FP)) is LockProbe.UNKNOWN
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["broken", "data"]
+
+
 class TestDaemonRestartCli:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
     def test_stop_then_start(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -3625,7 +4118,7 @@ class TestDaemonRestartCli:
         async def fake_shutdown(config, *, fingerprint=None):
             return True  # graceful ack, no handshake: stop confirms without a probe
 
-        def refuse(path):
+        def refuse(path, **kwargs):
             raise PermissionError(13, "Permission denied")
 
         monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
