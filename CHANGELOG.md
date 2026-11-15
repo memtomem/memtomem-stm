@@ -29,6 +29,23 @@ changes inline only. See the deprecation policy in
   **Behavior change**: on those lines such a character is written as
   `\uXXXX`. A value without one prints as before, and `--json` output is
   unchanged.
+- The secret classifier that `mms import`, `mms host sync` and `mms eject`
+  share now recognizes credentials under neutral key names. A value that
+  parses as a URL with a password (`DATABASE_URL=postgresql://user:pw@host/db`,
+  `REDIS_URL=redis://:pw@host`), or that carries a credential the proxy's
+  privacy scanner recognizes (a JWT, a provider token behind a `Bearer `
+  prefix, a PEM private-key header, a `password=` label), was classified
+  non-secret and printed as it was. The key patterns also gain `COOKIE`,
+  `BEARER` and `DSN`. A URL with a user and no password (`git@…`) is still
+  non-secret, and a URL inside a longer value (`--db=postgresql://…`) is
+  not parsed as one (#1345).
+  **Behavior change**: such values are now shown as `<REDACTED>` in the
+  human-readable output of `mms import` and `mms host sync`, in both `--plan`
+  and `--apply` (`mms import --show-imported` still reveals them, in either
+  mode), and `mms eject` of an entry written back through `claude mcp
+  add-json` (Claude Code user or project scope) now refuses such a payload
+  without `--allow-argv-secrets`, or asks on a TTY. A value that only names a
+  password label, such as `--password=false`, counts as a secret too.
 
 ## [0.7.9] — 2026-11-15
 
