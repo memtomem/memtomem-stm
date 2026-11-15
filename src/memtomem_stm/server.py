@@ -525,7 +525,7 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                         proxy_path=True,
                         has_tracker=feedback_tracker is not None,
                     ):
-                        logger.warning(message)
+                        logger.warning("%s", message)
                     if config.surfacing.warmup_enabled:
                         warmup_task = asyncio.create_task(mcp_adapter.warm_up(), name="ltm-warmup")
 

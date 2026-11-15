@@ -1651,14 +1651,17 @@ export MEMTOMEM_STM_LOG_EXCEPTION_TEXT=true   # server and daemon logs
 load always withhold.
 
 Every handler STM installs (stderr, the file, the daemon's log, `mms hook`'s
-stderr) escapes an attached traceback line by line: a bidi control, an escape
-sequence or another C0/C1 character inside it renders as `\uXXXX`, the same
-way log lines render config- and environment-derived values, so a hostile
-upstream key in a `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…` variable
-cannot reorder the lines around a validation traceback or drive the terminal
-(#1173). A newline in such a key still splits the traceback's location line in
-two; the escaping keeps line structure, so that second line is not marked as
-injected.
+stderr) escapes the values STM's own log lines interpolate, and an attached
+traceback: a bidi control, an escape sequence or another C0/C1 character
+renders as `\uXXXX`. A value is escaped whole, newline included, so an
+upstream key or `prefix` with a newline in it — config does not restrict
+their characters — stays on the line that names it instead of starting what
+looks like a record of its own (#1425). A traceback is escaped line by line,
+so a hostile upstream key in a
+`MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…` variable cannot reorder the
+lines around a validation traceback or drive the terminal (#1173). A newline
+in such a key still splits the traceback's location line in two; the escaping
+keeps line structure, so that second line is not marked as injected.
 
 See [Configuration → General](configuration.md#general) for details.
 

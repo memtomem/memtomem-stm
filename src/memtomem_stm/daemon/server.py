@@ -378,7 +378,7 @@ class DaemonServer:
         for message in holdout_startup_warnings(
             surfacing_cfg, proxy_path=False, has_tracker=self._tracker is not None
         ):
-            logger.warning(message)
+            logger.warning("%s", message)
 
     async def _teardown(self) -> None:
         """Graceful resource release, mirroring app_lifespan's order: engine →

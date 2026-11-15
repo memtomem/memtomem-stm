@@ -13,6 +13,29 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- A value interpolated into one of STM's log lines can no longer split or
+  reorder the line. The log formatter escaped an attached traceback only, and
+  left each message's values to its call site; most call sites passed them
+  through unchanged. Config does not restrict the characters of an upstream
+  server key or its `prefix`, and 114 logging calls interpolate one of the
+  two, so a key with a newline in it — in a hand-edited or imported
+  `stm_proxy.json` — made lines such as `Connected to '<key>' (3 tools
+  discovered)` continue on a second line that read as a record of its own,
+  and a bidirectional control or an escape sequence in it reached the terminal
+  and the log file as itself. The formatter every STM handler uses (stderr,
+  the log file, the daemon's log, `mms hook`'s stderr) now escapes each
+  argument as it is interpolated, the way the CLI escapes the same values.
+  The oversize-response warning (`Upstream '<server>/<tool>' response
+  exceeded max_upstream_bytes=…`) built its text before logging it and now
+  passes the names as arguments like the rest (#1425).
+  **Behavior change**: in a log line, a tab, a newline, another control
+  character, a line or paragraph separator, a bidirectional control or a lone
+  surrogate inside an interpolated value is written as `\uXXXX`. The fixed
+  text of a message is unchanged, and so is a value with none of those
+  characters. A `%c` conversion given a string that needs that escape, or an
+  instance of a `str` subclass, is reported as a logging error instead of
+  written; none of STM's own lines use `%c`.
+
 - `mms daemon status` and `mms daemon stop` derive the config fingerprint
   once per run. Each read the discovery key twice — once to find this config's
   daemon and again to decide which daemons are foreign, or to send the
