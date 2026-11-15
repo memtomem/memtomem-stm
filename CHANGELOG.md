@@ -13,6 +13,20 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms daemon status` and `mms daemon stop` derive the config fingerprint
+  once per run. Each read the discovery key twice — once to find this config's
+  daemon and again to decide which daemons are foreign, or to send the
+  shutdown request — so a key removed between the two reads made `status`
+  report the daemon that had just answered as `running` and list it again
+  under `foreign`, and made `stop` miss its own daemon's graceful shutdown and
+  fall back to signalling it by pid (#1423).
+  **Behavior change**: a discovery key damaged while `mms daemon stop` is
+  running no longer ends that run with the key error and exit 1, and
+  `stop --all` no longer signals this config's own daemon as a foreign one in
+  that case. The run finishes against the fingerprint it started with, and
+  the next command reports the key. A key that is already unusable when the
+  command starts is reported as before.
+
 - Three warnings about a cache that could not be opened now escape the path
   they quote. "Response cache disabled" and "Tool-graph consult cache disabled
   this session" print a key-file error whose text names the configured cache

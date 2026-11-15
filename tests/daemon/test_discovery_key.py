@@ -28,7 +28,7 @@ from click.testing import CliRunner
 from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client, discovery
-from memtomem_stm.daemon.protocol import OP_LTM_SEARCH
+from memtomem_stm.daemon.protocol import OP_LTM_SEARCH, OP_SHUTDOWN, PROTOCOL_VERSION
 from memtomem_stm.logging_setup import FILE_FORMAT, DisplayEscapingFormatter
 from memtomem_stm.surfacing.daemon_adapter import DaemonLtmAdapter
 from memtomem_stm.surfacing.mcp_client import LtmTransportError
@@ -495,41 +495,137 @@ def test_stop_all_reaches_every_published_daemon_without_a_usable_key(
         assert result.exit_code == 0, result.output
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
-def test_stop_all_still_cleans_up_when_the_key_goes_bad_mid_command(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``stop`` derives the fingerprint, then the graceful request derives it
-    again. A key damaged in between must end as the same report, after the
-    same cleanup, as one that was already unusable."""
-    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+# ── one fingerprint per command (#1423) ──────────────────────────────────────
+
+
+def _key_reads(monkeypatch: pytest.MonkeyPatch, *, then: str) -> list[Path]:
+    """Record every read of the discovery key, and change the key right after
+    the first one: ``removed``, ``corrupted``, or ``kept``.
+
+    A command that reads the key a second time then finds none, or one it
+    cannot use — so what the command goes on to report shows whether it did.
+    """
+    real = discovery.load_key
+    reads: list[Path] = []
+
+    def spy(path: Path, **kwargs: bool) -> bytes | None:
+        key = real(path, **kwargs)
+        reads.append(path)
+        if len(reads) == 1 and then == "removed":
+            path.unlink()
+        elif len(reads) == 1 and then == "corrupted":
+            path.write_bytes(b"not a key\n")
+        return key
+
+    monkeypatch.setattr(discovery, "load_key", spy)
+    return reads
+
+
+def _answering_daemon(monkeypatch: pytest.MonkeyPatch, data_dir: Path, pid: int) -> Path:
+    """This config's daemon, without a socket: its handshake is published
+    under the current fingerprint and every request to it succeeds. A shutdown
+    request also removes the handshake, as teardown does.
+
+    Only the wire is replaced. ``client.ping`` and ``client.shutdown`` are the
+    real ones, so a fingerprint they derive for themselves is a real read.
+    """
     current = discovery.config_fingerprint(STMConfig(), create_key=True)
-    # This config's own daemon is one of the published ones once its
-    # fingerprint can no longer be derived; it must not be left out.
-    handshakes = {
-        98765: _put_foreign(tmp_path, "0ldunkeyedfp0000", pid=98765),
-        4321: _put_foreign(tmp_path, current, pid=4321),
-    }
+    handshake = _put_foreign(data_dir, current, pid=pid)
+
+    async def request(
+        hs: dict[str, object], op: str, payload: object, **kwargs: object
+    ) -> dict[str, object]:
+        assert hs["pid"] == pid
+        if op == OP_SHUTDOWN:
+            handshake.unlink()
+        return {"ok": True, "v": PROTOCOL_VERSION, "ltm": "warm"}
+
+    monkeypatch.setattr(client, "_request", request)
+    return handshake
+
+
+@pytest.mark.parametrize("then", ["removed", "corrupted"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_status_reports_the_daemon_that_answered_once_when_the_key_changes_under_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, then: str, as_json: bool
+) -> None:
+    """``status`` derives the fingerprint once and pings with it. Derived a
+    second time after the ping, a key removed in between listed the daemon
+    that had just answered as a foreign one too, and a key corrupted in
+    between replaced the answer with a key error."""
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    _answering_daemon(monkeypatch, tmp_path, pid=4321)
+    _accepting(monkeypatch)  # were it listed as foreign, it would count as live
+    reads = _key_reads(monkeypatch, then=then)
+
+    result = CliRunner().invoke(_cli(), ["daemon", "status", *(["--json"] if as_json else [])])
+
+    assert result.exit_code == 0, result.output
+    assert len(reads) == 1
+    if as_json:
+        info = json.loads(result.output)
+        assert (info["state"], info["pid"]) == ("running", 4321)
+        assert info["foreign"] == []
+    else:
+        assert "running  pid=4321" in result.output
+        assert "different config" not in result.output
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_status_without_a_key_reads_for_it_once_and_asks_no_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, as_json: bool
+) -> None:
+    """No key, no fingerprint, so there is nothing to ping: the ping is
+    skipped rather than left to look for the key again."""
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    tmp_path.joinpath("unrelated").touch()
+
+    async def no_request(*args: object, **kwargs: object) -> None:
+        pytest.fail("no daemon can be addressed without a fingerprint")
+
+    monkeypatch.setattr(client, "_request", no_request)
+    reads = _key_reads(monkeypatch, then="kept")
+
+    result = CliRunner().invoke(_cli(), ["daemon", "status", *(["--json"] if as_json else [])])
+
+    assert result.exit_code == 0, result.output
+    assert "stopped" in result.output
+    assert len(reads) == 1
+    assert [p.name for p in tmp_path.iterdir()] == ["unrelated"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
+@pytest.mark.parametrize("then", ["removed", "corrupted"])
+@pytest.mark.parametrize("stop_all", [False, True], ids=["stop", "stop-all"])
+def test_stop_acts_on_the_fingerprint_it_started_with_when_the_key_changes_under_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, then: str, stop_all: bool
+) -> None:
+    """``stop`` hands the fingerprint it derived to the graceful request. When
+    that request derived it again, a key removed in between left it with no
+    daemon to ask, and ``stop`` fell back to signalling its own daemon by pid;
+    a key corrupted in between ended the run with the key error — with
+    ``--all``, after trying to signal that daemon as a foreign one."""
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    _answering_daemon(monkeypatch, tmp_path, pid=4321)
+    foreign = _put_foreign(tmp_path, "0ldunkeyedfp0000", pid=98765)
     _accepting(monkeypatch)
-
-    async def key_gone_bad(config: STMConfig) -> bool:
-        raise LocalKeyError("cannot read the key file stm-discovery.key: gone bad")
-
-    monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", key_gone_bad)
     killed: list[tuple[int, int]] = []
 
     def fake_kill(pid: int, sig: int) -> None:
         killed.append((pid, sig))
-        handshakes[pid].unlink()
+        foreign.unlink()  # teardown done
 
     monkeypatch.setattr(os, "kill", fake_kill)
+    reads = _key_reads(monkeypatch, then=then)
 
-    result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+    result = CliRunner().invoke(_cli(), ["daemon", "stop", *(["--all"] if stop_all else [])])
 
-    assert result.exit_code == 1
-    assert isinstance(result.exception, SystemExit)
-    assert sorted(killed) == [(4321, signal.SIGTERM), (98765, signal.SIGTERM)]
-    assert "stm-discovery.key: gone bad" in result.output
+    assert result.exit_code == 0, result.output
+    assert len(reads) == 1
+    # Stopped over the wire, as this config's daemon; never by pid.
+    assert "daemon stopped" in result.output.splitlines()
+    assert killed == ([(98765, signal.SIGTERM)] if stop_all else [])
+    assert "stm-discovery.key" not in result.output
 
 
 @pytest.mark.parametrize("can_signal", [True, False], ids=["posix", "windows"])

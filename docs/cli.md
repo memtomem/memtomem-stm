@@ -1229,6 +1229,11 @@ that the directory could be walked; if it could not (a dangling symlink above
 it), `status` reports `unknown` (`--json`: an `error` field) and `stop` exits
 1. `restart` with no key skips the lock wait and goes straight to `start`.
 
+`status` and `stop` each read the key once, when they start, and use that one
+fingerprint for the whole run. A key removed or damaged while one of them is
+running does not change which daemon that run reports or stops as this
+config's; the next command is the one that sees the change.
+
 A key that exists but cannot be read, or does not hold a key, is an error:
 
 - `start`, `stop`, `status` and `restart` exit 1 with one line naming the file.
