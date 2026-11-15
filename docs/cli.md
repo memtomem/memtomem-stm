@@ -1181,7 +1181,8 @@ Looking at another fingerprint's lock creates nothing: `status` and
 `stop --all` open only a lock file that is already there. A lock file that has
 been deleted counts as free; one that is a link to nothing, or sits under a
 directory that no longer resolves, counts as `lock could not be checked`. (On
-Windows, opening an existing lock file that is empty writes one byte to it.)
+Windows, opening an existing lock file that is empty tries to write one byte
+to it, and leaves it empty when another process has that byte locked.)
 
 Only `never exits when idle`, `idle timeout unknown` and those entries get the
 warning and the cleanup hint: if no running STM
