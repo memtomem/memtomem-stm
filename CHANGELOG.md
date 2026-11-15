@@ -11,6 +11,93 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.7.9] — 2026-11-15
+
+### Upgrade notes
+
+- **Stop the daemon an earlier build started.** The daemon's config
+  fingerprint is now keyed (#1416), so a daemon still running from an
+  earlier build is under another fingerprint: `mms daemon stop` and
+  `restart` no longer reach it, and hooks start a new daemon beside it. On
+  macOS and Linux `mms daemon stop --all` stops it; on Windows, end the
+  listed process. One with `daemon.idle_timeout_seconds = 0` never exits on
+  its own. Afterwards the old `stm-daemon-*.json` and `.lock` files can be
+  deleted, as the entry below describes (keep `stm-discovery.key`: deleting
+  or replacing it while daemons run turns them into foreign ones the same
+  way). On a `data_dir` it cannot walk and with no key, `mms daemon status
+  --json` reports `"state": "unknown"` where it reported `"stale"`.
+- **The response cache and the tool-graph consult cache start empty** once.
+  Restart running proxies after upgrading: a process from the previous
+  release can still write unkeyed rows. Each cache now has a key file
+  beside it; deleting or replacing it empties that cache, and an unreadable
+  one disables it for the run, as the entry below describes. (#1418, issue
+  #1416)
+- **The new key files need a filesystem with hard links.**
+  `<data_dir>/stm-discovery.key`, the `.key` file beside each cache database
+  and `~/.mms/import_state.toml.key` are created with a hard link. Where that
+  directory's filesystem has none (FAT, exFAT, some network mounts), the
+  daemon cannot be used, that cache runs disabled, and `mms host sync
+  --apply` / `mms import --apply` exit 1 before writing. Move the directory
+  to a filesystem that supports hard links. (#1416, #1418,
+  GHSA-8xcm-66jc-qmfr)
+- **`mms host` drift hashes are keyed.** `baseline_hash` and `current_hash`
+  become `hmac-sha256:<16 hex>`. Until the first `--apply` that writes
+  creates the key, `current_hash` is `null` and so is the `baseline_hash` of
+  an earlier version's row; such rows keep their state and are re-keyed in
+  place by that write. A lost, replaced or unreadable key changes what is
+  reported, as the Security entry below describes. That write moves
+  `~/.mms/import_state.toml` to `schema_version = 2`, which 0.7.8 refuses to
+  read; to go back, delete the file and run `mms host sync --apply` there.
+  A row that pairs an unkeyed `sha256:` hash with a `drift_hash_version`
+  other than 1, which 0.7.8 loaded and no release wrote, is now refused on
+  load; the same delete-and-sync recovers. Rotate a credential whose entry
+  appeared in a report that left the machine. (GHSA-8xcm-66jc-qmfr)
+- **Surfacing query digests are keyed, and the selection log drops two
+  digests.** New digests start with `hmac-sha256:` and do not compare with
+  earlier `sha256:` rows; selection-log records are `schema_version` 2,
+  which an older STM's replay and `mms selection feedback` skip. (#1381)
+- **With the embedding scorer, a pass whose query or response matches a
+  credential pattern is ranked by BM25** instead of being sent to the
+  endpoint. `relevance_scorer.privacy_scan_enabled = false` turns the screen
+  off. (#1382)
+- **Log messages escape control characters.** A tab, a line break, another
+  control character, a line or paragraph separator, a bidirectional control
+  or a lone surrogate is written as `\uXXXX`, so every message is one line;
+  a traceback keeps its lines (#1425, #1422). The text output of
+  `mms daemon status` and `stop --all` escapes a fingerprint and a recorded
+  `pid` the same way (#1429).
+- **`mms daemon status` and `stop --all` list a daemon that holds its lock
+  without a handshake** (`pid=?`, `handshake_absent: true`). `stop --all`
+  waits for it and exits 1 if its lock is still held, or could not be
+  checked, when the wait ends. (#1421)
+- **Host discovery reads home variables the way the host does.**
+  `CODEX_HOME=""` means `~/.codex`; a relative `CODEX_HOME`, or one with a
+  `.` or `..` component, skips Codex discovery. `mms hook install` and
+  `uninstall` exit with an error for a relative or dotted
+  `CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME` or `CODEX_HOME`, and for an empty
+  `CLAUDE_CONFIG_DIR` or `KIMI_CODE_HOME`. (#1404, issue #1345)
+- **An entry whose baseline source was skipped reads `not_inspected`** where
+  a same-name entry at another host made it `unchanged` or `changed`.
+  (#1403, #1414)
+- **A `<python> -m` host entry for STM or LTM counts as STM's own
+  registration or the LTM companion**: `mms init`, `mms add --from-clients`,
+  `mms import` and `mms host sync` no longer offer it, `mms eject` refuses
+  it, and one already imported shows as `removed_at_host`. (#1383, #1400)
+- **An upstream prefix ending in a newline is refused** by `mms add
+  --prefix`, and an imported host entry whose name ends in one gets prefix
+  `mcp`. Saved prefixes are not migrated. (#1391)
+- **TRUNCATE's code-aware previews change shape**: every remaining block's
+  signature line first, then body lines while the budget lasts. (#1410)
+- **`stm_compression_feedback` stores a placeholder for a `missing` text the
+  privacy screen flags**, and its reply says so. (#1380)
+- **On macOS with Python 3.12**, the leaked-child sweep after a failed LTM
+  adapter shutdown sends SIGKILL to a child that outlives its SIGTERM,
+  where it stopped with `AttributeError`. (#1384)
+- **Hint text only:** `mms project enable` (#1390), `mms host sync` (#1399),
+  `mms import --plan --allow-project-configs` (#1401) and the `mms host
+  status` missing-baseline footer (GHSA-8xcm-66jc-qmfr) now name a command
+  that works. Exit codes and what is written are unchanged.
+
 ### Fixed
 
 - A value named in a log message can no longer split or reorder the line. The
@@ -24,7 +111,9 @@ changes inline only. See the deprecation policy in
   or an escape sequence in it reached the terminal and the log file as
   itself. The formatter every STM handler uses (stderr, the log file, the
   daemon's log, `mms hook`'s stderr) now escapes the whole rendered line,
-  the way the CLI escapes the same values (#1425).
+  the way the CLI escapes the same values (#1425). That covers the cache path
+  quoted by the warning "Tool-graph consult cache could not be opened at",
+  which a newline in the consult cache path split across two lines (#1422).
   **Behavior change**: in a log message, a tab, a line break, another control
   character, a line or paragraph separator, a bidirectional control or a lone
   surrogate is written as `\uXXXX`, wherever in the message it is. Every
@@ -36,30 +125,30 @@ changes inline only. See the deprecation policy in
 - `mms daemon status` and `mms daemon stop --all` escape for display two
   values they read from files in `data_dir` and used to print as they were.
   One is the fingerprint of a daemon under another config, which is taken
-  from a file name (`stm-daemon-<fingerprint>.json` or `.lock`): a name
+  from its handshake's file name (`stm-daemon-<fingerprint>.json`): a name
   carrying a control or bidirectional-formatting character reached the
   terminal with it, and one that was not valid UTF-8 (Linux allows such a
   name) was written out as the bytes it was or, where the output stream
   encodes strictly, ended the command with `UnicodeEncodeError` at the first
-  line naming it. The other, in `status` only, is the `pid` recorded in this
-  config's handshake when no daemon answers for it, which was printed
-  whatever JSON value the file held. Both
-  now appear with such characters as `\uXXXX`; a name or pid without any is
-  printed as before. `--json` was not affected — JSON encoding already
-  escaped them — and still carries both values as found. The file has to be
-  in the operator's own `data_dir`.
-  With an unusable discovery key, the hint `stop` prints now says what
-  `stop --all` does — it signals the accepting daemons under `data_dir` and
-  waits for the others — where it said it signals every published daemon
-  (#1429).
+  line naming it. The daemons listed from a `.lock` file name (see the next
+  entry) are escaped the same way. The other value, in `status` only, is the
+  `pid` recorded in this config's handshake when no daemon answers for it,
+  which was printed whatever JSON value the file held. Both now appear with
+  such characters as `\uXXXX`; a name or pid without any is printed as
+  before. `--json` was not affected — JSON encoding already escaped them —
+  and still carries both values as found. The file has to be in the
+  operator's own `data_dir` (#1429).
+  **Behavior change**: in the text output of `mms daemon status` and
+  `mms daemon stop --all`, such a character in a fingerprint or `pid` is
+  written as `\uXXXX`, and a file name that is not valid UTF-8 no longer ends
+  the command with `UnicodeEncodeError`. `--json` output is unchanged.
 - `mms daemon status` and `mms daemon stop --all` find a daemon under another
   config fingerprint that holds its lifetime lock without a handshake. A
   daemon holds the lock from before it publishes its handshake until after
   its teardown has removed it, and daemons under other fingerprints were
   found through handshakes only, so for those two stretches one was not
   listed: `status` reported `stopped` with an empty `foreign` list and
-  `stop --all` reported nothing to stop, both with exit 0. That also covered
-  this config's own daemon once its discovery key had been removed. Such a
+  `stop --all` reported nothing to stop, both with exit 0. Such a
   daemon is now found by its lock file and listed as `pid=?` with `no
   handshake; lock held — starting or shutting down`; in `status --json` its
   `foreign` entry has `handshake_absent: true`, `listening: false` and
@@ -72,38 +161,16 @@ changes inline only. See the deprecation policy in
   looking at the same file would otherwise report each other; a lock file on
   a filesystem without file-lock support is listed as one that could not be
   checked rather than as held. The state reported for this config is
-  unchanged — with no discovery key it is still `stopped`, with the daemon
-  listed beside it (#1421).
+  unchanged (#1421).
   Looking at another fingerprint's lock no longer creates anything. `status`
   and `stop --all` used to create the lock file of a fingerprint whose
   handshake was stale and whose lock file was gone, and to create the target
   of a lock file that was a dangling link and then read that lock as free;
   they now open only a lock file that already exists.
-
-- `mms daemon status` and `mms daemon stop` derive the config fingerprint
-  once per run. Each read the discovery key twice — once to find this config's
-  daemon and again to decide which daemons are foreign, or to send the
-  shutdown request — so a key removed between the two reads made `status`
-  report the daemon that had just answered as `running` and list it again
-  under `foreign`, and made `stop` miss its own daemon's graceful shutdown and
-  fall back to signalling it by pid (#1423).
-  **Behavior change**: a discovery key damaged while `mms daemon stop` is
-  running no longer ends that run with the key error and exit 1, and
-  `stop --all` no longer signals this config's own daemon as a foreign one in
-  that case. The run finishes against the fingerprint it started with, and
-  the next command reports the key. A key that is already unusable when the
-  command starts is reported as before.
-
-- Three warnings about a cache that could not be opened now escape the path
-  they quote. "Response cache disabled" and "Tool-graph consult cache disabled
-  this session" print a key-file error whose text names the configured cache
-  path, and "Tool-graph consult cache could not be opened at" prints that path
-  directly; the log formatter escapes exception text only, so a newline or a
-  bidirectional control in `proxy.cache.db_path` or the consult cache path
-  reached the terminal and the log file as itself — a path with a newline
-  split the first two warnings across two lines. Each is now rendered with a
-  `\uXXXX` escape in place of such a character. The wording is unchanged for
-  a path without one (#1422).
+  **Behavior change**: `mms daemon status` lists such a daemon under
+  `foreign` where it listed none. `mms daemon stop --all` waits for its lock
+  and exits 1 if the lock is still held, or could not be checked, when the
+  wait ends, where it exited 0 with nothing to stop.
 
 - The response cache's row keys and the tool-graph consult cache's backend
   fingerprint are keyed. A response-cache key was a plain SHA-256 of the
@@ -119,7 +186,7 @@ changes inline only. See the deprecation policy in
   covered. The one-time purge of old rows is logical: their bytes can remain
   in the file's free pages, so before sharing a copy, stop STM and delete the
   cache database (it is recreated empty), unless another store shares that
-  file (#1416).
+  file (#1418, issue #1416).
   **Behavior change**: the response cache and the consult cache start empty
   after the upgrade (response-cache key schema 8, consult scope key 2). A
   deleted or replaced key file empties its cache on the next open; replace
@@ -157,7 +224,12 @@ changes inline only. See the deprecation policy in
   key: at startup, or at its next spawn request if the key is damaged later
   — requests to a daemon it already found go on), and
   `mms health` / `mms doctor` report it as an unreachable daemon with their
-  usual exit codes. Moving the file aside makes a new one (#1416).
+  usual exit codes. Moving the file aside makes a new one (#1416). `status`
+  and `stop` read the key once per run, so a key removed while one runs does
+  not make `status` list this config's daemon under `foreign` as well,
+  `stop --all` signal it as a foreign one, or `stop` fall back to signalling
+  it by pid; the run finishes
+  against the fingerprint it started with (#1423).
   **Behavior change**: every daemon started by an earlier build is under a
   different fingerprint after the upgrade, as after a protocol change:
   `mms daemon status` lists it as running under a different config,
@@ -226,21 +298,22 @@ changes inline only. See the deprecation policy in
   pass. It is not counted as a `scorer_fallback`.
 
 - `mms host status` and `mms host sync` no longer judge a registry entry by
-  another host, or re-stamp its baseline, while the host config that baseline
-  came from was skipped. Before, a baseline stamped by a different STM hash
-  version read as `no_baseline` even then, and `mms host sync --apply`
-  re-stamped it from a same-name entry at another host, recording that host as
-  its source; with no such entry it was reported as an entry without a
-  baseline. A same-name entry at another host also made the entry `unchanged`
-  or `changed` against that host. (#1403, #1414)
+  another host, or re-stamp its baseline from one, while the host config that
+  baseline came from was skipped. Before, a same-name entry at another host
+  made the entry `unchanged` or `changed` against that host, although the
+  baseline's own host had not been read. The same rule now also comes before
+  the hash-version check, so a baseline this release cannot compare (one
+  whose drift-hash key was lost, see the Security entry) is not re-stamped
+  from another host's entry and given that host as its source (#1403, #1414).
   **Behavior change**: those entries now read `not_inspected`, with the
-  skipped source's reason, where they read `no_baseline`, `unchanged` or
-  `changed`, and `mms host sync --apply` (with or without `--force`) leaves
-  their baseline as it is. In `mms host sync --json` they are listed under
-  `not_inspected` instead of `backfill`, `orphan_no_baseline` or
-  `skipped_changed`, or instead of being counted in `summary.unchanged`. In
-  `mms host status --json` their `current_hash` is the other host's entry's
-  hash when there is one.
+  skipped source's reason, where they read `unchanged` or `changed`. In
+  `mms host sync --json` they are listed under `not_inspected` instead of
+  `skipped_changed`, or instead of being counted in `summary.unchanged`.
+  `mms host sync --apply` (with or without `--force`) keeps their recorded
+  host shape and source; it can still re-key an earlier version's hash in
+  place. In `mms host status --json` their `current_hash` is the other
+  host's entry's hash when there is one and a drift-hash key exists, and
+  `null` otherwise.
 - TRUNCATE's code-aware output names more of the blocks it cannot keep whole.
   Those blocks are previewed after a `... (N more blocks)` line, and the
   previews used to be built one block at a time, each with its body lines, so
@@ -260,14 +333,19 @@ changes inline only. See the deprecation policy in
   block is shown as `# <signature>` only when not even its cut signature
   fits. Blocks are named in order, so a long block early can take the room a
   later short block used to get, and a signature still cut at 80 characters
-  hides whatever comes after that point, a name included.
+  hides whatever comes after that point, a name included (#1410).
 - On macOS with Python 3.12, the leaked-child sweep that runs when an LTM
-  adapter's shutdown fails no longer raises `AttributeError: module 'os' has
-  no attribute 'waitid'` instead of terminating the child. CPython has
+  adapter's shutdown fails no longer stops with `AttributeError: module 'os'
+  has no attribute 'waitid'` right after its SIGTERM, before it could send
+  SIGKILL to a child that ignored the SIGTERM. CPython has
   `os.waitid` on macOS only from 3.13; without it the sweep now asks
   `os.getpgid`, which the macOS kernel answers with "no such process" for an
   exited child nobody reaped yet, so the sweep still does not wait out its
-  escalation window for a child that already died.
+  escalation window for a child that already died (#1384).
+  **Behavior change**: on macOS with Python 3.12, that sweep now runs to
+  the end: a child still alive when its escalation window closes is sent
+  SIGKILL, where the sweep ended with the `AttributeError`. Other platforms
+  and Python versions are unchanged.
 - An empty or relative host home variable no longer points STM at files in the
   current directory. Before, `CODEX_HOME=""` made `mms import` and
   `mms host sync` read `./config.toml` as the Codex user config, outside
@@ -278,7 +356,7 @@ changes inline only. See the deprecation policy in
   host reads it, measured on Codex CLI 0.167.2 and Kimi Code 0.39.0: Codex
   treats an empty `CODEX_HOME` as unset, while Claude Code and Kimi Code
   resolve an empty or relative value against their own working directory,
-  which STM does not know.
+  which STM does not know (#1404, issue #1345).
   **Behavior change**: `CODEX_HOME=""` now means `~/.codex`. A `CODEX_HOME`
   that is relative or contains a `.` or `..` component makes Codex discovery
   skip both Codex configs: `mms import` imports nothing from Codex, and
@@ -296,7 +374,7 @@ changes inline only. See the deprecation policy in
   the prefix given to `mms add` or typed at the `mms add --from-clients` and
   `mms init` prompts, and to the prefix that `mms import` and `mms host sync`
   derive from a host config entry's name: a name ending in a newline now gets
-  the fallback prefix `mcp` instead of keeping the newline.
+  the fallback prefix `mcp` instead of keeping the newline (#1391).
   **Behavior change**: `mms add --prefix` with a trailing newline now exits
   with the invalid-prefix error, and an imported or synced host entry whose
   name ends in a newline is registered with prefix `mcp`. Prefixes already
@@ -311,7 +389,7 @@ changes inline only. See the deprecation policy in
   registered names. With an empty registry, the command now suggests
   `mms import --apply` instead of `mms import --from <host>`: without
   `--apply`, `mms import` only previews and writes nothing, so re-running
-  `mms project enable` as the message said failed again.
+  `mms project enable` as the message said failed again (#1390).
   **Behavior change**: only the hint text of these two errors changes; the
   exit code and the name check are the same.
 - `mms host sync` now points at a command that actually re-stamps a changed
@@ -377,13 +455,18 @@ changes inline only. See the deprecation policy in
   and the tool's reply adds `the description was withheld by the privacy
   screen and not stored`. Rows written before this change are not rewritten.
 
-- `mms host status` named a command that could not stamp some of the entries
-  it reported. Its "missing baseline hash" footer said to run `mms import
-  --apply`, which stamps only an entry with no sidecar row; for a row that
-  exists but cannot be compared (a hash version this STM does not know, or a
-  lost drift-hash key) it answered "Already up to date" and the entry stayed
-  `no_baseline`. The footer now names `mms host sync --apply`, which stamps
-  both, for any entry a host scan still finds.
+- The "missing baseline hash" footer of `mms host status` names
+  `mms host sync --apply` where it named `mms import --apply`. `mms import
+  --apply` stamps only an entry with no sidecar row; for a row that exists
+  but cannot be compared it answered "Already up to date" and the entry
+  stayed `no_baseline`. On this release such a row is one whose drift-hash
+  key was lost (see the Security entry); an unkeyed row with a hash version
+  other than 1, which no release wrote, is now refused on load instead.
+  `mms host sync --apply` stamps an entry with no row and one whose row
+  cannot be compared, for any entry a host scan still finds, except one
+  whose baseline source the scan skipped, which stays `not_inspected`
+  (GHSA-8xcm-66jc-qmfr).
+  **Behavior change**: only the footer text changes.
 
 ### Security
 
