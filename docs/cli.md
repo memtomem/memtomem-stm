@@ -1176,10 +1176,14 @@ shutting down`. It is found by its lock file (`stm-daemon-<fingerprint>.lock`).
 Lock files are never removed, so most of them belong to daemons long gone; one
 is listed only when its lock is held, or could not be checked. Testing a lock
 means taking it for an instant, which another `status` or a hook deciding
-whether to spawn a daemon does to the same file, so a lock found held is
-looked at three more times, 20 ms apart, and listed only if it is held every
-time. Such a list is never headed "running", and never answered with "nothing
-to stop".
+whether to spawn a daemon does to the same file. So for a fingerprint with no
+handshake, a lock found held is looked at again in up to three more rounds,
+each after a 20 ms pause shared by every such lock, and it is listed as held
+only if it is still held on the last of them; one found free on the way is
+dropped, and one that turns out not to be checkable is listed as that. With no
+such lock found held there is no pause. A fingerprint that has a handshake is
+looked at once. Such a list is never headed "running", and never answered with
+"nothing to stop".
 
 Looking at another fingerprint's lock creates nothing: `status` and
 `stop --all` open only a lock file that is already there. A lock file that has

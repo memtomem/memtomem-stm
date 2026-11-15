@@ -685,8 +685,9 @@ def _probe_foreign_lock(path: Path) -> LockProbe:
     return state
 
 
-# A lock file with nothing published is reported as a daemon only when it is
-# held on this many further looks, this far apart.
+# A lock file with nothing published is reported as held only when it is
+# still held after this many further rounds, each preceded by one pause of
+# this length for all such locks together.
 _UNPUBLISHED_LOCK_CONFIRMATIONS = 3
 _UNPUBLISHED_LOCK_CONFIRM_PAUSE_SECONDS = 0.02
 # Bound here, not looked up through ``time`` at call time: the pause is part
