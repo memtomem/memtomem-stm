@@ -252,6 +252,9 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     listener). Each entry carries only non-sensitive fields
     (``fingerprint``/``pid``/``host``/``port``/``idle_shutdown_seconds``/
     ``exits_when_idle``) — never the auth ``token`` — so callers can render them.
+    ``fingerprint`` is a file name, not something a daemon wrote: the entry keeps
+    it as found (paths are built from it, and ``--json`` reports it), and text
+    output renders it through ``_disp``.
 
     Cross-platform: the connect-probe is what makes Windows viable too, where
     :func:`is_pid_alive` is uninformative (returns ``True`` for any positive pid,
@@ -538,8 +541,10 @@ def stop_cmd(stop_all: bool) -> None:
 
     With an unusable discovery key there is no "current config" to act on, and
     the command exits 1 saying so. ``--all`` still runs first and treats every
-    published daemon as foreign — the way out when a daemon is still running
-    under a key that has since been damaged.
+    daemon it finds in ``data_dir`` as foreign — by a handshake, or by a lock
+    file with no handshake whose lock is held or cannot be checked. That is the
+    way out when a daemon is still running under a key that has since been
+    damaged.
 
     The key is read once, when the command starts. One damaged or removed after
     that does not change which daemon this run treats as the current config's.
@@ -571,7 +576,10 @@ def stop_cmd(stop_all: bool) -> None:
         if stop_all:
             hint = ""
         elif _can_force_terminate():
-            hint = "; `mms daemon stop --all` signals every daemon published under data_dir"
+            hint = (
+                "; `mms daemon stop --all` signals the accepting daemons under data_dir "
+                "and waits for the others to finish"
+            )
         else:
             # ``stop --all`` refuses to signal by pid on Windows.
             hint = "; end the daemon processes `mms daemon status` lists from Task Manager"
@@ -941,12 +949,12 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
 def _foreign_name(d: dict[str, Any]) -> str:
     """``pid=N (fp=…)`` for a foreign entry; ``pid=?`` when its record is unreadable."""
     pid = "?" if d["pid"] is None else d["pid"]
-    return f"pid={pid} (fp={d['fingerprint']})"
+    return f"pid={pid} (fp={_disp(d['fingerprint'])})"
 
 
 def _foreign_stopped(d: dict[str, Any]) -> str:
     pid = "?" if d["pid"] is None else d["pid"]
-    return f"daemon pid={pid} stopped (fp={d['fingerprint']})"
+    return f"daemon pid={pid} stopped (fp={_disp(d['fingerprint'])})"
 
 
 def _stop_foreign_daemons(config: STMConfig, current: str | None) -> None:
@@ -1175,7 +1183,7 @@ def status_cmd(as_json: bool) -> None:
         # No fingerprint, so no handshake or lock path to read or probe. With
         # no key at all there is no daemon for this config — provided the
         # directory could really be looked at. An unusable key leaves the
-        # question open; the daemons that are published are listed below
+        # question open; the daemons found in ``data_dir`` are listed below
         # either way.
         if key_error is not None:
             info = {"state": "unknown", "error": _key_error_text(key_error)}
@@ -1309,21 +1317,21 @@ def status_cmd(as_json: bool) -> None:
     elif state == "stale" and info["lock"] == LockProbe.HELD.value:
         click.echo(
             _warn(
-                f"daemon not answering (recorded pid={info['pid']}), lock held — "
+                f"daemon not answering (recorded pid={_stale_pid(info)}), lock held — "
                 "starting or shutting down"
             )
         )
     elif state == "stale" and info["lock"] == LockProbe.UNKNOWN.value:
         click.echo(
             _warn(
-                f"daemon not answering (recorded pid={info['pid']}), and its lock could "
-                "not be checked — state unknown"
+                f"daemon not answering (recorded pid={_stale_pid(info)}), and its lock "
+                "could not be checked — state unknown"
             )
         )
     elif state == "stale":
         click.echo(
             _warn(
-                f"stale handshake (pid={info['pid']} alive={info['pid_alive']}) — "
+                f"stale handshake (pid={_stale_pid(info)} alive={info['pid_alive']}) — "
                 "daemon not answering"
             )
         )
@@ -1358,6 +1366,16 @@ def status_cmd(as_json: bool) -> None:
         raise SystemExit(1)
 
 
+def _stale_pid(info: dict[str, Any]) -> str:
+    """The ``pid`` a handshake that nothing answers for records, for text output.
+
+    ``status`` reports it as the file has it — any JSON value, since nothing
+    validates a handshake's field types — so it is escaped here rather than
+    coerced: ``--json`` carries the same value, encoded by ``json.dumps``.
+    """
+    return _disp(str(info["pid"]))
+
+
 def _foreign_idle_label(daemon: dict[str, Any]) -> str:
     if not daemon["listening"]:
         if daemon.get("handshake_unreadable"):
@@ -1389,7 +1407,7 @@ def _render_foreign(foreign: list[dict[str, Any]]) -> None:
     the daemon; they say whether it can outlive its users.
     """
     listing = ", ".join(
-        f"pid={'?' if d['pid'] is None else d['pid']} fp={d['fingerprint']} "
+        f"pid={'?' if d['pid'] is None else d['pid']} fp={_disp(d['fingerprint'])} "
         f"({_foreign_idle_label(d)})"
         for d in foreign
     )

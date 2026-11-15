@@ -3885,8 +3885,12 @@ class TestForeignDaemonWithoutAHandshake:
             holder.release()
 
         monkeypatch.setattr(daemon_cmd, "_confirm_pause", other_prober_moves_on)
+        try:
+            foreign = self._status()["foreign"]
+        finally:
+            holder.release()
 
-        assert self._status()["foreign"] == []
+        assert foreign == []
         assert len(pauses) == 1  # looked again once, found it free, stopped
 
     def test_a_lock_held_on_every_look_is_listed_after_the_confirmations(
@@ -3949,6 +3953,7 @@ class TestForeignDaemonWithoutAHandshake:
             foreign = self._status()["foreign"]
         finally:
             daemon.release()
+            passing.release()
 
         assert [(d["fingerprint"], d["lock"]) for d in foreign] == [("aaaa000000000000", "held")]
         assert pauses == [0.02, 0.02, 0.02]  # the daemon is still confirmed in full
@@ -4068,6 +4073,280 @@ class TestForeignDaemonWithoutAHandshake:
         assert daemon_cmd._probe_foreign_lock(dangling) is LockProbe.UNKNOWN
         assert daemon_cmd._probe_foreign_lock(lock_path(broken, self.FP)) is LockProbe.UNKNOWN
         assert sorted(p.name for p in tmp_path.iterdir()) == ["broken", "data"]
+
+
+# #1429 — values read from files in ``data_dir`` and shown in text output.
+# The characters are built with ``chr`` and the expected text is spelled with
+# a doubled backslash, so this file holds no control character itself.
+_BIDI = chr(0x202E)  # RIGHT-TO-LEFT OVERRIDE
+_HOSTILE_FP = f"x{_BIDI}evil"
+_HOSTILE_FP_SHOWN = "x\\u202Eevil"
+_SURROGATE = chr(0xDCFF)  # what the byte 0xFF in a file name decodes to
+_SURROGATE_SHOWN = "\\uDCFF"
+
+
+def _daemon_output(*args: str) -> str:
+    """Text of ``mms daemon <args>``; any exit code, but no exception."""
+    from click.testing import CliRunner
+
+    result = CliRunner().invoke(_cli(), ["daemon", *args])
+    assert result.exception is None or isinstance(result.exception, SystemExit), repr(
+        result.exception
+    )
+    return result.output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics and symlinks")
+class TestAFingerprintFromAFileNameIsEscapedInText:
+    """#1429 — the fingerprint of a daemon under another config is the middle
+    of a file name, so it is whatever someone named a file in ``data_dir``.
+    ``status`` and ``stop --all`` print it; a control character in it must
+    not reach the terminal as itself. One test per way in and per helper that
+    prints it."""
+
+    def _data_dir(self, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(data_dir))
+        monkeypatch.setenv("NO_COLOR", "1")
+        _no_daemon(monkeypatch)
+
+    # The three ways in, one per place the listing builds an entry.
+
+    def _lock_only(self, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A link to nowhere: the lock cannot be checked, so it is listed.
+        lock_path(data_dir, _HOSTILE_FP).symlink_to(data_dir / "nowhere")
+
+    def _unreadable_handshake(self, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        discovery.handshake_path(data_dir, _HOSTILE_FP).write_text("not json", encoding="utf-8")
+        self._lock_only(data_dir, monkeypatch)
+
+    def _accepting(self, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        discovery.write_handshake(
+            discovery.handshake_path(data_dir, _HOSTILE_FP),
+            pid=98765,
+            host="127.0.0.1",
+            port=4242,
+            token="secret-token",
+            config_fingerprint=_HOSTILE_FP,
+            created_at=0.0,
+            idle_shutdown_seconds=None,
+        )
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+
+    @pytest.mark.parametrize("route", ["_lock_only", "_unreadable_handshake"])
+    def test_status_lists_it_escaped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+    ):
+        self._data_dir(tmp_path, monkeypatch)
+        getattr(self, route)(tmp_path, monkeypatch)
+
+        text = _daemon_output("status")
+
+        assert f"pid=? fp={_HOSTILE_FP_SHOWN} (" in text
+        assert _BIDI not in text
+
+    @pytest.mark.parametrize("route", ["_lock_only", "_unreadable_handshake"])
+    def test_stop_all_names_it_escaped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+    ):
+        self._data_dir(tmp_path, monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        getattr(self, route)(tmp_path, monkeypatch)
+        _fake_stop_clock(monkeypatch)
+
+        text = _daemon_output("stop", "--all")
+
+        named = f"daemon pid=? (fp={_HOSTILE_FP_SHOWN}) is not accepting"
+        assert text.count(named) == 2, text  # the wait notice, then the outcome
+        assert _BIDI not in text
+
+    def test_an_accepting_one_is_escaped_in_status(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._data_dir(tmp_path, monkeypatch)
+        self._accepting(tmp_path, monkeypatch)
+
+        text = _daemon_output("status")
+
+        assert f"pid=98765 fp={_HOSTILE_FP_SHOWN} (never exits when idle)" in text
+        assert _BIDI not in text
+
+    def test_an_accepting_one_is_escaped_when_signalled_and_when_stopped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._data_dir(tmp_path, monkeypatch)
+        self._accepting(tmp_path, monkeypatch)
+
+        def teardown_done(pid: int, sig: int) -> None:
+            discovery.handshake_path(tmp_path, _HOSTILE_FP).unlink()
+
+        monkeypatch.setattr(os, "kill", teardown_done)
+
+        text = _daemon_output("stop", "--all")
+
+        assert f"sent SIGTERM to daemon pid=98765 (fp={_HOSTILE_FP_SHOWN})" in text
+        assert f"daemon pid=98765 stopped (fp={_HOSTILE_FP_SHOWN})" in text
+        assert _BIDI not in text
+
+    def test_one_that_releases_its_lock_during_the_wait_is_escaped_when_stopped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The other way to the "stopped" line: nothing accepting, a lock
+        really held, released while ``stop --all`` waits."""
+        self._data_dir(tmp_path, monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        holder = _LockHolder(lock_path(tmp_path, _HOSTILE_FP))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            text = _daemon_output("stop", "--all")
+        finally:
+            holder.release()
+
+        assert f"daemon pid=? stopped (fp={_HOSTILE_FP_SHOWN})" in text
+        assert _BIDI not in text
+
+    @pytest.mark.parametrize("route", ["_lock_only", "_unreadable_handshake", "_accepting"])
+    def test_json_reports_the_name_as_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+    ):
+        """Escaping is for the text renderers. The entry keeps the real name:
+        paths are built from it, and JSON has its own encoding. Each way in
+        builds its own entry, so each is checked."""
+        import json
+
+        self._data_dir(tmp_path, monkeypatch)
+        getattr(self, route)(tmp_path, monkeypatch)
+
+        text = _daemon_output("status", "--json")
+
+        assert [d["fingerprint"] for d in json.loads(text)["foreign"]] == [_HOSTILE_FP]
+        assert _BIDI not in text
+
+    @pytest.mark.parametrize("args", [["status"], ["stop", "--all"]], ids=" ".join)
+    def test_a_name_that_is_not_utf8_is_printed_not_raised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+    ):
+        """A file name is bytes; one that is not UTF-8 reaches Python as a
+        lone surrogate, which a stream encoding strictly cannot write."""
+        import errno
+
+        self._data_dir(tmp_path, monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        name = os.path.join(os.fsencode(tmp_path), b"stm-daemon-\xff.lock")
+        try:
+            os.symlink(os.fsencode(tmp_path / "nowhere"), name)
+        except OSError as exc:
+            # macOS (APFS) answers EILSEQ. Anything else is not that refusal.
+            if exc.errno != errno.EILSEQ:
+                raise
+            pytest.skip(f"this filesystem refuses a file name that is not UTF-8: {exc!r}")
+        _fake_stop_clock(monkeypatch)
+
+        text = _daemon_output(*args)
+
+        assert f"fp={_SURROGATE_SHOWN}" in text
+        text.encode("utf-8")
+
+
+def _surrogate_entry() -> dict:
+    return {
+        "fingerprint": _SURROGATE,
+        "pid": None,
+        "host": None,
+        "port": None,
+        "idle_shutdown_seconds": None,
+        "exits_when_idle": None,
+        "listening": False,
+        "lock": "held",
+        "handshake_absent": True,
+    }
+
+
+@pytest.mark.parametrize("helper", ["_foreign_name", "_foreign_stopped"])
+def test_a_foreign_fingerprint_that_cannot_be_encoded_is_escaped(helper: str):
+    """#1429, on every platform: the file-name tests above need a filesystem
+    that accepts such a name, and Windows and macOS do not."""
+    from memtomem_stm.cli import daemon_cmd
+
+    text = getattr(daemon_cmd, helper)(_surrogate_entry())
+
+    assert f"fp={_SURROGATE_SHOWN}" in text
+    text.encode("utf-8")
+
+
+def test_the_foreign_listing_escapes_a_fingerprint_that_cannot_be_encoded(
+    capsys: pytest.CaptureFixture[str],
+):
+    from memtomem_stm.cli import daemon_cmd
+
+    daemon_cmd._render_foreign([_surrogate_entry()])
+
+    out = capsys.readouterr().out
+    assert f"pid=? fp={_SURROGATE_SHOWN} (no handshake; lock held" in out
+    out.encode("utf-8")
+
+
+class TestStatusEscapesTheRecordedPidOfAnUnansweredHandshake:
+    """#1429 — ``status`` reports the ``pid`` of this config's handshake as
+    the file has it when no daemon answers, and nothing validates that field:
+    it is any JSON value. Each of the three lines that print it, by the lock
+    state that selects the line."""
+
+    LINES = {
+        LockProbe.FREE: "stale handshake (pid={} alive=False) — daemon not answering",
+        LockProbe.HELD: "daemon not answering (recorded pid={}), lock held — ",
+        LockProbe.UNKNOWN: "daemon not answering (recorded pid={}), and its lock could not be",
+    }
+
+    def _status(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: object, lock: LockProbe, *args
+    ) -> str:
+        from memtomem_stm.cli import daemon_cmd
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("NO_COLOR", "1")
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr(daemon_cmd, "_probe_lock", lambda path: lock)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: False)
+        _write_handshake({"pid": pid, "host": "127.0.0.1", "port": 1, "token": "t"})
+        return _daemon_output("status", *args)
+
+    @pytest.mark.parametrize("lock", list(LINES), ids=lambda lock: lock.value)
+    @pytest.mark.parametrize(
+        ("pid", "shown"),
+        [(f"1{_BIDI}2", "1\\u202E2"), (_SURROGATE, _SURROGATE_SHOWN), (12345, "12345")],
+        ids=["bidi", "surrogate", "an ordinary pid"],
+    )
+    def test_each_line_prints_it_escaped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        pid: object,
+        shown: str,
+        lock: LockProbe,
+    ):
+        text = self._status(tmp_path, monkeypatch, pid, lock)
+
+        assert self.LINES[lock].format(shown) in text
+        assert _BIDI not in text
+        text.encode("utf-8")
+
+    def test_json_reports_it_as_the_file_has_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import json
+
+        pid = f"1{_BIDI}2"
+
+        text = self._status(tmp_path, monkeypatch, pid, LockProbe.FREE, "--json")
+
+        assert json.loads(text)["pid"] == pid
+        assert _BIDI not in text
 
 
 class TestDaemonRestartCli:
