@@ -191,8 +191,8 @@ build started.
    before any of them starts again, then run `mms version` and `mms doctor`.
 5. Start the hosts again.
 
-The first release after 0.7.8 also changes the fingerprint itself — it is
-keyed with `<data_dir>/stm-discovery.key` — so the same steps apply to it even
+0.7.9 also changes the fingerprint itself — it is keyed with
+`<data_dir>/stm-discovery.key` — so the same steps apply to it even
 though the protocol does not change: a daemon the earlier build started is
 under a fingerprint the new build no longer derives. If one is still running
 after the upgrade, `mms daemon status` lists it as running under a different
