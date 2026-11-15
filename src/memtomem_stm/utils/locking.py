@@ -20,10 +20,19 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def open_lock_fd(path: Path) -> int:
-    """Open ``path`` for locking and return an fd owned by the caller."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+def open_lock_fd(path: Path, *, create: bool = True) -> int:
+    """Open ``path`` for locking and return an fd owned by the caller.
+
+    With ``create=False`` nothing is made: no parent directory, no file, and
+    no target for a link that does not resolve — a path with no file behind it
+    raises ``FileNotFoundError``. For a caller that only asks whether a lock
+    that already exists is held.
+    """
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    else:
+        fd = os.open(str(path), os.O_RDWR)
     if os.name == "nt":  # pragma: no cover - Windows CI
         try:
             if os.fstat(fd).st_size == 0:

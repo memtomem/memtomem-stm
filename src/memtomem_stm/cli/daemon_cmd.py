@@ -222,8 +222,9 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     """Daemons running under a *different* config fingerprint than *current*.
 
     *current* is ``None`` when the caller has no fingerprint — no discovery
-    key, or an unusable one — and then every published daemon is listed: that
-    is what lets ``stop --all`` reach daemons whose key was lost or damaged.
+    key, or an unusable one — and then every daemon in ``data_dir`` is listed:
+    that is what lets ``stop --all`` reach daemons whose key was lost or
+    damaged.
 
     ``stop``/``status`` key to the *current* fingerprint, so these are invisible
     to them otherwise. A foreign daemon is not necessarily stale (#1195):
@@ -268,22 +269,39 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     Accepting entries carry ``listening: True`` and ``lock: None`` (not
     checked).
 
+    A fingerprint with no handshake file at all is listed the same way when
+    its lock is not free (#1421): a daemon holds the lock before it publishes
+    and after its teardown has removed the record, and for those stretches the
+    lock file is all there is to find. Those entries carry
+    ``handshake_absent: True``, ``listening: False``, ``lock``, and ``None``
+    for every field a record would have supplied. Candidates are the lock
+    files that exist (:func:`iter_foreign_lock_fingerprints`); daemons never
+    remove theirs, so the probe, not the file, says whether there is a daemon.
+
+    Nothing here creates a file: every lock probe on this side is
+    :func:`_probe_foreign_lock`.
+
     Raises :class:`_ForeignListingError` when ``data_dir`` cannot be listed, so
     no caller reads "could not look" as "none" (#1249). Only the enumeration is
     translated; the per-entry probes report their own failures.
     """
     from memtomem_stm.daemon.client import probe_listening
-    from memtomem_stm.daemon.discovery import is_pid_alive, iter_foreign_handshakes
+    from memtomem_stm.daemon.discovery import (
+        is_pid_alive,
+        iter_foreign_handshakes,
+        iter_foreign_lock_fingerprints,
+    )
     from memtomem_stm.daemon.locking import lock_path
 
     try:
         handshakes = iter_foreign_handshakes(config.data_dir, current, include_unreadable=True)
+        lock_fingerprints = iter_foreign_lock_fingerprints(config.data_dir, current)
     except OSError as exc:
         raise _ForeignListingError(type(exc).__name__) from exc
     live: list[dict[str, Any]] = []
     for fingerprint, hs in handshakes:
         if hs is None:
-            state = _probe_lock(lock_path(config.data_dir, fingerprint))
+            state = _probe_foreign_lock(lock_path(config.data_dir, fingerprint))
             if state is not LockProbe.FREE:
                 live.append(
                     {
@@ -317,9 +335,33 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
         if is_pid_alive(pid) and probe_listening(host, port):
             live.append({**entry, "listening": True, "lock": None})
             continue
-        state = _probe_lock(lock_path(config.data_dir, fingerprint))
+        state = _probe_foreign_lock(lock_path(config.data_dir, fingerprint))
         if state is not LockProbe.FREE:
             live.append({**entry, "listening": False, "lock": state.value})
+    # A fingerprint with a handshake file, readable or not, was judged above
+    # through that record. What is left has a lock file and nothing published.
+    # Lock files are never removed, so nearly all of these are free — the
+    # probe decides, not the file being there.
+    published = {fingerprint for fingerprint, _ in handshakes}
+    for fingerprint in lock_fingerprints:
+        if fingerprint in published:
+            continue
+        state = _probe_foreign_lock(lock_path(config.data_dir, fingerprint))
+        if state is not LockProbe.FREE:
+            live.append(
+                {
+                    "fingerprint": fingerprint,
+                    "pid": None,
+                    "host": None,
+                    "port": None,
+                    "idle_shutdown_seconds": None,
+                    "exits_when_idle": None,
+                    "listening": False,
+                    "lock": state.value,
+                    "handshake_absent": True,
+                }
+            )
+    live.sort(key=lambda daemon: daemon["fingerprint"])
     return live
 
 
@@ -615,6 +657,31 @@ def _probe_lock(path: Path) -> LockProbe:
         return state
 
 
+def _probe_foreign_lock(path: Path) -> LockProbe:
+    """One look at the lifetime lock of a fingerprint that is not this
+    config's. Creates nothing — no lock file, no ``data_dir``, no target for a
+    link that does not resolve.
+
+    Every probe on the foreign side goes through here. :func:`_probe_lock`
+    opens with ``O_CREAT``, which is right for this config's own lock (the
+    daemon would create the same file) and wrong for somebody else's: listing
+    daemons must not leave files behind for fingerprints it merely looked at,
+    and a lock that is a dangling link would get its target created and then
+    read as free (#1421).
+
+    When nothing could be opened at ``path``, :func:`_handshake_removed`
+    separates the two reasons: the entry is really gone, so nothing holds it
+    (``FREE``), or it is there and does not resolve, or its directory could
+    not be walked, so the question went unanswered (``UNKNOWN``).
+    """
+    from memtomem_stm.daemon.locking import probe_existing_lifetime_lock
+
+    state = probe_existing_lifetime_lock(path)
+    if state is None:
+        return LockProbe.FREE if _handshake_removed(path) else LockProbe.UNKNOWN
+    return state
+
+
 def _wait_lock_free(path: Path, on_free: Callable[[], None] | None = None) -> LockProbe:
     """Poll the lifetime lock at *path* until it is free or the stop budget runs out.
 
@@ -898,7 +965,7 @@ def _stop_foreign_daemons(config: STMConfig, current: str | None) -> None:
             # endpoint is gone. Runs before the platform check, so a target that
             # no longer needs a signal is not reported as one Windows cannot send.
             if not (is_pid_alive(pid) and client.probe_listening(d["host"], d["port"])):
-                state = _probe_lock(lp)
+                state = _probe_foreign_lock(lp)
                 if state is LockProbe.FREE:
                     if _handshake_removed(hs_path):
                         click.echo(_ok(_foreign_stopped(d)))
@@ -990,7 +1057,7 @@ def _wait_foreign_stops(
     while True:
         pending_hs = [p for p in pending_hs if not _handshake_removed(p)]
         for p in list(pending_locks):
-            state = _probe_lock(p)
+            state = _probe_foreign_lock(p)
             if state is LockProbe.FREE:
                 del pending_locks[p]
             else:
@@ -1249,6 +1316,8 @@ def _foreign_idle_label(daemon: dict[str, Any]) -> str:
     if not daemon["listening"]:
         if daemon.get("handshake_unreadable"):
             prefix = "handshake unreadable"
+        elif daemon.get("handshake_absent"):
+            prefix = "no handshake"
         else:
             prefix = "not accepting"
         if daemon["lock"] == LockProbe.UNKNOWN.value:

@@ -51,9 +51,11 @@ adapter — and never by a command that only looks (``status``, ``stop``, a
 ``ping``): with no key there is no fingerprint, so those report no daemon for
 this config without building a handshake or lock path. A daemon can still be
 running in the directory then — one an earlier build started, or one whose key
-was removed while it ran — and is found through its published handshake, as a
-daemon under a different config (:func:`iter_foreign_handshakes`). Losing the
-key loses nothing stored. A command that only looks does not change the key's
+was removed while it ran — and is found as a daemon under a different config:
+through its published handshake (:func:`iter_foreign_handshakes`), or, while it
+holds its lock without one, through its lock file
+(:func:`iter_foreign_lock_fingerprints`). Losing the key loses nothing stored.
+A command that only looks does not change the key's
 mode either: for a key someone left readable by group or other, dropping those
 bits is left to the next process that creates or starts a daemon (best effort,
 POSIX only — see ``local_key._tighten_mode``), not done by ``status``.
@@ -79,6 +81,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
+from memtomem_stm.daemon.locking import LOCK_PREFIX
 from memtomem_stm.daemon.protocol import PROTOCOL_VERSION
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.digest import keyed_framed_digest
@@ -290,18 +293,10 @@ def iter_foreign_handshakes(
 
     A missing ``data_dir`` returns an empty list. Any other failure to list it
     (no read permission, not a directory, …) raises ``OSError``: those leave the
-    foreign daemons unknown, not absent (#1249). ``Path.glob`` returns nothing
-    for a directory it cannot list, so ``os.listdir`` checks that first; the
-    matching and order stay glob's.
+    foreign daemons unknown, not absent (#1249) — see :func:`_daemon_files`.
     """
-    base = data_dir.expanduser()
-    try:
-        os.listdir(base)
-    except FileNotFoundError:
-        return []
-    paths = sorted(base.glob(f"{HANDSHAKE_PREFIX}-*.json"))
     out: list[tuple[str, dict[str, Any] | None]] = []
-    for path in paths:
+    for path in _daemon_files(data_dir, f"{HANDSHAKE_PREFIX}-*.json"):
         fingerprint = path.stem.removeprefix(f"{HANDSHAKE_PREFIX}-")
         if fingerprint == current_fingerprint:
             continue
@@ -310,6 +305,47 @@ def iter_foreign_handshakes(
             continue
         out.append((fingerprint, data))
     return out
+
+
+def iter_foreign_lock_fingerprints(data_dir: Path, current_fingerprint: str | None) -> list[str]:
+    """Every fingerprint *other than* ``current_fingerprint`` that has a
+    lifetime lock file (``stm-daemon-<fp>.lock``) under ``data_dir``.
+
+    A daemon holds its lock from before it publishes a handshake until after
+    its teardown has removed it, so for those two stretches the lock file is
+    the only sign of it on disk (#1421). ``None`` for ``current_fingerprint``
+    means the caller has none, and then every lock file's fingerprint is
+    returned.
+
+    Pure enumeration, like :func:`iter_foreign_handshakes`: it opens nothing.
+    A lock file says very little by existing — daemons never remove theirs, so
+    most belong to daemons long gone — and whether one is *held* is for the
+    caller to probe. The fingerprint is taken from the file name. Sorted, and
+    the same contract for a ``data_dir`` that is missing (empty list) or
+    cannot be listed (``OSError``).
+    """
+    prefix = f"{LOCK_PREFIX}-"
+    return [
+        fingerprint
+        for path in _daemon_files(data_dir, f"{prefix}*.lock")
+        if (fingerprint := path.stem.removeprefix(prefix)) != current_fingerprint
+    ]
+
+
+def _daemon_files(data_dir: Path, pattern: str) -> list[Path]:
+    """The entries of ``data_dir`` matching ``pattern``, sorted.
+
+    A missing ``data_dir`` has none. Any other failure to list it raises
+    ``OSError``. ``Path.glob`` returns nothing for a directory it cannot list,
+    which would report "could not look" as "none", so ``os.listdir`` checks
+    that first; the matching and order stay glob's.
+    """
+    base = data_dir.expanduser()
+    try:
+        os.listdir(base)
+    except FileNotFoundError:
+        return []
+    return sorted(base.glob(pattern))
 
 
 def remove_handshake_if_owner(path: Path, *, pid: int, token: str) -> None:
