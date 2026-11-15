@@ -176,7 +176,8 @@ def probe_existing_lifetime_lock(path: Path) -> LockProbe | None:
 
     ``HELD`` means held at that instant. The attempt itself takes the lock for
     a moment, so two processes probing the same file can each be the other's
-    holder; a caller that reports a daemon from this looks more than once.
+    holder. A caller with nothing else to go by — no published record for the
+    fingerprint — looks more than once before it reports a daemon.
     """
     try:
         fd = _open_lock_fd(path, create=False)

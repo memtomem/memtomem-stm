@@ -277,7 +277,7 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     for every field a record would have supplied. Candidates are the lock
     files that exist (:func:`iter_foreign_lock_fingerprints`); daemons never
     remove theirs, so the probe, not the file, says whether there is a daemon
-    — and it has to say so more than once (:func:`_probe_unpublished_lock`).
+    — and it has to say so more than once (:func:`_probe_unpublished_locks`).
 
     Nothing here creates a file: every lock probe on this side is
     :func:`_probe_foreign_lock`.
@@ -344,10 +344,12 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     # Lock files are never removed, so nearly all of these are free — the
     # probe decides, not the file being there.
     published = {fingerprint for fingerprint, _ in handshakes}
-    for fingerprint in lock_fingerprints:
-        if fingerprint in published:
-            continue
-        state = _probe_unpublished_lock(lock_path(config.data_dir, fingerprint))
+    unpublished = {
+        fingerprint: lock_path(config.data_dir, fingerprint)
+        for fingerprint in lock_fingerprints
+        if fingerprint not in published
+    }
+    for fingerprint, state in _probe_unpublished_locks(unpublished).items():
         if state is not LockProbe.FREE:
             live.append(
                 {
@@ -692,9 +694,10 @@ _UNPUBLISHED_LOCK_CONFIRM_PAUSE_SECONDS = 0.02
 _confirm_pause = time.sleep
 
 
-def _probe_unpublished_lock(path: Path) -> LockProbe:
-    """Whether a daemon holds the lock of a fingerprint that has published
-    nothing — judged over several looks, because one cannot tell.
+def _probe_unpublished_locks(paths: dict[str, Path]) -> dict[str, LockProbe]:
+    """Whether a daemon holds each of these locks — the locks of fingerprints
+    that have published nothing — judged over several looks, because one
+    cannot tell. Keyed like *paths*, by fingerprint.
 
     A probe takes the lock for an instant, and so does every other process
     looking at the same file: another ``status``, a spawn request checking
@@ -707,16 +710,21 @@ def _probe_unpublished_lock(path: Path) -> LockProbe:
     That makes a false report need that many coincidences in a row; it does
     not make one impossible.
 
-    ``FREE`` and ``UNKNOWN`` are returned as soon as they are seen: neither is
-    an artefact of someone else's probe.
+    The pauses are shared: each round pauses once and then looks again at
+    every lock still found held, so the wait does not grow with the number of
+    candidates. ``FREE`` and ``UNKNOWN`` are settled as soon as they are seen —
+    neither is an artefact of someone else's probe — and with no lock found
+    held there is no pause at all.
     """
-    state = _probe_foreign_lock(path)
+    states = {fingerprint: _probe_foreign_lock(path) for fingerprint, path in paths.items()}
     for _ in range(_UNPUBLISHED_LOCK_CONFIRMATIONS):
-        if state is not LockProbe.HELD:
+        held = [fingerprint for fingerprint, state in states.items() if state is LockProbe.HELD]
+        if not held:
             break
         _confirm_pause(_UNPUBLISHED_LOCK_CONFIRM_PAUSE_SECONDS)
-        state = _probe_foreign_lock(path)
-    return state
+        for fingerprint in held:
+            states[fingerprint] = _probe_foreign_lock(paths[fingerprint])
+    return states
 
 
 def _wait_lock_free(path: Path, on_free: Callable[[], None] | None = None) -> LockProbe:

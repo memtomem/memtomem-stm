@@ -54,8 +54,15 @@ def open_lock_fd(path: Path, *, create: bool = True) -> int:
 
 # What a non-blocking lock attempt raises when someone else holds the lock:
 # ``flock`` reports EWOULDBLOCK (EAGAIN on most systems) and ``msvcrt.locking``
-# EACCES, which is also what POSIX allows a contended lock to report.
-_CONTENDED = frozenset({errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES})
+# EACCES, which is also what POSIX allows a contended lock to report. On
+# Windows the C runtime's other lock-violation code is counted too. It is
+# documented for the retrying modes, not for the non-blocking one used here,
+# and is included so that a code this cannot be tested against errs toward
+# "held" — what every failure meant before the two were told apart.
+_CONTENDED = frozenset(
+    {errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES}
+    | ({getattr(errno, "EDEADLOCK", errno.EDEADLK)} if os.name == "nt" else set())
+)
 
 
 def try_lock_strict(fd: int) -> bool:

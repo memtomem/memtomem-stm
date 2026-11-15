@@ -3904,7 +3904,54 @@ class TestForeignDaemonWithoutAHandshake:
             holder.release()
 
         assert foreign == [self._absent_entry("held")]
-        assert len(pauses) == daemon_cmd._UNPUBLISHED_LOCK_CONFIRMATIONS
+        # Four looks, 20 ms apart — written out, so that changing either
+        # number in the code has to be said here too.
+        assert pauses == [0.02, 0.02, 0.02]
+
+    def test_held_locks_share_the_pauses(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """One pause per round for all of them. Pausing for each lock in turn
+        would make the wait grow with the number of candidates, and
+        ``stop --all`` signals nothing until the listing returns."""
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        pauses: list[float] = []
+        monkeypatch.setattr(daemon_cmd, "_confirm_pause", pauses.append)
+        fingerprints = ["aaaa000000000000", "bbbb000000000000", "cccc000000000000"]
+        holders = [_LockHolder(lock_path(tmp_path, fp)) for fp in fingerprints]
+        try:
+            foreign = self._status()["foreign"]
+        finally:
+            for holder in holders:
+                holder.release()
+
+        assert [(d["fingerprint"], d["lock"]) for d in foreign] == [
+            (fp, "held") for fp in fingerprints
+        ]
+        assert pauses == [0.02, 0.02, 0.02]
+
+    def test_a_passing_holder_among_daemons_is_dropped_and_the_daemons_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        daemon = _LockHolder(lock_path(tmp_path, "aaaa000000000000"))
+        passing = _LockHolder(lock_path(tmp_path, "bbbb000000000000"))
+        pauses: list[float] = []
+
+        def pause(seconds: float) -> None:
+            pauses.append(seconds)
+            passing.release()
+
+        monkeypatch.setattr(daemon_cmd, "_confirm_pause", pause)
+        try:
+            foreign = self._status()["foreign"]
+        finally:
+            daemon.release()
+
+        assert [(d["fingerprint"], d["lock"]) for d in foreign] == [("aaaa000000000000", "held")]
+        assert pauses == [0.02, 0.02, 0.02]  # the daemon is still confirmed in full
 
     def test_free_and_unchecked_locks_are_answered_on_the_first_look(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
