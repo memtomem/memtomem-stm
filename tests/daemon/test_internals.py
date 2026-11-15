@@ -4109,15 +4109,15 @@ class TestAFingerprintFromAFileNameIsEscapedInText:
         monkeypatch.setenv("NO_COLOR", "1")
         _no_daemon(monkeypatch)
 
-    @staticmethod
-    def _lock_only(data_dir: Path) -> None:
+    # The three ways in, one per place the listing builds an entry.
+
+    def _lock_only(self, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # A link to nowhere: the lock cannot be checked, so it is listed.
         lock_path(data_dir, _HOSTILE_FP).symlink_to(data_dir / "nowhere")
 
-    @classmethod
-    def _unreadable_handshake(cls, data_dir: Path) -> None:
+    def _unreadable_handshake(self, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         discovery.handshake_path(data_dir, _HOSTILE_FP).write_text("not json", encoding="utf-8")
-        cls._lock_only(data_dir)
+        self._lock_only(data_dir, monkeypatch)
 
     def _accepting(self, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         discovery.write_handshake(
@@ -4138,7 +4138,7 @@ class TestAFingerprintFromAFileNameIsEscapedInText:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
     ):
         self._data_dir(tmp_path, monkeypatch)
-        getattr(self, route)(tmp_path)
+        getattr(self, route)(tmp_path, monkeypatch)
 
         text = _daemon_output("status")
 
@@ -4151,7 +4151,7 @@ class TestAFingerprintFromAFileNameIsEscapedInText:
     ):
         self._data_dir(tmp_path, monkeypatch)
         monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
-        getattr(self, route)(tmp_path)
+        getattr(self, route)(tmp_path, monkeypatch)
         _fake_stop_clock(monkeypatch)
 
         text = _daemon_output("stop", "--all")
@@ -4210,13 +4210,17 @@ class TestAFingerprintFromAFileNameIsEscapedInText:
         assert f"daemon pid=? stopped (fp={_HOSTILE_FP_SHOWN})" in text
         assert _BIDI not in text
 
-    def test_json_reports_the_name_as_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    @pytest.mark.parametrize("route", ["_lock_only", "_unreadable_handshake", "_accepting"])
+    def test_json_reports_the_name_as_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+    ):
         """Escaping is for the text renderers. The entry keeps the real name:
-        paths are built from it, and JSON has its own encoding."""
+        paths are built from it, and JSON has its own encoding. Each way in
+        builds its own entry, so each is checked."""
         import json
 
         self._data_dir(tmp_path, monkeypatch)
-        self._lock_only(tmp_path)
+        getattr(self, route)(tmp_path, monkeypatch)
 
         text = _daemon_output("status", "--json")
 
