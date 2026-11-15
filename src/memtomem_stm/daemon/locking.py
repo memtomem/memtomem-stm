@@ -50,6 +50,7 @@ from memtomem_stm.utils.locking import (
     open_lock_fd as _open_lock_fd,
     release_lock as _release_lock,
     try_lock as _try_lock,
+    try_lock_strict as _try_lock_strict,
     unlock as _unlock,
 )
 
@@ -166,10 +167,16 @@ def probe_existing_lifetime_lock(path: Path) -> LockProbe | None:
       path whose directory cannot be walked; they are different answers to
       "is a daemon running", so telling them apart is left to the caller.
     - :attr:`LockProbe.UNKNOWN` — the file is there and could not be opened
-      or prepared for locking (any other ``OSError``).
+      or prepared for locking (any other ``OSError``), or the lock attempt
+      failed for a reason other than someone holding it: a filesystem with no
+      lock support would otherwise make every lock file look held.
     - :attr:`LockProbe.FREE` / :attr:`LockProbe.HELD` — it opened, and the
       lock was or was not available. Unlike :func:`probe_lifetime_lock`,
       ``FREE`` is not held on return: there is no block to do work in.
+
+    ``HELD`` means held at that instant. The attempt itself takes the lock for
+    a moment, so two processes probing the same file can each be the other's
+    holder; a caller that reports a daemon from this looks more than once.
     """
     try:
         fd = _open_lock_fd(path, create=False)
@@ -179,8 +186,10 @@ def probe_existing_lifetime_lock(path: Path) -> LockProbe | None:
         return LockProbe.UNKNOWN
     acquired = False
     try:
-        acquired = _try_lock(fd)
+        acquired = _try_lock_strict(fd)
         return LockProbe.FREE if acquired else LockProbe.HELD
+    except OSError:
+        return LockProbe.UNKNOWN
     finally:
         if acquired:
             _unlock(fd)

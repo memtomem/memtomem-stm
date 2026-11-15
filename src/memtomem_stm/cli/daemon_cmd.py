@@ -276,7 +276,8 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     ``handshake_absent: True``, ``listening: False``, ``lock``, and ``None``
     for every field a record would have supplied. Candidates are the lock
     files that exist (:func:`iter_foreign_lock_fingerprints`); daemons never
-    remove theirs, so the probe, not the file, says whether there is a daemon.
+    remove theirs, so the probe, not the file, says whether there is a daemon
+    — and it has to say so more than once (:func:`_probe_unpublished_lock`).
 
     Nothing here creates a file: every lock probe on this side is
     :func:`_probe_foreign_lock`.
@@ -346,7 +347,7 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     for fingerprint in lock_fingerprints:
         if fingerprint in published:
             continue
-        state = _probe_foreign_lock(lock_path(config.data_dir, fingerprint))
+        state = _probe_unpublished_lock(lock_path(config.data_dir, fingerprint))
         if state is not LockProbe.FREE:
             live.append(
                 {
@@ -679,6 +680,42 @@ def _probe_foreign_lock(path: Path) -> LockProbe:
     state = probe_existing_lifetime_lock(path)
     if state is None:
         return LockProbe.FREE if _handshake_removed(path) else LockProbe.UNKNOWN
+    return state
+
+
+# A lock file with nothing published is reported as a daemon only when it is
+# held on this many further looks, this far apart.
+_UNPUBLISHED_LOCK_CONFIRMATIONS = 3
+_UNPUBLISHED_LOCK_CONFIRM_PAUSE_SECONDS = 0.02
+# Bound here, not looked up through ``time`` at call time: the pause is part
+# of one look at a lock, not of the stop wait whose clock tests replace.
+_confirm_pause = time.sleep
+
+
+def _probe_unpublished_lock(path: Path) -> LockProbe:
+    """Whether a daemon holds the lock of a fingerprint that has published
+    nothing — judged over several looks, because one cannot tell.
+
+    A probe takes the lock for an instant, and so does every other process
+    looking at the same file: another ``status``, a spawn request checking
+    whether to launch. With a record to go by that hardly matters, but here
+    the lock is the only evidence, and every leftover lock file in
+    ``data_dir`` is a candidate — two ``status`` runs started together walk
+    the same list in step, and each reported the other's probes as daemons
+    starting up (#1421). A daemon holds its lock for its whole life, a probe
+    for microseconds, so a lock still held after a few pauses is a daemon's.
+    That makes a false report need that many coincidences in a row; it does
+    not make one impossible.
+
+    ``FREE`` and ``UNKNOWN`` are returned as soon as they are seen: neither is
+    an artefact of someone else's probe.
+    """
+    state = _probe_foreign_lock(path)
+    for _ in range(_UNPUBLISHED_LOCK_CONFIRMATIONS):
+        if state is not LockProbe.HELD:
+            break
+        _confirm_pause(_UNPUBLISHED_LOCK_CONFIRM_PAUSE_SECONDS)
+        state = _probe_foreign_lock(path)
     return state
 
 

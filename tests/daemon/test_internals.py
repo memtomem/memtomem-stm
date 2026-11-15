@@ -3866,6 +3866,85 @@ class TestForeignDaemonWithoutAHandshake:
         assert "stopped (fp=" not in result.output
         assert not target.exists()
 
+    def test_a_lock_held_only_for_a_moment_is_not_a_daemon(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Any process looking at the file takes the lock for an instant —
+        another ``status``, a spawn check. Two ``status`` runs started
+        together over the same leftover lock files each reported the other's
+        probes as daemons starting up. Here the other prober is a real lock,
+        gone by the second look."""
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        pauses: list[float] = []
+
+        def other_prober_moves_on(seconds: float) -> None:
+            pauses.append(seconds)
+            holder.release()
+
+        monkeypatch.setattr(daemon_cmd, "_confirm_pause", other_prober_moves_on)
+
+        assert self._status()["foreign"] == []
+        assert len(pauses) == 1  # looked again once, found it free, stopped
+
+    def test_a_lock_held_on_every_look_is_listed_after_the_confirmations(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        pauses: list[float] = []
+        monkeypatch.setattr(daemon_cmd, "_confirm_pause", pauses.append)
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        try:
+            foreign = self._status()["foreign"]
+        finally:
+            holder.release()
+
+        assert foreign == [self._absent_entry("held")]
+        assert len(pauses) == daemon_cmd._UNPUBLISHED_LOCK_CONFIRMATIONS
+
+    def test_free_and_unchecked_locks_are_answered_on_the_first_look(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Only "held" can be someone else's probe. Pausing on the others
+        would add the confirmation delay for every leftover lock file."""
+        from memtomem_stm.cli import daemon_cmd
+
+        self._data_dir(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            daemon_cmd, "_confirm_pause", lambda seconds: pytest.fail("no second look needed")
+        )
+        lock_path(tmp_path, "aaaa000000000000").touch()
+        lock_path(tmp_path, self.FP).symlink_to(tmp_path / "target")  # cannot be checked
+
+        assert self._status()["foreign"] == [self._absent_entry("unknown")]
+
+    def test_leftover_locks_where_locking_is_unsupported_are_unchecked_not_held(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On a filesystem with no lock support every attempt fails. That is
+        not a daemon holding each file."""
+        import errno
+        import fcntl
+
+        from click.testing import CliRunner
+
+        self._data_dir(tmp_path, monkeypatch)
+        lock_path(tmp_path, self.FP).touch()
+
+        def unsupported(fd: int, operation: int) -> None:
+            raise OSError(errno.ENOTSUP, "Operation not supported")
+
+        monkeypatch.setattr(fcntl, "flock", unsupported)
+
+        assert self._status()["foreign"] == [self._absent_entry("unknown")]
+        text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+        assert f"pid=? fp={self.FP} (no handshake; lock could not be checked)" in text
+        assert "lock held" not in text
+
     def _held_behind_a_link(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """``data_dir`` is a link to the real directory, and the lock in it
         is held. Returns the holder and a function that breaks the link."""

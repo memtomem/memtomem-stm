@@ -24,7 +24,13 @@ from memtomem_stm.daemon.locking import (
     probe_lifetime_lock,
 )
 from memtomem_stm.utils import locking
-from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock, unlock
+from memtomem_stm.utils.locking import (
+    open_lock_fd,
+    release_lock,
+    try_lock,
+    try_lock_strict,
+    unlock,
+)
 from helpers import held_empty_lock
 
 
@@ -164,5 +170,50 @@ def test_existing_lock_probe_reports_a_file_it_cannot_open_as_unknown(
         raise PermissionError(errno.EACCES, "denied")
 
     monkeypatch.setattr(daemon_locking, "_open_lock_fd", refuse)
+
+    assert probe_existing_lifetime_lock(path) is LockProbe.UNKNOWN
+
+
+# ── a lock that is not taken is not always a lock that is held (#1421) ───────
+
+
+def test_strict_attempt_reports_contention_as_not_acquired(tmp_path: Path) -> None:
+    """The one failure that means "held", on every platform: the holder is
+    another process, as a daemon would be."""
+    path = tmp_path / "x.lock"
+    with held_empty_lock(path):
+        fd = open_lock_fd(path, create=False)
+        try:
+            assert try_lock_strict(fd) is False
+            assert try_lock(fd) is False
+        finally:
+            os.close(fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="replaces fcntl.flock")
+@pytest.mark.parametrize("code", [errno.ENOTSUP, errno.ENOLCK, errno.EIO])
+def test_a_lock_attempt_that_fails_for_another_reason_is_unknown_not_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """A filesystem without lock support fails every attempt. Reported as
+    "held", each leftover lock file on it would be a daemon starting up."""
+    import fcntl
+
+    path = tmp_path / "x.lock"
+    path.touch()
+
+    def failing_flock(fd: int, operation: int) -> None:
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(fcntl, "flock", failing_flock)
+    fd = open_lock_fd(path, create=False)
+    try:
+        with pytest.raises(OSError) as raised:
+            try_lock_strict(fd)
+        assert raised.value.errno == code
+        # The owning callers' contract is unchanged: they did not get it.
+        assert try_lock(fd) is False
+    finally:
+        os.close(fd)
 
     assert probe_existing_lifetime_lock(path) is LockProbe.UNKNOWN

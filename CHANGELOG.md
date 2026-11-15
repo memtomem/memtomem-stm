@@ -27,7 +27,11 @@ changes inline only. See the deprecation policy in
   `"lock": "held"`. `stop --all` waits for its lock to be released and never
   signals it, as for any listed daemon that is not accepting. Lock files left
   by daemons that have exited are not listed: only a lock that is held, or
-  that could not be checked, is. The state reported for this config is
+  that could not be checked, is. "Held" is judged over four looks 20 ms
+  apart, because testing a lock takes it for an instant and two commands
+  looking at the same file would otherwise report each other; a lock file on
+  a filesystem without file-lock support is listed as one that could not be
+  checked rather than as held. The state reported for this config is
   unchanged — with no discovery key it is still `stopped`, with the daemon
   listed beside it (#1421).
   Looking at another fingerprint's lock no longer creates anything. `status`

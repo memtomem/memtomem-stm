@@ -1174,13 +1174,18 @@ its handshake until after its teardown has removed it, and for those two
 stretches it is listed as `pid=?` with `no handshake; lock held — starting or
 shutting down`. It is found by its lock file (`stm-daemon-<fingerprint>.lock`).
 Lock files are never removed, so most of them belong to daemons long gone; one
-is listed only when its lock is held, or could not be checked. Such a
-list is never headed "running", and never answered with "nothing to stop".
+is listed only when its lock is held, or could not be checked. Testing a lock
+means taking it for an instant, which another `status` or a hook deciding
+whether to spawn a daemon does to the same file, so a lock found held is
+looked at three more times, 20 ms apart, and listed only if it is held every
+time. Such a list is never headed "running", and never answered with "nothing
+to stop".
 
 Looking at another fingerprint's lock creates nothing: `status` and
 `stop --all` open only a lock file that is already there. A lock file that has
 been deleted counts as free; one that is a link to nothing, or sits under a
-directory that no longer resolves, counts as `lock could not be checked`. (On
+directory that no longer resolves, counts as `lock could not be checked`, and so
+does every lock file on a filesystem that does not support file locking. (On
 Windows, opening an existing lock file that is empty tries to write one byte
 to it, and leaves it empty when another process has that byte locked.)
 
