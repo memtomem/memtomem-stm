@@ -13,6 +13,25 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms daemon status` and `mms daemon stop --all` escape for display two
+  values they read from files in `data_dir` and used to print as they were.
+  One is the fingerprint of a daemon under another config, which is taken
+  from a file name (`stm-daemon-<fingerprint>.json` or `.lock`): a name
+  carrying a control or bidirectional-formatting character reached the
+  terminal with it, and one that was not valid UTF-8 (Linux allows such a
+  name) was written out as the bytes it was or, where the output stream
+  encodes strictly, ended the command with `UnicodeEncodeError` at the first
+  line naming it. The other, in `status` only, is the `pid` recorded in this
+  config's handshake when no daemon answers for it, which was printed
+  whatever JSON value the file held. Both
+  now appear with such characters as `\uXXXX`; a name or pid without any is
+  printed as before. `--json` was not affected — JSON encoding already
+  escaped them — and still carries both values as found. The file has to be
+  in the operator's own `data_dir`.
+  With an unusable discovery key, the hint `stop` prints now says what
+  `stop --all` does — it signals the accepting daemons under `data_dir` and
+  waits for the others — where it said it signals every published daemon
+  (#1429).
 - `mms daemon status` and `mms daemon stop --all` find a daemon under another
   config fingerprint that holds its lifetime lock without a handshake. A
   daemon holds the lock from before it publishes its handshake until after

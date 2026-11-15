@@ -648,6 +648,10 @@ def test_stop_with_an_unusable_key_names_the_file_and_the_way_out(
     assert str(key_path) in result.output
     assert ("mms daemon stop --all" in result.output) is can_signal
     assert ("Task Manager" in result.output) is not can_signal
+    # What it says ``stop --all`` does has to be what it does: a daemon that
+    # is not accepting is waited on, never signalled.
+    said = "signals the accepting daemons under data_dir and waits for the others to finish"
+    assert (said in result.output) is can_signal
     assert killed == []
 
 

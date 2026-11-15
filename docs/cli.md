@@ -1214,6 +1214,10 @@ it is unknown), `exits_when_idle` (`true`, `false`, or `null` when unknown),
 whose record is unreadable also has `handshake_unreadable: true` and `null`
 pid, host and port, and one with no handshake has `handshake_absent: true` and
 the same `null` fields.
+A fingerprint in these listings is read from a file name in `data_dir`. Text
+output shows it escaped for display — a control or bidirectional-formatting
+character, or a byte that is not valid UTF-8, appears as `\uXXXX` — and
+`--json` carries it as found, encoded by JSON.
 When `data_dir` exists but cannot be listed (no read permission, say), the
 daemons under other configs are unknown rather than absent: `status` prints a
 warning naming the error class instead of a list, `status --json` reports
@@ -1262,8 +1266,10 @@ A key that exists but cannot be read, or does not hold a key, is an error:
 
 - `start`, `stop`, `status` and `restart` exit 1 with one line naming the file.
   `status --json` reports `"state": "unknown"` with an `error` field, and
-  still lists every daemon published under `data_dir` as `foreign`.
-- `stop --all` treats every published daemon as foreign — this config's own
+  still lists as `foreign` every daemon it finds under `data_dir` — through a
+  handshake, or through a lock file with no handshake whose lock is held or
+  could not be checked.
+- `stop --all` treats every daemon found that way as foreign — this config's own
   included — and acts on them before it reports the key and exits 1: the way
   to stop daemons started under a key that has since been damaged. On macOS
   and Linux it signals them as described above; on Windows it cannot signal by
