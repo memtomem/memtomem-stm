@@ -13286,6 +13286,28 @@ class TestEjectCommand:
         assert fake_claude_host["calls"] == []
         assert "demo" in self._stm_servers(config)
 
+    @pytest.mark.parametrize(
+        ("section", "block", "flagged"),
+        [
+            ("env", {"DATABASE_URL": "postgresql://app:pw@db/prod"}, "env.DATABASE_URL"),
+            ("headers", {"Cookie": "sid=abc"}, "headers.Cookie"),
+        ],
+    )
+    def test_secret_gate_sees_neutral_key_credentials(
+        self, runner, config, fake_claude_host, section, block, flagged
+    ):
+        """#1345: a credentialed URL under ``DATABASE_URL`` and a ``Cookie``
+        header would land on the ``claude mcp add-json`` argv too."""
+        original = {"command": "npx", section: block}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert f"payload carries secret-classified values ({flagged})" in result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
     def test_secret_gate_allow_flag_proceeds(self, runner, config, fake_claude_host):
         original = {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_secret"}}
         self._seed_config(config, {"demo": _eject_entry(original=original)})

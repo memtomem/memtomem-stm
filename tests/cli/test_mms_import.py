@@ -82,6 +82,33 @@ class TestPlan:
         # apply hint at the bottom
         assert "mms import --from claude-code --apply" in res.output
 
+    def test_plan_redacts_a_credentialed_url_under_a_neutral_key(self, runner, sandbox):
+        """#1345: ``DATABASE_URL`` matches no key pattern; the password in
+        the URL's userinfo decides."""
+        _seed_claude_code(
+            sandbox,
+            {
+                "pg": {
+                    "command": "npx",
+                    "env": {
+                        "DATABASE_URL": "postgresql://app:supersecret@db.internal:5432/prod",
+                        "PGAPPNAME": "stm",
+                    },
+                },
+            },
+        )
+        res = runner.invoke(import_command, ["--from", "claude-code"])
+        assert res.exit_code == 0, res.output
+        assert "supersecret" not in res.output
+        rows = [line for line in res.output.splitlines() if "DATABASE_URL" in line]
+        assert len(rows) == 1, res.output
+        env_part = rows[0].split("env: ", 1)[1]
+        assert env_part == (
+            f"DATABASE_URL={REDACTED_DISPLAY} ← secret (URI with password), "
+            "PGAPPNAME=stm (non-secret)"
+        )
+        assert "Secrets above were REDACTED" in res.output
+
     def test_show_imported_reveals_secrets(self, runner, sandbox):
         _seed_claude_code(
             sandbox,

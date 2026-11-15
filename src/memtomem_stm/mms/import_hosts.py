@@ -212,8 +212,8 @@ def _is_self_reference(entry: dict[str, Any]) -> bool:
 
 
 # RFC §5.3 prefix shape: starts with letter, then [a-zA-Z0-9_]*.
-# Mirrors proxy/prefixes.py's PREFIX_RE — kept here so the mms registry
-# package stays free of imports from the proxy package.
+# Mirrors proxy/prefixes.py's PREFIX_RE; a copy, not an import, so a change
+# there must be made here too.
 _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
 
