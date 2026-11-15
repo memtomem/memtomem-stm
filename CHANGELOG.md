@@ -13,7 +13,7 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- A value named in a log line can no longer split or reorder the line. The
+- A value named in a log message can no longer split or reorder the line. The
   log formatter escaped an attached traceback only and left each message's
   values to its call site, and most call sites wrote them as they were.
   Config does not restrict the characters of an upstream server key or its
@@ -23,7 +23,7 @@ changes inline only. See the deprecation policy in
   second line that read as a record of its own, and a bidirectional control
   or an escape sequence in it reached the terminal and the log file as
   itself. The formatter every STM handler uses (stderr, the log file, the
-  daemon's log, `mms hook`'s stderr) now escapes the whole rendered message,
+  daemon's log, `mms hook`'s stderr) now escapes the whole rendered line,
   the way the CLI escapes the same values (#1425).
   **Behavior change**: in a log message, a tab, a line break, another control
   character, a line or paragraph separator, a bidirectional control or a lone

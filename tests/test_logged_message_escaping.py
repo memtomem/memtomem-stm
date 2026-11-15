@@ -221,6 +221,50 @@ def test_a_call_the_stdlib_rejects_is_still_rejected(msg, args, error):
         _format(msg, *args)
 
 
+class _Replaced(str):
+    def __str__(self) -> str:
+        return "replacement"
+
+
+class _Carrier:
+    def __str__(self) -> str:
+        return _Replaced("raw")
+
+
+class _OwnMod(str):
+    def __str__(self) -> str:
+        return self
+
+    def __mod__(self, other: object) -> int:  # type: ignore[override]
+        return 42
+
+
+@pytest.mark.parametrize(
+    ("style", "fmt"),
+    [("%", "%(message)s"), ("{", "{message}"), ("$", "${message}"), ("%", STDERR_FORMAT)],
+)
+@pytest.mark.parametrize(
+    ("msg", "args"),
+    [(_Carrier(), ()), (_OwnMod("x %s"), ("a",)), ("x %s", ("a",))],
+    ids=["str-returns-a-subclass", "mod-returns-an-int", "plain"],
+)
+def test_the_style_converts_the_message_as_the_stdlib_does(style, fmt, msg, args):
+    """The message goes to the format style as the record holds it; only the
+    line the style returns is escaped."""
+    ours = DisplayEscapingFormatter(fmt, style=style).format(_record(msg, *args))
+    theirs = logging.Formatter(fmt, style=style).format(_record(msg, *args))
+
+    assert ours == theirs
+
+
+def test_a_hostile_logger_name_is_escaped_with_the_rest_of_the_line():
+    record = _record("started", name=f"plugin.{HOSTILE}")
+
+    out = DisplayEscapingFormatter(STDERR_FORMAT).format(record)
+
+    assert out == f"WARNING plugin.{ESCAPED}: started"
+
+
 def test_the_record_is_left_as_the_stdlib_leaves_it():
     args = ("gh", HOSTILE, 3)
     record = _record("%s %s %d", *args)
@@ -248,13 +292,12 @@ def test_a_hostile_message_and_a_hostile_traceback_in_one_record():
     out = buf.getvalue()
     lines = out.splitlines()
 
+    # The message is exactly the first line: the traceback starts on the second.
     assert lines[0].endswith(f"Cache store failed for {ESCAPED}/search")
-    assert "Traceback (most recent call last):" in lines[1]
+    assert lines[1] == "Traceback (most recent call last):"
     # The traceback keeps its line structure and is escaped line by line.
     assert "ValueError: bad key\\u001B[31mgh" in out
     assert "\x1b" not in out and "\u202e" not in out
-    # The message contributes exactly one line: nothing it carries starts another.
-    assert sum(line.startswith("WARNING ") for line in lines) == 1
 
 
 # ---------------------------------------------------------------------------

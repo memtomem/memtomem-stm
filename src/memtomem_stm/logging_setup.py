@@ -305,19 +305,18 @@ class DisplayEscapingFormatter(logging.Formatter):
     carry a display-hostile character to the terminal or the log file (#1173,
     #1425).
 
-    **The message.** The stdlib renders it — ``msg % args``, with whatever the
-    call site passed — and the result is escaped whole through
-    ``utils/display._disp`` before it goes into the line: a member of the set
-    ``_disp_escapes`` defines becomes its ``\\uXXXX`` form. So a server key
-    with a newline in it stays on the line that names it, whichever way the
-    call site put it there: as a ``%s`` argument, under ``%r``, or formatted
-    into the message beforehand. Nothing about ``%`` formatting is changed or
-    re-implemented; only its result is. That makes the message one line by
+    **The message.** The stdlib renders it — ``msg % args`` with whatever the
+    call site passed, then the format's own line around it (level, logger
+    name, time) — and that line is escaped whole through
+    ``utils/display._disp``: a member of the set ``_disp_escapes`` defines
+    becomes its ``\\uXXXX`` form. So a server key with a newline in it stays
+    on the line that names it, whichever way the call site put it there: as a
+    ``%s`` argument, under ``%r``, or formatted into the message beforehand.
+    Nothing about formatting is changed or re-implemented, and the record is
+    not touched; only the rendered text is. That makes the message one line by
     construction: a line break or a tab a call site writes in the message text
     itself is escaped like any other, so a call site that wants two lines logs
-    twice. The other fields of the format (logger name, level, time) are
-    code-chosen and left alone, and ``record.message`` is put back once the
-    line is built, so the record is what the stdlib would have left.
+    twice.
 
     **Tracebacks.** The traceback is rendered here too, and a
     ``ValidationError`` location quotes the operator's own environment: the
@@ -369,15 +368,10 @@ class DisplayEscapingFormatter(logging.Formatter):
     def formatMessage(self, record: logging.LogRecord) -> str:
         from memtomem_stm.utils.display import _disp
 
-        message = record.message
         # ``str.__str__``: ``"%s" % value`` can hand back a ``str`` subclass
-        # as it is, and ``_disp`` must read the characters that will be
-        # written, not what that subclass chooses to iterate as.
-        record.message = _disp(str.__str__(message))
-        try:
-            return super().formatMessage(record)
-        finally:
-            record.message = message
+        # as it is, and ``_disp`` must read the characters the handler will
+        # write, not what that subclass chooses to iterate as.
+        return _disp(str.__str__(super().formatMessage(record)))
 
     def format(self, record: logging.LogRecord) -> str:
         if not self._withhold_exception_text:
