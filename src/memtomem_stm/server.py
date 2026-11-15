@@ -540,8 +540,10 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 except LocalKeyError as exc:
                     # Stated in the message rather than left to the traceback:
                     # the default log formatter withholds exception text, and
-                    # the operator needs the file name to act on it.
-                    logger.warning("Response cache disabled: %s", exc)
+                    # the operator needs the file name to act on it. Escaped
+                    # here because the formatter leaves the message's own
+                    # values to the call site, and the path is configuration.
+                    logger.warning("Response cache disabled: %s", _disp(str(exc)))
                     proxy_cache = None
                 except Exception:
                     # A corrupt/locked cache DB must not take down every
