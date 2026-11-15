@@ -11,6 +11,25 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- `mms daemon status` and `mms daemon start` escape for display the values
+  they print from a daemon that answers. On `start`'s "daemon already
+  running" and "daemon started" lines (which `restart` prints too) those are
+  the `pid` and `port`; on `status`'s `running`, `queue:` and `surface
+  latency:` lines, every value taken from the daemon's handshake or its ping
+  reply. Nothing checks the type of the `pid`, `ltm`, the counters or the
+  suggested timeout, so a string `pid` in the handshake or a string counter
+  in the reply reached the terminal as it was, control and
+  bidirectional-formatting characters included, and a lone surrogate in the
+  handshake `pid` (a file in the operator's own `data_dir`) ended the command
+  with `UnicodeEncodeError` where the output stream encodes strictly. Each of
+  those lines is now escaped as a whole, so a field added to one later is
+  covered too (#1431).
+  **Behavior change**: on those lines such a character is written as
+  `\uXXXX`. A value without one prints as before, and `--json` output is
+  unchanged.
+
 ## [0.7.9] — 2026-11-15
 
 ### Upgrade notes

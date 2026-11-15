@@ -462,7 +462,12 @@ def start_cmd() -> None:
     existing = asyncio.run(client.ping(config, timeout=2.0))
     if existing is not None:
         click.echo(
-            _ok(f"daemon already running (pid={existing.get('pid')} port={existing.get('port')})")
+            _ok(
+                _disp(
+                    f"daemon already running (pid={existing.get('pid')} "
+                    f"port={existing.get('port')})"
+                )
+            )
         )
         return
 
@@ -473,7 +478,7 @@ def start_cmd() -> None:
     while time.time() < deadline:
         hs = asyncio.run(client.ping(config, timeout=1.0))
         if hs is not None:
-            click.echo(_ok(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})"))
+            click.echo(_ok(_disp(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})")))
             return
         # request_spawn launches a detached child iff our config's lock is free;
         # it declines when a same-config daemon already holds it (mid-startup →
@@ -1259,10 +1264,16 @@ def status_cmd(as_json: bool) -> None:
 
     state = info["state"]
     if state == "running":
+        # The lines below print fields of the handshake and the ping reply
+        # that nothing checks the type of (the pid, ``ltm``, the counters):
+        # each line is escaped whole, before it is styled, so a field added
+        # to one later is covered too (#1431).
         click.echo(
             _ok(
-                f"running  pid={info['pid']} {info['host']}:{info['port']} "
-                f"ltm={info['ltm']} uptime={info['uptime_seconds']}s"
+                _disp(
+                    f"running  pid={info['pid']} {info['host']}:{info['port']} "
+                    f"ltm={info['ltm']} uptime={info['uptime_seconds']}s"
+                )
             )
         )
         queue = info.get("queue")
@@ -1271,13 +1282,15 @@ def status_cmd(as_json: bool) -> None:
             # an unreachable daemon rather than ``busy``; this line is the
             # operator's only plain-text sign of them.
             click.echo(
-                "queue: "
-                f"active={queue.get('active', 0)} "
-                f"in_flight={queue.get('in_flight', 0)}/{queue.get('concurrency', 1)} "
-                f"queued={queue.get('queued', 0)} "
-                f"capacity={queue.get('capacity', 0)} "
-                f"busy_rejections={queue.get('busy_rejections', 0)} "
-                f"pre_auth_evictions={queue.get('pre_auth_evictions', 0)}"
+                _disp(
+                    "queue: "
+                    f"active={queue.get('active', 0)} "
+                    f"in_flight={queue.get('in_flight', 0)}/{queue.get('concurrency', 1)} "
+                    f"queued={queue.get('queued', 0)} "
+                    f"capacity={queue.get('capacity', 0)} "
+                    f"busy_rejections={queue.get('busy_rejections', 0)} "
+                    f"pre_auth_evictions={queue.get('pre_auth_evictions', 0)}"
+                )
             )
         surface = (info.get("latency") or {}).get("surface")
         if isinstance(surface, dict) and any(surface.get(key) for key, _ in _SURFACE_COUNTERS):
@@ -1310,7 +1323,7 @@ def status_cmd(as_json: bool) -> None:
                 # "warm" is load-bearing: a cold-only daemon may well have
                 # completed searches, just none the percentiles accept.
                 summary += " no successful warm searches yet"
-            click.echo(summary)
+            click.echo(_disp(summary))
     elif state == "stale" and info.get("handshake_unreadable"):
         # No pid line: reading the record is what failed.
         click.echo(_warn("handshake present but unreadable — daemon state unknown"))
