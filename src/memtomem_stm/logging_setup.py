@@ -13,15 +13,15 @@ Hardening matches the data-at-rest convention (``utils/fileio.py``,
 handler-level redaction hook: call sites render error text before logging it,
 e.g. ``proxy/manager.py:_safe_error_text`` for upstream failures (#1082).
 
-What the handlers do render themselves is the interpolation of a record's
-arguments and an attached traceback, and either can carry a character the
-terminal must not get as itself. An upstream server key is an argument of most
-proxy log lines and config does not restrict its characters (#1425); a pydantic
-``ValidationError`` location carries the same key from a
+What the handlers do render themselves is the message and an attached
+traceback, and either can carry a character the terminal must not get as
+itself. An upstream server key is named in many proxy log lines and config does
+not restrict its characters (#1425); a pydantic ``ValidationError`` location
+carries the same key from a
 ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…`` variable name, which no call
 site ever saw (#1173). So every handler STM installs formats through
-:class:`DisplayEscapingFormatter`, which escapes each argument as it is
-interpolated and the exception and stack text line by line.
+:class:`DisplayEscapingFormatter`, which escapes the rendered message whole and
+the exception and stack text line by line.
 
 Below ``WARNING``, the same handlers also refuse every record that does not
 come from STM's own ``memtomem_stm`` logger tree (:class:`DependencyRecordFilter`,
@@ -41,12 +41,10 @@ from __future__ import annotations
 
 import errno
 import logging
-import operator
 import os
 import sys
 import traceback
 import types
-from collections.abc import Mapping
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -303,31 +301,23 @@ def _exception_type_label(cls: type[BaseException]) -> str:
 
 
 class DisplayEscapingFormatter(logging.Formatter):
-    """A ``Formatter`` whose interpolated arguments, exception text and stack
-    text cannot carry a display-hostile character to the terminal or the log
-    file (#1173, #1425).
+    """A ``Formatter`` whose message, exception text and stack text cannot
+    carry a display-hostile character to the terminal or the log file (#1173,
+    #1425).
 
-    **Arguments.** A call site passes its values as logging arguments, and each
-    one is escaped as ``%`` interpolates it, the way ``utils/display._disp``
-    escapes a value for the CLI: a member of the set ``_disp_escapes`` defines
-    becomes its ``\\uXXXX`` form, under ``%s`` and ``%r`` alike. So a server key
-    with a newline in it stays on the line that names it. The literal text of
-    the format string is not touched — a line break a call site wrote there is
-    its own — and neither is a value formatted into the message before the
-    call: an f-string or a pre-built message never reaches ``record.args``.
-    ``tests/test_log_call_sites.py`` holds STM's own call sites to a literal
-    message for that reason. ``record.args`` is swapped for the duration of one
-    ``format`` call and put back, so another handler sees the record as logged.
-
-    An argument whose rendering cannot contain a member of the set is passed as
-    itself (:func:`_display_arg`), which keeps ``%d``, ``%f`` and a ``*`` width
-    working on plain numbers. Every other argument is interpolated through a
-    stand-in, with one visible difference from the stdlib: ``%c`` refuses the
-    stand-in for a string, so a record that gives ``%c`` a one-character string
-    that needed escaping, or a one-character ``str`` subclass, is reported
-    through ``logging``'s error handler instead of written. ``%c`` of an ``int``
-    writes that code point raw, which is the other reason the same test keeps
-    ``%c`` out of STM's format strings.
+    **The message.** The stdlib renders it — ``msg % args``, with whatever the
+    call site passed — and the result is escaped whole through
+    ``utils/display._disp`` before it goes into the line: a member of the set
+    ``_disp_escapes`` defines becomes its ``\\uXXXX`` form. So a server key
+    with a newline in it stays on the line that names it, whichever way the
+    call site put it there: as a ``%s`` argument, under ``%r``, or formatted
+    into the message beforehand. Nothing about ``%`` formatting is changed or
+    re-implemented; only its result is. That makes the message one line by
+    construction: a line break or a tab a call site writes in the message text
+    itself is escaped like any other, so a call site that wants two lines logs
+    twice. The other fields of the format (logger name, level, time) are
+    code-chosen and left alone, and ``record.message`` is put back once the
+    line is built, so the record is what the stdlib would have left.
 
     **Tracebacks.** The traceback is rendered here too, and a
     ``ValidationError`` location quotes the operator's own environment: the
@@ -376,15 +366,20 @@ class DisplayEscapingFormatter(logging.Formatter):
     def formatStack(self, stack_info: str) -> str:
         return _escape_lines(super().formatStack(stack_info))
 
-    def format(self, record: logging.LogRecord) -> str:
-        args = record.args
-        record.args = _display_args(args)
-        try:
-            return self._format_escaped_traceback(record)
-        finally:
-            record.args = args
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        from memtomem_stm.utils.display import _disp
 
-    def _format_escaped_traceback(self, record: logging.LogRecord) -> str:
+        message = record.message
+        # ``str.__str__``: ``"%s" % value`` can hand back a ``str`` subclass
+        # as it is, and ``_disp`` must read the characters that will be
+        # written, not what that subclass chooses to iterate as.
+        record.message = _disp(str.__str__(message))
+        try:
+            return super().formatMessage(record)
+        finally:
+            record.message = message
+
+    def format(self, record: logging.LogRecord) -> str:
         if not self._withhold_exception_text:
             if record.exc_text:
                 record.exc_text = _escape_lines(record.exc_text)
@@ -401,87 +396,9 @@ class DisplayEscapingFormatter(logging.Formatter):
 
 
 def _escape_lines(text: str) -> str:
-    return "\n".join(_escape(line) for line in text.split("\n"))
-
-
-def _escape(text: str) -> str:
     from memtomem_stm.utils.display import _disp
 
-    return _disp(text)
-
-
-class _DisplayArg:
-    """Stand-in for one log argument: ``%s`` and ``%r`` of it are escaped.
-
-    The numeric conversions go to the value itself, so ``%d`` of a ``Decimal``
-    or of any object with ``__int__`` renders as the stdlib renders it.
-    """
-
-    __slots__ = ("_value",)
-
-    def __init__(self, value: object) -> None:
-        self._value = value
-
-    def __str__(self) -> str:
-        return _escape(str(self._value))
-
-    def __repr__(self) -> str:
-        return _escape(repr(self._value))
-
-    def __int__(self) -> int:
-        return int(self._value)  # type: ignore[call-overload, no-any-return]
-
-    def __index__(self) -> int:
-        return operator.index(self._value)  # type: ignore[arg-type]
-
-    def __float__(self) -> float:
-        return float(self._value)  # type: ignore[arg-type]
-
-
-class _DisplayMapping(_DisplayArg):
-    """Stand-in for a mapping argument (``"%(key)s" % mapping``).
-
-    Lookups go to the original mapping, so a ``defaultdict`` still supplies its
-    default, and what a lookup returns is escaped like any other argument.
-    ``%s`` of the whole mapping is the inherited escaped ``str()``.
-    """
-
-    __slots__ = ()
-
-    def __getitem__(self, key: object) -> object:
-        return _display_arg(self._value[key])  # type: ignore[index]
-
-
-def _display_arg(value: object) -> object:
-    """*value* as itself when no rendering of it can need escaping, else a stand-in.
-
-    As itself: ``None`` and an exact ``bool``, ``int`` or ``float`` — digits,
-    signs and a few fixed words — and an exact ``str`` that ``_disp`` would not
-    change. Exact types only: a subclass can define a ``__str__`` or
-    ``__repr__`` that returns anything. The exact ``int`` is more than a
-    shortcut, since ``%*d`` accepts nothing else as its width.
-    """
-    if value is None or type(value) in (bool, int, float):
-        return value
-    if type(value) is str and _escape(value) == value:
-        return value
-    return _DisplayArg(value)
-
-
-def _display_args(args: Any) -> Any:
-    """``record.args`` with every argument passed through :func:`_display_arg`.
-
-    The three shapes ``LogRecord.getMessage`` hands to ``%``: a tuple, a
-    mapping (the stdlib unwraps a single mapping argument), and — from a
-    record built by hand — one bare object.
-    """
-    if not args:
-        return args
-    if isinstance(args, Mapping):
-        return _DisplayMapping(args)
-    if isinstance(args, tuple):
-        return tuple(_display_arg(value) for value in args)
-    return _display_arg(args)
+    return "\n".join(_disp(line) for line in text.split("\n"))
 
 
 def stderr_handler(

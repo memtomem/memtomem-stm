@@ -13,28 +13,25 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- A value interpolated into one of STM's log lines can no longer split or
-  reorder the line. The log formatter escaped an attached traceback only, and
-  left each message's values to its call site; most call sites passed them
-  through unchanged. Config does not restrict the characters of an upstream
-  server key or its `prefix`, and 114 logging calls interpolate one of the
-  two, so a key with a newline in it — in a hand-edited or imported
-  `stm_proxy.json` — made lines such as `Connected to '<key>' (3 tools
-  discovered)` continue on a second line that read as a record of its own,
-  and a bidirectional control or an escape sequence in it reached the terminal
-  and the log file as itself. The formatter every STM handler uses (stderr,
-  the log file, the daemon's log, `mms hook`'s stderr) now escapes each
-  argument as it is interpolated, the way the CLI escapes the same values.
-  The oversize-response warning (`Upstream '<server>/<tool>' response
-  exceeded max_upstream_bytes=…`) built its text before logging it and now
-  passes the names as arguments like the rest (#1425).
-  **Behavior change**: in a log line, a tab, a newline, another control
+- A value named in a log line can no longer split or reorder the line. The
+  log formatter escaped an attached traceback only and left each message's
+  values to its call site, and most call sites wrote them as they were.
+  Config does not restrict the characters of an upstream server key or its
+  `prefix`, and many of the proxy's log lines name one of the two, so a key
+  with a newline in it — in a hand-edited or imported `stm_proxy.json` — made
+  a line such as `Connected to '<key>' (3 tools discovered)` continue on a
+  second line that read as a record of its own, and a bidirectional control
+  or an escape sequence in it reached the terminal and the log file as
+  itself. The formatter every STM handler uses (stderr, the log file, the
+  daemon's log, `mms hook`'s stderr) now escapes the whole rendered message,
+  the way the CLI escapes the same values (#1425).
+  **Behavior change**: in a log message, a tab, a line break, another control
   character, a line or paragraph separator, a bidirectional control or a lone
-  surrogate inside an interpolated value is written as `\uXXXX`. The fixed
-  text of a message is unchanged, and so is a value with none of those
-  characters. A `%c` conversion given a string that needs that escape, or an
-  instance of a `str` subclass, is reported as a logging error instead of
-  written; none of STM's own lines use `%c`.
+  surrogate is written as `\uXXXX`, wherever in the message it is. Every
+  message is therefore one line; a message that carried a line break,
+  including one logged by a library STM uses, is written on one line with
+  `\u000A` where the break was. A message with none of those characters is
+  unchanged, and a traceback keeps its lines.
 
 - `mms daemon status` and `mms daemon stop` derive the config fingerprint
   once per run. Each read the discovery key twice — once to find this config's

@@ -8075,12 +8075,7 @@ class ProxyManager:
                     f"Upstream '{server}/{tool}' response exceeded "
                     f"max_upstream_bytes={cfg_snap.max_upstream_bytes}"
                 )
-                logger.warning(
-                    "Upstream '%s/%s' response exceeded max_upstream_bytes=%d",
-                    server,
-                    tool,
-                    cfg_snap.max_upstream_bytes,
-                )
+                logger.warning(msg)
                 self.tracker.record_error(
                     CallMetrics(
                         server=server,

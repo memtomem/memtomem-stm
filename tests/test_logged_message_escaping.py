@@ -1,16 +1,16 @@
-"""A log argument cannot carry a display-hostile character to the log (#1425).
+"""A log message cannot carry a display-hostile character to the log (#1425).
 
 Config does not restrict the characters of an upstream server key or its
-``prefix``, and most proxy log lines interpolate one of them. Before #1425 the
+``prefix``, and many proxy log lines name one of them. Before #1425 the
 formatter escaped only the traceback, so a key with a newline in it split the
-line that named it. ``DisplayEscapingFormatter`` now escapes every argument as
-``%`` interpolates it.
+line that named it. ``DisplayEscapingFormatter`` now escapes the rendered
+message whole.
 
 These tests check the FORMATTED output — what the handler writes — not
 ``record.getMessage()``, which is the raw record and is unchanged. The first
 half drives the formatter directly; the second drives real call sites, one per
-kind of value: a server key, a server key the call site used to format into
-the message itself, a prefixed tool name, and a configured path.
+kind of value: a server key passed as an argument, a server key formatted into
+the message before the call, a prefixed tool name, and a configured path.
 """
 
 from __future__ import annotations
@@ -41,18 +41,21 @@ from memtomem_stm.utils.display import _disp_escapes
 HOSTILE = "gh\nERROR memtomem_stm.proxy.manager: forged\u202e"
 ESCAPED = "gh\\u000AERROR memtomem_stm.proxy.manager: forged\\u202E"
 
-
-def _format(msg: str, *args: object, fmt: str = HOOK_STDERR_FORMAT) -> str:
-    """*msg* and *args* as a logger call records them, through the formatter."""
-    log = logging.getLogger("memtomem_stm.test_logged_argument_escaping")
-    record = log.makeRecord(log.name, logging.WARNING, __file__, 1, msg, args, None)
-    return DisplayEscapingFormatter(fmt).format(record)
+_LOGGER = "memtomem_stm.test_logged_message_escaping"
 
 
-def _stdlib(msg: str, *args: object) -> str:
-    log = logging.getLogger("memtomem_stm.test_logged_argument_escaping")
-    record = log.makeRecord(log.name, logging.WARNING, __file__, 1, msg, args, None)
-    return logging.Formatter(HOOK_STDERR_FORMAT).format(record)
+def _record(msg: object, *args: object, name: str = _LOGGER) -> logging.LogRecord:
+    """*msg* and *args* as a logger call records them."""
+    log = logging.getLogger(name)
+    return log.makeRecord(name, logging.WARNING, __file__, 1, msg, args, None)
+
+
+def _format(msg: object, *args: object, fmt: str = HOOK_STDERR_FORMAT) -> str:
+    return DisplayEscapingFormatter(fmt).format(_record(msg, *args))
+
+
+def _stdlib(msg: object, *args: object) -> str:
+    return logging.Formatter(HOOK_STDERR_FORMAT).format(_record(msg, *args))
 
 
 def _assert_one_clean_line(text: str) -> None:
@@ -85,46 +88,76 @@ def test_every_member_of_the_display_set_is_escaped():
     assert out.startswith("value \\u0000\\u0001") and out.endswith("\\uDFFF end")
 
 
-def test_the_literal_text_of_the_message_is_left_alone():
-    assert _format("first line\nsecond line %s", "x") == "first line\nsecond line x"
-    assert _format("no arguments\tat all") == "no arguments\tat all"
+def test_a_value_formatted_into_the_message_beforehand_is_escaped():
+    """No argument at all: the call site built the text itself."""
+    assert _format(f"Upstream '{HOSTILE}/search' failed") == f"Upstream '{ESCAPED}/search' failed"
+    assert _format("Upstream '" + HOSTILE + "' failed") == f"Upstream '{ESCAPED}' failed"
 
 
-def test_repr_conversion_is_escaped_too():
+def test_a_record_from_any_logger_is_escaped():
+    record = _record(f"event: {HOSTILE}", name="some.library.client")
+
+    assert DisplayEscapingFormatter(STDERR_FORMAT).format(record) == (
+        f"WARNING some.library.client: event: {ESCAPED}"
+    )
+
+
+def test_a_line_break_written_in_the_message_text_is_escaped_too():
+    assert _format("first line\nsecond line %s", "x") == "first line\\u000Asecond line x"
+    assert _format("name\tvalue") == "name\\u0009value"
+
+
+def test_a_message_that_is_not_a_string_is_escaped_through_its_str():
+    _assert_one_clean_line(_format(ValueError(HOSTILE)))
+    assert _format(ValueError(HOSTILE)) == ESCAPED
+
+
+def test_repr_and_ascii_conversions():
     class Loud:
         def __repr__(self) -> str:
             return f"<Loud {HOSTILE}>"
 
-    _assert_one_clean_line(_format("got %r", Loud()))
-    # ``repr`` of a ``str`` already escapes the set; it is not escaped twice.
-    assert _format("got %r", "a\nb") == "got 'a\\nb'"
+    assert _format("got %r", Loud()) == f"got <Loud {ESCAPED}>"
+    # ``repr`` of a ``str`` has already turned the newline into a backslash
+    # form of its own; that is clean text and is left as it is.
+    assert _format("got %r and %a", "a\nb", "c\u202e") == "got 'a\\nb' and 'c\\u202e'"
 
 
-def test_a_non_string_argument_is_escaped_through_its_str():
+def test_a_character_conversion_cannot_write_a_control_character():
+    assert _format("%c%c%c", 65, 10, "\x1b") == "A\\u000A\\u001B"
+
+
+def test_a_non_string_argument_is_escaped():
     out = _format("opening %s failed: %s", Path("/data") / HOSTILE, ValueError(HOSTILE))
 
     _assert_one_clean_line(out)
     assert out.count(ESCAPED) == 2
 
 
-def test_a_numeric_subclass_cannot_carry_a_value_through():
-    class Count(int):
-        def __str__(self) -> str:
-            return HOSTILE
-
-    class Ratio(float):
-        def __repr__(self) -> str:
-            return HOSTILE
-
-    assert _format("%s", Count(5)) == ESCAPED
-    assert _format("%r", Ratio(0.5)) == ESCAPED
-    assert _format("%(n)s", {"n": Count(5)}) == ESCAPED
-    # The number itself still converts as a number.
-    assert _format("%d %.1f", Count(5), Ratio(0.5)) == "5 0.5"
-
-
-def test_a_mapping_argument_is_escaped_per_lookup():
+def test_a_mapping_argument_is_escaped():
     assert _format("%(name)s: %(count)d", {"name": HOSTILE, "count": 2}) == f"{ESCAPED}: 2"
+
+
+class _Sneaky(str):
+    """A ``str`` that iterates as something other than its characters."""
+
+    def __str__(self) -> str:
+        return self
+
+    def __repr__(self) -> str:
+        return self
+
+    def __iter__(self) -> Iterator[str]:
+        return iter("safe")
+
+
+@pytest.mark.parametrize("msg", ["%s", "%r"])
+def test_a_str_subclass_cannot_hide_its_characters(msg):
+    # ``"%s" % value`` returns the subclass instance itself, so what is checked
+    # must be the characters that are written, not ``iter(value)``.
+    assert type(msg % _Sneaky(HOSTILE)) is _Sneaky
+
+    assert _format(msg, _Sneaky(HOSTILE)) == ESCAPED
 
 
 class _Transport(enum.StrEnum):
@@ -132,37 +165,43 @@ class _Transport(enum.StrEnum):
 
 
 class _Level(enum.IntEnum):
-    HIGH = 3
+    FOUR = 4
 
 
+class _Width(int):
+    pass
+
+
+class _OwnInt(int):
+    def __int__(self) -> int:
+        return 999
+
+
+# The stdlib does the formatting, so each of these is its own output. They are
+# the shapes an escaping stand-in for the arguments got wrong.
 _CLEAN_CASES = [
     ("Connected to '%s' (%s tools discovered)", ("github", 12)),
-    ("%s/%s: %d of %d", ("gh", "search", 3, 10)),
     ("ratio %.3f < %.3f, mode %o, id %x, %g", (0.25, 0.5, 0o600, 255, 1.5)),
     ("%5d|%-8s|%10.3s|%r", (7, "ab", "abcdef", "cd")),
     ("%*d|%.*f", (5, 3, 2, 1.23456)),
+    ("%*s|%.*f", (_Width(4), "x", _Level.FOUR, 1.23456)),
+    ("%d %d", (_OwnInt(2), MagicMock(__int__=lambda self: 4))),
+    ("%d rows, %.2f", (Decimal("3"), Decimal("3.14159"))),
     ("%s %s %s %d", (None, True, False, True)),
     ("%s at %r", (Path("/a/b"), Path("/a/b"))),
-    ("%s %r", (b"by\ntes", ["a", "b\n"])),
-    (
-        "%d rows, %d rows, %.2f",
-        (Decimal("3"), MagicMock(__int__=lambda self: 4), Decimal("3.14159")),
-    ),
     ("%s|%r", (_Transport.STDIO, _Transport.STDIO)),
-    ("%s|%d|%r", (_Level.HIGH, _Level.HIGH, _Level.HIGH)),
-    ("%c%c", (65, "B")),
-    ("%a 100%%", ("é",)),
-    ("%s", (ValueError("plain"),)),
-    ("CJK %s emoji %s", ("한글", "👨‍👩‍👧")),
+    ("%s|%d|%r", (_Level.FOUR, _Level.FOUR, _Level.FOUR)),
+    ("%c%c 100%%", (65, _Transport.STDIO[0])),
+    ("CJK %s emoji %s", ("\ud55c\uae00", "\U0001f468\u200d\U0001f469\u200d\U0001f467")),
     ("%(a)s=%(b)d|%(c).1f", ({"a": "x", "b": 2, "c": 1.25},)),
     ("%(missing)s", (defaultdict(lambda: "fallback", {"present": 1}),)),
     ("%s", (OrderedDict(x="clean"),)),
-    ("%s", ({"k": "v\n"},)),
+    ("%s %r", (b"by\ntes", ["a", "b\n"])),
 ]
 
 
 @pytest.mark.parametrize(("msg", "args"), _CLEAN_CASES)
-def test_a_value_with_nothing_to_escape_renders_as_the_stdlib_renders_it(msg, args):
+def test_a_message_with_nothing_to_escape_is_the_stdlib_message(msg, args):
     assert _format(msg, *args) == _stdlib(msg, *args)
 
 
@@ -172,6 +211,7 @@ def test_a_value_with_nothing_to_escape_renders_as_the_stdlib_renders_it(msg, ar
         ("%(nope)s", ({"a": 1},), KeyError),
         ("%s %s", ("only one",), TypeError),
         ("%d", ("not a number",), TypeError),
+        ("%d", (b"12",), TypeError),
     ],
 )
 def test_a_call_the_stdlib_rejects_is_still_rejected(msg, args, error):
@@ -181,55 +221,40 @@ def test_a_call_the_stdlib_rejects_is_still_rejected(msg, args, error):
         _format(msg, *args)
 
 
-def test_a_record_built_with_one_bare_argument_is_escaped():
-    """``LogRecord`` accepts an ``args`` that is neither a tuple nor a mapping;
-    ``%`` then treats it as the single argument."""
-    record = logging.LogRecord("memtomem_stm.x", logging.WARNING, __file__, 1, "%s", HOSTILE, None)
-    assert record.args == HOSTILE
-
-    assert DisplayEscapingFormatter(HOOK_STDERR_FORMAT).format(record) == ESCAPED
-    assert record.args == HOSTILE
-
-
-def test_the_record_keeps_its_arguments_for_the_next_handler():
-    log = logging.getLogger("memtomem_stm.test_logged_argument_escaping")
+def test_the_record_is_left_as_the_stdlib_leaves_it():
     args = ("gh", HOSTILE, 3)
-    record = log.makeRecord(log.name, logging.WARNING, __file__, 1, "%s %s %d", args, None)
+    record = _record("%s %s %d", *args)
 
     DisplayEscapingFormatter(HOOK_STDERR_FORMAT).format(record)
 
-    assert record.args is args
+    assert record.args == args
+    assert record.message == f"gh {HOSTILE} 3"
+    assert record.getMessage() == f"gh {HOSTILE} 3"
+    # A handler with another formatter still writes the record as logged.
     assert logging.Formatter("%(message)s").format(record) == f"gh {HOSTILE} 3"
 
 
-def test_the_record_keeps_its_arguments_when_formatting_raises():
-    log = logging.getLogger("memtomem_stm.test_logged_argument_escaping")
-    args = (HOSTILE,)
-    record = log.makeRecord(log.name, logging.WARNING, __file__, 1, "%d", args, None)
-
-    with pytest.raises((TypeError, ValueError)):
-        DisplayEscapingFormatter(HOOK_STDERR_FORMAT).format(record)
-
-    assert record.args is args
-
-
-def test_a_hostile_argument_and_a_traceback_in_one_record():
+def test_a_hostile_message_and_a_hostile_traceback_in_one_record():
     buf = io.StringIO()
     handler = logging.StreamHandler(buf)
-    handler.setFormatter(DisplayEscapingFormatter(STDERR_FORMAT))
-    log = logging.getLogger("memtomem_stm.test_logged_argument_escaping.traceback")
+    handler.setFormatter(DisplayEscapingFormatter(STDERR_FORMAT, withhold_exception_text=False))
+    log = logging.getLogger(f"{_LOGGER}.traceback")
     log.handlers[:] = [handler]
     log.propagate = False
     try:
-        raise ValueError("withheld")
+        raise ValueError(f"bad key\x1b[31m{HOSTILE}")
     except ValueError:
         log.warning("Cache store failed for %s/%s", HOSTILE, "search", exc_info=True)
-    lines = buf.getvalue().splitlines()
+    out = buf.getvalue()
+    lines = out.splitlines()
 
     assert lines[0].endswith(f"Cache store failed for {ESCAPED}/search")
-    assert not any(line.startswith("ERROR memtomem_stm") for line in lines)
-    assert "\u202e" not in buf.getvalue()
-    assert any("Traceback" in line for line in lines[1:])
+    assert "Traceback (most recent call last):" in lines[1]
+    # The traceback keeps its line structure and is escaped line by line.
+    assert "ValueError: bad key\\u001B[31mgh" in out
+    assert "\x1b" not in out and "\u202e" not in out
+    # The message contributes exactly one line: nothing it carries starts another.
+    assert sum(line.startswith("WARNING ") for line in lines) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +293,8 @@ def test_a_server_key_in_the_tool_listing_warning():
 
 
 async def test_a_server_key_in_the_oversize_response_warning():
-    """This call site used to build the message with an f-string, so the key
-    was not an argument at all."""
+    """This call site builds its text before logging it, so the key is not an
+    argument of the record at all."""
     from mcp.server.mcpserver.exceptions import ToolError
 
     from memtomem_stm.proxy.config import CompressionStrategy, ProxyConfig, UpstreamServerConfig
