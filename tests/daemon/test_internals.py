@@ -4349,6 +4349,160 @@ class TestStatusEscapesTheRecordedPidOfAnUnansweredHandshake:
         assert _BIDI not in text
 
 
+_QUEUE_KEYS = (
+    "active",
+    "in_flight",
+    "concurrency",
+    "queued",
+    "capacity",
+    "busy_rejections",
+    "pre_auth_evictions",
+)
+_SURFACE_KEYS = ("samples", "timeout_samples", "error_samples", "cold_samples", "pre_rpc_faults")
+
+
+def _answering_daemon(monkeypatch: pytest.MonkeyPatch, pid: object, mark: str) -> dict:
+    """Fake a daemon that answers ``ping`` with the handshake-plus-reply below.
+
+    ``mark`` is appended to every field the text output shows that nothing
+    coerces: the handshake ``pid`` comes from a file and the rest from the
+    reply, and nothing checks those fields' types on either route. ``host`` and
+    ``port`` are marked too although a real ping only succeeds with a string
+    host and an integer port: the line is escaped whole, and a test that left
+    them clean would pass an implementation that escaped every field but those.
+    """
+    import time as _time
+
+    reply = {
+        "pid": pid,
+        "host": f"127.0.0.1{mark}",
+        "port": f"4567{mark}",
+        "ltm": f"warm{mark}",
+        "created_at": _time.time(),
+        "queue": {key: f"{n}{mark}" for n, key in enumerate(_QUEUE_KEYS, start=1)},
+        "latency": {
+            "surface": {
+                **{key: f"{n}{mark}" for n, key in enumerate(_SURFACE_KEYS, start=1)},
+                "p50_ms": 10.0,
+                "p95_ms": 20.0,
+                "recommendation": {"seconds": f"3{mark}"},
+            }
+        },
+    }
+
+    async def fake_ping(config, *, timeout=2.0, fingerprint=None):
+        return reply
+
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+    return reply
+
+
+def _answering_status_lines(pid_shown: str, mark: str) -> list[str]:
+    """The three lines ``status`` prints for :func:`_answering_daemon`'s reply."""
+    return [
+        f"running  pid={pid_shown} 127.0.0.1{mark}:4567{mark} ltm=warm{mark} uptime=",
+        f"queue: active=1{mark} in_flight=2{mark}/3{mark} queued=4{mark} capacity=5{mark} "
+        f"busy_rejections=6{mark} pre_auth_evictions=7{mark}",
+        f"surface latency: samples=1{mark} timeouts=2{mark} errors=3{mark} cold=4{mark} "
+        f"pre_rpc_faults=5{mark} p50=10ms p95=20ms suggested_timeout=3{mark}s",
+    ]
+
+
+class TestStatusAndStartEscapeAnAnsweringDaemonsValues:
+    """#1431 — when a daemon answers, ``status`` and ``start`` print fields of
+    its handshake (a file) and its ping reply, most of them of a type nothing
+    checks. Every line built from them is escaped as a whole, so a field
+    added to one later is covered without a call of its own."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("NO_COLOR", "1")
+        _discovery_key()
+
+    @pytest.mark.parametrize(
+        ("pid", "pid_shown"),
+        [(f"1{_BIDI}2", "1\\u202E2"), (_SURROGATE, _SURROGATE_SHOWN)],
+        ids=["bidi", "surrogate"],
+    )
+    def test_status_escapes_every_line_built_from_the_reply(
+        self, monkeypatch: pytest.MonkeyPatch, pid: object, pid_shown: str
+    ):
+        _answering_daemon(monkeypatch, pid, _BIDI)
+
+        text = _daemon_output("status")
+
+        lines = text.splitlines()
+        for expected in _answering_status_lines(pid_shown, "\\u202E"):
+            assert any(line.startswith(expected) for line in lines), (expected, text)
+        assert _BIDI not in text
+
+    def test_status_prints_ordinary_values_unchanged(self, monkeypatch: pytest.MonkeyPatch):
+        _answering_daemon(monkeypatch, 11, "")
+
+        lines = _daemon_output("status").splitlines()
+
+        for expected in _answering_status_lines("11", ""):
+            assert any(line.startswith(expected) for line in lines), (expected, lines)
+
+    def test_status_json_reports_the_values_as_received(self, monkeypatch: pytest.MonkeyPatch):
+        import json
+
+        reply = _answering_daemon(monkeypatch, f"1{_BIDI}2", _BIDI)
+
+        text = _daemon_output("status", "--json")
+
+        info = json.loads(text)
+        assert info["pid"] == reply["pid"]
+        assert info["ltm"] == reply["ltm"]
+        assert info["queue"] == reply["queue"]
+        assert info["latency"] == reply["latency"]
+        assert _BIDI not in text
+
+    def test_status_escapes_before_it_styles(self, monkeypatch: pytest.MonkeyPatch):
+        """The escape runs on the unstyled text: the colour codes ``_ok`` adds
+        are the only control characters left, and they still work."""
+        from click.testing import CliRunner
+
+        monkeypatch.delenv("NO_COLOR")
+        _answering_daemon(monkeypatch, f"1{_BIDI}2", _BIDI)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status"], color=True)
+
+        assert result.exit_code == 0, result.output
+        assert "\x1b[32mrunning  pid=1\\u202E2 " in result.output
+        assert "\\u001B" not in result.output
+        assert _BIDI not in result.output
+
+    def test_start_escapes_an_already_running_daemon(self, monkeypatch: pytest.MonkeyPatch):
+        _answering_daemon(monkeypatch, f"1{_BIDI}2", _BIDI)
+
+        text = _daemon_output("start")
+
+        assert "daemon already running (pid=1\\u202E2 port=4567\\u202E)" in text
+        assert _BIDI not in text
+
+    def test_start_escapes_the_daemon_it_started(self, monkeypatch: pytest.MonkeyPatch):
+        spawns: list[object] = []
+        reply = {"pid": _SURROGATE, "port": f"9{_BIDI}"}
+
+        async def fake_ping(config, *, timeout=2.0, fingerprint=None):
+            return reply if spawns else None
+
+        def fake_request_spawn(config, *, propagate_errors=False):
+            spawns.append(config)
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", fake_request_spawn)
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd.time.sleep", lambda seconds: None)
+
+        text = _daemon_output("start")
+
+        assert f"daemon started (pid={_SURROGATE_SHOWN} port=9\\u202E)" in text
+        assert _BIDI not in text
+
+
 class TestDaemonRestartCli:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
     def test_stop_then_start(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
