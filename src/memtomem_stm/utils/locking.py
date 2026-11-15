@@ -11,6 +11,7 @@ subtly different implementations.
 
 from __future__ import annotations
 
+import errno
 import importlib
 import logging
 import os
@@ -20,10 +21,19 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def open_lock_fd(path: Path) -> int:
-    """Open ``path`` for locking and return an fd owned by the caller."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+def open_lock_fd(path: Path, *, create: bool = True) -> int:
+    """Open ``path`` for locking and return an fd owned by the caller.
+
+    With ``create=False`` nothing is made: no parent directory, no file, and
+    no target for a link that does not resolve — a path with no file behind it
+    raises ``FileNotFoundError``. For a caller that only asks whether a lock
+    that already exists is held.
+    """
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    else:
+        fd = os.open(str(path), os.O_RDWR)
     if os.name == "nt":  # pragma: no cover - Windows CI
         try:
             if os.fstat(fd).st_size == 0:
@@ -42,24 +52,54 @@ def open_lock_fd(path: Path) -> int:
     return fd
 
 
-def try_lock(fd: int) -> bool:
-    """Attempt a non-blocking exclusive lock. Return whether it was acquired."""
-    if os.name == "nt":  # pragma: no cover - Windows CI
-        msvcrt: Any = importlib.import_module("msvcrt")
+# What a non-blocking lock attempt raises when someone else holds the lock:
+# ``flock`` reports EWOULDBLOCK (EAGAIN on most systems) and ``msvcrt.locking``
+# EACCES, which is also what POSIX allows a contended lock to report. On
+# Windows the C runtime's other lock-violation code is counted too. It is
+# documented for the retrying modes, not for the non-blocking one used here,
+# and is included so that a code this cannot be tested against errs toward
+# "held" — what every failure meant before the two were told apart.
+_CONTENDED = frozenset(
+    {errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES}
+    | ({getattr(errno, "EDEADLOCK", errno.EDEADLK)} if os.name == "nt" else set())
+)
 
-        try:
+
+def try_lock_strict(fd: int) -> bool:
+    """Attempt a non-blocking exclusive lock; say why when it is not taken.
+
+    ``True`` when acquired and ``False`` when another handle holds it. Any
+    other failure — a filesystem that does not support locking, an I/O error —
+    raises ``OSError``: the lock was not found to be held, the question was
+    not answered.
+    """
+    try:
+        if os.name == "nt":  # pragma: no cover - Windows CI
+            msvcrt: Any = importlib.import_module("msvcrt")
+
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
+        else:
+            fcntl: Any = importlib.import_module("fcntl")
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in _CONTENDED:
             return False
+        raise
+    return True
 
-    fcntl: Any = importlib.import_module("fcntl")
 
+def try_lock(fd: int) -> bool:
+    """Attempt a non-blocking exclusive lock. Return whether it was acquired.
+
+    ``False`` for every failure, not only for a lock someone else holds: the
+    callers that take a lock to own it only need to know they did not get it.
+    A caller that reports on a lock uses :func:`try_lock_strict`.
+    """
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except (BlockingIOError, OSError):
+        return try_lock_strict(fd)
+    except OSError:
         return False
 
 

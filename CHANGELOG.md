@@ -33,6 +33,53 @@ changes inline only. See the deprecation policy in
   `\u000A` where the break was. A message with none of those characters is
   unchanged, and a traceback keeps its lines.
 
+- `mms daemon status` and `mms daemon stop --all` escape for display two
+  values they read from files in `data_dir` and used to print as they were.
+  One is the fingerprint of a daemon under another config, which is taken
+  from a file name (`stm-daemon-<fingerprint>.json` or `.lock`): a name
+  carrying a control or bidirectional-formatting character reached the
+  terminal with it, and one that was not valid UTF-8 (Linux allows such a
+  name) was written out as the bytes it was or, where the output stream
+  encodes strictly, ended the command with `UnicodeEncodeError` at the first
+  line naming it. The other, in `status` only, is the `pid` recorded in this
+  config's handshake when no daemon answers for it, which was printed
+  whatever JSON value the file held. Both
+  now appear with such characters as `\uXXXX`; a name or pid without any is
+  printed as before. `--json` was not affected — JSON encoding already
+  escaped them — and still carries both values as found. The file has to be
+  in the operator's own `data_dir`.
+  With an unusable discovery key, the hint `stop` prints now says what
+  `stop --all` does — it signals the accepting daemons under `data_dir` and
+  waits for the others — where it said it signals every published daemon
+  (#1429).
+- `mms daemon status` and `mms daemon stop --all` find a daemon under another
+  config fingerprint that holds its lifetime lock without a handshake. A
+  daemon holds the lock from before it publishes its handshake until after
+  its teardown has removed it, and daemons under other fingerprints were
+  found through handshakes only, so for those two stretches one was not
+  listed: `status` reported `stopped` with an empty `foreign` list and
+  `stop --all` reported nothing to stop, both with exit 0. That also covered
+  this config's own daemon once its discovery key had been removed. Such a
+  daemon is now found by its lock file and listed as `pid=?` with `no
+  handshake; lock held — starting or shutting down`; in `status --json` its
+  `foreign` entry has `handshake_absent: true`, `listening: false` and
+  `"lock": "held"`. `stop --all` waits for its lock to be released and never
+  signals it, as for any listed daemon that is not accepting. Lock files left
+  by daemons that have exited are not listed: only a lock that is held, or
+  that could not be checked, is. For a lock file with no handshake, "held"
+  is judged over up to three further rounds, each after a 20 ms pause,
+  because testing a lock takes it for an instant and two commands
+  looking at the same file would otherwise report each other; a lock file on
+  a filesystem without file-lock support is listed as one that could not be
+  checked rather than as held. The state reported for this config is
+  unchanged — with no discovery key it is still `stopped`, with the daemon
+  listed beside it (#1421).
+  Looking at another fingerprint's lock no longer creates anything. `status`
+  and `stop --all` used to create the lock file of a fingerprint whose
+  handshake was stale and whose lock file was gone, and to create the target
+  of a lock file that was a dangling link and then read that lock as free;
+  they now open only a lock file that already exists.
+
 - `mms daemon status` and `mms daemon stop` derive the config fingerprint
   once per run. Each read the discovery key twice — once to find this config's
   daemon and again to decide which daemons are foreign, or to send the

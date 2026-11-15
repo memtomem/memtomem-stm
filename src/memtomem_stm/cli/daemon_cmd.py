@@ -222,8 +222,9 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     """Daemons running under a *different* config fingerprint than *current*.
 
     *current* is ``None`` when the caller has no fingerprint — no discovery
-    key, or an unusable one — and then every published daemon is listed: that
-    is what lets ``stop --all`` reach daemons whose key was lost or damaged.
+    key, or an unusable one — and then every daemon in ``data_dir`` is listed:
+    that is what lets ``stop --all`` reach daemons whose key was lost or
+    damaged.
 
     ``stop``/``status`` key to the *current* fingerprint, so these are invisible
     to them otherwise. A foreign daemon is not necessarily stale (#1195):
@@ -251,6 +252,9 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     listener). Each entry carries only non-sensitive fields
     (``fingerprint``/``pid``/``host``/``port``/``idle_shutdown_seconds``/
     ``exits_when_idle``) — never the auth ``token`` — so callers can render them.
+    ``fingerprint`` is a file name, not something a daemon wrote: the entry keeps
+    it as found (paths are built from it, and ``--json`` reports it), and text
+    output renders it through ``_disp``.
 
     Cross-platform: the connect-probe is what makes Windows viable too, where
     :func:`is_pid_alive` is uninformative (returns ``True`` for any positive pid,
@@ -268,22 +272,40 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
     Accepting entries carry ``listening: True`` and ``lock: None`` (not
     checked).
 
+    A fingerprint with no handshake file at all is listed the same way when
+    its lock is not free (#1421): a daemon holds the lock before it publishes
+    and after its teardown has removed the record, and for those stretches the
+    lock file is all there is to find. Those entries carry
+    ``handshake_absent: True``, ``listening: False``, ``lock``, and ``None``
+    for every field a record would have supplied. Candidates are the lock
+    files that exist (:func:`iter_foreign_lock_fingerprints`); daemons never
+    remove theirs, so the probe, not the file, says whether there is a daemon
+    — and it has to say so more than once (:func:`_probe_unpublished_locks`).
+
+    Nothing here creates a file: every lock probe on this side is
+    :func:`_probe_foreign_lock`.
+
     Raises :class:`_ForeignListingError` when ``data_dir`` cannot be listed, so
     no caller reads "could not look" as "none" (#1249). Only the enumeration is
     translated; the per-entry probes report their own failures.
     """
     from memtomem_stm.daemon.client import probe_listening
-    from memtomem_stm.daemon.discovery import is_pid_alive, iter_foreign_handshakes
+    from memtomem_stm.daemon.discovery import (
+        is_pid_alive,
+        iter_foreign_handshakes,
+        iter_foreign_lock_fingerprints,
+    )
     from memtomem_stm.daemon.locking import lock_path
 
     try:
         handshakes = iter_foreign_handshakes(config.data_dir, current, include_unreadable=True)
+        lock_fingerprints = iter_foreign_lock_fingerprints(config.data_dir, current)
     except OSError as exc:
         raise _ForeignListingError(type(exc).__name__) from exc
     live: list[dict[str, Any]] = []
     for fingerprint, hs in handshakes:
         if hs is None:
-            state = _probe_lock(lock_path(config.data_dir, fingerprint))
+            state = _probe_foreign_lock(lock_path(config.data_dir, fingerprint))
             if state is not LockProbe.FREE:
                 live.append(
                     {
@@ -317,9 +339,35 @@ def _live_foreign_daemons(config: STMConfig, current: str | None) -> list[dict[s
         if is_pid_alive(pid) and probe_listening(host, port):
             live.append({**entry, "listening": True, "lock": None})
             continue
-        state = _probe_lock(lock_path(config.data_dir, fingerprint))
+        state = _probe_foreign_lock(lock_path(config.data_dir, fingerprint))
         if state is not LockProbe.FREE:
             live.append({**entry, "listening": False, "lock": state.value})
+    # A fingerprint with a handshake file, readable or not, was judged above
+    # through that record. What is left has a lock file and nothing published.
+    # Lock files are never removed, so nearly all of these are free — the
+    # probe decides, not the file being there.
+    published = {fingerprint for fingerprint, _ in handshakes}
+    unpublished = {
+        fingerprint: lock_path(config.data_dir, fingerprint)
+        for fingerprint in lock_fingerprints
+        if fingerprint not in published
+    }
+    for fingerprint, state in _probe_unpublished_locks(unpublished).items():
+        if state is not LockProbe.FREE:
+            live.append(
+                {
+                    "fingerprint": fingerprint,
+                    "pid": None,
+                    "host": None,
+                    "port": None,
+                    "idle_shutdown_seconds": None,
+                    "exits_when_idle": None,
+                    "listening": False,
+                    "lock": state.value,
+                    "handshake_absent": True,
+                }
+            )
+    live.sort(key=lambda daemon: daemon["fingerprint"])
     return live
 
 
@@ -493,8 +541,10 @@ def stop_cmd(stop_all: bool) -> None:
 
     With an unusable discovery key there is no "current config" to act on, and
     the command exits 1 saying so. ``--all`` still runs first and treats every
-    published daemon as foreign — the way out when a daemon is still running
-    under a key that has since been damaged.
+    daemon it finds in ``data_dir`` as foreign — by a handshake, or by a lock
+    file with no handshake whose lock is held or cannot be checked. That is the
+    way out when a daemon is still running under a key that has since been
+    damaged.
 
     The key is read once, when the command starts. One damaged or removed after
     that does not change which daemon this run treats as the current config's.
@@ -526,7 +576,10 @@ def stop_cmd(stop_all: bool) -> None:
         if stop_all:
             hint = ""
         elif _can_force_terminate():
-            hint = "; `mms daemon stop --all` signals every daemon published under data_dir"
+            hint = (
+                "; `mms daemon stop --all` signals the accepting daemons under data_dir "
+                "and waits for the others to finish"
+            )
         else:
             # ``stop --all`` refuses to signal by pid on Windows.
             hint = "; end the daemon processes `mms daemon status` lists from Task Manager"
@@ -613,6 +666,74 @@ def _probe_lock(path: Path) -> LockProbe:
 
     with probe_lifetime_lock(path) as state:
         return state
+
+
+def _probe_foreign_lock(path: Path) -> LockProbe:
+    """One look at the lifetime lock of a fingerprint that is not this
+    config's. Creates nothing — no lock file, no ``data_dir``, no target for a
+    link that does not resolve.
+
+    Every probe on the foreign side goes through here. :func:`_probe_lock`
+    opens with ``O_CREAT``, which is right for this config's own lock (the
+    daemon would create the same file) and wrong for somebody else's: listing
+    daemons must not leave files behind for fingerprints it merely looked at,
+    and a lock that is a dangling link would get its target created and then
+    read as free (#1421).
+
+    When nothing could be opened at ``path``, :func:`_handshake_removed`
+    separates the two reasons: the entry is really gone, so nothing holds it
+    (``FREE``), or it is there and does not resolve, or its directory could
+    not be walked, so the question went unanswered (``UNKNOWN``).
+    """
+    from memtomem_stm.daemon.locking import probe_existing_lifetime_lock
+
+    state = probe_existing_lifetime_lock(path)
+    if state is None:
+        return LockProbe.FREE if _handshake_removed(path) else LockProbe.UNKNOWN
+    return state
+
+
+# A lock file with nothing published is reported as held only when it is
+# still held after this many further rounds, each preceded by one pause of
+# this length for all such locks together.
+_UNPUBLISHED_LOCK_CONFIRMATIONS = 3
+_UNPUBLISHED_LOCK_CONFIRM_PAUSE_SECONDS = 0.02
+# Bound here, not looked up through ``time`` at call time: the pause is part
+# of one look at a lock, not of the stop wait whose clock tests replace.
+_confirm_pause = time.sleep
+
+
+def _probe_unpublished_locks(paths: dict[str, Path]) -> dict[str, LockProbe]:
+    """Whether a daemon holds each of these locks — the locks of fingerprints
+    that have published nothing — judged over several looks, because one
+    cannot tell. Keyed like *paths*, by fingerprint.
+
+    A probe takes the lock for an instant, and so does every other process
+    looking at the same file: another ``status``, a spawn request checking
+    whether to launch. With a record to go by that hardly matters, but here
+    the lock is the only evidence, and every leftover lock file in
+    ``data_dir`` is a candidate — two ``status`` runs started together walk
+    the same list in step, and each reported the other's probes as daemons
+    starting up (#1421). A daemon holds its lock for its whole life, a probe
+    for microseconds, so a lock still held after a few pauses is a daemon's.
+    That makes a false report need that many coincidences in a row; it does
+    not make one impossible.
+
+    The pauses are shared: each round pauses once and then looks again at
+    every lock still found held, so the wait does not grow with the number of
+    candidates. ``FREE`` and ``UNKNOWN`` are settled as soon as they are seen —
+    neither is an artefact of someone else's probe — and with no lock found
+    held there is no pause at all.
+    """
+    states = {fingerprint: _probe_foreign_lock(path) for fingerprint, path in paths.items()}
+    for _ in range(_UNPUBLISHED_LOCK_CONFIRMATIONS):
+        held = [fingerprint for fingerprint, state in states.items() if state is LockProbe.HELD]
+        if not held:
+            break
+        _confirm_pause(_UNPUBLISHED_LOCK_CONFIRM_PAUSE_SECONDS)
+        for fingerprint in held:
+            states[fingerprint] = _probe_foreign_lock(paths[fingerprint])
+    return states
 
 
 def _wait_lock_free(path: Path, on_free: Callable[[], None] | None = None) -> LockProbe:
@@ -828,12 +949,12 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
 def _foreign_name(d: dict[str, Any]) -> str:
     """``pid=N (fp=…)`` for a foreign entry; ``pid=?`` when its record is unreadable."""
     pid = "?" if d["pid"] is None else d["pid"]
-    return f"pid={pid} (fp={d['fingerprint']})"
+    return f"pid={pid} (fp={_disp(d['fingerprint'])})"
 
 
 def _foreign_stopped(d: dict[str, Any]) -> str:
     pid = "?" if d["pid"] is None else d["pid"]
-    return f"daemon pid={pid} stopped (fp={d['fingerprint']})"
+    return f"daemon pid={pid} stopped (fp={_disp(d['fingerprint'])})"
 
 
 def _stop_foreign_daemons(config: STMConfig, current: str | None) -> None:
@@ -898,7 +1019,7 @@ def _stop_foreign_daemons(config: STMConfig, current: str | None) -> None:
             # endpoint is gone. Runs before the platform check, so a target that
             # no longer needs a signal is not reported as one Windows cannot send.
             if not (is_pid_alive(pid) and client.probe_listening(d["host"], d["port"])):
-                state = _probe_lock(lp)
+                state = _probe_foreign_lock(lp)
                 if state is LockProbe.FREE:
                     if _handshake_removed(hs_path):
                         click.echo(_ok(_foreign_stopped(d)))
@@ -990,7 +1111,7 @@ def _wait_foreign_stops(
     while True:
         pending_hs = [p for p in pending_hs if not _handshake_removed(p)]
         for p in list(pending_locks):
-            state = _probe_lock(p)
+            state = _probe_foreign_lock(p)
             if state is LockProbe.FREE:
                 del pending_locks[p]
             else:
@@ -1062,7 +1183,7 @@ def status_cmd(as_json: bool) -> None:
         # No fingerprint, so no handshake or lock path to read or probe. With
         # no key at all there is no daemon for this config — provided the
         # directory could really be looked at. An unusable key leaves the
-        # question open; the daemons that are published are listed below
+        # question open; the daemons found in ``data_dir`` are listed below
         # either way.
         if key_error is not None:
             info = {"state": "unknown", "error": _key_error_text(key_error)}
@@ -1196,21 +1317,21 @@ def status_cmd(as_json: bool) -> None:
     elif state == "stale" and info["lock"] == LockProbe.HELD.value:
         click.echo(
             _warn(
-                f"daemon not answering (recorded pid={info['pid']}), lock held — "
+                f"daemon not answering (recorded pid={_stale_pid(info)}), lock held — "
                 "starting or shutting down"
             )
         )
     elif state == "stale" and info["lock"] == LockProbe.UNKNOWN.value:
         click.echo(
             _warn(
-                f"daemon not answering (recorded pid={info['pid']}), and its lock could "
-                "not be checked — state unknown"
+                f"daemon not answering (recorded pid={_stale_pid(info)}), and its lock "
+                "could not be checked — state unknown"
             )
         )
     elif state == "stale":
         click.echo(
             _warn(
-                f"stale handshake (pid={info['pid']} alive={info['pid_alive']}) — "
+                f"stale handshake (pid={_stale_pid(info)} alive={info['pid_alive']}) — "
                 "daemon not answering"
             )
         )
@@ -1245,10 +1366,22 @@ def status_cmd(as_json: bool) -> None:
         raise SystemExit(1)
 
 
+def _stale_pid(info: dict[str, Any]) -> str:
+    """The ``pid`` a handshake that nothing answers for records, for text output.
+
+    ``status`` reports it as the file has it — any JSON value, since nothing
+    validates a handshake's field types — so it is escaped here rather than
+    coerced: ``--json`` carries the same value, encoded by ``json.dumps``.
+    """
+    return _disp(str(info["pid"]))
+
+
 def _foreign_idle_label(daemon: dict[str, Any]) -> str:
     if not daemon["listening"]:
         if daemon.get("handshake_unreadable"):
             prefix = "handshake unreadable"
+        elif daemon.get("handshake_absent"):
+            prefix = "no handshake"
         else:
             prefix = "not accepting"
         if daemon["lock"] == LockProbe.UNKNOWN.value:
@@ -1274,7 +1407,7 @@ def _render_foreign(foreign: list[dict[str, Any]]) -> None:
     the daemon; they say whether it can outlive its users.
     """
     listing = ", ".join(
-        f"pid={'?' if d['pid'] is None else d['pid']} fp={d['fingerprint']} "
+        f"pid={'?' if d['pid'] is None else d['pid']} fp={_disp(d['fingerprint'])} "
         f"({_foreign_idle_label(d)})"
         for d in foreign
     )

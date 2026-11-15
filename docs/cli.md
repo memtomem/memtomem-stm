@@ -1168,8 +1168,30 @@ anything uses it now:
 A daemon whose endpoint no longer accepts but whose lifetime lock is held is
 listed too, labelled `not accepting; lock held — starting or shutting down`
 (or `handshake unreadable; …` with `pid=?` when its record cannot be parsed,
-and `lock could not be checked` when the lock file cannot be opened). Such a
-list is never headed "running", and never answered with "nothing to stop".
+and `lock could not be checked` when the lock file cannot be opened). So is
+one with no handshake at all: a daemon holds its lock from before it publishes
+its handshake until after its teardown has removed it, and for those two
+stretches it is listed as `pid=?` with `no handshake; lock held — starting or
+shutting down`. It is found by its lock file (`stm-daemon-<fingerprint>.lock`).
+Lock files are never removed, so most of them belong to daemons long gone; one
+is listed only when its lock is held, or could not be checked. Testing a lock
+means taking it for an instant, which another `status` or a hook deciding
+whether to spawn a daemon does to the same file. So for a fingerprint with no
+handshake, a lock found held is looked at again in up to three more rounds,
+each after a 20 ms pause shared by every such lock, and it is listed as held
+only if it is still held on the last of them; one found free on the way is
+dropped, and one that turns out not to be checkable is listed as that. With no
+such lock found held there is no pause. A fingerprint that has a handshake is
+looked at once. Such a list is never headed "running", and never answered with
+"nothing to stop".
+
+Looking at another fingerprint's lock creates nothing: `status` and
+`stop --all` open only a lock file that is already there. A lock file that has
+been deleted counts as free; one that is a link to nothing, or sits under a
+directory that no longer resolves, counts as `lock could not be checked`, and so
+does every lock file on a filesystem that does not support file locking. (On
+Windows, opening an existing lock file that is empty tries to write one byte
+to it, and leaves it empty when another process has that byte locked.)
 
 Only `never exits when idle`, `idle timeout unknown` and those entries get the
 warning and the cleanup hint: if no running STM
@@ -1190,7 +1212,12 @@ it is unknown), `exits_when_idle` (`true`, `false`, or `null` when unknown),
 `listening` (`true` when its endpoint accepts), and `lock` (`"held"` or
 `"unknown"` for one that does not accept, `null` when not checked); an entry
 whose record is unreadable also has `handshake_unreadable: true` and `null`
-pid, host and port.
+pid, host and port, and one with no handshake has `handshake_absent: true` and
+the same `null` fields.
+A fingerprint in these listings is read from a file name in `data_dir`. Text
+output shows it escaped for display — a control or bidirectional-formatting
+character, or a byte that is not valid UTF-8, appears as `\uXXXX` — and
+`--json` carries it as found, encoded by JSON.
 When `data_dir` exists but cannot be listed (no read permission, say), the
 daemons under other configs are unknown rather than absent: `status` prints a
 warning naming the error class instead of a list, `status --json` reports
@@ -1222,9 +1249,10 @@ no fingerprint to look under, so `status` reports `stopped` and `stop` reports
 "no running daemon" for this config; on a `data_dir` that holds no daemon
 files — or does not exist — they create nothing at all. A daemon can still be
 running there: one an earlier build started, or one whose key was removed
-while it ran. `status` lists those as running under a different config,
-through the handshakes they published, and checking one that does not accept
-connections opens its lock file as it always has. Both commands still check
+while it ran. `status` lists those as daemons under a different config —
+through the handshakes they published, or through a held lock when one has
+none yet or none any more — and still reports `stopped` for this config, which
+has no fingerprint to claim any of them with. Both commands still check
 that the directory could be walked; if it could not (a dangling symlink above
 it), `status` reports `unknown` (`--json`: an `error` field) and `stop` exits
 1. `restart` with no key skips the lock wait and goes straight to `start`.
@@ -1238,14 +1266,16 @@ A key that exists but cannot be read, or does not hold a key, is an error:
 
 - `start`, `stop`, `status` and `restart` exit 1 with one line naming the file.
   `status --json` reports `"state": "unknown"` with an `error` field, and
-  still lists every daemon published under `data_dir` as `foreign`.
-- `stop --all` treats every published daemon as foreign — this config's own
+  still lists as `foreign` every daemon it finds under `data_dir` — through a
+  handshake, or through a lock file with no handshake whose lock is held or
+  could not be checked.
+- `stop --all` treats every daemon found that way as foreign — this config's own
   included — and acts on them before it reports the key and exits 1: the way
   to stop daemons started under a key that has since been damaged. On macOS
   and Linux it signals them as described above; on Windows it cannot signal by
-  pid, so end those processes from Task Manager. It reaches daemons that have
-  a handshake; one that holds its lock without one (starting, or finishing its
-  teardown) is not listed.
+  pid, so end those processes from Task Manager. One that holds its lock
+  without a handshake (starting, or finishing its teardown) is listed and
+  waited on like any daemon that is not accepting, never signalled.
 - `mms hook` takes its configured `hook.fallback`. Standalone surfacing reads
   the key when it starts and again whenever it asks for a daemon to be
   spawned; from the first of those that fails it logs one warning naming the
