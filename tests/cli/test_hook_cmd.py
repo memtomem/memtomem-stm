@@ -1166,6 +1166,49 @@ def test_orchestrate_records_the_host_in_the_metrics_server(
     assert rows == [(f"builtin:{adapter.host_tag}", "hook")]
 
 
+@pytest.mark.parametrize(
+    ("argv", "fixture", "recorded"),
+    [
+        (["hook"], "claude/inbound_read_posttooluse.json", "builtin:claude"),
+        (["hook", "--host", "claude"], "claude/inbound_read_posttooluse.json", "builtin:claude"),
+        (["hook", "--host", "codex"], "codex/inbound_bash_posttooluse.json", "builtin:codex"),
+        (["hook"], "kimi/inbound_shell_posttooluse.json", "builtin:kimi"),
+        # An unrecognized --host falls open to auto-detect; the row follows
+        # the host that detection picked, not the typo.
+        (["hook", "--host", "nope"], "kimi/inbound_shell_posttooluse.json", "builtin:kimi"),
+    ],
+    ids=["bare", "explicit-claude", "explicit-codex", "auto-detected-kimi", "unknown-host"],
+)
+def test_cli_records_the_resolved_host(
+    argv: list[str],
+    fixture: str,
+    recorded: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_hook_state: tuple[Path, Path],
+):
+    """End to end through the CLI: the row names the host ``--host`` resolved to.
+
+    The ``_orchestrate`` tests above hand the adapter in, so they cannot catch a
+    wrong host resolution on the way there.
+    """
+    import sqlite3
+
+    metrics_db, _home = _hermetic_hook_state
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+    payload = (_HOOK_FIXTURES / fixture).read_text(encoding="utf-8")
+
+    result = CliRunner().invoke(cli, argv, input=payload)
+
+    assert result.exit_code == 0, result.output
+    db = sqlite3.connect(str(metrics_db))
+    try:
+        rows = db.execute("SELECT server FROM proxy_metrics").fetchall()
+    finally:
+        db.close()
+    assert rows == [(recorded,)]
+
+
 def test_bare_and_explicit_claude_record_the_same_host(
     monkeypatch: pytest.MonkeyPatch,
     _hermetic_hook_state: tuple[Path, Path],
