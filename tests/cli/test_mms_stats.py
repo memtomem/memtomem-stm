@@ -457,6 +457,281 @@ class TestStatsBySource:
         assert "all-time" not in result.output
 
 
+def _seed_hook_rows(db: Path, rows: list[tuple[str, str, int, int]], **store_kwargs) -> None:
+    """``(server, tool, original_chars, compressed_chars)`` rows with ``source='hook'``."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    store = MetricsStore(db, **store_kwargs)
+    store.initialize()
+    try:
+        for server, tool, orig, comp in rows:
+            store.record(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=orig,
+                    compressed_chars=comp,
+                    source="hook",
+                )
+            )
+    finally:
+        store.close()
+
+
+_CLAUDE_AND_CODEX = [
+    ("builtin:claude", "Bash", 20_000, 16_000),
+    ("builtin:claude", "Read", 5_000, 5_000),
+    ("builtin:codex", "Bash", 30_000, 30_000),
+    ("builtin:codex", "Bash", 30_000, 30_000),
+]
+_CLAUDE_ENTRY = {
+    "host": "claude",
+    "calls": 2,
+    "original_chars": 25_000,
+    "compressed_chars": 21_000,
+    "saved_ratio": 0.16,
+    "can_replace_output": True,
+}
+_CODEX_ENTRY = {
+    "host": "codex",
+    "calls": 2,
+    "original_chars": 60_000,
+    "compressed_chars": 60_000,
+    "saved_ratio": 0.0,
+    "can_replace_output": False,
+}
+
+
+class TestStatsHookByHost:
+    """The hook ratio is split by host (#1438).
+
+    A host that cannot replace tool output only ever adds to the denominator,
+    so one blended ``hook`` ratio says nothing about the host that can.
+    """
+
+    def test_each_host_gets_its_own_line_under_the_hook_source(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX)
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        hook = lines.index("    hook  calls: 4  chars: 85,000 -> 81,000  (saved 4.7%)")
+        # Largest host first; the one that cannot replace output has no ratio.
+        assert lines[hook + 1 : hook + 3] == [
+            "      codex  calls: 2  chars: 60,000  (measured only: host cannot replace output)",
+            "      claude calls: 2  chars: 25,000 -> 21,000  (saved 16.0%)",
+        ]
+        # The longest label fits the per-tool table's server cell whole.
+        assert any(line.startswith("  builtin:claude Bash ") for line in lines)
+
+    def test_json_reports_the_hosts(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["hook_by_host"] == [_CODEX_ENTRY, _CLAUDE_ENTRY]
+
+    def test_a_lone_host_that_cannot_replace_output_is_still_explained(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # Hook-only DB with one host: no per-source lines to hang the host
+        # under, and a bare "saved 0.0%" would read as compression not working.
+        set_home(monkeypatch, tmp_path)
+        _seed_hook_rows(
+            tmp_path / ".memtomem" / "proxy_metrics.db", [("builtin:codex", "Bash", 30_000, 30_000)]
+        )
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert (
+            "    codex  calls: 1  chars: 30,000  (measured only: host cannot replace output)"
+            in result.output.splitlines()
+        )
+
+    def test_a_lone_host_that_can_replace_output_adds_no_line(self, runner, tmp_path, monkeypatch):
+        # Its ratio is the hook ratio already.
+        set_home(monkeypatch, tmp_path)
+        _seed_hook_rows(
+            tmp_path / ".memtomem" / "proxy_metrics.db",
+            [("builtin:claude", "Bash", 20_000, 16_000)],
+        )
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert "chars: 20,000 -> 16,000  (saved 4,000, 20.0%)" in result.output
+        assert "claude calls:" not in result.output
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert [entry["host"] for entry in data["hook_by_host"]] == ["claude"]
+
+    def test_rows_without_a_recorded_host_are_reported_apart(self, runner, tmp_path, monkeypatch):
+        # Rows written before the host was recorded, or by an older hook that
+        # shares the DB, keep the bare ``builtin`` and cannot be attributed.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(
+            db, [("builtin", "Bash", 90_000, 90_000), ("builtin:claude", "Bash", 20_000, 16_000)]
+        )
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        # Last, whatever its volume.
+        first = lines.index("    claude calls: 1  chars: 20,000 -> 16,000  (saved 20.0%)")
+        assert lines[first + 1] == (
+            "    (host not recorded) calls: 1  chars: 90,000 -> 90,000  (saved 0.0%)"
+        )
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert data["hook_by_host"][1] == {
+            "host": None,
+            "calls": 1,
+            "original_chars": 90_000,
+            "compressed_chars": 90_000,
+            "saved_ratio": 0.0,
+            "can_replace_output": None,
+        }
+
+    def test_a_host_this_version_does_not_know_gets_no_capability(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # ``get_adapter`` falls back to Claude for an unknown tag; the reader
+        # must not, or a newer hook's rows would be labelled as replaceable.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(
+            db, [("builtin:future", "Bash", 10_000, 10_000), ("builtin:codex", "Bash", 1, 1)]
+        )
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert [(e["host"], e["can_replace_output"]) for e in data["hook_by_host"]] == [
+            ("future", None),
+            ("codex", False),
+        ]
+        human = runner.invoke(cli, ["stats"]).output.splitlines()
+        assert "    future calls: 1  chars: 10,000 -> 10,000  (saved 0.0%)" in human
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [("hook", [_CODEX_ENTRY, _CLAUDE_ENTRY]), ("mcp", None)],
+    )
+    def test_source_filter(self, runner, tmp_path, monkeypatch, source, expected):
+        # ``--source hook`` drops the per-source breakdown the hosts hang under
+        # by default; the split has to follow the hook summary itself.
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--source", source, "--json"]).output)
+        human = runner.invoke(cli, ["stats", "--source", source]).output.splitlines()
+
+        assert data["compression_by_source"] is None
+        assert data["hook_by_host"] == expected
+        shown = "    claude calls: 2  chars: 25,000 -> 21,000  (saved 16.0%)" in human
+        assert shown is (expected is not None)
+
+    def test_tool_filter_reaches_the_hosts(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--tool", "Read", "--json"]).output)
+
+        assert data["hook_by_host"] == [
+            {
+                "host": "claude",
+                "calls": 1,
+                "original_chars": 5_000,
+                "compressed_chars": 5_000,
+                "saved_ratio": 0.0,
+                "can_replace_output": True,
+            }
+        ]
+
+    def test_hosts_survive_trimming_into_the_rollup(self, runner, tmp_path, monkeypatch):
+        # The daily rollup is keyed by server, which is why the host rides there.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX, max_history=1)
+
+        raw = sqlite3.connect(str(db))
+        try:
+            retained = raw.execute("SELECT server, tool FROM proxy_metrics").fetchall()
+            rolled = dict(
+                raw.execute(
+                    "SELECT server, SUM(calls) FROM proxy_metrics_daily GROUP BY server"
+                ).fetchall()
+            )
+        finally:
+            raw.close()
+        # Positive control: rows of BOTH hosts left the raw table.
+        assert retained == [("builtin:codex", "Bash")]
+        assert rolled == {"builtin:claude": 2, "builtin:codex": 1}
+
+        windowed = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert [entry["host"] for entry in windowed["hook_by_host"]] == ["codex"]
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+        assert data["hook_by_host"] == [_CODEX_ENTRY, _CLAUDE_ENTRY]
+        human = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+        assert "    claude calls: 2  chars: 25,000 -> 21,000  (saved 16.0%)" in human
+
+    def test_an_upstream_server_with_a_hook_label_is_not_a_host(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # ``server`` is operator data for MCP rows: nothing stops an upstream
+        # from being named like a hook label. Only ``source='hook'`` rows count.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(db, [("builtin:codex", "Bash", 30_000, 30_000)])
+        store = MetricsStore(db)
+        store.initialize()
+        try:
+            for server in ("builtin:claude", "builtin"):
+                store.record(
+                    CallMetrics(
+                        server=server, tool="Bash", original_chars=8_000, compressed_chars=2_000
+                    )
+                )
+        finally:
+            store.close()
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["compression_by_source"]["mcp"]["total_calls"] == 2
+        assert data["hook_by_host"] == [
+            {
+                "host": "codex",
+                "calls": 1,
+                "original_chars": 30_000,
+                "compressed_chars": 30_000,
+                "saved_ratio": 0.0,
+                "can_replace_output": False,
+            }
+        ]
+
+    def test_host_tag_is_escaped_for_display(self, runner, tmp_path, monkeypatch):
+        # The tag is read back from the DB file, like every other recorded name.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(
+            db, [("builtin:\x1b[31mx", "Bash", 10, 10), ("builtin:codex", "Bash", 1, 1)]
+        )
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert "\x1b" not in result.output
+        assert (
+            "    \\u001B[31mx calls: 1  chars: 10 -> 10  (saved 0.0%)" in result.output.splitlines()
+        )
+
+
 class TestStatsProgressive:
     def test_delivered_vs_produced(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)

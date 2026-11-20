@@ -2601,10 +2601,74 @@ def _all_time_coverage_lines(rollup: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _hook_by_host(hook_summary: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Per-host totals of a ``source='hook'`` compression summary.
+
+    A host that cannot replace tool output only ever adds to the denominator of
+    the hook ratio, so the hosts are reported apart. Grouped from ``by_tool``
+    by the host tag in each row's ``server``; rows written before the host was
+    recorded form one entry whose ``host`` is ``None``. ``can_replace_output``
+    is what the adapter in THIS version can do, not what happened when the row
+    was written, and is ``None`` for an unrecorded or unknown host. ``None``
+    when there is no hook summary to split.
+    """
+    if not hook_summary or not hook_summary.get("available"):
+        return None
+    from memtomem_stm.cli.hook_adapter import host_can_replace_output
+    from memtomem_stm.proxy.metrics import hook_host_of
+
+    totals: dict[str | None, dict[str, int]] = {}
+    for row in hook_summary.get("by_tool") or []:
+        entry = totals.setdefault(
+            hook_host_of(str(row["server"])),
+            {"calls": 0, "original_chars": 0, "compressed_chars": 0},
+        )
+        for key in entry:
+            entry[key] += row[key]
+    hosts: list[dict[str, Any]] = []
+    # Recorded hosts by volume, the unrecorded remainder last.
+    for host, entry in sorted(
+        totals.items(), key=lambda item: (item[0] is None, -item[1]["original_chars"])
+    ):
+        orig, comp = entry["original_chars"], entry["compressed_chars"]
+        hosts.append(
+            {
+                "host": host,
+                **entry,
+                "saved_ratio": round(1.0 - comp / orig, 4) if orig > 0 else 0.0,
+                "can_replace_output": host_can_replace_output(host) if host else None,
+            }
+        )
+    return hosts
+
+
+def _hook_host_lines(hosts: list[dict[str, Any]] | None, indent: str) -> list[str]:
+    """One line per host, or none when a split would add nothing.
+
+    Nothing to split: a single host that can replace output (its ratio is the
+    hook ratio already) or only rows with no recorded host.
+    """
+    if not hosts:
+        return []
+    if len(hosts) == 1 and hosts[0]["can_replace_output"] is not False:
+        return []
+    lines = []
+    for entry in hosts:
+        name = _disp(entry["host"]) if entry["host"] else "(host not recorded)"
+        head = f"{indent}{name:<6} calls: {entry['calls']}  chars: {entry['original_chars']:,}"
+        if entry["can_replace_output"] is False:
+            lines.append(f"{head}  (measured only: host cannot replace output)")
+        else:
+            saved = f"saved {float(entry['saved_ratio']) * 100:.1f}%"
+            lines.append(f"{head} -> {entry['compressed_chars']:,}  ({saved})")
+    return lines
+
+
 def _render_compression_block(
     summary: dict[str, Any],
     by_source: dict[str, dict[str, Any]] | None = None,
     max_history: int | None = None,
+    hook_by_host: list[dict[str, Any]] | None = None,
 ) -> None:
     raw_rollup = summary.get("rollup")
     rollup: dict[str, Any] | None = raw_rollup if isinstance(raw_rollup, dict) else None
@@ -2656,6 +2720,14 @@ def _render_compression_block(
             if src_structured:
                 line += f"  [{src_structured} structured, separate accounting]"
             click.echo(line)
+            if src == "hook":
+                for host_line in _hook_host_lines(hook_by_host, "      "):
+                    click.echo(host_line)
+    else:
+        # No per-source lines (``--source hook``, or the hook is the only
+        # source with rows), so the hosts hang off the total.
+        for host_line in _hook_host_lines(hook_by_host, "    "):
+            click.echo(host_line)
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
     if rollup is not None:
         for line in _all_time_coverage_lines(rollup):
@@ -2677,7 +2749,7 @@ def _render_compression_block(
     if by_tool:
         click.echo("")
         header = (
-            f"  {'SERVER':<12} {'TOOL':<28} {'CALLS':>6} {'ORIG':>10} {'COMP':>10} {'SAVED%':>7}"
+            f"  {'SERVER':<14} {'TOOL':<28} {'CALLS':>6} {'ORIG':>10} {'COMP':>10} {'SAVED%':>7}"
         )
         click.echo(_hdr(header))
         for row in by_tool:
@@ -2685,9 +2757,10 @@ def _render_compression_block(
             # Truncate first, then escape: the slice keeps its existing
             # meaning (28 characters of the recorded name) and an escaped
             # cell overflows like an over-long one, rather than being cut
-            # mid-escape into an ambiguous ``\u00`` (#755).
+            # mid-escape into an ambiguous ``\u00`` (#755). 14 for the server
+            # so the longest hook label (``builtin:claude``) shows whole.
             click.echo(
-                f"  {_disp(str(row['server'])[:12]):<12} {_disp(str(row['tool'])[:28]):<28} "
+                f"  {_disp(str(row['server'])[:14]):<14} {_disp(str(row['tool'])[:28]):<28} "
                 f"{row['calls']:>6} {row['original_chars']:>10,} "
                 f"{row['compressed_chars']:>10,} {saved_pct:>6.1f}%"
             )
@@ -2943,6 +3016,12 @@ def stats(
         if source_filter is None
         else None
     )
+    # The hook summary to split by host: its own line when every source is
+    # reported, the whole block under ``--source hook``, nothing under ``mcp``.
+    if compression_by_source is not None:
+        hook_by_host = _hook_by_host(compression_by_source["hook"])
+    else:
+        hook_by_host = _hook_by_host(compression if source_filter == "hook" else None)
     progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
@@ -2971,6 +3050,7 @@ def stats(
                     "compression_scope": "all_time" if all_time else "retained",
                     "compression": compression,
                     "compression_by_source": compression_by_source,
+                    "hook_by_host": hook_by_host,
                     "progressive": progressive,
                     "surfacing": surfacing,
                 },
@@ -2990,7 +3070,10 @@ def stats(
     click.echo(f"Data   : {data_source}")
     click.echo("")
     _render_compression_block(
-        compression, compression_by_source, max_history=proxy_cfg.metrics.max_history
+        compression,
+        compression_by_source,
+        max_history=proxy_cfg.metrics.max_history,
+        hook_by_host=hook_by_host,
     )
     click.echo("")
     _render_progressive_block(

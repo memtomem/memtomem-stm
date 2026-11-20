@@ -1019,13 +1019,15 @@ def test_record_hook_metrics_writes_source_hook_row(tmp_path: Path):
 
     cfg = _metrics_config(tmp_path)
     updated = {"stdout": f"{_COMPRESS_SENTINEL}\nshort", "stderr": ""}
-    _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), updated, _BLOCK, cfg)
+    _record_hook_metrics(
+        _canonical(_bash_payload({"stdout": _BIG_STDOUT})), updated, _BLOCK, cfg, "claude"
+    )
 
     summary = read_compression_summary(tmp_path / "metrics.db", source="hook")
     assert summary["available"] is True
     assert summary["total_calls"] == 1
     row = summary["by_tool"][0]
-    assert (row["server"], row["tool"]) == ("builtin", "Bash")
+    assert (row["server"], row["tool"]) == ("builtin:claude", "Bash")
     assert row["original_chars"] == len(_BIG_STDOUT)
     assert row["compressed_chars"] == len(f"{_COMPRESS_SENTINEL}\nshort")
 
@@ -1058,7 +1060,9 @@ def test_record_hook_metrics_does_not_reconcile_foreign_sources(tmp_path: Path):
     # Hook invocation with a smaller (env-default-like) cap of 10.
     cfg = _metrics_config(tmp_path)
     cfg.proxy.metrics.max_history = 10
-    _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)
+    _record_hook_metrics(
+        _canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg, "claude"
+    )
 
     db = sqlite3.connect(str(tmp_path / "metrics.db"))
     try:
@@ -1081,7 +1085,7 @@ def test_record_hook_metrics_no_compression_original_equals_compressed(tmp_path:
         "tool_response": {"content": "y" * 4000},
     }
     # Both stages no-op (Read is never compressed; no surfaced context).
-    _record_hook_metrics(_canonical(payload), None, None, cfg)
+    _record_hook_metrics(_canonical(payload), None, None, cfg, "claude")
 
     row = read_compression_summary(tmp_path / "metrics.db", source="hook")["by_tool"][0]
     assert row["tool"] == "Read"
@@ -1113,10 +1117,143 @@ def test_orchestrate_writes_metrics_only_to_hermetic_db(
     summary = read_compression_summary(metrics_db, source="hook")
     assert summary["total_calls"] == 1
     row = summary["by_tool"][0]
-    assert (row["server"], row["tool"]) == ("builtin", "Bash")
+    assert (row["server"], row["tool"]) == ("builtin:claude", "Bash")
     assert row["original_chars"] == len(_BIG_STDOUT)
     assert row["compressed_chars"] == len(_BIG_STDOUT)
     assert not (home / ".memtomem" / "proxy_metrics.db").exists()
+
+
+_HOOK_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "hooks"
+
+
+@pytest.mark.parametrize(
+    ("adapter", "fixture"),
+    [
+        (ClaudeHookAdapter(), "claude/inbound_read_posttooluse.json"),
+        (CodexHookAdapter(), "codex/inbound_bash_posttooluse.json"),
+        (CursorHookAdapter(), "cursor/inbound_shell_posttooluse.json"),
+        (KimiHookAdapter(), "kimi/inbound_shell_posttooluse.json"),
+    ],
+    ids=lambda value: value.host_tag if hasattr(value, "host_tag") else None,
+)
+def test_orchestrate_records_the_host_in_the_metrics_server(
+    adapter,
+    fixture: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_hook_state: tuple[Path, Path],
+):
+    """Each host's rows are told apart by ``server`` (#1438).
+
+    A host that cannot replace output can never shrink a row, so without the
+    host on the row its volume is indistinguishable from compressible output
+    that was left alone. Driven through ``_orchestrate`` with each host's golden
+    payload: the tag has to come from the adapter that parsed the call.
+    """
+    import sqlite3
+
+    metrics_db, _home = _hermetic_hook_state
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+    payload = json.loads((_HOOK_FIXTURES / fixture).read_text(encoding="utf-8"))
+
+    asyncio.run(_orchestrate(payload, adapter))
+
+    db = sqlite3.connect(str(metrics_db))
+    try:
+        rows = db.execute("SELECT server, source FROM proxy_metrics").fetchall()
+    finally:
+        db.close()
+    assert rows == [(f"builtin:{adapter.host_tag}", "hook")]
+
+
+@pytest.mark.parametrize(
+    ("argv", "fixture", "recorded"),
+    [
+        (["hook"], "claude/inbound_read_posttooluse.json", "builtin:claude"),
+        (["hook", "--host", "claude"], "claude/inbound_read_posttooluse.json", "builtin:claude"),
+        (["hook", "--host", "codex"], "codex/inbound_bash_posttooluse.json", "builtin:codex"),
+        # A Claude-shaped payload (no ``turn_id``) auto-detects as Claude, so
+        # only an honored ``--host`` can record it as Codex.
+        (["hook", "--host", "codex"], "claude/inbound_read_posttooluse.json", "builtin:codex"),
+        (["hook"], "kimi/inbound_shell_posttooluse.json", "builtin:kimi"),
+        # An unrecognized --host falls open to auto-detect; the row follows
+        # the host that detection picked, not the typo.
+        (["hook", "--host", "nope"], "kimi/inbound_shell_posttooluse.json", "builtin:kimi"),
+    ],
+    ids=[
+        "bare",
+        "explicit-claude",
+        "explicit-codex",
+        "explicit-codex-overrides-detection",
+        "auto-detected-kimi",
+        "unknown-host",
+    ],
+)
+def test_cli_records_the_resolved_host(
+    argv: list[str],
+    fixture: str,
+    recorded: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_hook_state: tuple[Path, Path],
+):
+    """End to end through the CLI: the row names the host ``--host`` resolved to.
+
+    The ``_orchestrate`` tests above hand the adapter in, so they cannot catch a
+    wrong host resolution on the way there.
+    """
+    import sqlite3
+
+    metrics_db, _home = _hermetic_hook_state
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+    payload = (_HOOK_FIXTURES / fixture).read_text(encoding="utf-8")
+
+    result = CliRunner().invoke(cli, argv, input=payload)
+
+    assert result.exit_code == 0, result.output
+    db = sqlite3.connect(str(metrics_db))
+    try:
+        rows = db.execute("SELECT server FROM proxy_metrics").fetchall()
+    finally:
+        db.close()
+    assert rows == [(recorded,)]
+
+
+def test_bare_and_explicit_claude_record_the_same_host(
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_hook_state: tuple[Path, Path],
+):
+    """The host on the row is who ran the tool, not whether replacement was allowed.
+
+    A bare ``mms hook`` resolves to the Claude adapter but refuses to replace
+    output (#1437), so its rows carry the same ``builtin:claude`` as an explicit
+    ``--host claude`` and the label alone cannot say which registration wrote
+    them.
+    """
+    import sqlite3
+
+    metrics_db, _home = _hermetic_hook_state
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+    payload = _bash_payload({"stdout": _BIG_STDOUT})
+
+    refused = asyncio.run(
+        _orchestrate(payload, ClaudeHookAdapter(), allow_output_replacement=False)
+    )
+    allowed = asyncio.run(_orchestrate(payload, ClaudeHookAdapter(), allow_output_replacement=True))
+
+    assert refused == {}
+    assert "updatedToolOutput" in json.dumps(allowed)
+    db = sqlite3.connect(str(metrics_db))
+    try:
+        rows = db.execute(
+            "SELECT server, compressed_chars < original_chars FROM proxy_metrics ORDER BY id"
+        ).fetchall()
+    finally:
+        db.close()
+    assert rows == [("builtin:claude", 0), ("builtin:claude", 1)]
 
 
 def test_orchestrate_metrics_count_preserved_stderr_in_the_compressed_size(
@@ -1147,7 +1284,9 @@ def test_orchestrate_metrics_count_preserved_stderr_in_the_compressed_size(
 
 def test_record_hook_metrics_disabled_writes_nothing(tmp_path: Path):
     cfg = _metrics_config(tmp_path, enabled=False)
-    _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)
+    _record_hook_metrics(
+        _canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg, "claude"
+    )
     assert not (tmp_path / "metrics.db").exists()  # store never opened
 
 
@@ -1155,7 +1294,11 @@ def test_record_hook_metrics_skips_empty_output(tmp_path: Path):
     # A result that flattens to nothing carries no spend to record.
     cfg = _metrics_config(tmp_path)
     _record_hook_metrics(
-        _canonical({"hook_event_name": "PostToolUse", "tool_name": "Bash"}), None, None, cfg
+        _canonical({"hook_event_name": "PostToolUse", "tool_name": "Bash"}),
+        None,
+        None,
+        cfg,
+        "claude",
     )
     assert not (tmp_path / "metrics.db").exists()
 
@@ -1169,7 +1312,9 @@ def test_record_hook_metrics_never_raises_on_bad_store(tmp_path: Path):
         hook=SimpleNamespace(metrics_enabled=True),
         proxy=SimpleNamespace(metrics=SimpleNamespace(db_path=tmp_path, max_history=10000)),
     )
-    _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, bad)
+    _record_hook_metrics(
+        _canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, bad, "claude"
+    )
 
 
 def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
@@ -1192,7 +1337,9 @@ def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
     try:
         cfg = _metrics_config(tmp_path)  # db_path == db
         start = time.monotonic()
-        _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)
+        _record_hook_metrics(
+            _canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg, "claude"
+        )
         elapsed = time.monotonic() - start
     finally:
         blocker.rollback()
@@ -1230,7 +1377,7 @@ def test_record_hook_metrics_degrades_when_the_rollup_install_meets_a_lock(tmp_p
     blocker.execute("BEGIN IMMEDIATE")
     try:
         start = time.monotonic()
-        _record_hook_metrics(payload, None, None, cfg)
+        _record_hook_metrics(payload, None, None, cfg, "claude")
         elapsed = time.monotonic() - start
     finally:
         blocker.rollback()
@@ -1239,7 +1386,7 @@ def test_record_hook_metrics_degrades_when_the_rollup_install_meets_a_lock(tmp_p
     assert elapsed < 2.0
     assert read_compression_all_time(db)["rollup"]["installed"] is False
 
-    _record_hook_metrics(payload, None, None, cfg)
+    _record_hook_metrics(payload, None, None, cfg, "claude")
     after = read_compression_all_time(db, source="hook")
     assert after["rollup"]["installed"] is True
     assert after["total_calls"] == 1

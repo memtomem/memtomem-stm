@@ -586,6 +586,16 @@ def known_hosts() -> tuple[str, ...]:
     return tuple(_ADAPTERS)
 
 
+def host_can_replace_output(host_tag: str) -> bool | None:
+    """Whether ``host_tag``'s adapter can replace tool output; ``None`` if unknown.
+
+    No Claude fallback, unlike :func:`get_adapter`: a reader labelling recorded
+    rows must not claim a capability for a tag this version does not know.
+    """
+    adapter = _ADAPTERS.get(host_tag)
+    return adapter.can_replace_output if adapter is not None else None
+
+
 def detect_host(payload: Any) -> str:
     """Best-effort host inference from a PostToolUse payload's *shape*.
 
