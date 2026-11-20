@@ -16,7 +16,12 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from memtomem_stm.proxy import metrics_store as metrics_store_module
-from memtomem_stm.proxy.metrics import CallMetrics
+from memtomem_stm.proxy.metrics import (
+    HOOK_SERVER,
+    CallMetrics,
+    hook_host_of,
+    hook_server_label,
+)
 from memtomem_stm.proxy.metrics_store import (
     _BASE_COLUMNS,
     _CREATE,
@@ -416,21 +421,22 @@ class TestRecordPersistsNewFields:
                 compression_strategy="truncate",
             )
         )
-        store.record(
-            CallMetrics(
-                server="builtin",
-                tool="Bash",
-                original_chars=900,
-                compressed_chars=300,
-                cleaned_chars=900,
-                compression_strategy="truncate",
-                source="hook",
+        # Both labels a hook row can carry: with the host, and the bare one
+        # written before the host was recorded.
+        for server in (hook_server_label("claude"), HOOK_SERVER):
+            store.record(
+                CallMetrics(
+                    server=server,
+                    tool="Bash",
+                    original_chars=900,
+                    compressed_chars=300,
+                    cleaned_chars=900,
+                    compression_strategy="truncate",
+                    source="hook",
+                )
             )
-        )
         profiles = store.get_tool_profiles(since_seconds=3600.0)
-        keys = {(p["server"], p["tool"]) for p in profiles}
-        assert ("lf", "search") in keys
-        assert ("builtin", "Bash") not in keys
+        assert {(p["server"], p["tool"]) for p in profiles} == {("lf", "search")}
 
     def test_get_tool_profiles_excludes_metadata_bypass_rows(self, store):
         # Annotated multi-block responses are never compressed (#1112), so
@@ -1998,3 +2004,30 @@ def test_legacy_schemas_classify_without_migrating(tmp_path, present):
     assert summary["initial_response_calls"] == (1 if "compression_accounting" in present else 0)
     assert "unclassified" in summary["measurement"]
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("server", "host"),
+    [
+        ("builtin:claude", "claude"),
+        ("builtin:a:b", "a:b"),
+        ("builtin", None),
+        ("builtin:", None),
+        ("xbuiltin:claude", None),
+        ("lf", None),
+        ("", None),
+    ],
+)
+def test_hook_host_of_reads_only_a_prefixed_label(server: str, host: str | None):
+    assert hook_host_of(server) == host
+
+
+def test_hook_server_label_round_trips_every_registered_host():
+    from memtomem_stm.cli.hook_adapter import known_hosts
+
+    assert known_hosts(), "positive control: there are hosts to check"
+    for tag in known_hosts():
+        assert hook_host_of(hook_server_label(tag)) == tag
+    # No tag to record degrades to the label that reads back as "not recorded".
+    assert hook_server_label("") == HOOK_SERVER
+    assert hook_host_of(hook_server_label("")) is None

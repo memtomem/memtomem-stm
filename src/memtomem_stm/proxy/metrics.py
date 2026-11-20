@@ -36,6 +36,32 @@ LATENCY_WINDOW = 10_000
 METADATA_BYPASS_STRATEGY = "none→metadata_bypass"
 STRUCTURED_BYPASS_STRATEGY = "none→structured_bypass"
 
+# ``server`` of a ``source='hook'`` row. Native tools have no upstream server,
+# so the column names the host that ran the tool instead: ``builtin:<host_tag>``.
+# The host rides in ``server`` rather than in a column of its own because the
+# daily rollup is keyed by ``(day, source, server, tool)``: per-host totals then
+# survive trimming with no change to the rollup trigger, and the schema
+# fingerprint other STM versions compare against stays the same. A bare
+# ``builtin`` is a row written before the host was recorded.
+HOOK_SERVER = "builtin"
+_HOOK_SERVER_PREFIX = HOOK_SERVER + ":"
+
+
+def hook_server_label(host_tag: str) -> str:
+    """The ``server`` value ``mms hook`` records for a call from ``host_tag``."""
+    return f"{_HOOK_SERVER_PREFIX}{host_tag}" if host_tag else HOOK_SERVER
+
+
+def hook_host_of(server: str) -> str | None:
+    """The host tag in a hook row's ``server``, or ``None`` when none was recorded.
+
+    Only meaningful for ``source='hook'`` rows: an upstream MCP server may carry
+    any name, this prefix included.
+    """
+    if not server.startswith(_HOOK_SERVER_PREFIX):
+        return None
+    return server[len(_HOOK_SERVER_PREFIX) :] or None
+
 
 def format_error_message_from_exc(exc: BaseException) -> str:
     """Format an exception for ``CallMetrics.error_message`` (capped).

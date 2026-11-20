@@ -46,6 +46,26 @@ changes inline only. See the deprecation policy in
   add-json` (Claude Code user or project scope) now refuses such a payload
   without `--allow-argv-secrets`, or asks on a TTY. A value that only names a
   password label, such as `--password=false`, counts as a secret too.
+- `mms stats` splits the `hook` compression ratio by host. `mms hook`
+  records every host's native tool calls under one source, and only Claude
+  Code's hook can replace tool output; rows from Codex, Cursor and Kimi can
+  never shrink, so on a machine with more than one host registered they
+  diluted the single `hook` ratio toward zero and nothing on the row said
+  which host wrote it. The hook now records the host, and `mms stats` prints
+  one line per host under the `hook` line: a host that can replace output
+  with its own ratio, one that cannot as `measured only`, and rows with no
+  host as `(host not recorded)`. `--json` carries the same split as
+  `hook_by_host`. The split also holds under `--all-time`, for rows recorded
+  from this version on; earlier rows carry no host and cannot be attributed.
+  Why a host's own ratio is low (output under the threshold, a registration
+  without `--host claude`) is still not recorded (#1438).
+  **Behavior change**: `mms hook` writes `builtin:<host>` (for example
+  `builtin:claude`) instead of `builtin` in the `server` column of
+  `proxy_metrics` and, as rows are trimmed, of `proxy_metrics_daily`. The
+  per-tool table of `mms stats` and the `by_tool` rows of its `--json` output
+  therefore show one row per host and tool, and the table's server column is
+  14 characters wide instead of 12. The `server` recorded with surfacing
+  events is still `builtin`.
 
 ## [0.7.9] — 2026-11-15
 

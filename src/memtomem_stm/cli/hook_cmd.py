@@ -701,6 +701,7 @@ def _record_hook_metrics(
     updated: dict[str, Any] | None,
     additional_context: str | None,
     config: "STMConfig",
+    host_tag: str,
 ) -> None:
     """Record one native built-in tool call into ``proxy_metrics.db`` (``source='hook'``).
 
@@ -708,7 +709,9 @@ def _record_hook_metrics(
     to proxied calls. Reads the normalized :class:`CanonicalHookCall` (``tool_name``
     + the once-flattened ``tool_response_text``), so the raw payload is parsed
     exactly once. Persists **sizes only** (original / compressed / surfaced chars
-    + the tool name): never ``tool_input`` and never the output text, mirroring
+    + the tool name, under a ``server`` that names the host — see
+    :func:`~memtomem_stm.proxy.metrics.hook_server_label`): never ``tool_input``
+    and never the output text, mirroring
     the hook's no-query-text privacy posture (a ``Bash`` command may carry
     secrets). Gated on ``config.hook.metrics_enabled`` (independent of
     ``proxy.metrics.enabled`` so a hook-only deployment still measures), reusing
@@ -733,7 +736,7 @@ def _record_hook_metrics(
 
         # Lazy import: keep ``mms hook --help`` and the metrics-disabled path off
         # the metrics / sqlite import cost.
-        from memtomem_stm.proxy.metrics import CallMetrics
+        from memtomem_stm.proxy.metrics import CallMetrics, hook_server_label
         from memtomem_stm.proxy.metrics_store import MetricsStore
 
         # reconcile_on_init=False: this config is the env-only STMConfig, not
@@ -750,7 +753,7 @@ def _record_hook_metrics(
         try:
             store.record(
                 CallMetrics(
-                    server="builtin",
+                    server=hook_server_label(host_tag),
                     tool=tool_name,
                     original_chars=original_chars,
                     compressed_chars=compressed_chars,
@@ -840,7 +843,7 @@ async def _orchestrate(
         except Exception:
             logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
-    _record_hook_metrics(call, updated, additional_context, config)
+    _record_hook_metrics(call, updated, additional_context, config, adapter.host_tag)
     return adapter.render(updated_tool_output=updated, additional_context=additional_context)
 
 
