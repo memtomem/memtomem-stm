@@ -140,5 +140,16 @@ export MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=true
 export MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION=0.65
 ```
 
+Replacement also requires the hook command to pass `--host claude`, which
+`mms hook install --host claude --apply` writes. A bare `mms hook`
+auto-detects the host, and auto-detection cannot tell Claude from Codex, so it
+never replaces output. When compression would have been attempted on such a
+call, the hook still passes the output through, prints a warning to stderr, and
+returns it as `systemMessage`, which Claude Code and Codex show to the user and
+not to the model. Claude Code does not show the stderr of a hook that exits 0
+outside its debug log. With compression enabled, `mms doctor` also warns about
+STM hook commands in `~/.claude/settings.json` that lack `--host claude`. It
+does not read Claude Code's project or local settings.
+
 See the [hook CLI reference](../reference/cli-hooks.md) and the complete
 [environment-variable reference](../reference/environment-variables.md).

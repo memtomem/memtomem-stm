@@ -1327,6 +1327,47 @@ def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
     assert "updatedMCPToolOutput" in native_hooks
 
 
+def test_hook_compression_docs_require_explicit_claude_host() -> None:
+    """Enabling the env var alone does not compress: replacement needs a
+    registration with ``--host claude`` (#1437). Every surface that tells an
+    operator how to turn compression on must say so, and the one hand-written
+    registration example must carry the flag."""
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli import hook_cmd
+    from memtomem_stm.cli.hook_cmd import hook_command
+
+    for relative in (
+        "README.md",
+        "docs/cli.md",
+        "docs/configuration.md",
+        "docs/guides/native-hooks.md",
+        "docs/guides/vibe-coding-getting-started-ko.md",
+        "docs/reference/cli-hooks.md",
+        "docs/reference/environment-variables.md",
+    ):
+        assert "--host claude" in _read(relative), f"{relative} lost the --host claude requirement"
+    env_row = next(
+        line
+        for line in _read("docs/reference/environment-variables.md").splitlines()
+        if line.startswith("| `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` |")
+    )
+    assert "--host claude" in env_row
+    doctor_row = next(
+        line
+        for line in _read("docs/cli.md").splitlines()
+        if line.startswith("| `hook registration` |")
+    )
+    assert "mms hook install --host claude --apply" in doctor_row
+
+    module_doc = hook_cmd.__doc__ or ""
+    assert '"command": "mms hook --host claude"' in module_doc
+    assert '"command": "mms hook"}' not in module_doc
+    result = CliRunner().invoke(hook_command, ["--help"], terminal_width=200)
+    assert result.exit_code == 0
+    assert "--host claude" in result.output
+
+
 def test_vibe_coding_guide_pins_client_registration_and_hook_boundaries() -> None:
     """Keep the Korean first-user journey aligned with live host contracts."""
     from click import Choice

@@ -13,6 +13,29 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook` no longer ignores `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED`
+  silently when the hook is registered without `--host claude`. Output
+  replacement still runs only for an explicit `--host claude`, because
+  auto-detection cannot tell Claude from Codex. A bare `mms hook`, the form the
+  `hook_cmd` module docstring used to show, therefore passed every Bash result
+  through, and nothing in `mms stats` or `mms doctor` said why. Now, when
+  compression would have been attempted on such a call (an eligible Bash result
+  over `max_chars`), the hook still passes the output through, writes a warning
+  to stderr, and returns it as a top-level `systemMessage`. Claude Code and
+  Codex show that field to the user and not to the model. The warning says the
+  attempt was not made; it does not claim the output would have shrunk,
+  because the refused path skips the compressor and so the retention guard.
+  With compression enabled, `mms doctor` adds a `hook registration` check
+  that WARNs for each STM hook command in `~/.claude/settings.json` whose
+  effective `--host` is not `claude`, read by `mms hook`'s own option parser,
+  and suggests `mms hook install --host claude --apply`. Project and local
+  Claude Code settings are not read. The docstring example and the docs now
+  state the `--host claude` requirement (#1437).
+  **Behavior change**: a bare `mms hook` with compression enabled prints a
+  warning on Claude Code for each Bash result over `max_chars`, and its JSON
+  output gains `systemMessage` on those calls. The tool output itself and the
+  metrics row are unchanged. Registering with `--host claude` removes the
+  warning and turns compression on.
 - `mms daemon status` and `mms daemon start` escape for display the values
   they print from a daemon that answers. On `start`'s "daemon already
   running" and "daemon started" lines (which `restart` prints too) those are

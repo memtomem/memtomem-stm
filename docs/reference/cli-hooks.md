@@ -50,7 +50,9 @@ Current host paths are:
 - Kimi: `$KIMI_CODE_HOME/config.toml` or `~/.kimi-code/config.toml`
 
 Claude Bash output replacement requires Claude Code 2.1.121+ and remains
-opt-in. Codex officially accepts PostToolUse `additionalContext`, but STM only
+opt-in. It also requires a registration with `--host claude`; under `auto` it
+never runs, and a call it would have attempted gets a `systemMessage` and a
+stderr warning instead. Codex officially accepts PostToolUse `additionalContext`, but STM only
 surfaces read-like `Bash` calls after `/hooks` approval; `apply_patch` is
 metrics-only and Codex output replacement is unsupported. Claude `--bare` and
 `--safe-mode` can bypass installed hooks/MCP. See

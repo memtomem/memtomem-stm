@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -32,6 +34,7 @@ from memtomem_stm.cli.hook_adapter import (
     KimiHookAdapter,
 )
 from memtomem_stm.cli.hook_cmd import (
+    HOST_NOT_EXPLICIT_NOTICE,
     _COMPRESS_SENTINEL,
     _SAFE_DAEMON_BUDGET,
     _bounded_call,
@@ -1244,7 +1247,7 @@ def test_bare_and_explicit_claude_record_the_same_host(
     )
     allowed = asyncio.run(_orchestrate(payload, ClaudeHookAdapter(), allow_output_replacement=True))
 
-    assert refused == {}
+    assert refused == {"systemMessage": HOST_NOT_EXPLICIT_NOTICE}
     assert "updatedToolOutput" in json.dumps(allowed)
     db = sqlite3.connect(str(metrics_db))
     try:
@@ -1715,3 +1718,280 @@ def test_cli_broken_proxy_env_passes_through_and_logs_the_hint(
     assert not hint_records[0].exc_info
     traceback_records = [r for r in caplog.records if r.exc_info]
     assert len(traceback_records) == 1
+
+
+# ── #1437: a refused replacement is reported, not silent ─────────────────────
+
+
+def _refused_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+
+
+def _compressor_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record every ``TruncateCompressor.compress`` call (by input length)."""
+    from memtomem_stm.proxy.compression import TruncateCompressor
+
+    calls: list[int] = []
+    real = TruncateCompressor.compress
+
+    def spy(self, text, *args, **kwargs):
+        calls.append(len(text))
+        return real(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(TruncateCompressor, "compress", spy)
+    return calls
+
+
+def test_refused_replacement_reports_notice_without_running_the_compressor(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    _refused_env(monkeypatch)
+    calls = _compressor_calls(monkeypatch)
+    payload = _bash_payload({"stdout": _BIG_STDOUT})
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        out = asyncio.run(
+            _orchestrate(payload, ClaudeHookAdapter(), allow_output_replacement=False)
+        )
+
+    assert out == {"systemMessage": HOST_NOT_EXPLICIT_NOTICE}
+    assert "--host claude" in HOST_NOT_EXPLICIT_NOTICE
+    assert "mms hook install --host claude --apply" in HOST_NOT_EXPLICIT_NOTICE
+    assert calls == []
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [HOST_NOT_EXPLICIT_NOTICE]
+
+
+def test_refused_notice_keeps_the_surfaced_context(monkeypatch: pytest.MonkeyPatch):
+    _refused_env(monkeypatch)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value=_SURF_DICT))
+    payload = _bash_payload({"stdout": _BIG_STDOUT})
+
+    out = asyncio.run(_orchestrate(payload, ClaudeHookAdapter(), allow_output_replacement=False))
+
+    assert out == {
+        "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": _SURF_BLOCK},
+        "systemMessage": HOST_NOT_EXPLICIT_NOTICE,
+    }
+    serialized = json.loads(ClaudeHookAdapter().serialize(out))
+    assert serialized == out
+
+
+def test_refused_notice_also_covers_output_the_retention_guard_would_keep(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The refused path skips the compressor, so it cannot know the retention
+    guard's verdict; the notice says the attempt was not made, which holds
+    either way. Pinned so a later change that starts claiming savings has to
+    run the compressor first."""
+    _refused_env(monkeypatch)
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION", "0.99")
+    payload = _bash_payload({"stdout": _BIG_STDOUT})
+
+    allowed = asyncio.run(_orchestrate(payload, ClaudeHookAdapter(), allow_output_replacement=True))
+    refused = asyncio.run(
+        _orchestrate(payload, ClaudeHookAdapter(), allow_output_replacement=False)
+    )
+
+    assert allowed == {}  # retention_guard on the authorized path
+    assert refused == {"systemMessage": HOST_NOT_EXPLICIT_NOTICE}
+    assert "not attempted" in HOST_NOT_EXPLICIT_NOTICE
+
+
+@pytest.mark.parametrize(
+    ("env", "payload"),
+    [
+        pytest.param({}, _bash_payload({"stdout": "short"}), id="below_threshold"),
+        pytest.param(
+            {"MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED": "0"},
+            _bash_payload({"stdout": _BIG_STDOUT}),
+            id="compression_disabled",
+        ),
+        pytest.param(
+            {"MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS": "5"},
+            _bash_payload({"stdout": _BIG_STDOUT}),
+            id="budget_too_small",
+        ),
+        pytest.param(
+            {}, _bash_payload({"stdout": _BIG_STDOUT, "exitCode": 1}), id="unsafe_result"
+        ),
+        pytest.param(
+            {}, _bash_payload({"stdout": _BIG_STDOUT}, tool="Read"), id="ineligible_tool"
+        ),
+        pytest.param({}, _bash_payload(_BIG_STDOUT), id="unsupported_shape"),
+        pytest.param(
+            {},
+            _bash_payload({"stdout": f"{_COMPRESS_SENTINEL}\n{_BIG_STDOUT}"}),
+            id="already_compressed",
+        ),
+    ],
+)
+def test_refused_path_stays_silent_when_compression_would_not_run(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    env: dict[str, str],
+    payload: dict[str, Any],
+):
+    _refused_env(monkeypatch)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        out = asyncio.run(
+            _orchestrate(payload, ClaudeHookAdapter(), allow_output_replacement=False)
+        )
+
+    assert "systemMessage" not in out
+    assert "updatedToolOutput" not in json.dumps(out)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_cli_bare_hook_reports_refusal_and_explicit_claude_compresses(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    # Under pytest the root logger already has handlers, so the hook's own
+    # stderr handler is not installed; the record is asserted through caplog.
+    _refused_env(monkeypatch)
+    stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        bare = CliRunner().invoke(cli, ["hook"], input=stdin)
+    bare_warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        explicit = CliRunner().invoke(cli, ["hook", "--host", "claude"], input=stdin)
+
+    assert bare.exit_code == 0
+    assert json.loads(bare.stdout) == {"systemMessage": HOST_NOT_EXPLICIT_NOTICE}
+    assert bare_warnings == [HOST_NOT_EXPLICIT_NOTICE]
+    assert explicit.exit_code == 0
+    explicit_out = json.loads(explicit.stdout)
+    assert "systemMessage" not in explicit_out
+    assert "updatedToolOutput" in explicit_out["hookSpecificOutput"]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize("host", ["codex", "cursor", "kimi"])
+def test_cli_explicit_non_replacing_hosts_get_no_refusal_notice(
+    monkeypatch: pytest.MonkeyPatch, host: str
+):
+    """A host that cannot replace output is a capability, not a registration
+    mistake: no notice, whatever the compression setting."""
+    _refused_env(monkeypatch)
+    stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
+
+    result = CliRunner().invoke(cli, ["hook", "--host", host], input=stdin)
+
+    assert result.exit_code == 0
+    assert "systemMessage" not in result.stdout
+    assert HOST_NOT_EXPLICIT_NOTICE not in result.stderr
+
+
+def test_cli_auto_detected_kimi_gets_no_refusal_notice(monkeypatch: pytest.MonkeyPatch):
+    _refused_env(monkeypatch)
+    payload = {**_KIMI_SHELL_PAYLOAD, "tool_output": _BIG_STDOUT}
+
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(payload))
+
+    assert result.exit_code == 0
+    assert result.stdout == ""
+    assert HOST_NOT_EXPLICIT_NOTICE not in result.stderr
+
+
+def test_cli_auto_detected_codex_gets_no_refusal_notice(monkeypatch: pytest.MonkeyPatch):
+    _refused_env(monkeypatch)
+    payload = {**_bash_payload({"stdout": _BIG_STDOUT}), "turn_id": "turn-1"}
+
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(payload))
+
+    assert result.exit_code == 0
+    assert "systemMessage" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("mms hook", "auto"),
+        ("mms hook --host claude", "claude"),
+        ("mms hook --host=claude", "claude"),
+        ("mms hook --host ' claude '", " claude "),
+        ("mms hook --host claude --host auto", "auto"),
+        ("mms hook --host", "auto"),
+        ("mms hook --help", "auto"),
+        ("mms hook --host codex", "codex"),
+        (
+            "uv run --directory /src/memtomem-stm memtomem-stm hook --host claude "
+            "--use-daemon --surfacing-timeout-seconds 12",
+            "claude",
+        ),
+        ("env MEMTOMEM_STM_HOOK__USE_DAEMON=0 memtomem-stm-proxy hook", "auto"),
+        ("echo hook && mms status", None),
+        ("mms status", None),
+    ],
+)
+def test_registered_hook_host_reads_the_flag_the_runtime_reads(
+    command: str, expected: str | None
+):
+    from memtomem_stm.cli.hook_cmd import registered_hook_host
+
+    assert registered_hook_host(command) == expected
+
+
+@pytest.mark.parametrize(
+    ("host", "allowed"),
+    [("claude", True), (" claude ", True), ("auto", False), ("codex", False), ("Claude", False)],
+)
+def test_host_authorizes_replacement_only_for_explicit_claude(host: str, allowed: bool):
+    from memtomem_stm.cli.hook_cmd import host_authorizes_replacement
+
+    assert host_authorizes_replacement(host) is allowed
+
+
+def test_bare_hook_process_writes_the_notice_to_stderr(tmp_path: Path):
+    """The stderr half, in a real process: pytest's own log handlers keep the
+    hook from installing its stderr handler in-process."""
+    import subprocess
+    import sys
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("MEMTOMEM_STM_")
+    }
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "USERPROFILE": str(tmp_path / "home"),
+            "MEMTOMEM_STM_DATA_DIR": str(tmp_path / "daemon"),
+            "MEMTOMEM_STM_HOOK__METRICS_ENABLED": "0",
+            "MEMTOMEM_STM_SURFACING__ENABLED": "0",
+            "MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED": "1",
+            "MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS": "2000",
+            "MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION": "0",
+        }
+    )
+    stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
+    argv = [sys.executable, "-c", "from memtomem_stm.cli.proxy import cli; cli()", "hook"]
+
+    bare = subprocess.run(
+        argv, input=stdin, capture_output=True, text=True, env=env, timeout=60, check=False
+    )
+    explicit = subprocess.run(
+        [*argv, "--host", "claude"],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+    assert bare.returncode == 0
+    assert json.loads(bare.stdout) == {"systemMessage": HOST_NOT_EXPLICIT_NOTICE}
+    assert bare.stderr.splitlines() == [HOST_NOT_EXPLICIT_NOTICE]
+    assert explicit.returncode == 0
+    assert "updatedToolOutput" in json.loads(explicit.stdout)["hookSpecificOutput"]
+    assert HOST_NOT_EXPLICIT_NOTICE not in explicit.stderr
