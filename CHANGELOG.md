@@ -11,6 +11,21 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- `mms hook install` says when the user-scope hook it writes is bound to a
+  project (#1464, issue #1379). When the nearest `pyproject.toml` (the current
+  directory or one of its four parents) lists `memtomem-stm` as a dependency,
+  install writes `uv run --directory <project> memtomem-stm hook …` into a
+  config every project shares, so every hook call runs from that project's
+  environment. The output now names the project and how to get the bare
+  launcher instead, in the preview, after `--apply`, and when the hook is
+  already installed. STM's own source checkout (a `memtomem-stm` project with
+  `src/memtomem_stm/__init__.py`) and directories where no such file is found
+  get no notice; a project that is only named `memtomem-stm` does. **Behavior
+  change**: one more line of install output in those cases; the written
+  command is unchanged.
+
 ### Fixed
 
 - A server shutdown started by SIGTERM, SIGINT or the parent-liveness backstop
