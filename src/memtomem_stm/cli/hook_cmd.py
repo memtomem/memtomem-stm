@@ -702,6 +702,7 @@ def _record_hook_metrics(
     additional_context: str | None,
     config: "STMConfig",
     host_tag: str,
+    status: str,
 ) -> None:
     """Record one native built-in tool call into ``proxy_metrics.db`` (``source='hook'``).
 
@@ -710,7 +711,9 @@ def _record_hook_metrics(
     + the once-flattened ``tool_response_text``), so the raw payload is parsed
     exactly once. Persists **sizes only** (original / compressed / surfaced chars
     + the tool name, under a ``server`` that names the host — see
-    :func:`~memtomem_stm.proxy.metrics.hook_server_label`): never ``tool_input``
+    :func:`~memtomem_stm.proxy.metrics.hook_server_label`) and the compression
+    stage's ``status`` (one of
+    :data:`~memtomem_stm.proxy.metrics.HOOK_COMPRESSION_STATUSES`): never ``tool_input``
     and never the output text, mirroring
     the hook's no-query-text privacy posture (a ``Bash`` command may carry
     secrets). Gated on ``config.hook.metrics_enabled`` (independent of
@@ -760,6 +763,7 @@ def _record_hook_metrics(
                     surfaced_chars=surfaced_chars,
                     compression_strategy="truncate" if updated is not None else None,
                     source="hook",
+                    hook_compression_status=status,
                 )
             )
         finally:
@@ -819,16 +823,18 @@ async def _orchestrate(
         # already — this line carries the hint, not a second traceback.
         log_stm_config_failure(exc, logger=logger, context="orchestrating the hook", exc_info=False)
         raise
-    replacement_allowed = (
-        adapter.can_replace_output
-        if allow_output_replacement is None
-        else adapter.can_replace_output and allow_output_replacement
-    )
-    compression = (
-        compress_builtin(call, config.hook.compression)
-        if replacement_allowed
-        else BuiltinCompressionOutcome("unsupported_host")
-    )
+    # Each refusal gets its own status, so ``mms stats`` can tell them apart.
+    # ``disabled`` comes first: a hook that never enabled compression must not
+    # read as one that is missing ``--host claude``. ``allow_output_replacement``
+    # is tri-state — ``None`` (direct callers) defers to the adapter.
+    if not config.hook.compression.enabled:
+        compression = BuiltinCompressionOutcome("disabled")
+    elif not adapter.can_replace_output:
+        compression = BuiltinCompressionOutcome("unsupported_host")
+    elif allow_output_replacement is False:
+        compression = BuiltinCompressionOutcome("replacement_not_requested")
+    else:
+        compression = compress_builtin(call, config.hook.compression)
     logger.debug(
         "native compression status=%s original_chars=%d compressed_chars=%d",
         compression.status,
@@ -843,7 +849,9 @@ async def _orchestrate(
         except Exception:
             logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
-    _record_hook_metrics(call, updated, additional_context, config, adapter.host_tag)
+    _record_hook_metrics(
+        call, updated, additional_context, config, adapter.host_tag, compression.status
+    )
     return adapter.render(updated_tool_output=updated, additional_context=additional_context)
 
 

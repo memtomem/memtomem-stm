@@ -28,6 +28,8 @@ _MUST_STAY_UNLOADED = [
     "mcp",
     "memtomem_stm.proxy.manager",
     "memtomem_stm.mms.state",
+    # ``mms stats`` and the hook import the metrics store inside the function.
+    "memtomem_stm.proxy.metrics_store",
     "pydantic",
     "tomli_w",
     *(module for module, _attr in _LAZY_SUBCOMMANDS.values()),

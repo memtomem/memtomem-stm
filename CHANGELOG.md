@@ -57,8 +57,7 @@ changes inline only. See the deprecation policy in
   host as `(host not recorded)`. `--json` carries the same split as
   `hook_by_host`. The split also holds under `--all-time`, for rows recorded
   from this version on; earlier rows carry no host and cannot be attributed.
-  Why a host's own ratio is low (output under the threshold, a registration
-  without `--host claude`) is still not recorded (#1438).
+  Why a host's own ratio is low is recorded too; see the next entry (#1438).
   **Behavior change**: `mms hook` writes `builtin:<host>` (for example
   `builtin:claude`) instead of `builtin` in the `server` column of
   `proxy_metrics` and, as rows are trimmed, of `proxy_metrics_daily`. The
@@ -66,6 +65,26 @@ changes inline only. See the deprecation policy in
   therefore show one row per host and tool, and the table's server column is
   14 characters wide instead of 12. The `server` recorded with surfacing
   events is still `builtin`.
+- `mms stats` says why retained `hook` rows were or were not compressed.
+  The hook decided it on every call (output under the threshold, a result
+  the retention floor would have cut too far, a failed command, a host that
+  cannot replace output) and kept only the size, so a low ratio could not be
+  told apart from a broken registration. Each `hook` row now records that
+  decision, and under each host that can replace output `mms stats` prints a
+  `status:` line counting its rows by it; `--json` carries the counts as
+  `hook_status`. A Claude Code hook registered without `--host claude`, which
+  never replaces output (#1437), now shows as `replacement_not_requested`
+  instead of being folded in with hosts that cannot replace output. The
+  daily rollup keeps no status, so the counts cover retained rows only, also
+  under `--all-time`; rows written before this version count as `not
+  recorded` (#1438).
+  **Behavior change**: `proxy_metrics` gains a nullable
+  `hook_compression_status` column, added the first time this version opens
+  the metrics DB. An older STM version sharing the file keeps writing rows
+  without it (they read as `not recorded`), and each time the two versions
+  open the file in turn the schema check runs again (about 0.2 ms more per
+  open, measured on a 10,000-row DB). The `mms stats` text output gains the
+  `status:` lines; existing lines and `--json` keys are unchanged.
 
 ## [0.7.9] — 2026-11-15
 

@@ -732,6 +732,251 @@ class TestStatsHookByHost:
         )
 
 
+def _seed_hook_statuses(
+    db: Path, rows: list[tuple[str, str, int, str | None]], **store_kwargs
+) -> None:
+    """``(server, tool, original_chars, status)`` hook rows; compressed only when
+    the status says so, as the hook writes them."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    store = MetricsStore(db, **store_kwargs)
+    store.initialize()
+    try:
+        for server, tool, orig, status in rows:
+            store.record(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=orig,
+                    compressed_chars=orig // 2 if status == "compressed" else orig,
+                    compression_strategy="truncate" if status == "compressed" else None,
+                    source="hook",
+                    hook_compression_status=status,
+                )
+            )
+    finally:
+        store.close()
+
+
+_MIXED_STATUSES = [
+    ("builtin:claude", "Bash", 20_000, "compressed"),
+    ("builtin:claude", "Bash", 600, "below_threshold"),
+    ("builtin:claude", "Bash", 900, "below_threshold"),
+    ("builtin:claude", "Read", 4_000, "ineligible_tool"),
+    ("builtin:claude", "Bash", 300, None),
+    ("builtin:codex", "Bash", 30_000, "unsupported_host"),
+    ("builtin:codex", "Bash", 30_000, "unsupported_host"),
+]
+
+
+class TestStatsHookStatus:
+    """Why each retained hook call was or was not compressed (#1438)."""
+
+    def test_capable_hosts_get_a_status_line(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_statuses(db, _MIXED_STATUSES)
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        claude = lines.index("      claude calls: 5  chars: 25,800 -> 15,800  (saved 38.8%)")
+        assert lines[claude + 1] == (
+            "        status: below_threshold 2, compressed 1, ineligible_tool 1, not recorded 1"
+        )
+        # The "measured only" note already explains a host that cannot replace.
+        codex = lines.index(
+            "      codex  calls: 2  chars: 60,000  (measured only: host cannot replace output)"
+        )
+        assert not lines[codex + 1].lstrip().startswith("status:")
+        assert "unsupported_host" not in result.output
+
+    def test_json_reports_every_host(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_statuses(db, _MIXED_STATUSES)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["hook_status"] == {
+            "scope": "retained",
+            "by_host": [
+                {
+                    "host": "claude",
+                    "statuses": [
+                        {"status": "below_threshold", "calls": 2, "original_chars": 1_500},
+                        {"status": "compressed", "calls": 1, "original_chars": 20_000},
+                        {"status": "ineligible_tool", "calls": 1, "original_chars": 4_000},
+                        {"status": None, "calls": 1, "original_chars": 300},
+                    ],
+                },
+                {
+                    "host": "codex",
+                    "statuses": [
+                        {"status": "unsupported_host", "calls": 2, "original_chars": 60_000}
+                    ],
+                },
+            ],
+        }
+        # Reported once, at the top level, not again inside the hook summary.
+        assert "hook_status" not in data["compression_by_source"]["hook"]
+
+    @pytest.mark.parametrize(
+        ("with_mcp", "indent"),
+        [(True, "      "), (False, "    ")],
+        ids=["under-the-hook-source", "under-the-total"],
+    )
+    def test_a_lone_capable_host_still_gets_its_status(
+        self, runner, tmp_path, monkeypatch, with_mcp, indent
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path) if with_mcp else tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+                ("builtin:claude", "Bash", 30_000, "retention_guard"),
+                ("builtin:claude", "Bash", 30_000, "retention_guard"),
+            ],
+        )
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        assert f"{indent}status: retention_guard 2, compressed 1" in lines
+        assert not any("claude calls:" in line for line in lines)
+
+    def test_no_line_when_no_row_recorded_a_status(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(db, [("builtin:claude", "Bash", 300, None)])
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert "status:" not in result.output
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert data["hook_status"]["by_host"] == [
+            {"host": "claude", "statuses": [{"status": None, "calls": 1, "original_chars": 300}]}
+        ]
+
+    def test_a_stored_value_outside_the_set_prints_as_other(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+                "source, created_at, hook_compression_status) "
+                "VALUES ('builtin:claude', 'Bash', 10, 10, 'hook', 0, '\x1b[31mred')"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert "\x1b" not in result.output and "31mred" not in result.output
+        assert "    status: compressed 1, other 1" in result.output.splitlines()
+
+    def test_all_time_keeps_the_status_on_retained_rows(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+                ("builtin:claude", "Bash", 900, "below_threshold"),
+                ("builtin:codex", "Bash", 30_000, "unsupported_host"),
+                ("builtin:kimi", "Bash", 7_000, "unsupported_host"),
+            ],
+            max_history=1,
+        )
+        raw = sqlite3.connect(str(db))
+        try:
+            retained = raw.execute("SELECT server FROM proxy_metrics").fetchall()
+        finally:
+            raw.close()
+        assert retained == [("builtin:kimi",)]  # the others live only in the rollup
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+
+        assert [entry["host"] for entry in data["hook_by_host"]] == ["codex", "claude", "kimi"]
+        # No bucket at all for hosts whose rows were all trimmed.
+        assert data["hook_status"] == {
+            "scope": "retained",
+            "by_host": [
+                {
+                    "host": "kimi",
+                    "statuses": [
+                        {"status": "unsupported_host", "calls": 1, "original_chars": 7_000}
+                    ],
+                }
+            ],
+        }
+        human = runner.invoke(cli, ["stats", "--all-time"]).output
+        assert "status:" not in human  # claude's rows are gone from the raw table
+
+    def test_all_time_labels_the_status_line(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
+
+        lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+
+        assert "    status: compressed 1  (retained rows)" in lines
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["--source", "mcp"], None),
+            (
+                ["--source", "hook", "--tool", "Read"],
+                [
+                    {
+                        "host": "claude",
+                        "statuses": [
+                            {"status": "ineligible_tool", "calls": 1, "original_chars": 4_000}
+                        ],
+                    }
+                ],
+            ),
+        ],
+        ids=["mcp", "hook-and-tool"],
+    )
+    def test_filters(self, runner, tmp_path, monkeypatch, argv, expected):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_statuses(db, _MIXED_STATUSES)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json", *argv]).output)
+
+        if expected is None:
+            assert data["hook_status"] is None
+        else:
+            assert data["hook_status"] == {"scope": "retained", "by_host": expected}
+
+    def test_empty_and_missing_stores(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        missing = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert missing["hook_status"] is None
+
+        db = _seed_metrics(tmp_path)  # MCP rows only, one named like a hook label
+        store = MetricsStore(db)
+        store.initialize()
+        try:
+            store.record(
+                CallMetrics(
+                    server="builtin:claude", tool="Bash", original_chars=10, compressed_chars=10
+                )
+            )
+        finally:
+            store.close()
+        empty = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert empty["hook_status"] == {"scope": "retained", "by_host": []}
+
+
 class TestStatsProgressive:
     def test_delivered_vs_produced(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)
