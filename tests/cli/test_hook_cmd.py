@@ -2201,6 +2201,12 @@ def test_bare_hook_process_writes_the_notice_to_stderr(tmp_path: Path):
             "MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED": "1",
             "MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS": "2000",
             "MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION": "0",
+            # The replaced output starts with the non-ASCII sentinel and is
+            # written with ``ensure_ascii=False``; on a Windows pipe (cp1252)
+            # that write fails and the hook emits nothing. That is a
+            # separate, pre-existing limit of the compression path, not what
+            # this test is about, so pin the child's stdout encoding.
+            "PYTHONIOENCODING": "utf-8",
         }
     )
     stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
