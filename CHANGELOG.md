@@ -18,36 +18,28 @@ changes inline only. See the deprecation policy in
   replacement still runs only for an explicit `--host claude`, because
   auto-detection cannot tell Claude from Codex. A bare `mms hook`, the form the
   `hook_cmd` module docstring used to show, therefore passed every Bash result
-  through, and nothing in `mms stats` or `mms doctor` said why. Now, when
-  compression would have been attempted on such a call (a Bash result that
-  passes every check made before the compressor runs: safe, structured, over
-  `max_chars`, not already compressed, and a budget larger than the sentinel),
-  the hook still passes the output through, writes a warning to stderr, and
-  returns it as a top-level `systemMessage`, which Claude Code and Codex
-  document as a warning shown to the user. The warning is raised before
-  surfacing runs, so a surfacing call that outlives the hook deadline does not
-  erase it. It says the attempt was not made, and does not claim the output
-  would have shrunk, because the refused path skips the compressor and so the
-  retention guard. It asks for `--host claude` to be added where the hook is
-  registered rather than naming `mms hook install`, which rewrites only the
-  user settings file and drops an inline `env` wrapper's
-  `MEMTOMEM_STM_HOOK__COMPRESSION__*` assignments.
-  With compression enabled, `mms doctor` adds a `hook registration` check over
-  the STM hook commands in the file `mms hook install --host claude` writes
-  (`$CLAUDE_CONFIG_DIR/settings.json`, otherwise `~/.claude/settings.json`),
-  each read by `mms hook`'s own option parser. It WARNs for a command whose
-  effective `--host` is not `claude`, and for one that never runs the hook (a
-  usage error, `--help`, a subcommand, or an unmatched quote). The suggested
-  fix is `mms hook install --host claude --apply`, or a hand edit of the
-  flagged commands when any STM command in that file sets compression inline,
-  because install replaces them all with one command and keeps none of those
-  settings. Project and local Claude Code settings are not read. The docstring example and the docs now state the `--host claude`
-  requirement (#1437).
+  through, and nothing in `mms stats` or `mms doctor` said why. Now, on a call
+  routed to the Claude adapter (auto-detection's fallback; a payload with a
+  non-empty Codex `turn_id` goes to the Codex adapter and gets no warning) that
+  compression would have attempted (a Bash result that passes every check made
+  before the compressor runs: safe, structured, over `max_chars`, not already
+  compressed, and a budget larger than the sentinel), the hook still passes
+  the output through, writes a warning to stderr, and returns it as a
+  top-level `systemMessage`, which Claude Code and Codex document as a warning
+  shown to the user. The warning is raised before surfacing runs, so a
+  surfacing call that outlives the hook deadline does not erase it. It says
+  the attempt was not made, and does not claim the output would have shrunk,
+  because the refused path skips the compressor and so the retention guard.
+  It asks for `--host claude` to be added where the hook is registered rather
+  than naming `mms hook install`, which rewrites only the user settings file
+  and keeps only the daemon, timeout and query-text settings of an inline
+  `env` wrapper. The docstring example and the docs now state the
+  `--host claude` requirement (#1437).
   **Behavior change**: a bare `mms hook` with compression enabled prints a
-  warning for each call compression would have attempted, and its JSON output
-  gains `systemMessage` on those calls, including when surfacing times out.
-  The tool output itself and the metrics row are unchanged. Registering with
-  `--host claude` removes the warning and turns compression on.
+  warning for each such call, and its JSON output gains `systemMessage` on
+  those calls, including when surfacing times out. The tool output itself and
+  the metrics row are unchanged. Registering with `--host claude` removes the
+  warning and turns compression on.
 - `mms daemon status` and `mms daemon start` escape for display the values
   they print from a daemon that answers. On `start`'s "daemon already
   running" and "daemon started" lines (which `restart` prints too) those are

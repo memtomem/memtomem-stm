@@ -143,8 +143,10 @@ export MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION=0.65
 Replacement also requires the hook command to pass `--host claude`, which
 `mms hook install --host claude --apply` writes. A bare `mms hook`
 auto-detects the host, and auto-detection cannot tell Claude from Codex, so it
-never replaces output. On a call compression would have attempted (a Bash
-result that passes every check made before the compressor runs: safe,
+never replaces output. On a call that auto-detection routes to the Claude
+adapter (its fallback; a payload with a non-empty Codex `turn_id` goes to the
+Codex adapter and gets no warning) and that compression would have attempted (a
+Bash result that passes every check made before the compressor runs: safe,
 structured, over `max_chars`, not already compressed, and a budget larger than
 the sentinel), the hook still passes the output through, prints a warning to
 stderr, and returns it as `systemMessage`, which Claude Code and Codex document
@@ -154,13 +156,10 @@ that exits 0 outside its debug log.
 To fix it, add `--host claude` to the hook command where it is registered.
 `mms hook install --host claude --apply` does that for the user settings file
 (`$CLAUDE_CONFIG_DIR/settings.json`, otherwise `~/.claude/settings.json`), but
-not for Claude Code's project or local settings, and it does not keep
-`MEMTOMEM_STM_HOOK__COMPRESSION__*` variables set inline with `env` in the old
-command. With compression enabled, `mms doctor` checks the user settings file:
-it warns about STM hook commands that lack `--host claude` and about ones that
-never run the hook (a usage error, `--help`, a subcommand, or an unmatched
-quote). Its suggested fix is the install command unless some STM command in
-that file sets compression inline; then it asks for a hand edit.
+not for Claude Code's project or local settings. It also replaces every STM
+hook command in that file with one new command, and of an old command's inline
+`env MEMTOMEM_STM_*=…` assignments it keeps only the daemon, timeout and
+query-text settings, as flags.
 
 See the [hook CLI reference](../reference/cli-hooks.md) and the complete
 [environment-variable reference](../reference/environment-variables.md).

@@ -51,8 +51,8 @@ Current host paths are:
 
 Claude Bash output replacement requires Claude Code 2.1.121+ and remains
 opt-in. It also requires a registration with `--host claude`; under `auto` it
-never runs, and a call it would have attempted gets a `systemMessage` and a
-stderr warning instead. Codex officially accepts PostToolUse `additionalContext`, but STM only
+never runs, and a call routed to the Claude adapter that it would have
+attempted gets a `systemMessage` and a stderr warning instead. Codex officially accepts PostToolUse `additionalContext`, but STM only
 surfaces read-like `Bash` calls after `/hooks` approval; `apply_patch` is
 metrics-only and Codex output replacement is unsupported. Claude `--bare` and
 `--safe-mode` can bypass installed hooks/MCP. See

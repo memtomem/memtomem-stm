@@ -1940,107 +1940,6 @@ def test_cli_auto_detected_codex_gets_no_refusal_notice(monkeypatch: pytest.Monk
     assert "systemMessage" not in result.stdout
 
 
-_REGISTRATIONS = [
-    # (command, host, runs_bridge, inline_compression_env)
-    ("mms hook", "auto", True, False),
-    ("mms hook --host claude", "claude", True, False),
-    ("mms hook --host=claude", "claude", True, False),
-    ("mms hook --host ' claude '", " claude ", True, False),
-    ("mms hook --host claude --host auto", "auto", True, False),
-    ("mms hook --host", "auto", True, False),
-    ("mms hook --host codex", "codex", True, False),
-    ("mms hook --host claude --help", "claude", False, False),
-    ("mms hook --host claude --typo", "claude", False, False),
-    ("mms hook --host claude extra", "claude", False, False),
-    ("mms hook --host claude --surfacing-timeout-seconds", "claude", False, False),
-    (
-        "uv run --directory /src/memtomem-stm memtomem-stm hook --host claude "
-        "--use-daemon --surfacing-timeout-seconds 12",
-        "claude",
-        True,
-        False,
-    ),
-    ("env MEMTOMEM_STM_HOOK__USE_DAEMON=0 memtomem-stm-proxy hook", "auto", True, False),
-    ("env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook", "auto", True, True),
-    ('mms hook --host claude --daemon-timeout-seconds "10', "claude", False, False),
-]
-
-
-def _shell_splits(command: str) -> bool:
-    """The shell's first step, modelled with POSIX shlex: an unmatched quote
-    fails here, before ``mms`` runs. (That bash agrees is checked below.)"""
-    import shlex
-
-    try:
-        shlex.split(command)
-    except ValueError:
-        return False
-    return True
-
-
-@pytest.mark.parametrize(("command", "host", "runs_bridge", "inline_compression"), _REGISTRATIONS)
-def test_inspect_hook_registration_reads_the_command_the_runtime_runs(
-    command: str, host: str, runs_bridge: bool, inline_compression: bool
-):
-    from memtomem_stm.cli.hook_cmd import HookRegistration, inspect_hook_registration
-
-    assert inspect_hook_registration(command) == HookRegistration(
-        host=host, runs_bridge=runs_bridge, inline_compression_env=inline_compression
-    )
-
-
-@pytest.mark.parametrize(("command", "host", "runs_bridge", "inline_compression"), _REGISTRATIONS)
-def test_runs_bridge_matches_what_the_runtime_does(
-    monkeypatch: pytest.MonkeyPatch,
-    command: str,
-    host: str,
-    runs_bridge: bool,
-    inline_compression: bool,
-):
-    """Checks the table, not the function: run each registered argv and see
-    whether the bridge answered (exit 0, a JSON object on stdout). The test
-    above holds :func:`inspect_hook_registration` to the same table, so the
-    two together pin the function to what the runtime does."""
-    import shlex
-
-    from memtomem_stm.cli import hook_hosts
-
-    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
-    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "0")
-    split = hook_hosts.stm_hook_args(command)
-    assert split is not None
-    result = CliRunner().invoke(cli, ["hook", *split[1]], input="{}")
-    answered = (
-        _shell_splits(command)
-        and result.exit_code == 0
-        and result.stdout.strip().startswith("{")
-    )
-    assert answered is runs_bridge, shlex.join(split[1])
-
-
-def test_bash_rejects_an_unmatched_quote_before_running_anything():
-    import shutil
-    import subprocess
-
-    bash = shutil.which("bash")
-    if bash is None:
-        pytest.skip("bash not available")
-    line = 'mms hook --host claude --daemon-timeout-seconds "10'
-    result = subprocess.run(
-        [bash, "-n", "-c", line], capture_output=True, text=True, timeout=30, check=False
-    )
-
-    assert result.returncode != 0
-    assert not _shell_splits(line)
-
-
-@pytest.mark.parametrize("command", ["echo hook && mms status", "mms status"])
-def test_inspect_hook_registration_ignores_non_stm_commands(command: str):
-    from memtomem_stm.cli.hook_cmd import inspect_hook_registration
-
-    assert inspect_hook_registration(command) is None
-
-
 def test_surfacing_timeout_keeps_the_refusal_notice(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
@@ -2138,3 +2037,65 @@ def test_bare_hook_process_writes_the_notice_to_stderr(tmp_path: Path):
     assert explicit.returncode == 0
     assert "updatedToolOutput" in json.loads(explicit.stdout)["hookSpecificOutput"]
     assert HOST_NOT_EXPLICIT_NOTICE not in explicit.stderr
+
+
+# ── what `mms hook install --host claude` keeps (docs/guides/native-hooks.md) ──
+
+
+def test_install_keeps_only_daemon_timeout_and_query_text_from_inline_env():
+    """The guide says install turns an inline ``env`` wrapper's daemon,
+    timeout and query-text settings into flags and keeps nothing else, which
+    is why the #1437 notice asks for a hand edit instead of naming install."""
+    import shlex
+
+    from memtomem_stm.cli.hook_cmd import _hook_install_command_argv
+    from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
+
+    existing = (
+        "env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 MEMTOMEM_STM_HOOK__METRICS_ENABLED=0 "
+        "MEMTOMEM_STM_HOOK__USE_DAEMON=0 MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=9 mms hook"
+    )
+    policy = resolve_host_runtime_policy(
+        existing_command=existing, use_daemon=None, surfacing_timeout_seconds=None
+    )
+    argv = _hook_install_command_argv("claude", policy=policy)
+    rewritten = shlex.join(argv)
+
+    assert argv[argv.index("hook") :][:3] == ["hook", "--host", "claude"]
+    assert "--no-daemon" in argv
+    assert argv[argv.index("--surfacing-timeout-seconds") + 1] == "9"
+    assert "MEMTOMEM_STM_" not in rewritten
+
+
+def test_install_replaces_every_stm_handler_with_one(tmp_path: Path, monkeypatch):
+    from memtomem_stm.cli import hook_hosts
+
+    config_dir = tmp_path / "claude"
+    config_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Read|Grep|Glob|Bash",
+                            "hooks": [
+                                {"type": "command", "command": "mms hook"},
+                                {
+                                    "type": "command",
+                                    "command": "env MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS"
+                                    "=8000 mms hook --host claude",
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+    change = hook_hosts.plan_install("claude", "mms hook --host claude")
+
+    handlers = json.loads(change.new_text)["hooks"]["PostToolUse"][0]["hooks"]
+    assert [h["command"] for h in handlers] == ["mms hook --host claude"]

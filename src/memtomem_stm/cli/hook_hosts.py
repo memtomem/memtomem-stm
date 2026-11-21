@@ -121,21 +121,9 @@ def _is_stm_hook_command(command: str) -> bool:
     token anywhere" — is what keeps a compound user command like
     ``echo hook && memtomem-stm status`` from matching: ``status`` is not ``hook``,
     so install/uninstall leave it alone."""
-    return stm_hook_args(command) is not None
-
-
-def stm_hook_args(command: str) -> tuple[list[str], list[str]] | None:
-    """``(prefix, args)`` when ``command`` is an STM ``mms hook`` invocation
-    (see :func:`_is_stm_hook_command`), else ``None``: the tokens before the
-    executable (a ``uv run`` launcher or an inline ``env`` wrapper) and the
-    tokens after ``hook``.
-
-    Lets a reader evaluate the registered flags (``mms doctor``'s
-    ``--host`` check, #1437) on exactly the commands install and uninstall
-    treat as STM's, instead of re-deriving which token starts them."""
     tokens = _shell_tokens(command)
     if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
-        return None
+        return False
     # A source checkout directory can itself be named ``memtomem-stm``. Count
     # only executable-shaped tokens immediately followed by the subcommand, so
     # ``uv run --directory /repo/memtomem-stm memtomem-stm hook`` has one owner
@@ -146,9 +134,9 @@ def stm_hook_args(command: str) -> tuple[list[str], list[str]] | None:
         if Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
     ]
     if len(starts) != 1:
-        return None
+        return False
     i = starts[0]
-    launcher = prefix = tokens[:i]
+    prefix = tokens[:i]
     # Pre-runtime-flag installs commonly used POSIX ``env`` to pin timeout
     # values in the host command.  Recognize only a leading env executable
     # followed exclusively by MEMTOMEM_STM_* assignments; an arbitrary env
@@ -161,11 +149,11 @@ def stm_hook_args(command: str) -> tuple[list[str], list[str]] | None:
                 break
             j += 1
         if j == 1:
-            return None
+            return False
         prefix = prefix[j:]
     if prefix and not (prefix[:2] == ["uv", "run"] and all(token != "--" for token in prefix)):
-        return None
-    return launcher, tokens[i + 2 :]
+        return False
+    return True
 
 
 def _is_stm_command_handler(handler: Any) -> bool:
@@ -574,13 +562,6 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
             f"{'object' if fmt == 'json' else 'table'}; refusing to modify it."
         )
     return data, raw
-
-
-def hook_config_path(host_tag: str) -> Path:
-    """The hook-config file ``mms hook install --host <host_tag>`` reads and
-    writes. Raises :class:`HookInstallError` when the host's home override
-    cannot be resolved (see :func:`_config_path`)."""
-    return _config_path(HOOK_HOSTS[host_tag])
 
 
 def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:

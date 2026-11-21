@@ -1366,12 +1366,6 @@ def test_hook_compression_docs_require_explicit_claude_host() -> None:
         if line.startswith("| `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` |")
     )
     assert "--host claude" in env_row
-    doctor_row = next(
-        line
-        for line in _read("docs/cli.md").splitlines()
-        if line.startswith("| `hook registration` |")
-    )
-    assert "mms hook install --host claude --apply" in doctor_row
 
     module_doc = hook_cmd.__doc__ or ""
     assert '"command": "mms hook --host claude"' in module_doc

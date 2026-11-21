@@ -39,7 +39,9 @@ daemon stage (P2/Stage D).
 Hard rule — a hook must never disrupt the host. This command **always exits
 0** and, on any malformed input, disabled surfacing, timeout, or internal
 error, emits an empty object ``{}`` so the original tool result passes through
-untouched.
+untouched. The one addition on those paths is a ``systemMessage`` reporting a
+compression refusal found before the failure (#1437); the tool result still
+passes through.
 
 Register in Claude Code ``settings.json``::
 
@@ -77,7 +79,6 @@ import sys
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, TextIO
 
 import click
@@ -1221,8 +1222,7 @@ def host_authorizes_replacement(host: str) -> bool:
     """Whether a runtime ``--host`` value lets ``mms hook`` replace tool output.
 
     Only an explicit ``claude`` does: ``auto`` and an unrecognized value both
-    resolve by payload shape, which cannot tell Codex from Claude. Shared by
-    the runtime bridge and ``mms doctor``'s registration check (#1437)."""
+    resolve by payload shape, which cannot tell Codex from Claude (#1437)."""
     return host.strip() == "claude"
 
 
@@ -1233,83 +1233,6 @@ def render_notices(adapter: "HostHookAdapter", notices: list[str]) -> dict[str, 
     if not notices or not adapter.can_replace_output:
         return {}
     return {"systemMessage": notices[0]}
-
-
-@dataclass(frozen=True, slots=True)
-class HookRegistration:
-    """How ``mms hook`` would run for a registered command string."""
-
-    host: str
-    """The ``--host`` value, read as the runtime reads it."""
-    runs_bridge: bool
-    """Whether the command reaches the runtime bridge at all: ``False`` for a
-    usage error (exit 2), ``--help``, a subcommand such as ``install``, or a
-    command line the shell cannot even split (an unmatched quote)."""
-    inline_compression_env: bool
-    """Whether an inline ``env`` wrapper sets ``MEMTOMEM_STM_HOOK__COMPRESSION__*``.
-    ``mms hook install`` turns an older wrapper's daemon, timeout and
-    query-text assignments into flags, but drops these."""
-
-
-def inspect_hook_registration(command: str) -> HookRegistration | None:
-    """Read a registered command the way ``mms hook`` would, or ``None`` when
-    the string is not an STM hook command.
-
-    Parsed by :func:`hook_command`'s own Click options rather than by matching
-    tokens, so ``--host=claude``, a repeated ``--host`` (the last wins) and a
-    value-less ``--host`` (``auto``) read the way the runtime reads them. A
-    strict parse decides ``runs_bridge``, after the command must lex as a
-    shell line; what Click would print for
-    ``--help`` or a usage error is captured, never shown. ``host`` comes from
-    a resilient parse, so it is reported even for a command that fails.
-    """
-    import contextlib
-    import io
-    import warnings
-
-    from memtomem_stm.cli import hook_hosts
-
-    split = hook_hosts.stm_hook_args(command)
-    if split is None:
-        return None
-    launcher, args = split
-    # ``stm_hook_args`` falls back to whitespace splitting when the command
-    # does not lex (an unmatched quote), which is what install needs to
-    # recognize it; the host's shell rejects such a line before ``mms`` runs.
-    try:
-        list(shlex.shlex(command, posix=True, punctuation_chars="|&;<>"))
-    except ValueError:
-        lexes = False
-    else:
-        lexes = True
-    resilient = hook_command.make_context("hook", list(args), resilient_parsing=True)
-    value = resilient.params.get("host")
-    host = value if isinstance(value, str) else "auto"
-    sink = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            strict = hook_command.make_context("hook", list(args))
-    except Exception:  # click.UsageError, or click.exceptions.Exit from --help
-        runs_bridge = False
-    else:
-        # Leftover tokens name a subcommand (``install``) or fail as an
-        # unknown one; either way the bridge does not run. Click 8.x keeps the
-        # first in ``protected_args`` (deprecated, folded into ``args`` in 9).
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            leftover = [*getattr(strict, "protected_args", ()), *strict.args]
-        runs_bridge = not leftover and lexes
-    inline_compression_env = (
-        bool(launcher)
-        and Path(launcher[0]).name == "env"
-        and any(
-            token.partition("=")[0].startswith("MEMTOMEM_STM_HOOK__COMPRESSION__")
-            for token in launcher[1:]
-        )
-    )
-    return HookRegistration(
-        host=host, runs_bridge=runs_bridge, inline_compression_env=inline_compression_env
-    )
 
 
 def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:

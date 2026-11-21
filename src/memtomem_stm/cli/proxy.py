@@ -19,7 +19,7 @@ import subprocess
 import sys
 import textwrap
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -10904,94 +10904,6 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
     return checks
 
 
-def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
-    """``hook_registration``: Claude Code hook commands that refuse compression.
-
-    Bash output compression is on (the caller checks), but ``mms hook`` replaces
-    output only when its registration says ``--host claude``; a bare
-    ``mms hook`` passes every result through (#1437). Reads the file
-    ``mms hook install --host claude`` writes — not Claude Code's project or
-    local settings, which the detail says. WARN only, like every hook check: the
-    proxy itself is unaffected. Any failure to read degrades to a WARN rather
-    than costing the rest of the report.
-    """
-    from memtomem_stm.cli import hook_hosts
-    from memtomem_stm.cli.hook_cmd import host_authorizes_replacement, inspect_hook_registration
-
-    label = "hook registration"
-    try:
-        path = hook_hosts.hook_config_path("claude")
-        commands = hook_hosts.installed_stm_hook_commands("claude")
-        registrations = [inspect_hook_registration(command) for command in commands]
-    except Exception as exc:
-        check(
-            "hook_registration",
-            label,
-            "WARN",
-            "hook compression is enabled but the Claude Code hook config could not be "
-            f"read ({type(exc).__name__}); not checked",
-            None,
-        )
-        return
-    if not commands:
-        check(
-            "hook_registration",
-            label,
-            "PASS",
-            f"hook compression is enabled; no STM hook in {path} "
-            "(project and local Claude Code settings are not checked)",
-        )
-        return
-    total = len(commands)
-    broken = [r for r in registrations if r is None or not r.runs_bridge]
-    lacking = [
-        r
-        for r in registrations
-        if r is not None and r.runs_bridge and not host_authorizes_replacement(r.host)
-    ]
-    if not broken and not lacking:
-        check(
-            "hook_registration",
-            label,
-            "PASS",
-            f"every STM hook command in {path} passes --host claude "
-            "(project and local Claude Code settings are not checked)",
-        )
-        return
-    problems = []
-    if lacking:
-        problems.append(
-            f"{len(lacking)} of {total} STM hook command(s) in {path} lack --host claude, "
-            "so hook compression never replaces their output"
-        )
-    if broken:
-        problems.append(
-            f"{len(broken)} of {total} STM hook command(s) in {path} do not run the hook "
-            "(a usage error, --help, a subcommand, or an unmatched quote)"
-        )
-    # Install replaces every STM command in that file with one fresh command,
-    # which fixes both kinds but drops any inline ``env`` compression setting,
-    # including one on a command this check did not flag. Then only a hand
-    # edit of the flagged commands keeps the operator's configuration.
-    if any(r is not None and r.inline_compression_env for r in registrations):
-        steps = []
-        if lacking:
-            steps.append("add --host claude to the commands that lack it")
-        if broken:
-            steps.append(
-                "remove the invalid argument, --help, subcommand or unmatched quote "
-                "from the commands that do not run the hook"
-            )
-        next_action = (
-            "; ".join(steps) + ", by hand: `mms hook install --host claude --apply` would "
-            "replace every STM hook command in that file and drop their inline "
-            "MEMTOMEM_STM_HOOK__COMPRESSION__* settings"
-        )
-    else:
-        next_action = "mms hook install --host claude --apply"
-    check("hook_registration", label, "WARN", "; ".join(problems), next_action)
-
-
 @cli.command()
 @click.option(
     "--config",
@@ -11965,9 +11877,8 @@ def doctor(
     from memtomem_stm.config import STMConfig
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
-    env_config: STMConfig | None = None
     try:
-        env_config = STMConfig()
+        STMConfig()
     except Exception as exc:
         check(
             "env_overrides",
@@ -11985,9 +11896,6 @@ def doctor(
             "PASS",
             "bare STMConfig() constructs — hook/daemon env path healthy",
         )
-
-    if env_config is not None and env_config.hook.compression.enabled:
-        _doctor_hook_registration_check(check)
 
     counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}
     overall = "fail" if counts["FAIL"] else ("warn" if counts["WARN"] else "pass")
