@@ -256,15 +256,32 @@ changes inline only. See the deprecation policy in
   it reads the same values as before. Hook input is read as UTF-8
   whatever the locale, with a leading byte-order mark ignored.
 - `mms doctor`'s `hook registration` row counts more STM hooks spelled with
-  quotes. A line made only of plain words and quotes, up to 4,096 characters,
-  is now also matched on the words left after quote removal, so `m"m"s hook`
-  next to `mms hook --host claude` is counted, marked not checked, and the
-  row WARNs instead of reporting PASS. A quoted hook in a longer line, or in
+  quotes. A line made only of plain words and quotes, up to 4,096 characters
+  and with balanced quotes, is now also matched on the words left after quote
+  removal. So `m"m"s hook` next to `mms hook --host claude` is counted, marked
+  not checked, and the row WARNs instead of reporting PASS. That example is
+  for shell-form handlers outside Windows: on Windows shell form is never
+  read, so the same file WARNed before too. A quoted hook in a longer line, or in
   a line with other shell syntax (a comment, an operator, a line
   continuation), gets only the raw-text search as before, which can miss it
   and still let the row PASS. A plain command whose `hook` is only part of a
   word, such as `mms status --config /tmp/hook.json`, is no longer counted
   as an STM hook (#1455, issue #1450).
+- `mms doctor`'s `hook registration` row now says what it cannot see. It
+  recognizes an STM hook by the command text, an STM name and a later `hook`.
+  So a hook behind a wrapper script is not counted, and neither is one whose
+  name the shell puts together (`m"m"s hook # note`, `sh -c 'm"m"s hook'`) or
+  that is attached to an option (`python -mmemtomem_stm hook`). Next to a
+  passing handler, the row still reports PASS for such a file. The PASS now
+  reads `N recognized, all passing --host claude to mms hook`, and the PASS
+  and WARN details that report on commands end with that limit (the WARN for
+  a settings file that cannot be used does not). Recognition itself is unchanged:
+  those hooks are still missed, and a command that only mentions both words,
+  such as `mms version hook`, is still counted and reported as not checked
+  (issue #1457).
+  **Behavior change**: the row's detail text changes, in the text output and
+  in `checks[].detail` of `mms doctor --json`. Its statuses, the conditions
+  for showing it, and doctor's exit code do not.
 
 ## [0.7.9] — 2026-11-15
 
