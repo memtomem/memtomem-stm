@@ -538,10 +538,18 @@ def test_unusable_settings_get_specific_advice(
     assert row["next_action"] == action
 
 
-def test_relative_claude_config_dir_warns(
-    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("kind", ["relative", "a file"])
+def test_unusable_claude_config_dir_warns(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/claude")
+    if kind == "relative":
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/claude")
+    else:
+        # ``settings.json`` under a file raises NotADirectoryError, which is
+        # the override's fault, not the settings file's.
+        not_a_dir = tmp_path / "claude-config-file"
+        not_a_dir.write_text("{}")
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(not_a_dir))
 
     row = _row(tmp_path)
 

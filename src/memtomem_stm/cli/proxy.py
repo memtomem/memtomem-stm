@@ -11094,7 +11094,8 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     lacking = [
         loc for loc, r in checked if r.host is not None and not host_authorizes_replacement(r.host)
     ]
-    passing = [loc for loc, r in checked if r.runs_bridge and loc not in lacking]
+    lacking_set = set(lacking)
+    passing = [loc for loc, r in checked if r.runs_bridge and loc not in lacking_set]
     shell_syntax = [loc for loc, r in readings if r.not_checked == NOT_PLAIN]
     # Shell form on Windows is not read at all, so even a correct install
     # lands here; it is reported, but it is not a reason to WARN.

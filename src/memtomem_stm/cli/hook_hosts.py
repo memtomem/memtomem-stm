@@ -615,6 +615,15 @@ def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:
     return tuple(commands)
 
 
+def _is_non_directory(path: Path) -> bool:
+    """Whether ``path`` exists and is not a directory (``False`` when it cannot
+    be inspected at all)."""
+    try:
+        return not stat.S_ISDIR(path.stat().st_mode)
+    except OSError:
+        return False
+
+
 def claude_post_tool_handlers() -> tuple[Path, list[tuple[str, Any]] | None]:
     """Every ``hooks.PostToolUse[i].hooks[j]`` handler in Claude Code's user
     settings, keyed by that location, read from the file ``mms hook install
@@ -640,8 +649,17 @@ def claude_post_tool_handlers() -> tuple[Path, list[tuple[str, Any]] | None]:
         raise HookConfigLocationUnknown(str(exc)) from None
     try:
         mode = path.stat().st_mode
-    except FileNotFoundError:
-        return path, None
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        # ``CLAUDE_CONFIG_DIR`` naming a file is the override's fault, not the
+        # settings file's. Checked on the directory itself: below a file, POSIX
+        # raises NotADirectoryError but Windows reports the path as not found.
+        if host_home_override(spec.host_tag) is not None and _is_non_directory(path.parent):
+            raise HookConfigLocationUnknown(
+                f"{spec.label} config directory is not a directory"
+            ) from None
+        if isinstance(exc, FileNotFoundError):
+            return path, None
+        raise
     if not stat.S_ISREG(mode):
         raise HookConfigNotRegularFile(f"{path} is not a regular file")
     current = _read_current(path, spec.fmt)
