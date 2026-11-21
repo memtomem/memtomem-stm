@@ -29,20 +29,18 @@ _LOC1 = "hooks.PostToolUse[0].hooks[1]"
 _NOT_RUNNING = "not running the hook (--help, a usage error or a subcommand): "
 _PREFIX = "STM hook commands: "
 _LACKING = "without --host claude, so hook compression, if enabled, never replaces their output: "
-_NOT_CHECKED = (
-    "not checked (only plain words without quotes or expansions, after a known launcher, "
-    "are read): "
-)
+_SHELL_SYNTAX = "not checked because of shell syntax (quotes, $, ~, # or operators): "
+_OTHER = "not checked (an unknown launcher or an unsupported handler field): "
 _SCOPE = "project, local and managed Claude Code settings are not read"
 _NEXT_RUN = "fix the arguments of the commands that do not run the hook"
 _NEXT_HOST = (
     "add --host claude where Claude Code routing is intended (or make the last "
     "--host claude), keeping each command's other settings"
 )
-_NEXT_BY_HAND = (
-    "check the not-checked commands by hand, or spell them as plain words "
-    "(an absolute path instead of $HOME or ~)"
+_NEXT_PLAIN = (
+    "spell the commands with shell syntax as plain words (an absolute path instead of $HOME or ~)"
 )
+_NEXT_BY_HAND = "check the other not-checked commands by hand"
 
 
 def _read(command: str, *, windows: bool = False, **fields: Any) -> hr.HookRegistration:
@@ -92,16 +90,32 @@ def test_plain_command_reads_its_host(command: str, host: str) -> None:
     [
         ("mms hook --host claude --help", "claude"),  # case 1: prints help, exits 0
         ("mms hook --host claude -h", "claude"),  # -h is a root help option
-        ("mms hook --host claude install", "claude"),  # a subcommand
-        ("mms hook --host claude uninstall", "claude"),
-        ("mms hook --host claude extra", "claude"),  # case 2: exits 2
-        ("mms hook extra", "auto"),
         # case 8: both facts on one location.
         ("env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook --help", "auto"),
     ],
 )
-def test_help_or_leftover_does_not_run_but_keeps_the_host(command: str, host: str) -> None:
+def test_help_does_not_run_but_keeps_the_host(command: str, host: str) -> None:
     assert _read(command) == hr.HookRegistration(None, runs_bridge=False, host=host)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mms hook --host claude install",  # a subcommand
+        "mms hook --host claude uninstall",
+        "mms hook --host claude extra",  # case 2: exits 2
+        "mms hook extra",
+        # The group stops reading options at the first leftover token, so a
+        # later --host is never parsed: neither "lacks" nor "passes" holds.
+        "mms hook extra --host claude",
+        "mms hook install --host claude",
+        "mms hook --host claude extra --host auto",
+        "mms hook -- --host=claude",
+        "mms hook --host claude --help extra --host auto",
+    ],
+)
+def test_leftover_does_not_run_and_the_host_is_unknown(command: str) -> None:
+    assert _read(command) == hr.HookRegistration(None, runs_bridge=False, host=None)
 
 
 @pytest.mark.parametrize(
@@ -184,6 +198,7 @@ def test_shell_syntax_is_not_checked(command: str) -> None:
         "env MEMTOMEM_STM_X=1 OTHER=/mms hook --host claude",
         "PATH=/usr/env MEMTOMEM_STM_X=1 mms hook --host claude",
         "env MY_CUSTOM_VAR=1 mms hook --host claude",  # issue case 7b
+        "python3 -P -m memtomem_stm hook --host claude",  # the module entry point
         # These name directories; pathlib would shorten them to ``mms``.
         "mms/ hook --host claude",
         "/opt/bin/mms/. hook --host claude",
@@ -229,6 +244,10 @@ def test_shell_field_other_than_bash_is_not_checked() -> None:
     assert _read("mms hook --host claude", shell=None).not_checked == hr.SHELL_FIELD
     assert _read("mms hook --host claude", args=None).not_checked == hr.ARGS_FIELD
     assert _read("mms hook --host claude", shell="bash").host == "claude"
+    # Whether ``shell`` applies next to ``args`` is undocumented.
+    reading = _read("mms", args=["hook", "--host", "claude"], shell="powershell")
+    assert reading.not_checked == hr.SHELL_FIELD
+    assert _read("mms", args=["hook"], shell="bash").not_checked == hr.SHELL_FIELD
 
 
 def test_windows_rules() -> None:
@@ -324,7 +343,7 @@ def test_registration_with_host_claude_passes(tmp_path: Path, claude_dir: Path) 
         "id": "hook_registration",
         "label": "hook registration",
         "status": "PASS",
-        "detail": f"1 STM hook command(s) pass --host claude to mms hook in {path}; {_SCOPE}",
+        "detail": f"{_PREFIX}1 pass --host claude to mms hook — in {path}; {_SCOPE}",
         "next_action": None,
     }
 
@@ -372,11 +391,13 @@ def test_mixed_handlers_report_each_category_by_location(tmp_path: Path, claude_
     assert row["detail"] == (
         f"{_PREFIX}2 {_NOT_RUNNING}{loc(3)}, {loc(4)}; "
         f"3 {_LACKING}{loc(0)}, {loc(2)}, {loc(3)}; "
-        f"3 {_NOT_CHECKED}{loc(5)} (launcher), {loc(6)} (launcher), "
-        "hooks.PostToolUse[1].hooks[0] (shell syntax)"
+        f"1 {_SHELL_SYNTAX}hooks.PostToolUse[1].hooks[0]; "
+        f"2 {_OTHER}{loc(5)} (launcher), {loc(6)} (launcher)"
         f" — in {path}; {_SCOPE}"
     )
-    assert row["next_action"] == f"{_NEXT_RUN}; then {_NEXT_HOST}; then {_NEXT_BY_HAND}"
+    assert row["next_action"] == (
+        f"{_NEXT_RUN}; then {_NEXT_HOST}; then {_NEXT_PLAIN}; then {_NEXT_BY_HAND}"
+    )
     # Cases 6/7: install rewrites every STM handler and drops inline settings,
     # and does not recognize a ``NAME=value mms hook`` line at all.
     assert "install" not in row["next_action"]
@@ -391,8 +412,47 @@ def test_this_macs_registration_shape_is_not_checked(tmp_path: Path, claude_dir:
     row = _row(tmp_path)
 
     assert row["status"] == "WARN"
-    assert row["detail"] == f"{_PREFIX}1 {_NOT_CHECKED}{_LOC0} (shell syntax) — in {path}; {_SCOPE}"
-    assert row["next_action"] == _NEXT_BY_HAND
+    assert row["detail"] == f"{_PREFIX}1 {_SHELL_SYNTAX}{_LOC0} — in {path}; {_SCOPE}"
+    assert row["next_action"] == _NEXT_PLAIN
+
+
+def test_windows_shell_form_is_reported_without_a_warning(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shell form is never read on Windows, so install's own output lands there;
+    the row says so but does not WARN for it."""
+    monkeypatch.setattr(hr, "running_on_windows", lambda: True)
+    path = _write(
+        claude_dir,
+        _cmd("memtomem-stm hook --host claude --use-daemon"),
+        {"type": "command", "command": "mms.exe", "args": ["hook", "--host", "claude"]},
+    )
+
+    row = _row(tmp_path)
+
+    assert row["status"] == "PASS"
+    assert row["detail"] == (
+        f"{_PREFIX}1 pass --host claude to mms hook; 1 in shell form not checked on Windows, "
+        f"where Claude Code may run them under Git Bash or PowerShell: {_LOC0} — in {path}; "
+        f"{_SCOPE}"
+    )
+
+    _write(claude_dir, _cmd("memtomem-stm hook --host claude"), _cmd("mms hook --help"))
+    monkeypatch.setattr(hr, "running_on_windows", lambda: True)
+    row = _row(tmp_path)
+    assert row["status"] == "PASS"  # both are shell form, so neither is read
+
+
+def test_default_settings_path_without_claude_config_dir(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    (tmp_path / "home" / ".claude").mkdir(parents=True)
+    path = _write(tmp_path / "home" / ".claude", _cmd("mms hook"))
+
+    row = _row(tmp_path)
+
+    assert row["detail"] == f"{_PREFIX}1 {_LACKING}{_LOC0} — in {path}; {_SCOPE}"
 
 
 def test_command_text_is_never_shown(tmp_path: Path, claude_dir: Path) -> None:
@@ -446,8 +506,36 @@ def test_invalid_json_warns_with_the_type_only(tmp_path: Path, claude_dir: Path)
         "status": "WARN",
         "detail": "the Claude Code user settings could not be read (JSONDecodeError); "
         "STM hook registrations were not checked",
-        "next_action": "make the Claude Code settings file readable, then rerun mms doctor",
+        "next_action": (
+            "make the Claude Code settings file readable and valid JSON, then rerun mms doctor"
+        ),
     }
+
+
+@pytest.mark.parametrize(
+    ("make", "detail", "action"),
+    [
+        (
+            lambda d: (d / "settings.json").write_text("[]"),
+            "the Claude Code user settings are valid JSON but not an object",
+            "make the settings file's top level a JSON object, then rerun mms doctor",
+        ),
+        (
+            lambda d: (d / "settings.json").mkdir(),
+            "the Claude Code user settings path is not a regular file",
+            "replace it with the settings JSON file, then rerun mms doctor",
+        ),
+    ],
+)
+def test_unusable_settings_get_specific_advice(
+    tmp_path: Path, claude_dir: Path, make: Any, detail: str, action: str
+) -> None:
+    make(claude_dir)
+
+    row = _row(tmp_path)
+
+    assert row["detail"] == f"{detail}; STM hook registrations were not checked"
+    assert row["next_action"] == action
 
 
 def test_relative_claude_config_dir_warns(
@@ -457,8 +545,14 @@ def test_relative_claude_config_dir_warns(
 
     row = _row(tmp_path)
 
-    assert row["status"] == "WARN"
-    assert row["detail"].startswith("the Claude Code user settings could not be read (")
+    assert row == {
+        "id": "hook_registration",
+        "label": "hook registration",
+        "status": "WARN",
+        "detail": "CLAUDE_CONFIG_DIR does not name a usable directory; "
+        "STM hook registrations were not checked",
+        "next_action": "set CLAUDE_CONFIG_DIR to an absolute directory, or unset it",
+    }
 
 
 @pytest.mark.skipif(
@@ -530,6 +624,6 @@ def test_fifo_settings_warn_instead_of_blocking(tmp_path: Path, claude_dir: Path
 
     checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
     assert checks["hook_registration"]["detail"] == (
-        "the Claude Code user settings could not be read (HookConfigNotRegularFile); "
+        "the Claude Code user settings path is not a regular file; "
         "STM hook registrations were not checked"
     )

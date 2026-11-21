@@ -108,6 +108,15 @@ class HookConfigNotRegularFile(HookInstallError):
     FIFO, a device). Reading a FIFO would block until a writer appears."""
 
 
+class HookConfigNotAnObject(HookInstallError):
+    """The host config parses but its root is not an object/table."""
+
+
+class HookConfigLocationUnknown(HookInstallError):
+    """The host's home override (``CLAUDE_CONFIG_DIR``, …) does not name a
+    usable directory, so no config file can be chosen."""
+
+
 # ---------------------------------------------------------------------------
 # STM-hook command recognition (idempotency + symmetric uninstall)
 # ---------------------------------------------------------------------------
@@ -563,7 +572,7 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
             "modify it. Fix or remove the file, then re-run."
         ) from exc
     if not isinstance(data, dict):
-        raise HookInstallError(
+        raise HookConfigNotAnObject(
             f"{path} is valid {fmt.upper()} but not a top-level "
             f"{'object' if fmt == 'json' else 'table'}; refusing to modify it."
         )
@@ -615,15 +624,20 @@ def claude_post_tool_handlers() -> tuple[Path, list[tuple[str, Any]] | None]:
     that judges registrations (``mms doctor``, #1443) must also see the ones
     install does not recognize, such as ``NAME=value mms hook``.
 
-    Raises :class:`HookInstallError` for a config that cannot be located or
-    parsed, :class:`HookConfigNotRegularFile` for a path that is not a regular
-    file (a FIFO would block the read), and :class:`OSError` when the file
-    cannot be inspected. ``stat`` runs first because on Python 3.14
-    ``Path.exists`` reports a file under an unsearchable directory as absent
-    (#1285), which would hide that failure.
+    Raises :class:`HookConfigLocationUnknown` when ``CLAUDE_CONFIG_DIR`` names
+    no usable directory, :class:`HookConfigNotRegularFile` for a path that is
+    not a regular file (a FIFO would block the read), :class:`HookInstallError`
+    (:class:`HookConfigNotAnObject` for a non-object root) for a file that
+    cannot be read or parsed, and :class:`OSError` when it cannot be
+    inspected. ``stat`` runs first because on Python 3.14 ``Path.exists``
+    reports a file under an unsearchable directory as absent (#1285), which
+    would hide that failure.
     """
     spec = HOOK_HOSTS["claude"]
-    path = _config_path(spec)
+    try:
+        path = _config_path(spec)
+    except HookInstallError as exc:
+        raise HookConfigLocationUnknown(str(exc)) from None
     try:
         mode = path.stat().st_mode
     except FileNotFoundError:

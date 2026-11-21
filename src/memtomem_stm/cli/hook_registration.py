@@ -38,7 +38,8 @@ from memtomem_stm.cli.hook_hosts import _STM_EXECUTABLES
 # executable names without ``hook`` costs one scan rather than one per name: if
 # no ``hook`` follows the first name, none follows a later one either.
 _CANDIDATE_EXE = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:memtomem-stm-proxy|memtomem-stm|mms)(?:\.exe)?(?![A-Za-z0-9_-])",
+    # ``memtomem_stm`` is the module name (``python -m memtomem_stm hook``).
+    r"(?<![A-Za-z0-9_-])(?:memtomem-stm-proxy|memtomem[-_]stm|mms)(?:\.exe)?(?![A-Za-z0-9_-])",
     re.IGNORECASE,
 )
 # No left boundary on ``hook``: ``mms ${ACTION:-hook}`` still means STM's hook.
@@ -166,27 +167,31 @@ def _read_hook_args(args: list[str]) -> HookRegistration:
             strict = hook_command.make_context("hook", list(args), help_option_names=help_names)
     except click.exceptions.Exit:
         # ``--help``/``-h``: parsing finished before the help callback exited,
-        # so a resilient parse of the same words reads the host completely.
+        # so a resilient parse of the same words reads the host.
         resilient = hook_command.make_context(
             "hook", list(args), resilient_parsing=True, help_option_names=help_names
         )
-        value = resilient.params.get("host")
-        return HookRegistration(
-            None, runs_bridge=False, host=value if isinstance(value, str) else None
-        )
+        return _registration(resilient, runs_bridge=False)
     except Exception:
         # A usage error stops Click at the offending token, so options after
         # it were never read: the host is unknown (``--typo --host claude``).
         return HookRegistration(None, runs_bridge=False, host=None)
+    return _registration(strict, runs_bridge=True)
+
+
+def _registration(ctx: click.Context, *, runs_bridge: bool) -> HookRegistration:
+    """The reading of a parsed context. A group stops reading options at its
+    first leftover token (a subcommand name, an unknown word, or ``--``), so
+    any later ``--host`` was never parsed and the host is unknown."""
     # Click 8.x keeps the first leftover token in ``protected_args``
     # (deprecated; folded into ``args`` in 9.0).
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        leftover = [*getattr(strict, "protected_args", ()), *strict.args]
-    value = strict.params.get("host")
-    return HookRegistration(
-        None, runs_bridge=not leftover, host=value if isinstance(value, str) else None
-    )
+        leftover = [*getattr(ctx, "protected_args", ()), *ctx.args]
+    value = ctx.params.get("host")
+    if leftover or not isinstance(value, str):
+        return HookRegistration(None, runs_bridge=False, host=None)
+    return HookRegistration(None, runs_bridge=runs_bridge, host=value)
 
 
 def inspect_hook_registration(handler: dict[str, Any], *, windows: bool) -> HookRegistration:
@@ -197,7 +202,8 @@ def inspect_hook_registration(handler: dict[str, Any], *, windows: bool) -> Hook
     neither shell Claude Code may use there (Git Bash, PowerShell), nor Git's
     MSYS ``env.exe``, is guaranteed to pass the words through as written.
     A field that is present must have its documented type: ``"args": null``
-    and ``"shell": null`` are not read as absent.
+    and ``"shell": null`` are not read as absent, and ``shell`` next to
+    ``args`` is not read at all.
     """
     command: str = handler["command"]
     if "args" in handler:
@@ -205,6 +211,10 @@ def inspect_hook_registration(handler: dict[str, Any], *, windows: bool) -> Hook
         # Exec form: no shell; each element is one argument as written.
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             return HookRegistration(ARGS_FIELD)
+        if "shell" in handler:
+            # Whether Claude Code honors ``shell`` next to ``args`` is not
+            # documented, so neither reading can be relied on.
+            return HookRegistration(SHELL_FIELD)
         if not all(_WORD.fullmatch(a) for a in args):
             return HookRegistration(NOT_PLAIN)
         words = [command, *args]

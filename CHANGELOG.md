@@ -18,19 +18,20 @@ changes inline only. See the deprecation policy in
   claude` writes, and reports by location the STM hook commands that lack
   `--host claude`, so hook compression, if enabled, never replaces their
   output, or that do not run the hook at all (`--help`, a usage error, a
-  subcommand). It reads only commands made of plain words (in exec form, only
-  the `args` must be), and marks anything else as not checked instead of
-  guessing how the shell would run it. That covers quotes, `$HOME` or `~`,
-  settings other than `MEMTOMEM_STM_*` before the executable, a launcher other
-  than `env` or `uv run --directory`, and on Windows shell form and the `env`
-  launcher. It never shows command text. A
-  settings file it cannot read is a WARN naming only the exception type. It is
-  not gated on compression being enabled, and it is WARN-only, so doctor's
-  exit code does not change. The suggested fix is a hand edit rather than
-  `mms hook install --apply`: install merges every STM handler it recognizes
-  into one, drops most inline `env` settings, and does not recognize a
-  `NAME=value mms hook` line. Project, local and managed Claude Code settings
-  are not read.
+  subcommand or another leftover word). It reads only commands made of plain
+  words (in exec form, the `args`), and marks anything else as not checked
+  instead of guessing how the shell would run it. That covers quotes, `$HOME`
+  or `~`, settings other than `MEMTOMEM_STM_*` before the executable, a
+  launcher other than `env` or `uv run --directory`, and the `env` launcher on
+  Windows. On Windows, shell form is never read; those commands are listed
+  without making the row WARN, since install writes that form. It never shows
+  command text, and a settings file it cannot use is a WARN naming the reason,
+  never the file's contents. It is not gated on compression being enabled, and
+  it is WARN-only, so doctor's exit code does not change. The suggested fix is
+  a hand edit rather than `mms hook install --apply`: install merges every STM
+  handler it recognizes into one, drops most inline `env` settings, and does
+  not recognize a `NAME=value mms hook` line. Project, local and managed Claude
+  Code settings are not read.
 
 ### Fixed
 

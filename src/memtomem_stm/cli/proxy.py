@@ -11059,6 +11059,8 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     from memtomem_stm.cli import hook_hosts
     from memtomem_stm.cli.hook_cmd import host_authorizes_replacement
     from memtomem_stm.cli.hook_registration import (
+        NOT_PLAIN,
+        WINDOWS_SHELL,
         inspect_hook_registration,
         is_candidate,
         running_on_windows,
@@ -11068,16 +11070,13 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     try:
         path, handlers = hook_hosts.claude_post_tool_handlers()
     except Exception as exc:
-        # ``HookInstallError`` wraps the cause; its message can quote the
-        # path's directory, so only the type is shown.
-        kind = type(exc.__cause__ or exc).__name__
+        detail, action = _hook_settings_read_failure(exc)
         check(
             "hook_registration",
             label,
             "WARN",
-            f"the Claude Code user settings could not be read ({kind}); "
-            "STM hook registrations were not checked",
-            "make the Claude Code settings file readable, then rerun mms doctor",
+            f"{detail}; STM hook registrations were not checked",
+            action,
         )
         return
     if not handlers:
@@ -11090,19 +11089,33 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     ]
     if not readings:
         return
-    not_checked = [f"{loc} ({r.not_checked})" for loc, r in readings if r.not_checked]
     checked = [(loc, r) for loc, r in readings if not r.not_checked]
     stopped = [loc for loc, r in checked if not r.runs_bridge]
     lacking = [
         loc for loc, r in checked if r.host is not None and not host_authorizes_replacement(r.host)
     ]
+    passing = [loc for loc, r in checked if r.runs_bridge and loc not in lacking]
+    shell_syntax = [loc for loc, r in readings if r.not_checked == NOT_PLAIN]
+    # Shell form on Windows is not read at all, so even a correct install
+    # lands here; it is reported, but it is not a reason to WARN.
+    windows_shell = [loc for loc, r in readings if r.not_checked == WINDOWS_SHELL]
+    other = [
+        f"{loc} ({r.not_checked})"
+        for loc, r in readings
+        if r.not_checked and r.not_checked not in (NOT_PLAIN, WINDOWS_SHELL)
+    ]
+    notes = []
+    if passing:
+        notes.append(f"{len(passing)} pass --host claude to mms hook")
+    if windows_shell:
+        notes.append(
+            f"{len(windows_shell)} in shell form not checked on Windows, where Claude Code "
+            "may run them under Git Bash or PowerShell: " + ", ".join(windows_shell)
+        )
     where = f"in {path}; {_HOOK_REGISTRATION_SCOPE}"
-    if not (not_checked or stopped or lacking):
+    if not (stopped or lacking or shell_syntax or other):
         check(
-            "hook_registration",
-            label,
-            "PASS",
-            f"{len(readings)} STM hook command(s) pass --host claude to mms hook {where}",
+            "hook_registration", label, "PASS", f"STM hook commands: {'; '.join(notes)} — {where}"
         )
         return
     problems = []
@@ -11122,21 +11135,56 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
             "add --host claude where Claude Code routing is intended (or make the last "
             "--host claude), keeping each command's other settings"
         )
-    if not_checked:
+    if shell_syntax:
         problems.append(
-            f"{len(not_checked)} not checked (only plain words without quotes or "
-            "expansions, after a known launcher, are read): " + ", ".join(not_checked)
+            f"{len(shell_syntax)} not checked because of shell syntax (quotes, $, ~, # or "
+            "operators): " + ", ".join(shell_syntax)
         )
         steps.append(
-            "check the not-checked commands by hand, or spell them as plain words "
-            "(an absolute path instead of $HOME or ~)"
+            "spell the commands with shell syntax as plain words (an absolute path "
+            "instead of $HOME or ~)"
         )
+    if other:
+        problems.append(
+            f"{len(other)} not checked (an unknown launcher or an unsupported handler "
+            "field): " + ", ".join(other)
+        )
+        steps.append("check the other not-checked commands by hand")
+    if windows_shell:
+        problems.append(notes[-1])
     check(
         "hook_registration",
         label,
         "WARN",
         f"STM hook commands: {'; '.join(problems)} — {where}",
         "; then ".join(steps),
+    )
+
+
+def _hook_settings_read_failure(exc: Exception) -> tuple[str, str]:
+    """``(detail, next action)`` for a Claude Code settings file doctor could not
+    read. Messages are never shown: they can quote the path's directory."""
+    from memtomem_stm.cli import hook_hosts
+
+    if isinstance(exc, hook_hosts.HookConfigLocationUnknown):
+        return (
+            "CLAUDE_CONFIG_DIR does not name a usable directory",
+            "set CLAUDE_CONFIG_DIR to an absolute directory, or unset it",
+        )
+    if isinstance(exc, hook_hosts.HookConfigNotRegularFile):
+        return (
+            "the Claude Code user settings path is not a regular file",
+            "replace it with the settings JSON file, then rerun mms doctor",
+        )
+    if isinstance(exc, hook_hosts.HookConfigNotAnObject):
+        return (
+            "the Claude Code user settings are valid JSON but not an object",
+            "make the settings file's top level a JSON object, then rerun mms doctor",
+        )
+    kind = type(exc.__cause__ or exc).__name__
+    return (
+        f"the Claude Code user settings could not be read ({kind})",
+        "make the Claude Code settings file readable and valid JSON, then rerun mms doctor",
     )
 
 
