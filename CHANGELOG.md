@@ -59,7 +59,7 @@ changes inline only. See the deprecation policy in
   `CancelledError` that escaped a step, skipping every close after it, still
   exited 0 without the "teardown did not run to the end" warning. Completion
   is now recorded only when the sequence reaches its end, and a new lifespan
-  in the same process starts with it cleared (issue #1459). In local macOS
+  in the same process starts with it cleared (#1465, issue #1459). In local macOS
   runs, SIGINT sent immediately after the MCP handshake cut the teardown
   short this way.
   **Behavior change**: such a shutdown now exits 1 and logs the warning. A
