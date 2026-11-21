@@ -35,6 +35,28 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook install` and `mms hook uninstall` no longer keep quiet about an
+  STM hook they do not recognize, such as
+  `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook`. Install added its own
+  handler beside such a line and said nothing, and uninstall printed
+  `Removed` (or `no memtomem-stm hook found`) while it stayed in the config
+  and kept running. Both still leave it in place, but now name the location
+  of each handler that looks like STM's hook and is not one they manage,
+  never its text. They look where install itself looks in the host's
+  config file: `PostToolUse` for Claude Code and Codex, `postToolUse` for
+  Cursor, and every entry for Kimi (issue #1453).
+  **Behavior change**: when such a handler is present, both commands print a
+  `!` line naming its location: in the written file after an `--apply` that
+  writes, otherwise in the current file. Uninstall's status line then says it
+  covers only the hook it manages (`Removed the memtomem-stm hook install
+  manages.`, `not installed (no memtomem-stm hook that uninstall
+  manages).`); install's status lines are unchanged. Separately, an uninstall
+  that only prunes empty hook containers (an empty matcher group, event list
+  or `hooks` section) now says `Removed empty hook entries
+  only (no memtomem-stm hook that uninstall manages).` instead of `Removed
+  memtomem-stm's PostToolUse hook.` Config files are written exactly as
+  before.
+
 - `mms host sync --plan` no longer tells you to run an `--apply` that has
   nothing to do. The text preview always printed ``Run `mms host sync
   --apply` to execute.``, even when that run had nothing to write — every

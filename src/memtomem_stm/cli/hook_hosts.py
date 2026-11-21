@@ -45,9 +45,12 @@ Design choices (all surfaced to the operator before any write):
   immediately followed by a ``hook`` token), so re-running updates that block in
   place rather than appending a duplicate, regardless of whether it was
   registered global (``memtomem-stm hook …``) or source
-  (``uv run … memtomem-stm hook …``).
-* **Symmetric uninstall.** :func:`plan_uninstall` removes exactly the blocks
-  :func:`plan_install` would add — never a hand-written hook. Install is equally
+  (``uv run … memtomem-stm hook …``). A handler that only *looks* like STM's
+  hook (``NAME=value mms hook``) is not recognized; it is left alone and named
+  by location (:func:`unmanaged_stm_like`), never silently duplicated (#1453).
+* **Symmetric uninstall.** :func:`plan_uninstall` removes the blocks
+  :func:`_is_stm_hook_command` recognizes, the shapes :func:`plan_install`
+  writes, and names the look-alikes it leaves. Install is equally
   careful: a non-STM handler a user co-located in STM's matcher group is
   preserved across a re-install (see :func:`_nested_install`).
 * **Dry-run default + backup.** The CLI previews by default; an ``--apply`` write
@@ -520,7 +523,9 @@ class HookChange:
 
     ``changed`` drives whether :func:`apply_change` writes at all; ``status`` is
     the human verdict (``"create"`` / ``"update"`` / ``"already"`` for install;
-    ``"remove"`` / ``"absent"`` / ``"not_installed"`` for uninstall).
+    ``"remove"`` / ``"prune"`` (only emptied containers) / ``"absent"`` /
+    ``"not_installed"`` for uninstall). ``unmanaged`` / ``unmanaged_after``
+    locate the look-alike handlers left as they are, before and after.
     ``current_text`` is the verbatim prior file (``None`` when absent) — used both
     as the ``.bak`` payload and to show nothing will be lost. ``rendered_block`` is
     a readable snippet of just STM's block (the host's native format)."""
@@ -536,6 +541,12 @@ class HookChange:
     new_text: str
     rendered_block: str
     notes: tuple[str, ...]
+    unmanaged: tuple[str, ...] = ()
+    """Locations, in the current file, of handlers that look like STM's hook
+    but that install/uninstall do not recognize, so they stay as they are."""
+    unmanaged_after: tuple[str, ...] = ()
+    """The same handlers' locations in ``new_text`` (a merge or removal can
+    shift them)."""
 
 
 def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
@@ -591,7 +602,12 @@ def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:
     current = _read_current(_config_path(spec), spec.fmt)
     if current is None:
         return ()
-    data = current[0]
+    return _stm_hook_commands(host_tag, current[0])
+
+
+def _stm_hook_commands(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
+    """The STM hook commands :func:`_is_stm_hook_command` recognizes in parsed
+    config ``data``, in file order."""
     commands: list[str] = []
     if host_tag in {"claude", "codex"}:
         hooks = data.get("hooks")
@@ -613,6 +629,58 @@ def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:
         if isinstance(entries, list):
             commands.extend(entry["command"] for entry in entries if _is_stm_command_handler(entry))
     return tuple(commands)
+
+
+def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
+    """Locations of handlers in ``data`` that look like STM's hook but that
+    :func:`_is_stm_hook_command` does not recognize (#1453).
+
+    Install and uninstall leave these as they are, so a hand-written
+    ``NAME=value mms hook`` would otherwise run beside the installed hook with
+    nothing said. "Look like" is ``mms doctor``'s candidate test, which errs
+    toward matching; only locations are returned, never command text, which
+    can hold secret values. The containers are the ones install examines.
+    """
+    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
+    from memtomem_stm.cli.hook_registration import is_candidate
+
+    found: list[str] = []
+
+    def consider(location: str, handler: Any, *, typed: bool) -> None:
+        if not isinstance(handler, dict):
+            return
+        command = handler.get("command")
+        if not isinstance(command, str) or _is_stm_hook_command(command):
+            return
+        # Claude and Codex handlers name their ``type``, and only a ``command``
+        # handler runs anything. Cursor and Kimi entries are commands whatever
+        # else they hold (their merges match on ``command`` alone), so the type
+        # is set last, over any ``type`` field of their own.
+        probe = handler if typed else {**handler, "type": "command"}
+        if is_candidate(probe):
+            found.append(location)
+
+    if host_tag in {"claude", "codex"}:
+        hooks = data.get("hooks")
+        entries = hooks.get("PostToolUse") if isinstance(hooks, dict) else None
+        if isinstance(entries, list):
+            for i, entry in enumerate(entries):
+                inner = entry.get("hooks") if isinstance(entry, dict) else None
+                if isinstance(inner, list):
+                    for j, handler in enumerate(inner):
+                        consider(f"hooks.PostToolUse[{i}].hooks[{j}]", handler, typed=True)
+    elif host_tag == "cursor":
+        hooks = data.get("hooks")
+        entries = hooks.get("postToolUse") if isinstance(hooks, dict) else None
+        if isinstance(entries, list):
+            for i, entry in enumerate(entries):
+                consider(f"hooks.postToolUse[{i}]", entry, typed=False)
+    else:  # kimi: every entry, whatever its ``event``, as its install loop reads them
+        entries = data.get("hooks")
+        if isinstance(entries, list):
+            for i, entry in enumerate(entries):
+                consider(f"hooks[{i}]", entry, typed=False)
+    return tuple(found)
 
 
 def _is_non_directory(path: Path) -> bool:
@@ -709,7 +777,10 @@ def plan_install(host_tag: str, command: str) -> HookChange:
 
     Pure (no writes): parses the current config (if any), computes the merged
     result, and reports whether applying it would create / update / no-op. The
-    merge is idempotent — an existing STM block is replaced in place."""
+    merge is idempotent — an existing STM block is replaced in place. Handlers
+    that only look like STM's hook are left as they are and located in
+    ``unmanaged`` (current file) and ``unmanaged_after`` (``new_text``), both
+    from this one parse."""
     spec = HOOK_HOSTS[host_tag]
     path = _config_path(spec)
     current = _read_current(path, spec.fmt)
@@ -742,14 +813,20 @@ def plan_install(host_tag: str, command: str) -> HookChange:
         new_text=new_text,
         rendered_block=_render_block(host_tag, command),
         notes=spec.notes,
+        unmanaged=unmanaged_stm_like(host_tag, base),
+        unmanaged_after=unmanaged_stm_like(host_tag, new_data),
     )
 
 
 def plan_uninstall(host_tag: str) -> HookChange:
     """Plan removing STM's PostToolUse hook from ``host_tag``'s config.
 
-    Removes exactly what :func:`plan_install` adds (recognized by command shape).
-    A no-op when the file is absent or holds no STM block."""
+    Removes the handlers :func:`_is_stm_hook_command` recognizes, the shapes
+    :func:`plan_install` writes or refreshes. A handler that only looks like
+    STM's hook is left in place and reported in ``unmanaged``. A no-op when the
+    file is absent or holds no recognized STM block, except that emptied
+    containers (an empty matcher group, event list or ``hooks`` section) are
+    still pruned (status ``prune``)."""
     spec = HOOK_HOSTS[host_tag]
     path = _config_path(spec)
     current = _read_current(path, spec.fmt)
@@ -780,12 +857,21 @@ def plan_uninstall(host_tag: str) -> HookChange:
         path=path,
         fmt=spec.fmt,
         action="uninstall",
-        status="remove" if changed else "not_installed",
+        # ``prune``: only empty containers go (a matcher group, event list or
+        # ``hooks`` section with nothing in it), so
+        # nothing the hook ran is removed and "Removed" would be false.
+        status=(
+            ("remove" if _stm_hook_commands(host_tag, base) else "prune")
+            if changed
+            else "not_installed"
+        ),
         changed=changed,
         current_text=current_text,
         new_text=new_text,
         rendered_block="",
         notes=(),
+        unmanaged=unmanaged_stm_like(host_tag, base),
+        unmanaged_after=unmanaged_stm_like(host_tag, new_data),
     )
 
 

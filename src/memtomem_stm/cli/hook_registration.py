@@ -13,7 +13,9 @@ is what Click makes of them. Whether the executable resolves, and whether
 compression is enabled for the hook process, are not claimed.
 
 Kept out of :mod:`memtomem_stm.cli.hook_cmd` so the runtime bridge's import
-path does not grow; only doctor imports this module.
+path does not grow. Its callers are ``mms doctor``, and ``mms hook install``
+and ``mms hook uninstall``, which import :func:`is_candidate` lazily (through
+``hook_hosts.unmanaged_stm_like``) to name look-alike handlers they leave alone.
 """
 
 from __future__ import annotations
