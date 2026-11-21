@@ -32,6 +32,23 @@ changes inline only. See the deprecation policy in
   handler it recognizes into one, drops most inline `env` settings, and does
   not recognize a `NAME=value mms hook` line. Project, local and managed Claude
   Code settings are not read.
+- `scripts/stm_trial.py --status` (#1454, repository only) prints the holdout
+  trial's progress toward its frozen target as one JSON object: copied
+  assignments, pre-freeze and rate-excluded rows, and the provisional count of
+  analysable assigned eligible memories, with the extractor's coverage:
+  finished and unfinished run counts over all runs, a worst-case time since the
+  last copy, and, from the freeze on, the largest uncovered gap between
+  finished runs, the largest worst-case gap (none, with a note, when runs
+  overlap), and the distinct retention settings recorded by runs that finished
+  at or after it, with a note when a gap outlasts the shortest recorded
+  `cleanupPeriodDays`. It applies no retention-gap exclusion and draws no stop
+  verdict, because the settings an extractor run recorded cannot prove the
+  retention the daemon pruned with. It reads no outcome and nothing per arm,
+  opens both databases read-only (SQLite may still create its WAL `-wal` and
+  `-shm` files) and counts from one snapshot, and refuses (exit 1) before the
+  freeze, under another HMAC key, or on a trial database it cannot read or
+  whose path cannot be inspected. **Behavior change**: the script gains
+  a `--status` mode; the extractor, `--freeze` and `--purge` behave as before.
 
 ### Fixed
 
@@ -238,6 +255,16 @@ changes inline only. See the deprecation policy in
   for a character outside the Basic Multilingual Plane); a host that parses
   it reads the same values as before. Hook input is read as UTF-8
   whatever the locale, with a leading byte-order mark ignored.
+- `mms doctor`'s `hook registration` row counts more STM hooks spelled with
+  quotes. A line made only of plain words and quotes, up to 4,096 characters,
+  is now also matched on the words left after quote removal, so `m"m"s hook`
+  next to `mms hook --host claude` is counted, marked not checked, and the
+  row WARNs instead of reporting PASS. A quoted hook in a longer line, or in
+  a line with other shell syntax (a comment, an operator, a line
+  continuation), gets only the raw-text search as before, which can miss it
+  and still let the row PASS. A plain command whose `hook` is only part of a
+  word, such as `mms status --config /tmp/hook.json`, is no longer counted
+  as an STM hook (#1455, issue #1450).
 
 ## [0.7.9] — 2026-11-15
 

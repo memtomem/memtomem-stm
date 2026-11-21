@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import io
 import re
+import shlex
 import sys
 import warnings
 from dataclasses import dataclass
@@ -32,10 +33,10 @@ import click
 
 from memtomem_stm.cli.hook_hosts import _STM_EXECUTABLES
 
-# A loose test for "this handler means to run STM's hook", independent of
-# whether the line can be read: an STM executable name, then later a ``hook``
-# word. Over-matching is safe because a match that does not fit a checkable
-# shape is reported as not checked, never given a verdict.
+# The loose fallback of :func:`is_candidate` for lines with shell syntax: an STM
+# executable name, then later a ``hook`` word, anywhere in the raw text.
+# Over-matching is safe because a match that does not fit a checkable shape is
+# reported as not checked, never given a verdict.
 # Two searches, not one ``exe.*?hook`` pattern, so a long line of repeated
 # executable names without ``hook`` costs one scan rather than one per name: if
 # no ``hook`` follows the first name, none follows a later one either.
@@ -54,6 +55,15 @@ _NOT_EXECUTABLE = re.compile(r"[=\x00-\x1f\x7f]")
 # word can look like an assignment and run as a command name.
 _WORD = re.compile(r"[A-Za-z0-9_./:=+-]+")
 _SHELL_LINE = re.compile(r"[A-Za-z0-9_./:=+\- \t]*")
+# The plain characters plus quotes and nothing else: no ``\``, ``$``, backtick,
+# ``#``, line break, operator or redirection. In such a line the shell's only
+# step that changes words is quote removal, which ``shlex`` performs, so its
+# words are a fair (not exact: assignments and reserved words are not modelled)
+# reading of what the shell joins. Used only to decide candidacy, never to read.
+_QUOTED_LINE = re.compile(r"[A-Za-z0-9_./:=+\- \t'\"]*")
+# ``shlex`` grows a token by repeated concatenation, which is quadratic in its
+# length; past this a line gets only the raw search.
+_QUOTED_MAX_CHARS = 4096
 # Only STM's own settings may prefix the command; any other name (``PATH``,
 # Click's ``_MMS_COMPLETE``) can change what runs or how it dispatches.
 _STM_ASSIGNMENT = re.compile(r"MEMTOMEM_STM_[A-Za-z0-9_]*=[A-Za-z0-9_./:=+-]*")
@@ -94,21 +104,64 @@ def running_on_windows() -> bool:
 
 
 def is_candidate(handler: Any) -> bool:
-    """Whether ``handler`` is a command handler that means to run STM's hook."""
+    """Whether ``handler`` looks like a command handler meant to run STM's hook.
+
+    A heuristic for which handlers to report on, not a reading of them. Plain
+    words are the arguments as passed, so they must hold a word naming an STM
+    executable and a later word ``hook``. A shell line of at most
+    ``_QUOTED_MAX_CHARS`` characters made only of plain words and quotes also
+    counts when the words left by quote removal do (``m"m"s hook``), in
+    addition to the loose raw-text search every other line gets, longer ones
+    included. It over-matches some commands that only mention STM (``echo
+    m"m"s ho"ok"``), and other shell syntax can still hide a hook.
+    """
     if not isinstance(handler, dict) or handler.get("type") != "command":
         return False
     command = handler.get("command")
     if not isinstance(command, str):
         return False
     args = handler.get("args")
-    text = command
     if isinstance(args, list):
-        text += " " + " ".join(a for a in args if isinstance(a, str))
-    elif isinstance(args, str):
+        # Exec form: no shell, so each element is one argument as written.
+        words = [command, *(a for a in args if isinstance(a, str))]
+        if all(_WORD.fullmatch(word) for word in words):
+            return _names_the_hook(words)
+        return _raw_names_the_hook(" ".join(words))
+    text = command
+    if isinstance(args, str):
         # Malformed (not a list), but still meant as STM's hook: report it.
         text += " " + args
+    if _SHELL_LINE.fullmatch(text):
+        return _names_the_hook(text.split())
+    if len(text) <= _QUOTED_MAX_CHARS and _QUOTED_LINE.fullmatch(text):
+        words_or_none = _quoted_words(text)
+        if words_or_none is not None and _names_the_hook(words_or_none):
+            return True
+    return _raw_names_the_hook(text)
+
+
+def _names_the_hook(words: list[str]) -> bool:
+    """Whether a word names an STM executable and a later word is ``hook``.
+    Linear: only the first such word is tried, since a ``hook`` after a later
+    one is also after the first."""
+    for i, word in enumerate(words):
+        if _CANDIDATE_EXE.search(word):
+            return any(later.casefold() == "hook" for later in words[i + 1 :])
+    return False
+
+
+def _raw_names_the_hook(text: str) -> bool:
     exe = _CANDIDATE_EXE.search(text)
     return exe is not None and _CANDIDATE_HOOK.search(text, exe.end()) is not None
+
+
+def _quoted_words(text: str) -> list[str] | None:
+    """The words of a quotes-only line after quote removal, or ``None`` when
+    its quotes do not balance."""
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return None
 
 
 def _executable_name(word: str, *, windows: bool) -> str:
