@@ -38,7 +38,8 @@ _NEXT_HOST = (
     "--host claude), keeping each command's other settings"
 )
 _NEXT_PLAIN = (
-    "spell the commands with shell syntax as plain words (an absolute path instead of $HOME or ~)"
+    "check the commands with shell syntax by hand, or spell them as plain words where that "
+    "keeps their behavior (e.g. an absolute path instead of $HOME or ~)"
 )
 _NEXT_BY_HAND = "check the other not-checked commands by hand"
 
@@ -416,31 +417,34 @@ def test_this_macs_registration_shape_is_not_checked(tmp_path: Path, claude_dir:
     assert row["next_action"] == _NEXT_PLAIN
 
 
-def test_windows_shell_form_is_reported_without_a_warning(
+def test_windows_shell_form_warns_with_windows_advice(
     tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Shell form is never read on Windows, so install's own output lands there;
-    the row says so but does not WARN for it."""
+    """Shell form is never read on Windows, so even install's own output is
+    unverified there: WARN, with advice that fits (a plain-word rewrite would
+    not make it checkable). Exec form is still read and can pass."""
     monkeypatch.setattr(hr, "running_on_windows", lambda: True)
     path = _write(
         claude_dir,
-        _cmd("memtomem-stm hook --host claude --use-daemon"),
+        _cmd("mms hook --help"),
         {"type": "command", "command": "mms.exe", "args": ["hook", "--host", "claude"]},
     )
 
     row = _row(tmp_path)
 
-    assert row["status"] == "PASS"
+    assert row["status"] == "WARN"
     assert row["detail"] == (
-        f"{_PREFIX}1 pass --host claude to mms hook; 1 in shell form not checked on Windows, "
-        f"where Claude Code may run them under Git Bash or PowerShell: {_LOC0} — in {path}; "
-        f"{_SCOPE}"
+        f"{_PREFIX}1 in shell form, which is not checked on Windows (Claude Code may run it "
+        f"under Git Bash or PowerShell): {_LOC0} — in {path}; {_SCOPE}"
+    )
+    assert row["next_action"] == (
+        "check by hand that each Windows shell-form command runs mms hook with --host claude"
     )
 
-    _write(claude_dir, _cmd("memtomem-stm hook --host claude"), _cmd("mms hook --help"))
-    monkeypatch.setattr(hr, "running_on_windows", lambda: True)
-    row = _row(tmp_path)
-    assert row["status"] == "PASS"  # both are shell form, so neither is read
+    _write(
+        claude_dir, {"type": "command", "command": "mms.exe", "args": ["hook", "--host", "claude"]}
+    )
+    assert _row(tmp_path)["status"] == "PASS"
 
 
 def test_default_settings_path_without_claude_config_dir(

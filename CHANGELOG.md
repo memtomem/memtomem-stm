@@ -23,8 +23,8 @@ changes inline only. See the deprecation policy in
   instead of guessing how the shell would run it. That covers quotes, `$HOME`
   or `~`, settings other than `MEMTOMEM_STM_*` before the executable, a
   launcher other than `env` or `uv run --directory`, and the `env` launcher on
-  Windows. On Windows, shell form is never read; those commands are listed
-  without making the row WARN, since install writes that form. It never shows
+  Windows. On Windows, shell form is never read, so those commands, install's
+  own output included, WARN with advice to check them by hand. It never shows
   command text, and a settings file it cannot use is a WARN naming the reason,
   never the file's contents. It is not gated on compression being enabled, and
   it is WARN-only, so doctor's exit code does not change. The suggested fix is

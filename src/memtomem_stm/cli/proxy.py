@@ -11097,26 +11097,22 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     lacking_set = set(lacking)
     passing = [loc for loc, r in checked if r.runs_bridge and loc not in lacking_set]
     shell_syntax = [loc for loc, r in readings if r.not_checked == NOT_PLAIN]
-    # Shell form on Windows is not read at all, so even a correct install
-    # lands here; it is reported, but it is not a reason to WARN.
+    # Shell form on Windows is never read, so even install's own output lands
+    # here. It still WARNs, because nothing was verified, but with advice that
+    # fits: rewriting it as plain words would not make it checkable.
     windows_shell = [loc for loc, r in readings if r.not_checked == WINDOWS_SHELL]
     other = [
         f"{loc} ({r.not_checked})"
         for loc, r in readings
         if r.not_checked and r.not_checked not in (NOT_PLAIN, WINDOWS_SHELL)
     ]
-    notes = []
-    if passing:
-        notes.append(f"{len(passing)} pass --host claude to mms hook")
-    if windows_shell:
-        notes.append(
-            f"{len(windows_shell)} in shell form not checked on Windows, where Claude Code "
-            "may run them under Git Bash or PowerShell: " + ", ".join(windows_shell)
-        )
     where = f"in {path}; {_HOOK_REGISTRATION_SCOPE}"
-    if not (stopped or lacking or shell_syntax or other):
+    if not (stopped or lacking or shell_syntax or windows_shell or other):
         check(
-            "hook_registration", label, "PASS", f"STM hook commands: {'; '.join(notes)} — {where}"
+            "hook_registration",
+            label,
+            "PASS",
+            f"STM hook commands: {len(passing)} pass --host claude to mms hook — {where}",
         )
         return
     problems = []
@@ -11142,8 +11138,16 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
             "operators): " + ", ".join(shell_syntax)
         )
         steps.append(
-            "spell the commands with shell syntax as plain words (an absolute path "
-            "instead of $HOME or ~)"
+            "check the commands with shell syntax by hand, or spell them as plain words "
+            "where that keeps their behavior (e.g. an absolute path instead of $HOME or ~)"
+        )
+    if windows_shell:
+        problems.append(
+            f"{len(windows_shell)} in shell form, which is not checked on Windows (Claude "
+            "Code may run it under Git Bash or PowerShell): " + ", ".join(windows_shell)
+        )
+        steps.append(
+            "check by hand that each Windows shell-form command runs mms hook with --host claude"
         )
     if other:
         problems.append(
@@ -11151,8 +11155,6 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
             "field): " + ", ".join(other)
         )
         steps.append("check the other not-checked commands by hand")
-    if windows_shell:
-        problems.append(notes[-1])
     check(
         "hook_registration",
         label,
