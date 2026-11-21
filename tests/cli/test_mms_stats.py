@@ -1367,6 +1367,11 @@ class TestMmsStatsAllTime:
         assert result.exit_code == 0, result.output
         assert "All-time totals unavailable" in result.output
         assert "calls:" not in result.output.split("Progressive delivery")[0]
+        # The hook split follows the summary it belongs to: unavailable too,
+        # though the retained rows are readable (the rollup arrives on the
+        # next writing open).
+        data = json.loads(runner.invoke(cli, ["stats", "--all-time", "--json"]).output)
+        assert (data["hook_by_host"], data["hook_status"]) == (None, None)
         raw = sqlite3.connect(str(db))
         tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master")}
         raw.close()
