@@ -11130,7 +11130,7 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
         )
         steps.append(
             "add --host claude where Claude Code routing is intended (or make the last "
-            "--host claude), keeping each command's other settings"
+            "--host claude), before any standalone --, keeping each command's other settings"
         )
     if shell_syntax:
         problems.append(

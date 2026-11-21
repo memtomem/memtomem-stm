@@ -35,7 +35,7 @@ _SCOPE = "project, local and managed Claude Code settings are not read"
 _NEXT_RUN = "fix the arguments of the commands that do not run the hook"
 _NEXT_HOST = (
     "add --host claude where Claude Code routing is intended (or make the last "
-    "--host claude), keeping each command's other settings"
+    "--host claude), before any standalone --, keeping each command's other settings"
 )
 _NEXT_PLAIN = (
     "check the commands with shell syntax by hand, or spell them as plain words where that "
@@ -80,6 +80,9 @@ def _read(command: str, *, windows: bool = False, **fields: Any) -> hr.HookRegis
             "claude",
         ),
         ("mms\thook  --host claude ", "claude"),
+        # A bare ``--`` ends the options but runs the bridge; a --host appended
+        # after it would be a leftover word, hence the advice's "before any --".
+        ("mms hook --", "auto"),
     ],
 )
 def test_plain_command_reads_its_host(command: str, host: str) -> None:
