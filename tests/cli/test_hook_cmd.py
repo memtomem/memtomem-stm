@@ -440,9 +440,7 @@ def test_cli_barrier_serialize_failure_degrades_to_nothing(monkeypatch: pytest.M
         def serialize(self, output):  # type: ignore[override]
             raise RuntimeError("serialize exploded")
 
-    monkeypatch.setattr(
-        "memtomem_stm.cli.hook_cmd.get_adapter", lambda *a, **k: _BrokenAdapter()
-    )
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.get_adapter", lambda *a, **k: _BrokenAdapter())
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(return_value={}))
     result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
     assert result.exit_code == 0
@@ -1023,7 +1021,12 @@ def test_record_hook_metrics_writes_source_hook_row(tmp_path: Path):
     cfg = _metrics_config(tmp_path)
     updated = {"stdout": f"{_COMPRESS_SENTINEL}\nshort", "stderr": ""}
     _record_hook_metrics(
-        _canonical(_bash_payload({"stdout": _BIG_STDOUT})), updated, _BLOCK, cfg, "claude"
+        _canonical(_bash_payload({"stdout": _BIG_STDOUT})),
+        updated,
+        _BLOCK,
+        cfg,
+        "claude",
+        "compressed",
     )
 
     summary = read_compression_summary(tmp_path / "metrics.db", source="hook")
@@ -1064,7 +1067,12 @@ def test_record_hook_metrics_does_not_reconcile_foreign_sources(tmp_path: Path):
     cfg = _metrics_config(tmp_path)
     cfg.proxy.metrics.max_history = 10
     _record_hook_metrics(
-        _canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg, "claude"
+        _canonical(_bash_payload({"stdout": _BIG_STDOUT})),
+        None,
+        None,
+        cfg,
+        "claude",
+        "below_threshold",
     )
 
     db = sqlite3.connect(str(tmp_path / "metrics.db"))
@@ -1088,7 +1096,7 @@ def test_record_hook_metrics_no_compression_original_equals_compressed(tmp_path:
         "tool_response": {"content": "y" * 4000},
     }
     # Both stages no-op (Read is never compressed; no surfaced context).
-    _record_hook_metrics(_canonical(payload), None, None, cfg, "claude")
+    _record_hook_metrics(_canonical(payload), None, None, cfg, "claude", "ineligible_tool")
 
     row = read_compression_summary(tmp_path / "metrics.db", source="hook")["by_tool"][0]
     assert row["tool"] == "Read"
@@ -1259,6 +1267,157 @@ def test_bare_and_explicit_claude_record_the_same_host(
     assert rows == [("builtin:claude", 0), ("builtin:claude", 1)]
 
 
+def _codex_bash_payload() -> dict:
+    return json.loads(
+        (_HOOK_FIXTURES / "codex/inbound_bash_posttooluse.json").read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "adapter", "payload", "allow", "env", "status"),
+    [
+        # Disabled first: a hook that never turned compression on is not one
+        # missing ``--host claude``, and not an incapable host either.
+        (False, ClaudeHookAdapter(), "big", None, {}, "disabled"),
+        (False, ClaudeHookAdapter(), "big", False, {}, "disabled"),
+        (False, CodexHookAdapter(), "codex", True, {}, "disabled"),
+        # The adapter's capability wins over an explicit opt-in, even on
+        # output Claude would have compressed.
+        (True, CodexHookAdapter(), "codex_big", True, {}, "unsupported_host"),
+        (True, CodexHookAdapter(), "codex", None, {}, "unsupported_host"),
+        # Bare ``mms hook`` on Claude (#1437): capable host, refused by the CLI.
+        (True, ClaudeHookAdapter(), "big", False, {}, "replacement_not_requested"),
+        # ``None`` (direct callers) defers to the adapter, as ``True`` does.
+        (True, ClaudeHookAdapter(), "big", "omitted", {}, "compressed"),
+        (True, ClaudeHookAdapter(), "big", True, {}, "compressed"),
+        (True, ClaudeHookAdapter(), "small", True, {}, "below_threshold"),
+        (True, ClaudeHookAdapter(), "failed", True, {}, "unsafe_result"),
+        (
+            True,
+            ClaudeHookAdapter(),
+            "big",
+            True,
+            {"MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION": "0.99"},
+            "retention_guard",
+        ),
+    ],
+    ids=[
+        "disabled-claude-default",
+        "disabled-bare-claude",
+        "disabled-codex",
+        "codex-opt-in-ignored",
+        "codex-default",
+        "bare-claude",
+        "claude-direct-caller",
+        "explicit-claude",
+        "below-threshold",
+        "unsafe-result",
+        "retention-guard",
+    ],
+)
+def test_orchestrate_records_the_compression_status(
+    enabled: bool,
+    adapter,
+    payload: str,
+    allow: bool | str | None,
+    env: dict[str, str],
+    status: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_hook_state: tuple[Path, Path],
+):
+    """Each decision the compression stage makes lands on the row (#1438).
+
+    Asserted together with what the host was sent and with
+    ``compression_strategy`` on the same row: the status is a new column, so a
+    replacement still reads ``truncate`` and every pass-through keeps a NULL
+    strategy — no status may leak into the strategy column.
+    """
+    import sqlite3
+
+    metrics_db, _home = _hermetic_hook_state
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1" if enabled else "0")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+    payloads = {
+        "big": _bash_payload({"stdout": _BIG_STDOUT}),
+        "small": _bash_payload({"stdout": "ok\n"}),
+        "failed": _bash_payload({"stdout": _BIG_STDOUT, "exitCode": 1}),
+        "codex": _codex_bash_payload(),
+        "codex_big": {**_codex_bash_payload(), "tool_response": {"stdout": _BIG_STDOUT}},
+    }
+
+    kwargs = {} if allow == "omitted" else {"allow_output_replacement": allow}
+    out = asyncio.run(_orchestrate(payloads[payload], adapter, **kwargs))
+
+    replaced = status == "compressed"
+    assert ("updatedToolOutput" in json.dumps(out)) is replaced
+    db = sqlite3.connect(str(metrics_db))
+    try:
+        rows = db.execute(
+            "SELECT hook_compression_status, compression_strategy FROM proxy_metrics"
+        ).fetchall()
+    finally:
+        db.close()
+    assert rows == [(status, "truncate" if replaced else None)]
+
+
+def test_every_compression_status_is_a_recorded_status(monkeypatch: pytest.MonkeyPatch):
+    """``HOOK_COMPRESSION_STATUSES`` is exactly what the hook can write.
+
+    Each ``compress_builtin`` branch is driven for real, then the two refusals
+    only ``_orchestrate`` makes are added: a status missing from the set would
+    print as ``other``, and a name in the set nothing writes is dead.
+    """
+    from memtomem_stm.proxy import compression as compression_mod
+    from memtomem_stm.proxy.metrics import HOOK_COMPRESSION_STATUSES
+
+    big = {"stdout": _BIG_STDOUT}
+    cases = [
+        (_bash_call(big), HookCompressionConfig(enabled=False), "disabled"),
+        (_bash_call(big, event="PreToolUse"), _CFG, "ineligible_event"),
+        (_bash_call(big, tool="Read"), _CFG, "ineligible_tool"),
+        (_bash_call(_BIG_STDOUT), _CFG, "unsupported_shape"),
+        (_bash_call({**big, "interrupted": True}), _CFG, "unsafe_result"),
+        (
+            _bash_call({"stdout": f"{_COMPRESS_SENTINEL}\n" + _BIG_STDOUT}),
+            _CFG,
+            "already_compressed",
+        ),
+        (_bash_call({"stdout": "ok"}), _CFG, "below_threshold"),
+        (
+            _bash_call(big),
+            HookCompressionConfig(enabled=True, max_chars=1, min_retention=0.0),
+            "budget_too_small",
+        ),
+        (
+            _bash_call(big),
+            HookCompressionConfig(enabled=True, max_chars=2000, min_retention=0.99),
+            "retention_guard",
+        ),
+        (_bash_call(big), _CFG, "compressed"),
+    ]
+    produced = set()
+    for call, cfg, expected in cases:
+        status = compress_builtin(call, cfg).status
+        assert status == expected
+        produced.add(status)
+
+    def _boom(self, text, *, max_chars):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(compression_mod.TruncateCompressor, "compress", _boom)
+    error = compress_builtin(_bash_call(big), _CFG).status
+    assert error == "error"
+    produced.add(error)
+
+    assert produced | {"unsupported_host", "replacement_not_requested"} == (
+        HOOK_COMPRESSION_STATUSES
+    )
+
+
 def test_orchestrate_metrics_count_preserved_stderr_in_the_compressed_size(
     monkeypatch: pytest.MonkeyPatch,
     _hermetic_hook_state: tuple[Path, Path],
@@ -1288,7 +1447,12 @@ def test_orchestrate_metrics_count_preserved_stderr_in_the_compressed_size(
 def test_record_hook_metrics_disabled_writes_nothing(tmp_path: Path):
     cfg = _metrics_config(tmp_path, enabled=False)
     _record_hook_metrics(
-        _canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg, "claude"
+        _canonical(_bash_payload({"stdout": _BIG_STDOUT})),
+        None,
+        None,
+        cfg,
+        "claude",
+        "below_threshold",
     )
     assert not (tmp_path / "metrics.db").exists()  # store never opened
 
@@ -1302,6 +1466,7 @@ def test_record_hook_metrics_skips_empty_output(tmp_path: Path):
         None,
         cfg,
         "claude",
+        "unsupported_shape",
     )
     assert not (tmp_path / "metrics.db").exists()
 
@@ -1316,7 +1481,12 @@ def test_record_hook_metrics_never_raises_on_bad_store(tmp_path: Path):
         proxy=SimpleNamespace(metrics=SimpleNamespace(db_path=tmp_path, max_history=10000)),
     )
     _record_hook_metrics(
-        _canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, bad, "claude"
+        _canonical(_bash_payload({"stdout": _BIG_STDOUT})),
+        None,
+        None,
+        bad,
+        "claude",
+        "below_threshold",
     )
 
 
@@ -1341,7 +1511,12 @@ def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
         cfg = _metrics_config(tmp_path)  # db_path == db
         start = time.monotonic()
         _record_hook_metrics(
-            _canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg, "claude"
+            _canonical(_bash_payload({"stdout": _BIG_STDOUT})),
+            None,
+            None,
+            cfg,
+            "claude",
+            "below_threshold",
         )
         elapsed = time.monotonic() - start
     finally:
@@ -1380,7 +1555,7 @@ def test_record_hook_metrics_degrades_when_the_rollup_install_meets_a_lock(tmp_p
     blocker.execute("BEGIN IMMEDIATE")
     try:
         start = time.monotonic()
-        _record_hook_metrics(payload, None, None, cfg, "claude")
+        _record_hook_metrics(payload, None, None, cfg, "claude", "below_threshold")
         elapsed = time.monotonic() - start
     finally:
         blocker.rollback()
@@ -1389,7 +1564,7 @@ def test_record_hook_metrics_degrades_when_the_rollup_install_meets_a_lock(tmp_p
     assert elapsed < 2.0
     assert read_compression_all_time(db)["rollup"]["installed"] is False
 
-    _record_hook_metrics(payload, None, None, cfg, "claude")
+    _record_hook_metrics(payload, None, None, cfg, "claude", "below_threshold")
     after = read_compression_all_time(db, source="hook")
     assert after["rollup"]["installed"] is True
     assert after["total_calls"] == 1
@@ -2112,3 +2287,34 @@ def test_install_replaces_every_stm_handler_with_one(tmp_path: Path, monkeypatch
 
     handlers = json.loads(change.new_text)["hooks"]["PostToolUse"][0]["hooks"]
     assert [h["command"] for h in handlers] == ["mms hook --host claude"]
+
+
+@pytest.mark.parametrize(("stdout", "notice"), [(_BIG_STDOUT, True), ("ok\n", False)])
+def test_refused_status_and_notice_are_separate_decisions(
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_hook_state: tuple[Path, Path],
+    stdout: str,
+    notice: bool,
+):
+    """Every call of a registration without ``--host claude`` records
+    ``replacement_not_requested`` (#1438); only one compression would have
+    attempted also gets the notice (#1437)."""
+    import sqlite3
+
+    metrics_db, _home = _hermetic_hook_state
+    _refused_env(monkeypatch)
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+
+    out = asyncio.run(
+        _orchestrate(
+            _bash_payload({"stdout": stdout}), ClaudeHookAdapter(), allow_output_replacement=False
+        )
+    )
+
+    assert ("systemMessage" in out) is notice
+    db = sqlite3.connect(str(metrics_db))
+    try:
+        rows = db.execute("SELECT hook_compression_status FROM proxy_metrics").fetchall()
+    finally:
+        db.close()
+    assert rows == [("replacement_not_requested",)]

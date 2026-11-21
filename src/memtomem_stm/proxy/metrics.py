@@ -63,6 +63,34 @@ def hook_host_of(server: str) -> str | None:
     return server[len(_HOOK_SERVER_PREFIX) :] or None
 
 
+# Every value ``mms hook`` stores in ``hook_compression_status``: what the
+# native output-compression stage decided for that call. Readers render only
+# these names and fold anything else into "other", so a value written by
+# something other than this code never reaches a terminal verbatim.
+HOOK_COMPRESSION_STATUSES = frozenset(
+    {
+        "compressed",
+        # Not compressed, by gate:
+        "below_threshold",
+        "already_compressed",
+        "retention_guard",
+        "budget_too_small",
+        "unsafe_result",
+        # Not a candidate for compression:
+        "disabled",
+        "ineligible_event",
+        "ineligible_tool",
+        "unsupported_shape",
+        # The host cannot replace tool output (Codex, Cursor, Kimi).
+        "unsupported_host",
+        # The host can, but the hook was not registered with ``--host claude``
+        # (#1437): replacement is refused under host auto-detection.
+        "replacement_not_requested",
+        "error",
+    }
+)
+
+
 def format_error_message_from_exc(exc: BaseException) -> str:
     """Format an exception for ``CallMetrics.error_message`` (capped).
 
@@ -299,6 +327,12 @@ class CallMetrics:
     compression_accounting: str | None = None
     delivery_format: str = "legacy"
     wire_bytes: int | None = None
+    # ``source='hook'`` rows only: the native compression stage's decision, one
+    # of ``HOOK_COMPRESSION_STATUSES``. ``None`` on MCP rows and on hook rows
+    # written before the column existed. Kept apart from
+    # ``compression_strategy``, which names a strategy that ran — a call the
+    # gate passed over ran none. Last, so no positional caller shifts.
+    hook_compression_status: str | None = None
 
 
 class RPSTracker:

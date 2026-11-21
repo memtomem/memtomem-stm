@@ -319,7 +319,7 @@ def _compression_candidate(
     beyond the sentinel prefix — so the refused-replacement path in
     :func:`_orchestrate` can ask "would compression have been attempted?"
     without paying for an attempt. Unguarded itself: both callers
-    (:func:`compress_builtin`, :func:`_refused_replacement_outcome`) catch.
+    (:func:`compress_builtin`, :func:`_would_attempt_compression`) catch.
     """
     if not cfg.enabled:
         return BuiltinCompressionOutcome("disabled")
@@ -426,26 +426,20 @@ HOST_NOT_EXPLICIT_NOTICE = (
 )
 
 
-def _refused_replacement_outcome(
-    call: "CanonicalHookCall", cfg: "HookCompressionConfig"
-) -> BuiltinCompressionOutcome:
-    """Outcome for a replacement-capable adapter whose registration did not
-    authorize replacement (``--host`` other than ``claude``). **Never raises.**
+def _would_attempt_compression(call: "CanonicalHookCall", cfg: "HookCompressionConfig") -> bool:
+    """Whether :func:`compress_builtin` would have run its compressor on
+    ``call``, for a registration that did not authorize replacement
+    (``--host`` other than ``claude``). **Never raises.**
 
-    ``host_not_explicit`` when compression would have been attempted, so the
-    refusal can be reported; otherwise the ``unsupported_host`` the path has
-    always returned. Runs only the cheap gates: the compressor and the
-    retention guard are skipped, which is why the notice says the attempt was
-    not made rather than that output would have shrunk.
+    Runs only the cheap gates: the compressor and the retention guard are
+    skipped, which is why the notice says the attempt was not made rather
+    than that output would have shrunk.
     """
     try:
-        candidate = _compression_candidate(call, cfg)
+        return isinstance(_compression_candidate(call, cfg), _CompressionCandidate)
     except Exception:
         logger.debug("compression gate failed on the refused path", exc_info=True)
-        return BuiltinCompressionOutcome("unsupported_host")
-    if isinstance(candidate, _CompressionCandidate):
-        return BuiltinCompressionOutcome("host_not_explicit", original_chars=len(candidate.stdout))
-    return BuiltinCompressionOutcome("unsupported_host")
+        return False
 
 
 def maybe_compress_builtin(
@@ -781,6 +775,7 @@ def _record_hook_metrics(
     additional_context: str | None,
     config: "STMConfig",
     host_tag: str,
+    status: str,
 ) -> None:
     """Record one native built-in tool call into ``proxy_metrics.db`` (``source='hook'``).
 
@@ -789,7 +784,9 @@ def _record_hook_metrics(
     + the once-flattened ``tool_response_text``), so the raw payload is parsed
     exactly once. Persists **sizes only** (original / compressed / surfaced chars
     + the tool name, under a ``server`` that names the host — see
-    :func:`~memtomem_stm.proxy.metrics.hook_server_label`): never ``tool_input``
+    :func:`~memtomem_stm.proxy.metrics.hook_server_label`) and the compression
+    stage's ``status`` (one of
+    :data:`~memtomem_stm.proxy.metrics.HOOK_COMPRESSION_STATUSES`): never ``tool_input``
     and never the output text, mirroring
     the hook's no-query-text privacy posture (a ``Bash`` command may carry
     secrets). Gated on ``config.hook.metrics_enabled`` (independent of
@@ -839,6 +836,7 @@ def _record_hook_metrics(
                     surfaced_chars=surfaced_chars,
                     compression_strategy="truncate" if updated is not None else None,
                     source="hook",
+                    hook_compression_status=status,
                 )
             )
         finally:
@@ -899,27 +897,29 @@ async def _orchestrate(
         # already — this line carries the hint, not a second traceback.
         log_stm_config_failure(exc, logger=logger, context="orchestrating the hook", exc_info=False)
         raise
-    replacement_allowed = (
-        adapter.can_replace_output
-        if allow_output_replacement is None
-        else adapter.can_replace_output and allow_output_replacement
-    )
-    if replacement_allowed:
-        compression = compress_builtin(call, config.hook.compression)
-    elif adapter.can_replace_output:
-        # The adapter could replace output but the registration did not say
-        # ``--host claude``: the auto-detect refusal stays, and is reported
-        # when it cost an attempt (#1437).
-        compression = _refused_replacement_outcome(call, config.hook.compression)
-        if compression.status == "host_not_explicit":
-            # Reported before surfacing starts: if surfacing then runs past the
-            # outer hook deadline, the caller still has the notice to emit
-            # (``notices``), and stderr already carries it.
+    # Each refusal gets its own status, so ``mms stats`` can tell them apart.
+    # ``disabled`` comes first: a hook that never enabled compression must not
+    # read as one that is missing ``--host claude``. ``allow_output_replacement``
+    # is tri-state — ``None`` (direct callers) defers to the adapter.
+    notice = False
+    if not config.hook.compression.enabled:
+        compression = BuiltinCompressionOutcome("disabled")
+    elif not adapter.can_replace_output:
+        compression = BuiltinCompressionOutcome("unsupported_host")
+    elif allow_output_replacement is False:
+        compression = BuiltinCompressionOutcome("replacement_not_requested")
+        # The status above covers every call of such a registration; the
+        # notice only the ones compression would have attempted (#1437).
+        # Reported before surfacing starts: if surfacing then runs past the
+        # outer hook deadline, the caller still has the notice to emit
+        # (``notices``), and stderr already carries it.
+        notice = _would_attempt_compression(call, config.hook.compression)
+        if notice:
             logger.warning("%s", HOST_NOT_EXPLICIT_NOTICE)
             if notices is not None:
                 notices.append(HOST_NOT_EXPLICIT_NOTICE)
     else:
-        compression = BuiltinCompressionOutcome("unsupported_host")
+        compression = compress_builtin(call, config.hook.compression)
     logger.debug(
         "native compression status=%s original_chars=%d compressed_chars=%d",
         compression.status,
@@ -934,9 +934,11 @@ async def _orchestrate(
         except Exception:
             logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
-    _record_hook_metrics(call, updated, additional_context, config, adapter.host_tag)
+    _record_hook_metrics(
+        call, updated, additional_context, config, adapter.host_tag, compression.status
+    )
     rendered = adapter.render(updated_tool_output=updated, additional_context=additional_context)
-    if compression.status == "host_not_explicit":
+    if notice:
         # ``systemMessage`` is a top-level field of the JSON output that both
         # Claude Code and Codex document as a warning shown to the user.
         # Reachable only through a replacement-capable adapter, which is a

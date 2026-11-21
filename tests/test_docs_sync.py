@@ -1287,6 +1287,25 @@ def test_cli_md_stats_documents_source_filter() -> None:
         )
 
 
+def test_cli_md_stats_documents_the_hook_status_scope() -> None:
+    """The hook status breakdown is retained-only even under ``--all-time``
+    (the daily rollup keeps no status, #1438). Pin the JSON key, every status
+    name the hook can write, and the retained-only scope, so the prose cannot
+    drift into describing all-time counts or a status that no longer exists."""
+    from memtomem_stm.proxy.metrics import HOOK_COMPRESSION_STATUSES
+
+    cli_md = _read("docs/cli.md")
+    section_match = re.search(r"### `stats`\n(.*?)(?=\n### |\n## |\Z)", cli_md, re.DOTALL)
+    if not section_match:
+        pytest.fail("docs/cli.md must have a ### `stats` section")
+    section = section_match.group(1)
+    assert "`hook_status`" in section
+    assert '"scope": "retained"' in section
+    assert "retained rows only, also under `--all-time`" in section
+    missing = sorted(name for name in HOOK_COMPRESSION_STATUSES if f"`{name}`" not in section)
+    assert not missing, f"docs/cli.md `stats` must name every hook status: {missing}"
+
+
 def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
     """The hook guide, CLI reference, and live help must agree with host specs."""
     from click.testing import CliRunner
