@@ -26,6 +26,22 @@ changes inline only. See the deprecation policy in
   change**: one more line of install output in those cases; the written
   command is unchanged.
 
+### Fixed
+
+- A server shutdown started by SIGTERM, SIGINT or the parent-liveness backstop
+  no longer exits 0 when its teardown was cut short. The exit status was
+  meant to say whether the close sequence ran to the end, but the completion
+  was recorded in a `finally`, so it was recorded on every path. A
+  `CancelledError` that escaped a step, skipping every close after it, still
+  exited 0 without the "teardown did not run to the end" warning. Completion
+  is now recorded only when the sequence reaches its end, and a new lifespan
+  in the same process starts with it cleared (#1465, issue #1459). In local
+  macOS runs, SIGINT sent immediately after the MCP handshake cut the
+  teardown short this way.
+  **Behavior change**: such a shutdown now exits 1 and logs the warning. A
+  shutdown whose close sequence and leaked-child sweep both finish still
+  exits 0, including one where a step failed inside its own error handling.
+
 ## [0.7.10] — 2026-11-21
 
 ### Upgrade notes
