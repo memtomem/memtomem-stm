@@ -22,7 +22,7 @@ changes inline only. See the deprecation policy in
   changes.` The closing line is now decided by the
   same test the apply run uses to decide whether it writes anything: added,
   removed, backfilled, re-stamped and re-keyed entries and stale sidecar
-  rows (#1402).
+  rows (#1448, issue #1402).
   **Behavior change**: when that run would change nothing, the preview's
   closing line reads ``Nothing for `mms host sync --apply` to do.`` (with the same
   flags the old line named). A preview with changes to apply is unchanged,
