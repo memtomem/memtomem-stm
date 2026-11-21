@@ -31,10 +31,10 @@ _PREFIX = "STM hook commands: "
 _LACKING = "without --host claude, so hook compression, if enabled, never replaces their output: "
 _SHELL_SYNTAX = "not checked because of shell syntax (quotes, $, ~, # or operators): "
 _OTHER = "not checked (an unknown launcher or an unsupported handler field): "
-# What the row does not see, at the end of each detail that reports on commands (#1457).
+# What the row can miss, at the end of each detail that reports on commands (#1457).
 _SCOPE = (
     "an STM hook is recognized by an STM name and a later hook in the command text, so one "
-    "behind a wrapper script or with its name split by shell syntax is not seen; project, "
+    "behind a wrapper script or with its name split by shell syntax can be missed; project, "
     "local and managed Claude Code settings are not read"
 )
 _NEXT_RUN = "fix the arguments of the commands that do not run the hook"
@@ -345,8 +345,8 @@ def test_known_misses_recognition_cannot_close(handler: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        "mms version hook",  # runs ``mms version``
-        "mms status --config hook",  # runs ``mms status``
+        "mms version hook",  # the ``version`` subcommand, which rejects the extra word
+        "mms status --config hook",  # the ``status`` subcommand
         "echo /opt/bin/mms/README hook",  # runs ``echo``
     ],
 )
@@ -474,18 +474,19 @@ def test_pass_says_it_covers_recognized_commands_only(
     assert row["detail"] == (
         f"{_PREFIX}1 recognized, all passing --host claude to mms hook — in {path}; {_SCOPE}"
     )
-    assert "not seen" in row["detail"]
+    assert "can be missed" in row["detail"]
 
 
 def test_text_output_states_the_recognition_limit(tmp_path: Path, claude_dir: Path) -> None:
-    """The text renderer shows the same detail as ``--json``."""
-    _write(claude_dir, _cmd("mms hook --host claude"))
+    """The text renderer shows the whole detail that ``--json`` carries, once."""
+    path = _write(claude_dir, _cmd("mms hook --host claude"))
 
     result = CliRunner().invoke(cli, ["doctor", "--config", str(tmp_path / "absent.json")])
 
     line = next(line for line in result.output.splitlines() if "hook registration" in line)
-    assert "1 recognized, all passing --host claude to mms hook" in line
-    assert "behind a wrapper script or with its name split by shell syntax is not seen" in line
+    detail = f"{_PREFIX}1 recognized, all passing --host claude to mms hook — in {path}; {_SCOPE}"
+    assert line.endswith(detail)
+    assert line.count("can be missed") == 1
 
 
 @pytest.mark.parametrize("env", [None, "1", "0"])
