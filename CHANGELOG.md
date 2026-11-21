@@ -43,6 +43,25 @@ changes inline only. See the deprecation policy in
   those calls, including when surfacing times out. The tool output itself and
   the metrics row are unchanged. Registering with `--host claude` removes the
   warning and turns compression on.
+
+- `mms import` names the host config sources it chose not to read instead of
+  reporting them as missing. When STM cannot tell which file Claude Code or
+  Codex uses (`CLAUDE_CONFIG_DIR` or `CODEX_HOME` relative, a custom OAuth
+  URL, a legacy `.config.json`, an unusable home directory), cannot name the
+  Claude Code project entry (a linked worktree, a submodule, a symlinked
+  `.git`), or cannot read Claude Code's config or `.mcp.json` as a JSON
+  object, the scan skips that source — and with every source of the host
+  skipped the command said `No MCP definitions found from --from=<host>. Is
+  the host config in place?`, sending the user to look for a file STM had not
+  looked at. Each skipped source now gets one `Note: <source> not inspected:
+  <reason>.` line on stderr, ahead of the skipped-entry notes and the result,
+  with the reason wording `mms host scan` uses (#1407).
+  **Behavior change**: those notes are new stderr lines in `--plan` and
+  `--apply` alike, and an empty result with a skipped source now reads `No MCP
+  definitions found from --from=<host>; <n> sources were not inspected.` (`1
+  source was` for one). Output with no skipped source is unchanged, and exit
+  codes are unchanged.
+
 - `mms daemon status` and `mms daemon start` escape for display the values
   they print from a daemon that answers. On `start`'s "daemon already
   running" and "daemon started" lines (which `restart` prints too) those are
