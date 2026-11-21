@@ -1,11 +1,56 @@
 from __future__ import annotations
 
+import pytest
+
 from memtomem_stm.daemon.latency import (
     DaemonLatencyTracker,
     WINDOW_SIZE,
+    _ceil_half,
+    _percentile,
     hook_timeout_recommendation,
     recommendation_from_summary,
 )
+
+
+@pytest.mark.parametrize(
+    ("values", "percentile", "expected"),
+    [
+        ([], 50, 0.0),
+        ([3.0], 99, 3.0),
+        ([1.0, 2.0, 3.0, 4.0], 50, 2.5),
+        ([4.0, 1.0, 3.0, 2.0], 50, 2.5),
+        ([1.0, 2.0, 3.0, 4.0], 0, 1.0),
+        ([1.0, 2.0, 3.0, 4.0], 100, 4.0),
+        ([10.0, 20.0], 25, 12.5),
+        ([1.0, 2.0, 3.0], 50, 2.0),
+    ],
+)
+def test_percentile_direct(
+    values: list[float], percentile: float, expected: float
+) -> None:
+    assert _percentile(values, percentile) == expected
+
+
+def test_percentile_does_not_reorder_input() -> None:
+    values = [4.0, 1.0, 3.0, 2.0]
+    assert _percentile(values, 50) == 2.5
+    assert values == [4.0, 1.0, 3.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0.0, 0.0),
+        (0.1, 0.5),
+        (0.5, 0.5),
+        (0.51, 1.0),
+        (1.0, 1.0),
+        (1.26, 1.5),
+        (2.75, 3.0),
+    ],
+)
+def test_ceil_half_direct(value: float, expected: float) -> None:
+    assert _ceil_half(value) == expected
 
 
 def test_recommendation_requires_five_uncensored_samples() -> None:
