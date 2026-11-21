@@ -1112,19 +1112,36 @@ def status(
     at = now()
     completed = [r for r in runs if r[1] is not None]
     unfinished = [r[0] for r in runs if r[1] is None]
-    # a gap wholly before the freeze holds no assignment
-    pairs = [(p, n) for p, n in zip(completed, completed[1:]) if n[1] >= frozen_at]
-    observed = max((n[0] - p[1] for p, n in pairs), default=None)
-    worst = max((n[1] - p[0] for p, n in pairs), default=None)
+    # Gaps are measured against the latest end reached so far, so a long run that
+    # an earlier-starting one still covers is not a gap. A gap wholly before the
+    # freeze holds no assignment and is skipped.
+    gaps: list[float] = []
+    spans: list[float] = []
+    overlap = False
+    reach: float | None = None
+    for prev, nxt in zip(completed, completed[1:]):
+        reach = prev[1] if reach is None else max(reach, prev[1])
+        if nxt[1] < frozen_at:
+            continue
+        overlap = overlap or nxt[0] < reach
+        gaps.append(max(0.0, nxt[0] - reach))
+        spans.append(nxt[1] - prev[0])
+    observed = max(gaps, default=None)
+    # The worst case (one copy anywhere inside each run) is the next run's end
+    # minus this run's start only while runs are disjoint; once they overlap the
+    # copies can fall in any order, so no bound is claimed.
+    worst = None if overlap else max(spans, default=None)
     since_freeze = [r for r in completed if r[1] >= frozen_at]
     last_completed = max((r[1] for r in completed), default=None)
     since_copy = None if not completed else at - completed[-1][0]
     cleanups = [r[3] for r in since_freeze if r[3] and r[3] > 0]
     notes: list[str] = []
-    widest = max((g for g in (worst, since_copy) if g is not None), default=None)
+    if overlap:
+        notes.append("finished extractor runs overlap since the freeze; no worst-case gap is given")
+    widest = max((g for g in (worst, observed, since_copy) if g is not None), default=None)
     if cleanups and widest is not None and widest > min(cleanups) * 86400:
         notes.append(
-            f"a worst-case gap since the freeze ({widest / 86400:.1f} days) is longer than the "
+            f"a gap since the freeze (up to {widest / 86400:.1f} days) is longer than the "
             f"shortest recorded cleanupPeriodDays ({min(cleanups)}); outcomes from that span "
             "may be missing"
         )

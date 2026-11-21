@@ -32,14 +32,15 @@ changes inline only. See the deprecation policy in
   handler it recognizes into one, drops most inline `env` settings, and does
   not recognize a `NAME=value mms hook` line. Project, local and managed Claude
   Code settings are not read.
-- `scripts/stm_trial.py --status` (repository only) prints the holdout trial's
-  progress toward its frozen target as one JSON object: copied assignments,
-  pre-freeze and rate-excluded rows, and the provisional count of analysable
-  assigned eligible memories, with the extractor's coverage: finished and
-  unfinished run counts over all runs, a worst-case time since the last copy,
-  and, from the freeze on, the largest gaps between finished runs and the
-  distinct retention settings recorded by runs that finished at or after it,
-  with a note when a worst-case gap outlasts the shortest recorded
+- `scripts/stm_trial.py --status` (#1454, repository only) prints the holdout
+  trial's progress toward its frozen target as one JSON object: copied
+  assignments, pre-freeze and rate-excluded rows, and the provisional count of
+  analysable assigned eligible memories, with the extractor's coverage:
+  finished and unfinished run counts over all runs, a worst-case time since the
+  last copy, and, from the freeze on, the largest uncovered gap between
+  finished runs, the largest worst-case gap (none, with a note, when runs
+  overlap), and the distinct retention settings recorded by runs that finished
+  at or after it, with a note when a gap outlasts the shortest recorded
   `cleanupPeriodDays`. It applies no retention-gap exclusion and draws no stop
   verdict, because the settings an extractor run recorded cannot prove the
   retention the daemon pruned with. It reads no outcome and nothing per arm,

@@ -136,6 +136,45 @@ def test_stale_completed_run_is_noted(env: dict[str, Path]) -> None:
     assert not any("days ago" in n for n in _status(env, at=START + DAY)["notes"])
 
 
+def test_overlapping_runs_report_the_uncovered_gap_and_no_worst_case(
+    env: dict[str, Path],
+) -> None:
+    _run(env, FROZEN - DAY / 10, FROZEN - DAY / 10 + 60)  # keeps the straddling gap short
+    _run(env, FROZEN + 1 * DAY, FROZEN + 11 * DAY)  # a long run ...
+    _run(env, FROZEN + 3 * DAY, FROZEN + 4 * DAY)  # ... with a short one nested inside
+    _run(env, FROZEN + 12 * DAY, FROZEN + 13 * DAY)
+    out = _status(env, at=FROZEN + 13.5 * DAY)
+    cov = out["coverage"]
+    # uncovered: 1.1 d before the long run and 1 d after it — not the 8 d from
+    # the nested run's end, and never negative
+    assert cov["max_observed_gap_days_since_freeze"] == st._days(1.1 * DAY - 60)
+    assert cov["max_worst_case_gap_days_since_freeze"] is None
+    assert any("overlap" in n for n in out["notes"])
+    assert cov["worst_case_days_since_last_copy"] == 1.5
+
+
+def test_an_overlapping_only_pair_is_a_zero_gap_never_negative(env: dict[str, Path]) -> None:
+    _run(env, START + DAY, FROZEN - DAY)  # ends before the freeze: its pair is skipped
+    _run(env, FROZEN - 2 * DAY, FROZEN + DAY)  # starts inside it
+    assert _status(env)["coverage"]["max_observed_gap_days_since_freeze"] == 0.0
+
+
+def test_with_overlap_the_observed_gap_still_feeds_the_transcript_note(
+    env: dict[str, Path],
+) -> None:
+    _run(env, FROZEN - DAY / 10, FROZEN - DAY / 10 + 60)
+    _run(env, FROZEN + 3 * DAY, FROZEN + 5 * DAY, cleanup=2)  # ~3.1 d after the last run
+    _run(env, FROZEN + 4 * DAY, FROZEN + 4.5 * DAY)  # nested: no worst case is given
+    out = _status(env, at=FROZEN + 5.5 * DAY)  # 1.5 d since the last copy: below 2
+    assert out["coverage"]["max_worst_case_gap_days_since_freeze"] is None
+    assert any("cleanupPeriodDays (2)" in n for n in out["notes"])
+
+
+def test_disjoint_runs_raise_no_overlap_note(env: dict[str, Path]) -> None:
+    _run(env, FROZEN + DAY, FROZEN + DAY + 60)
+    assert not any("overlap" in n for n in _status(env, at=FROZEN + 2 * DAY)["notes"])
+
+
 def test_a_run_ending_exactly_at_the_freeze_closes_a_counted_gap(env: dict[str, Path]) -> None:
     _run(env, FROZEN - DAY, FROZEN)
     cov = _status(env)["coverage"]
