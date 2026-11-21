@@ -143,9 +143,10 @@ export MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION=0.65
 Replacement also requires the hook command to pass `--host claude`, which
 `mms hook install --host claude --apply` writes. A bare `mms hook`
 auto-detects the host, and auto-detection cannot tell Claude from Codex, so it
-never replaces output. On a call compression would have attempted (a safe,
-structured Bash result over `max_chars` that passes every check made before the
-compressor runs), the hook still passes the output through, prints a warning to
+never replaces output. On a call compression would have attempted (a Bash
+result that passes every check made before the compressor runs: safe,
+structured, over `max_chars`, not already compressed, and a budget larger than
+the sentinel), the hook still passes the output through, prints a warning to
 stderr, and returns it as `systemMessage`, which Claude Code and Codex document
 as a warning shown to the user. Claude Code does not show the stderr of a hook
 that exits 0 outside its debug log. With compression enabled, `mms doctor` also

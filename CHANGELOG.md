@@ -19,8 +19,10 @@ changes inline only. See the deprecation policy in
   auto-detection cannot tell Claude from Codex. A bare `mms hook`, the form the
   `hook_cmd` module docstring used to show, therefore passed every Bash result
   through, and nothing in `mms stats` or `mms doctor` said why. Now, when
-  compression would have been attempted on such a call (an eligible Bash result
-  over `max_chars`), the hook still passes the output through, writes a warning
+  compression would have been attempted on such a call (a Bash result that
+  passes every check made before the compressor runs: safe, structured, over
+  `max_chars`, not already compressed, and a budget larger than the sentinel),
+  the hook still passes the output through, writes a warning
   to stderr, and returns it as a top-level `systemMessage`, which Claude Code
   and Codex document as a warning shown to the user. The warning says the
   attempt was not made; it does not claim the output would have shrunk,
@@ -34,8 +36,7 @@ changes inline only. See the deprecation policy in
   Claude Code settings are not read. The docstring example and the docs now
   state the `--host claude` requirement (#1437).
   **Behavior change**: a bare `mms hook` with compression enabled prints a
-  warning for each call compression would have attempted (a safe, structured
-  Bash result over `max_chars`), and its JSON output gains `systemMessage` on
+  warning for each call compression would have attempted, and its JSON output gains `systemMessage` on
   those calls. The tool output itself and the
   metrics row are unchanged. Registering with `--host claude` removes the
   warning and turns compression on.

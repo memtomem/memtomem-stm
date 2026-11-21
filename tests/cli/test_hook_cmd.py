@@ -1914,10 +1914,11 @@ def test_cli_cursor_shell_payload_gets_no_refusal_notice(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, argv: list[str]
 ):
     """Outcome pin, not a pin of the capability gate: with the gate removed
-    this still passes, because the compression gates stop Cursor's call first
-    (its event stays camelCase ``postToolUse``). The Kimi control is silenced
-    the same way (``tool_output`` is not a structured result); the Codex
-    controls are the ones that fail without the gate."""
+    this still passes, because the compression gates stop Cursor's call first.
+    The adapter normalizes the event to ``PostToolUse``, but Cursor's
+    ``tool_output`` is a string, not a structured result, so the call ends at
+    ``unsupported_shape``. The Kimi control is silenced the same way; the
+    Codex controls are the ones that fail without the gate."""
     _refused_env(monkeypatch)
 
     with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
