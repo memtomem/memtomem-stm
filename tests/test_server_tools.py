@@ -2756,6 +2756,66 @@ class TestLifespan:
 
         assert killed == [{4242}]
 
+    @staticmethod
+    def _record_completion(monkeypatch):
+        completed = []
+        monkeypatch.setattr("memtomem_stm.server.teardown_completed", lambda: completed.append(1))
+        return completed
+
+    async def test_a_teardown_cut_short_is_not_reported_as_completed(self, monkeypatch):
+        """The exit status after a signal says whether the close sequence ran
+        to the end. A CancelledError out of a step skips every later close, so
+        reporting completion there would be a false success (#1459)."""
+        completed = self._record_completion(monkeypatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_minimal_lifespan(pm_stop=asyncio.CancelledError())
+
+        assert completed == []
+
+    async def test_a_sweep_cut_short_is_not_reported_as_completed(self, monkeypatch):
+        """Completion covers the sweep too: the close sequence reaching its end
+        is not enough if the sweep after it is interrupted. The watchdog is
+        still stood down."""
+        completed = self._record_completion(monkeypatch)
+        disarmed = []
+
+        class _RecordingWatchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                pass
+
+            def arm(self):
+                pass
+
+            def disarm(self):
+                disarmed.append(1)
+
+        def _sweep_cancelled(**_kwargs):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _RecordingWatchdog)
+        monkeypatch.setattr(
+            "memtomem_stm.server.child_reaper.sweep_leaked_children", _sweep_cancelled
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_minimal_lifespan()
+
+        assert completed == []
+        assert disarmed == [1]
+
+    @pytest.mark.parametrize(
+        "pm_stop", [None, RuntimeError("stop failed")], ids=["clean", "handled-failure"]
+    )
+    async def test_a_teardown_that_ran_to_the_end_is_reported_as_completed(
+        self, monkeypatch, pm_stop
+    ):
+        # A step that failed inside its own guard did not cut the sequence
+        # short: every later close still ran, so the sequence is complete.
+        completed = self._record_completion(monkeypatch)
+        await self._run_minimal_lifespan(pm_stop=pm_stop)
+        assert completed == [1]
+
     async def test_a_wedged_stop_does_not_park_the_rest_of_teardown(self, monkeypatch, caplog):
         """Teardown is on the critical path of process exit, so one stop() that
         never returns used to take the whole shutdown with it. The step is

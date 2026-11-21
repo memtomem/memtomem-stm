@@ -27,7 +27,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import wraps
-from typing import TYPE_CHECKING, Any, NoReturn, TextIO, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, TextIO, TypeGuard
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import click
@@ -877,15 +877,19 @@ def _dep_name(spec: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _pyproject_references_stm(pyp: Path) -> bool:
-    """True if ``pyp`` is STM's own pyproject.toml, or lists memtomem-stm as
-    a dep. Parses the TOML via ``tomllib`` so comments, descriptions, and
-    adjacent-name packages (``memtomem-stm-extension``) can't false-positive.
-    """
+def _load_pyproject(pyp: Path) -> dict[str, Any] | None:
+    """``pyp`` parsed, or ``None`` when it cannot be read or parsed."""
     try:
-        data = tomllib.loads(pyp.read_text(encoding="utf-8"))
+        return tomllib.loads(pyp.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-        return False
+        return None
+
+
+def _project_table_references_stm(data: dict[str, Any]) -> bool:
+    """True if parsed pyproject ``data`` is STM's own (``[project].name``), or
+    lists memtomem-stm as a dependency or optional dependency. ``tomllib``
+    parsing means comments, descriptions and adjacent-name packages
+    (``memtomem-stm-extension``) can't false-positive."""
     project = data.get("project")
     if not isinstance(project, dict):
         return False
@@ -905,43 +909,109 @@ def _pyproject_references_stm(pyp: Path) -> bool:
     return False
 
 
-def _detect_install_type() -> tuple[str, list[str]]:
-    """Return ``(server_cmd, server_args)`` to register with an MCP client.
+class _StmProject(NamedTuple):
+    """The project a user-scope hook launcher binds to.
 
-    Branches:
+    ``source_checkout`` is True when the directory is shaped like STM's own
+    source checkout: ``[project].name = "memtomem-stm"`` and the package at
+    ``src/memtomem_stm/__init__.py`` (the name alone could be any project's).
+    Both fields come from one read of the same ``pyproject.toml``, so the
+    written command and the binding notice cannot describe different
+    versions of the file (#1379)."""
 
-    * Inside a ``pyproject.toml`` that is STM's own source checkout OR a
-      user project that lists ``memtomem-stm`` in ``[project].dependencies``
-      / ``[project].optional-dependencies`` → ``uv run --directory <root>
-      memtomem-stm``.
-    * Default (global install via ``uv tool install`` / ``pipx``, or a cwd
-      with no relevant pyproject) → bare ``memtomem-stm`` console script.
+    root: Path
+    source_checkout: bool
 
-    Both branches spawn the ``memtomem-stm`` console script, not ``mms``:
-    ``mms`` is the click CLI group and exits 0 on no-subcommand, which closes
-    the stdio pipe immediately and the MCP client reports "Failed to
-    reconnect". ``memtomem-stm`` is the actual server entrypoint
-    (``memtomem_stm.server:main``).
 
-    Parent ``mm init`` keeps source/project as separate branches because
-    the parent is a monorepo (``packages/`` subdir is the discriminator).
-    STM has a flat layout so the two collapse into one.
-
-    PEP 735 ``dependency-groups`` and tool-specific dev-dep tables (``[tool.uv
-    .dev-dependencies]``, ``[tool.poetry.group.*.dependencies]``) are
-    intentionally **not** matched — a dev-only dep usually means the user
-    wants `uv run --group <name>` which the registration command can't pick.
-    Bare ``memtomem-stm`` is the safer default; users can override manually.
-    """
+def _stm_project() -> _StmProject | None:
+    """The nearest ``pyproject.toml`` (cwd and up to four parents) that
+    references STM, read once; ``None`` when the nearest one does not (the
+    walk stops at the first ``pyproject.toml``, so an unrelated project
+    nested inside an STM checkout yields ``None``) or there is none."""
     check = Path.cwd()
     for _ in range(5):
         pyp = check / "pyproject.toml"
         if pyp.exists():
-            if _pyproject_references_stm(pyp):
-                return ("uv", ["run", "--directory", str(check), "memtomem-stm"])
-            break
+            data = _load_pyproject(pyp)
+            if data is None or not _project_table_references_stm(data):
+                return None
+            return _StmProject(check, _is_stm_source_checkout(check, data))
         check = check.parent
+    return None
+
+
+def _is_stm_source_checkout(root: Path, data: dict[str, Any]) -> bool:
+    """Whether ``root`` (whose parsed pyproject is ``data``) is shaped like
+    STM's own source checkout. An unreadable package marker counts as not
+    confirmed, so install goes on and reports the binding: ``Path.is_file``
+    raises ``PermissionError`` before Python 3.14 for an unreadable ``src/``."""
+    project = data.get("project")
+    if not isinstance(project, dict) or project.get("name") != "memtomem-stm":
+        return False
+    try:
+        return (root / "src" / "memtomem_stm" / "__init__.py").is_file()
+    except OSError:
+        return False
+
+
+def _detect_install_type() -> tuple[str, list[str]]:
+    """Return ``(cmd, args)``, the launcher ``mms hook install`` writes into a
+    host's **user-scope** hook (its only caller: MCP registration uses
+    ``sys.executable -P -m memtomem_stm``, :func:`_registration_command`).
+
+    Branches, decided by the nearest ``pyproject.toml`` in the cwd or one of
+    its four parents (:func:`_stm_project`):
+
+    * It declares ``[project].name = "memtomem-stm"`` (STM's own checkout, or
+      any project with that name) or lists ``memtomem-stm`` in
+      ``[project].dependencies`` / ``[project].optional-dependencies`` →
+      ``uv run --directory <its directory> memtomem-stm``. Unless the
+      directory is shaped like STM's source checkout, the hook is then bound
+      to that project's environment for every project, which
+      :func:`_hook_project_binding` names so install can say so (#1379).
+    * Otherwise (global install via ``uv tool install`` / ``pipx``, or no
+      such pyproject) → bare ``memtomem-stm`` console script.
+
+    Both branches name the ``memtomem-stm`` entry point, the spelling the
+    hook-registration readers recognize after ``uv run --directory``.
+
+    PEP 735 ``dependency-groups`` and tool-specific dev-dep tables (``[tool.uv
+    .dev-dependencies]``, ``[tool.poetry.group.*.dependencies]``) are
+    intentionally **not** matched — a dev-only dep usually means the user
+    wants `uv run --group <name>` which the written command can't pick.
+    Bare ``memtomem-stm`` is the safer default; users can override manually.
+    """
+    return _launcher_for(_stm_project())
+
+
+def _launcher_for(project: _StmProject | None) -> tuple[str, list[str]]:
+    """The launcher for a :func:`_stm_project` result. Split out so ``mms hook
+    install`` derives the written command and its binding notice from one
+    lookup."""
+    if project is not None:
+        return ("uv", ["run", "--directory", str(project.root), "memtomem-stm"])
     return ("memtomem-stm", [])
+
+
+def _hook_project_binding() -> Path | None:
+    """The project a user-scope hook launcher from :func:`_detect_install_type`
+    is tied to, or ``None`` when it is not tied to one.
+
+    ``None`` for the bare console script and for STM's own source checkout
+    (the developer binding, intended). A dependent project's directory
+    otherwise: every hook call, in every project, would run from that
+    project's environment, which install reports instead of changing (#1379).
+    The written command is left alone because the install shell's PATH is not
+    the host app's, so switching to a bare command could break a working hook.
+    """
+    return _binding_for(_stm_project())
+
+
+def _binding_for(project: _StmProject | None) -> Path | None:
+    """:func:`_hook_project_binding` for an already looked-up project."""
+    if project is None or project.source_checkout:
+        return None
+    return project.root
 
 
 def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, str]]:
