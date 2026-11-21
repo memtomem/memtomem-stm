@@ -1877,29 +1877,33 @@ def test_cli_bare_hook_reports_refusal_and_explicit_claude_compresses(
 
 @pytest.mark.parametrize("host", ["codex", "cursor", "kimi"])
 def test_cli_explicit_non_replacing_hosts_get_no_refusal_notice(
-    monkeypatch: pytest.MonkeyPatch, host: str
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, host: str
 ):
     """A host that cannot replace output is a capability, not a registration
     mistake: no notice, whatever the compression setting."""
     _refused_env(monkeypatch)
     stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
 
-    result = CliRunner().invoke(cli, ["hook", "--host", host], input=stdin)
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        result = CliRunner().invoke(cli, ["hook", "--host", host], input=stdin)
 
     assert result.exit_code == 0
     assert "systemMessage" not in result.stdout
-    assert HOST_NOT_EXPLICIT_NOTICE not in result.stderr
+    assert HOST_NOT_EXPLICIT_NOTICE not in caplog.messages
 
 
-def test_cli_auto_detected_kimi_gets_no_refusal_notice(monkeypatch: pytest.MonkeyPatch):
+def test_cli_auto_detected_kimi_gets_no_refusal_notice(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
     _refused_env(monkeypatch)
     payload = {**_KIMI_SHELL_PAYLOAD, "tool_output": _BIG_STDOUT}
 
-    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(payload))
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        result = CliRunner().invoke(cli, ["hook"], input=json.dumps(payload))
 
     assert result.exit_code == 0
     assert result.stdout == ""
-    assert HOST_NOT_EXPLICIT_NOTICE not in result.stderr
+    assert HOST_NOT_EXPLICIT_NOTICE not in caplog.messages
 
 
 _CURSOR_BIG_SHELL_PAYLOAD = {
@@ -1965,19 +1969,28 @@ def test_surfacing_timeout_keeps_the_refusal_notice(
 
 
 def test_surfacing_timeout_without_a_refusal_still_passes_through(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
     _refused_env(monkeypatch)
+    started: list[bool] = []
 
     async def stalled(*_args, **_kwargs):
+        started.append(True)
         await asyncio.sleep(30)
 
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", stalled)
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda: 0.2)
     stdin = json.dumps(_bash_payload({"stdout": "short"}))
 
-    result = CliRunner().invoke(cli, ["hook"], input=stdin)
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        result = CliRunner().invoke(cli, ["hook"], input=stdin)
 
+    assert started == [True]
+    failures = [r for r in caplog.records if "hook processing failed" in r.getMessage()]
+    assert len(failures) == 1
+    assert failures[0].exc_info is not None
+    assert isinstance(failures[0].exc_info[1], TimeoutError)
+    assert HOST_NOT_EXPLICIT_NOTICE not in caplog.messages
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {}
 

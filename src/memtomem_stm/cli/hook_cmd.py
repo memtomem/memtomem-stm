@@ -39,9 +39,10 @@ daemon stage (P2/Stage D).
 Hard rule — a hook must never disrupt the host. This command **always exits
 0** and, on any malformed input, disabled surfacing, timeout, or internal
 error, emits an empty object ``{}`` so the original tool result passes through
-untouched. The one addition on those paths is a ``systemMessage`` reporting a
-compression refusal found before the failure (#1437); the tool result still
-passes through.
+untouched. The one addition is a ``systemMessage`` reporting a compression
+refusal found before a failure that the per-call barrier catches, a timeout
+included (#1437); the tool result still passes through. A ``BaseException``
+that reaches the outermost barrier still emits ``{}``.
 
 Register in Claude Code ``settings.json``::
 
@@ -1082,7 +1083,7 @@ def hook_command(
     use; set ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` for the legacy cold in-process
     path. Always exits 0; on any problem the tool output passes through unchanged
     (prints ``{}``, or only a ``systemMessage`` when compression was refused for
-    the call before the problem, #1437).
+    the call before a timeout or other caught failure, #1437).
 
     ``--host`` selects the adapter, which owns both the output *shape*
     (``render``) and its *stdout serialization* (``serialize`` — JSON for

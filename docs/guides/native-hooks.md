@@ -148,18 +148,22 @@ adapter (its fallback; a payload with a non-empty Codex `turn_id` goes to the
 Codex adapter and gets no warning) and that compression would have attempted (a
 Bash result that passes every check made before the compressor runs: safe,
 structured, over `max_chars`, not already compressed, and a budget larger than
-the sentinel), the hook still passes the output through, prints a warning to
-stderr, and returns it as `systemMessage`, which Claude Code and Codex document
-as a warning shown to the user. Claude Code does not show the stderr of a hook
+the sentinel and its newline), the hook still passes the output through,
+prints a warning to stderr, and returns it as `systemMessage`, which Claude Code
+and Codex document as a warning shown to the user. Claude Code does not show the stderr of a hook
 that exits 0 outside its debug log.
 
 To fix it, add `--host claude` to the hook command where it is registered.
 `mms hook install --host claude --apply` does that for the user settings file
 (`$CLAUDE_CONFIG_DIR/settings.json`, otherwise `~/.claude/settings.json`), but
-not for Claude Code's project or local settings. It also replaces every STM
-hook command in that file with one new command, and of an old command's inline
-`env MEMTOMEM_STM_*=…` assignments it keeps only the daemon, timeout and
-query-text settings, as flags.
+not for Claude Code's project or local settings. It replaces the STM hook
+commands it recognizes in that file (`mms hook …` under any entry-point name,
+`uv run … memtomem-stm hook …`, or either behind an `env` that sets only
+`MEMTOMEM_STM_*` variables) with one new command. It carries settings over from
+the first of them only, and of that command's inline `env` assignments it keeps
+only the daemon, timeout and query-text settings, as flags. A command it does
+not recognize, such as one behind `env` with another variable, stays in place
+next to the new one and keeps firing; edit such a registration by hand.
 
 See the [hook CLI reference](../reference/cli-hooks.md) and the complete
 [environment-variable reference](../reference/environment-variables.md).

@@ -23,17 +23,17 @@ changes inline only. See the deprecation policy in
   non-empty Codex `turn_id` goes to the Codex adapter and gets no warning) that
   compression would have attempted (a Bash result that passes every check made
   before the compressor runs: safe, structured, over `max_chars`, not already
-  compressed, and a budget larger than the sentinel), the hook still passes
-  the output through, writes a warning to stderr, and returns it as a
-  top-level `systemMessage`, which Claude Code and Codex document as a warning
+  compressed, and a budget larger than the sentinel and its newline), the hook
+  still passes the output through, writes a warning to stderr, and returns it
+  as a top-level `systemMessage`, which Claude Code and Codex document as a warning
   shown to the user. The warning is raised before surfacing runs, so a
   surfacing call that outlives the hook deadline does not erase it. It says
   the attempt was not made, and does not claim the output would have shrunk,
   because the refused path skips the compressor and so the retention guard.
   It asks for `--host claude` to be added where the hook is registered rather
-  than naming `mms hook install`, which rewrites only the user settings file
-  and keeps only the daemon, timeout and query-text settings of an inline
-  `env` wrapper. The docstring example and the docs now state the
+  than naming `mms hook install`, which rewrites only the user settings file,
+  leaves a registration it does not recognize in place, and keeps only the
+  daemon, timeout and query-text settings of an inline `env` wrapper. The docstring example and the docs now state the
   `--host claude` requirement (#1437).
   **Behavior change**: a bare `mms hook` with compression enabled prints a
   warning for each such call, and its JSON output gains `systemMessage` on
