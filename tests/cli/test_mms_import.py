@@ -1107,7 +1107,7 @@ class TestSkippedSources:
             "No MCP definitions found from --from=all; 4 sources were not inspected."
         )
 
-    def test_apply_with_only_skipped_sources_names_them_and_writes_nothing(
+    def test_apply_with_only_skipped_sources_names_them_and_writes_no_import_state(
         self, runner, sandbox, monkeypatch
     ):
         _gap_codex_home(sandbox, monkeypatch)
@@ -1119,7 +1119,10 @@ class TestSkippedSources:
             _note(_CODEX_USER, "codex_home"),
             _note(_CODEX_PROJECT, "codex_home"),
         ]
-        assert not (sandbox["home"] / ".mms" / "registry.toml").exists()
+        # ``--apply`` still takes the write lock; the registry and the sidecar
+        # are what an import writes, and neither may appear.
+        assert not state.registry_path().exists()
+        assert not state.import_state_path().exists()
 
     def _seed_gap_beside_candidates(self, sandbox):
         (sandbox["cwd"] / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
