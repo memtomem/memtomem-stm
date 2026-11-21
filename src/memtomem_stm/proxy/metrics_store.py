@@ -477,8 +477,8 @@ def read_compression_summary(
     ``with_hook_status`` adds a ``hook_status`` key: the retained
     ``source='hook'`` rows grouped by ``(server, status)`` — see
     :func:`_read_hook_status` — read in the same snapshot as the totals, so
-    the two describe the same rows. ``None`` whenever ``available`` is False
-    or the read failed.
+    the two describe the same rows. Only with ``source='hook'``; any other
+    ``source``, an unavailable summary or a failed read leaves it ``None``.
     """
     return _read_compression(
         db_path, tool=tool, source=source, all_time=False, with_hook_status=with_hook_status
@@ -564,22 +564,31 @@ def _read_hook_status(
     Each entry has ``server``, ``status``, ``calls`` and ``original_chars``.
     ``status`` is a name from ``HOOK_COMPRESSION_STATUSES``, ``None`` for a row
     that recorded none (written before the column existed), or ``"other"`` for
-    any value outside the set — folded here so no caller renders a stored
-    value verbatim. A DB that predates ``source`` has no hook rows. Sizes pass
-    through the same ``_finite`` guard and ``SUM``→``TOTAL`` fallback as the
-    totals they sit beside.
+    any value outside the set — folded in SQL, before anything is decoded, so
+    no caller renders a stored value verbatim and an undecodable one cannot
+    fail the read. Sizes pass through the same ``_finite`` guard and
+    ``SUM``→``TOTAL`` fallback as the totals they sit beside. Called only for a
+    DB that has ``source``.
     """
-    if "source" not in cols:
-        return []
-    status = "hook_compression_status" if "hook_compression_status" in cols else "NULL"
+    if "hook_compression_status" in cols:
+        # The names are fixed identifiers, so interpolating them is safe.
+        known = ", ".join(f"'{name}'" for name in sorted(HOOK_COMPRESSION_STATUSES))
+        status = (
+            "CASE WHEN hook_compression_status IS NULL THEN NULL "
+            f"WHEN hook_compression_status IN ({known}) THEN hook_compression_status "
+            "ELSE 'other' END"
+        )
+    else:
+        status = "NULL"
     where = "source = 'hook'"
     params: list[object] = []
     if tool is not None:
         where += " AND tool = ?"
         params.append(tool)
     statement = (
-        f"SELECT server, {status}, COUNT(*), {{agg}}({_finite('original_chars')}) "
-        f"FROM proxy_metrics WHERE {where} GROUP BY server, {status}"
+        f"SELECT server, {status} AS status, COUNT(*), "
+        f"{{agg}}({_finite('original_chars')}) "
+        f"FROM proxy_metrics WHERE {where} GROUP BY server, status"
     )
     try:
         rows = db.execute(statement.replace("{agg}", "SUM"), params).fetchall()
@@ -587,17 +596,15 @@ def _read_hook_status(
         if "integer overflow" not in str(exc):
             raise
         rows = db.execute(statement.replace("{agg}", "TOTAL"), params).fetchall()
-    merged: dict[tuple[str, str | None], dict[str, object]] = {}
-    for server, value, calls, orig in rows:
-        if value is not None and value not in HOOK_COMPRESSION_STATUSES:
-            value = "other"
-        entry = merged.setdefault(
-            (str(server), value),
-            {"server": str(server), "status": value, "calls": 0, "original_chars": 0},
-        )
-        entry["calls"] = _count(entry["calls"]) + _count(calls)
-        entry["original_chars"] = _count(entry["original_chars"]) + _count(orig)
-    return list(merged.values())
+    return [
+        {
+            "server": str(server),
+            "status": value,
+            "calls": _count(calls),
+            "original_chars": _count(orig),
+        }
+        for server, value, calls, orig in rows
+    ]
 
 
 def _read_compression(
@@ -643,6 +650,9 @@ def _read_compression(
         summary["rollup"] = rollup
     if with_hook_status:
         summary["hook_status"] = None
+    # Hook rows only: beside any other source's totals the counts would
+    # describe different rows, so another ``source`` keeps ``None``.
+    want_status = with_hook_status and source == "hook"
     if not resolved.exists():
         return summary
 
@@ -653,7 +663,7 @@ def _read_compression(
         return summary
 
     try:
-        if with_hook_status:
+        if want_status:
             # One read transaction, so the status groups below see the same
             # rows as the totals even while a writer appends or trims.
             db.execute("BEGIN")
@@ -690,7 +700,7 @@ def _read_compression(
             # ``mms stats`` refuses this at the CLI boundary; direct callers of
             # this reader still land here.
             summary["available"] = True
-            if with_hook_status:
+            if want_status:
                 summary["hook_status"] = []
             return summary
 
@@ -699,7 +709,7 @@ def _read_compression(
             # request for any other provenance matches nothing. Report an empty
             # but available summary rather than over-counting every legacy row.
             summary["available"] = True
-            if with_hook_status:
+            if want_status:
                 summary["hook_status"] = []
             return summary
 
@@ -772,7 +782,7 @@ def _read_compression(
             if "integer overflow" not in str(exc):
                 raise
             rows = db.execute(statement.replace("{agg}", "TOTAL"), inner_params).fetchall()
-        hook_status = _read_hook_status(db, cols, tool) if with_hook_status else None
+        hook_status = _read_hook_status(db, cols, tool) if want_status else None
     except sqlite3.Error as exc:
         summary["error"] = exception_summary(exc)
         return summary

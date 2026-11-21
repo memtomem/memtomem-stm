@@ -1278,13 +1278,14 @@ def _codex_bash_payload() -> dict:
         (False, ClaudeHookAdapter(), "big", None, {}, "disabled"),
         (False, ClaudeHookAdapter(), "big", False, {}, "disabled"),
         (False, CodexHookAdapter(), "codex", True, {}, "disabled"),
-        # The adapter's capability wins over an explicit opt-in.
-        (True, CodexHookAdapter(), "codex", True, {}, "unsupported_host"),
+        # The adapter's capability wins over an explicit opt-in, even on
+        # output Claude would have compressed.
+        (True, CodexHookAdapter(), "codex_big", True, {}, "unsupported_host"),
         (True, CodexHookAdapter(), "codex", None, {}, "unsupported_host"),
         # Bare ``mms hook`` on Claude (#1437): capable host, refused by the CLI.
         (True, ClaudeHookAdapter(), "big", False, {}, "replacement_not_requested"),
         # ``None`` (direct callers) defers to the adapter, as ``True`` does.
-        (True, ClaudeHookAdapter(), "big", None, {}, "compressed"),
+        (True, ClaudeHookAdapter(), "big", "omitted", {}, "compressed"),
         (True, ClaudeHookAdapter(), "big", True, {}, "compressed"),
         (True, ClaudeHookAdapter(), "small", True, {}, "below_threshold"),
         (True, ClaudeHookAdapter(), "failed", True, {}, "unsafe_result"),
@@ -1315,7 +1316,7 @@ def test_orchestrate_records_the_compression_status(
     enabled: bool,
     adapter,
     payload: str,
-    allow: bool | None,
+    allow: bool | str | None,
     env: dict[str, str],
     status: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1342,9 +1343,11 @@ def test_orchestrate_records_the_compression_status(
         "small": _bash_payload({"stdout": "ok\n"}),
         "failed": _bash_payload({"stdout": _BIG_STDOUT, "exitCode": 1}),
         "codex": _codex_bash_payload(),
+        "codex_big": {**_codex_bash_payload(), "tool_response": {"stdout": _BIG_STDOUT}},
     }
 
-    out = asyncio.run(_orchestrate(payloads[payload], adapter, allow_output_replacement=allow))
+    kwargs = {} if allow == "omitted" else {"allow_output_replacement": allow}
+    out = asyncio.run(_orchestrate(payloads[payload], adapter, **kwargs))
 
     replaced = status == "compressed"
     assert ("updatedToolOutput" in json.dumps(out)) is replaced

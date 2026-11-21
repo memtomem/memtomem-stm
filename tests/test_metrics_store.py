@@ -2079,17 +2079,6 @@ def _read_meta(db_path) -> dict[str, str]:
         db.close()
 
 
-def _set_stamp(db_path, value: str) -> None:
-    db = sqlite3.connect(str(db_path))
-    try:
-        db.execute(
-            "UPDATE metrics_meta SET value = ? WHERE key = ?", (value, _SCHEMA_FINGERPRINT_KEY)
-        )
-        db.commit()
-    finally:
-        db.close()
-
-
 def _without_status_column(monkeypatch) -> str:
     """Make this process the binary before the column: returns its fingerprint."""
     monkeypatch.delitem(metrics_store_module._MIGRATIONS, _STATUS_COL)
@@ -2168,9 +2157,16 @@ class TestHookCompressionStatus:
         installed = _read_meta(db_path)["rollup_installed_at"]
         with monkeypatch.context() as patch:
             old = _without_status_column(patch)
+        assert old != _SCHEMA_FINGERPRINT
         for i in range(3):
-            # The previous release: its stamp, and an insert naming only its columns.
-            _set_stamp(db_path, old)
+            # The previous release opens a DB this version stamped: it must take
+            # its own slow path, restamp, and insert naming only its columns.
+            with monkeypatch.context() as patch:
+                _without_status_column(patch)
+                prior = MetricsStore(db_path)
+                prior.initialize()
+                prior.close()
+            assert _read_schema_stamp(db_path) == old
             _raw_insert(db_path, tool=f"old{i}")
             store = MetricsStore(db_path)  # slow path: restamps
             store.initialize()
@@ -2251,6 +2247,39 @@ class TestReadHookStatus:
             ("builtin:claude", "compressed"): (1, 100),
         }
 
+    @pytest.mark.parametrize("source", [None, "mcp"])
+    def test_only_a_hook_summary_carries_statuses(self, tmp_path, source):
+        """Hook statuses beside MCP or mixed totals would describe other rows."""
+        db_path = tmp_path / "m.db"
+        self._seed(db_path)
+        summary = read_compression_summary(db_path, source=source, with_hook_status=True)
+        assert summary["available"] is True
+        assert summary["total_calls"] > 0
+        assert summary["hook_status"] is None
+
+    def test_an_undecodable_status_counts_as_other_without_losing_the_totals(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        MetricsStore(db_path).initialize()
+        _raw_insert(db_path, **{_STATUS_COL: "compressed"})
+        db = sqlite3.connect(str(db_path))
+        try:
+            # Stored as TEXT, but not valid UTF-8: Python cannot decode it.
+            db.execute(
+                f"INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+                f"source, created_at, {_STATUS_COL}) "
+                "VALUES ('builtin:claude', 'Bash', 100, 100, 'hook', 0, CAST(X'FF61' AS TEXT))"
+            )
+            db.commit()
+        finally:
+            db.close()
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert summary["available"] is True, summary["error"]
+        assert summary["total_calls"] == 2
+        assert _statuses(summary) == {
+            ("builtin:claude", "compressed"): (1, 100),
+            ("builtin:claude", "other"): (1, 100),
+        }
+
     def test_not_requested_means_no_key(self, tmp_path):
         db_path = tmp_path / "m.db"
         self._seed(db_path)
@@ -2281,11 +2310,11 @@ class TestReadHookStatus:
         summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
         assert summary["available"] is True
         assert summary["hook_status"] == []
-        # Unfiltered, nothing returns early: the status read itself must not ask
-        # for a column the DB lacks, or the totals beside it go down too.
+        # Unfiltered, the totals are not hook rows, so no status rides along —
+        # and asking for one must not take those totals down.
         unfiltered = read_compression_summary(db_path, with_hook_status=True)
         assert unfiltered["available"] is True, unfiltered["error"]
-        assert (unfiltered["total_calls"], unfiltered["hook_status"]) == (1, [])
+        assert (unfiltered["total_calls"], unfiltered["hook_status"]) == (1, None)
 
     def test_pre_status_db_reads_as_not_recorded_without_writing(self, tmp_path, monkeypatch):
         db_path = tmp_path / "m.db"

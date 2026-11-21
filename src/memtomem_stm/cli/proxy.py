@@ -2661,9 +2661,14 @@ def _hook_status(rows: list[dict[str, Any]] | None) -> dict[str, Any] | None:
         entry["calls"] += row["calls"]
         entry["original_chars"] += row["original_chars"]
     by_host = []
+    # Recorded hosts by calls, ties by name; the unrecorded remainder last.
     for host, statuses in sorted(
         grouped.items(),
-        key=lambda item: (item[0] is None, -sum(e["calls"] for e in item[1].values())),
+        key=lambda item: (
+            item[0] is None,
+            -sum(e["calls"] for e in item[1].values()),
+            item[0] or "",
+        ),
     ):
         ordered = sorted(
             statuses.items(), key=lambda item: (item[0] is None, -item[1]["calls"], item[0] or "")
@@ -2680,9 +2685,13 @@ def _hook_status_line(
     """``status:`` counts for one host's retained rows, or nothing to add.
 
     Nothing to add: no status was read, the host has no retained rows (all of
-    them rolled up), or none of its rows recorded a status. Status names come
-    from :data:`HOOK_COMPRESSION_STATUSES` or are ``other`` (the reader folds
-    anything else), so they print as they are.
+    them rolled up), or the host itself was not recorded and neither was any
+    status — those rows predate both and the line would only repeat
+    ``(host not recorded)``. A known host whose rows all predate the status
+    still gets ``not recorded N``, which is the answer for it. Status names
+    come from :data:`HOOK_COMPRESSION_STATUSES` or are ``other`` (the reader
+    folds anything else), so they print as they are. Counts are in descending
+    order with ``not recorded`` last.
     """
     if not hook_status:
         return []
@@ -2692,7 +2701,7 @@ def _hook_status_line(
             break
     else:
         return []
-    if all(item["status"] is None for item in statuses):
+    if host is None and all(item["status"] is None for item in statuses):
         return []
     counts = ", ".join(f"{item['status'] or 'not recorded'} {item['calls']:,}" for item in statuses)
     scope = "  (retained rows)" if all_time else ""

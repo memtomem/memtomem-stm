@@ -323,16 +323,16 @@ class CallMetrics:
     # (CLI/stats, the tuner) separate native-tool spend — otherwise invisible —
     # from proxied spend without splitting the store.
     source: str = "mcp"
-    # ``source='hook'`` rows only: the native compression stage's decision, one
-    # of ``HOOK_COMPRESSION_STATUSES``. ``None`` on MCP rows and on hook rows
-    # written before the column existed. Kept apart from
-    # ``compression_strategy``, which names a strategy that ran — a call the
-    # gate passed over ran none.
-    hook_compression_status: str | None = None
     # None marks old/unclassified writers; never infer their accounting basis.
     compression_accounting: str | None = None
     delivery_format: str = "legacy"
     wire_bytes: int | None = None
+    # ``source='hook'`` rows only: the native compression stage's decision, one
+    # of ``HOOK_COMPRESSION_STATUSES``. ``None`` on MCP rows and on hook rows
+    # written before the column existed. Kept apart from
+    # ``compression_strategy``, which names a strategy that ran — a call the
+    # gate passed over ran none. Last, so no positional caller shifts.
+    hook_compression_status: str | None = None
 
 
 class RPSTracker:

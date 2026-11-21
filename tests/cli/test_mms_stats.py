@@ -584,9 +584,10 @@ class TestStatsHookByHost:
         lines = result.output.splitlines()
         # Last, whatever its volume.
         first = lines.index("    claude calls: 1  chars: 20,000 -> 16,000  (saved 20.0%)")
-        assert lines[first + 1] == (
-            "    (host not recorded) calls: 1  chars: 90,000 -> 90,000  (saved 0.0%)"
-        )
+        assert lines[first + 1 : first + 3] == [
+            "      status: not recorded 1",
+            "    (host not recorded) calls: 1  chars: 90,000 -> 90,000  (saved 0.0%)",
+        ]
         data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
         assert data["hook_by_host"][1] == {
             "host": None,
@@ -845,7 +846,8 @@ class TestStatsHookStatus:
         assert f"{indent}status: retention_guard 2, compressed 1" in lines
         assert not any("claude calls:" in line for line in lines)
 
-    def test_no_line_when_no_row_recorded_a_status(self, runner, tmp_path, monkeypatch):
+    def test_a_known_host_with_no_recorded_status_says_so(self, runner, tmp_path, monkeypatch):
+        # Rows from part 1 of #1438: the host was recorded, the status not yet.
         set_home(monkeypatch, tmp_path)
         db = tmp_path / ".memtomem" / "proxy_metrics.db"
         _seed_hook_statuses(db, [("builtin:claude", "Bash", 300, None)])
@@ -853,11 +855,94 @@ class TestStatsHookStatus:
         result = runner.invoke(cli, ["stats"])
 
         assert result.exit_code == 0, result.output
-        assert "status:" not in result.output
+        assert "    status: not recorded 1" in result.output.splitlines()
         data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
         assert data["hook_status"]["by_host"] == [
             {"host": "claude", "statuses": [{"status": None, "calls": 1, "original_chars": 300}]}
         ]
+
+    def test_rows_with_neither_host_nor_status_add_no_line(self, runner, tmp_path, monkeypatch):
+        # Older than both: ``(host not recorded)`` already says all there is.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                ("builtin", "Bash", 90_000, None),
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+            ],
+        )
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        unrecorded = next(i for i, line in enumerate(lines) if "(host not recorded)" in line)
+        assert not lines[unrecorded + 1].lstrip().startswith("status:")
+        assert "      status: compressed 1" in lines
+
+    def test_order_is_by_calls_with_not_recorded_last_and_ties_by_name(
+        self, runner, tmp_path, monkeypatch
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                *[("builtin:claude", "Bash", 10, None)] * 3,
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+                ("builtin:kimi", "Bash", 10, "unsupported_host"),
+                ("builtin:codex", "Bash", 10, "unsupported_host"),
+            ],
+        )
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        by_host = data["hook_status"]["by_host"]
+        assert [entry["host"] for entry in by_host] == ["claude", "codex", "kimi"]
+        assert [item["status"] for item in by_host[0]["statuses"]] == ["compressed", None]
+
+    def test_host_ties_do_not_depend_on_the_row_order(self):
+        # SQLite happens to return groups sorted; the order must not rely on it.
+        from memtomem_stm.cli.proxy import _hook_status
+
+        rows = [
+            {
+                "server": f"builtin:{host}",
+                "status": "unsupported_host",
+                "calls": 1,
+                "original_chars": 1,
+            }
+            for host in ("kimi", "codex", "cursor")
+        ]
+        hosts = [
+            [e["host"] for e in _hook_status(order)["by_host"]] for order in (rows, rows[::-1])
+        ]
+        assert hosts == [["codex", "cursor", "kimi"]] * 2
+
+    def test_json_status_for_unreadable_and_pre_source_stores(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b"not a sqlite database" * 100)
+        corrupt = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert corrupt["hook_status"] is None
+
+        db.unlink()
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute(
+                "CREATE TABLE proxy_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "server TEXT, tool TEXT, original_chars INTEGER, compressed_chars INTEGER, "
+                "cleaned_chars INTEGER DEFAULT 0, created_at REAL)"
+            )
+            raw.execute(
+                "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+                "created_at) VALUES ('builtin:claude', 'Bash', 100, 40, 0)"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        legacy = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert legacy["hook_status"] == {"scope": "retained", "by_host": []}
 
     def test_a_stored_value_outside_the_set_prints_as_other(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)
