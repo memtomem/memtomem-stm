@@ -1270,6 +1270,40 @@ def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = 
     return argv
 
 
+def _emit_unmanaged(
+    change: Any, locations: tuple[str, ...], *, written: bool, preview: bool = False
+) -> None:
+    """Name the handlers that look like STM's hook but that this command leaves
+    alone (#1453), by location only: their text can hold secret values.
+
+    ``written`` says whether ``locations`` index the file just written or the
+    current one; a preview names the current file, since that is the one the
+    operator can open now."""
+    if not locations:
+        return
+    from memtomem_stm.cli.proxy import _warn
+
+    one = len(locations) == 1
+    managed_by = "install" if change.action == "install" else "uninstall"
+    if one:
+        subject = f"1 other handler looks like memtomem-stm's hook but is not one {managed_by}"
+        stays = "it will stay" if preview else "it stays"
+        them = "it"
+    else:
+        subject = (
+            f"{len(locations)} other handlers look like memtomem-stm's hook but are not "
+            f"ones {managed_by}"
+        )
+        stays = "they will stay" if preview else "they stay"
+        them = "them"
+    where = "in the written file" if written else "in the current file"
+    click.echo(
+        f"  {_warn('!')} {subject} manages, so {stays} in the config ({where}: "
+        f"{_disp(', '.join(locations))}). Check {them} by hand, and edit or remove any "
+        "that should not run."
+    )
+
+
 def _emit_hook_change(
     change: Any, *, apply_: bool, backup: Any, apply_hint: str | None = None
 ) -> None:
@@ -1285,14 +1319,21 @@ def _emit_hook_change(
     # `action`, `host_tag` and `notes` are literals this package writes
     # itself and stay raw. Escape the value, never the styled line (#760).
     click.echo(f"{_hdr(change.label + ' hook')} — {_disp(str(change.path))}")
+    unmanaged = change.unmanaged
 
     if not change.changed:
+        not_installed = (
+            "not installed (no memtomem-stm hook that uninstall manages)."
+            if unmanaged
+            else "not installed (no memtomem-stm hook found)."
+        )
         no_change = {
             "already": "already installed (no change).",
-            "not_installed": "not installed (no memtomem-stm hook found).",
+            "not_installed": not_installed,
             "absent": "config not found (nothing to remove).",
         }.get(change.status, "no change.")
         click.echo(f"  {_ok(no_change) if change.status == 'already' else no_change}")
+        _emit_unmanaged(change, unmanaged, written=False)
         return
 
     if change.action == "install":
@@ -1324,13 +1365,27 @@ def _emit_hook_change(
                 # blank, and prefixing them would emit trailing-whitespace lines.
                 click.echo(f"    {line}" if line else "")
             click.echo("")
-    else:  # uninstall (only reached when changed → status == "remove")
+    else:  # uninstall, changed: status "remove" or "prune"
+        if change.status == "prune":
+            # Only emptied containers go; nothing the host runs is removed.
+            what = "empty hook entries only (no memtomem-stm hook that uninstall manages)."
+        elif unmanaged:
+            # With a look-alike left behind, "the hook" alone would read as
+            # every STM hook in the file.
+            what = "the memtomem-stm hook install manages."
+        else:
+            what = "memtomem-stm's PostToolUse hook."
         if apply_:
             if backup is not None:
                 click.echo(f"  {_ok('Backed up')} {_disp(str(backup))}")
-            click.echo(f"  {_ok('Removed')} memtomem-stm's PostToolUse hook.")
+            click.echo(f"  {_ok('Removed')} {what}")
         else:
-            click.echo("  Would remove memtomem-stm's PostToolUse hook.")
+            click.echo(f"  Would remove {what}")
+
+    if apply_:
+        _emit_unmanaged(change, change.unmanaged_after, written=True)
+    else:
+        _emit_unmanaged(change, unmanaged, written=False, preview=True)
 
     if not apply_ and change.fmt == "toml":
         click.echo(
@@ -1403,7 +1458,9 @@ def hook_install_command(
     ``~/.cursor/hooks.json``, ``$KIMI_CODE_HOME/config.toml`` or
     ``~/.kimi-code/config.toml``, or ``~/.codex/config.toml``)
     so the host fires ``mms hook --host <name>`` after each built-in tool call.
-    Re-running updates STM's existing block in place rather than duplicating it.
+    Re-running updates the STM block it recognizes in place rather than
+    duplicating it; a handler that only looks like STM's hook is left alone and
+    named by location.
     Default is a dry-run preview; ``--apply`` writes (backing up any prior file)
     under the hook-host write lock, with plan and apply in one locked span so
     concurrent mms runs cannot interleave (the host app's own concurrent writes
@@ -1491,9 +1548,12 @@ def hook_install_command(
 def hook_uninstall_command(host: str, apply_: bool) -> None:
     """Remove STM's PostToolUse hook from a host's config (symmetric to install).
 
-    Removes exactly the block ``install`` would add (recognized by command
-    shape), leaving any hand-written hooks untouched. A no-op when the config is
-    absent or holds no STM block. Default is a dry-run preview; ``--apply`` writes
+    Removes the STM blocks it recognizes by command shape (the ones ``install``
+    writes), leaving other hooks untouched; one that only looks like STM's hook
+    is named by location. A no-op when the config is absent or holds no
+    recognized STM block, except that empty hook containers (an empty matcher
+    group, event list or ``hooks`` section) are still pruned, and reported as
+    such. Default is a dry-run preview; ``--apply`` writes
     (backing up the prior file) under the same locked plan+apply span as
     ``install``."""
     # Lazy import: see hook_install_command.

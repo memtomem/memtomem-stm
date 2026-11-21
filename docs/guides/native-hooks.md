@@ -162,8 +162,10 @@ commands it recognizes in that file (`mms hook …` under any entry-point name,
 `MEMTOMEM_STM_*` variables) with one new command. It carries settings over from
 the first of them only, and of that command's inline `env` assignments it keeps
 only the daemon, timeout and query-text settings, as flags. A command it does
-not recognize, such as one behind `env` with another variable, stays in place
-next to the new one and keeps firing; edit such a registration by hand.
+not recognize, such as `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook` or
+one behind `env` with another variable, stays in place next to the new one;
+install and uninstall name its location (`hooks.PostToolUse[i].hooks[j]`) when
+it looks like STM's hook, and you edit such a registration by hand.
 
 See the [hook CLI reference](../reference/cli-hooks.md) and the complete
 [environment-variable reference](../reference/environment-variables.md).

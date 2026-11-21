@@ -1748,6 +1748,8 @@ class TestEmitHookChangeDisplayEscaping:
             rendered_block: str = "[[hooks]]"
             notes: tuple = ()
             host_tag: str = "claude"
+            unmanaged: tuple = ()
+            unmanaged_after: tuple = ()
 
         return _Change(path=tmp_path / f"cfg{self.HOSTILE}" / "settings.toml")
 

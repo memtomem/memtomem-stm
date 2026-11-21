@@ -1071,11 +1071,21 @@ Options:
                                   persistence settings.
 ```
 
-The merge is idempotent — an existing STM block (recognized by command shape,
+The merge is idempotent: an existing STM block (recognized by command shape,
 so a global or `uv run …` registration with any `--host` is matched) is updated
-in place, never duplicated — and `uninstall` is symmetric: it removes exactly
-what `install` adds, prunes the emptied containers, and leaves hand-written
-hooks untouched. Both **default to a dry-run preview**; pass `--apply` to write,
+in place instead of adding another. Claude Code and Codex also fold any further
+recognized STM handlers into it; Cursor and Kimi update the first one and leave
+the rest as they are. `uninstall` removes every recognized STM handler, prunes
+the emptied containers, and leaves other hooks untouched. A handler that only
+looks like STM's hook, such as `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms
+hook`, is not recognized: both commands leave it in place and print its
+location (in the written file after an `--apply` that writes, otherwise in the
+current file), never its text, so a duplicate is not silent. They look where
+install itself looks in that host's config file (`PostToolUse` for Claude Code
+and Codex, `postToolUse` for Cursor, every entry for Kimi). An uninstall that
+only prunes empty hook containers (an empty matcher group, event list or
+`hooks` section) says so instead of reporting a removal.
+Both **default to a dry-run preview**; pass `--apply` to write,
 which first backs up any existing file to `<path>.bak` (or `<path>.bak.1`, `.bak.2`,
 … if one already exists, so a second apply never clobbers the first backup). A
 config that exists but does not parse is refused, never overwritten. TOML hosts

@@ -1166,3 +1166,335 @@ def test_cli_apply_write_failure_exits_cleanly(redirect, monkeypatch, action) ->
     assert result.exit_code == 1
     assert f"cannot write {path}" in result.output
     assert path.read_text(encoding="utf-8") == prior
+
+
+# ── handlers that look like STM's hook but are not managed (#1453) ───────────
+#
+# Install and uninstall still rewrite or remove only what ``_is_stm_hook_command``
+# recognizes. Anything else that looks like STM's hook stays in the config and is
+# named by location, so a duplicate is never silent. ``_BARE`` is the shape
+# #1453 reported: install appended a second handler beside it, said nothing,
+# and uninstall printed "Removed" while it kept running.
+
+_BARE = "MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 /home/u/.local/bin/mms hook"
+_MANAGED = "mms hook --host claude"
+
+
+def _seed(path: Path, data: dict, fmt: str = "json") -> None:
+    import tomli_w
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data) if fmt == "json" else tomli_w.dumps(data)
+    path.write_text(text, encoding="utf-8")
+
+
+def _claude_groups(*groups: list[dict]) -> dict:
+    return {
+        "hooks": {"PostToolUse": [{"matcher": "Read|Grep|Glob|Bash", "hooks": g} for g in groups]}
+    }
+
+
+def _h(command: str, **fields: object) -> dict:
+    return {"type": "command", "command": command, **fields}
+
+
+@pytest.mark.parametrize(
+    ("host", "data", "location"),
+    [
+        ("claude", _claude_groups([_h(_BARE)]), "hooks.PostToolUse[0].hooks[0]"),
+        ("codex", _claude_groups([_h(_BARE)]), "hooks.PostToolUse[0].hooks[0]"),
+        (
+            "cursor",
+            {"version": 1, "hooks": {"postToolUse": [{"command": _BARE}]}},
+            "hooks.postToolUse[0]",
+        ),
+        (
+            "kimi",
+            {"hooks": [{"event": "PostToolUse", "matcher": "Bash", "command": _BARE}]},
+            "hooks[0]",
+        ),
+    ],
+)
+def test_unmanaged_stm_like_handler_is_named_on_every_host(
+    host: str, data: dict, location: str, redirect
+) -> None:
+    path = redirect(host)
+    _seed(path, data, HOOK_HOSTS[host].fmt)
+
+    installed = plan_install(host, _CMD.format(host=host))
+    removed = plan_uninstall(host)
+
+    # Kept as is: install appends its own handler, uninstall finds nothing of its own.
+    assert _BARE in installed.new_text
+    assert installed.unmanaged == (location,)
+    assert installed.unmanaged_after == (location,)  # appended after it, so it stays put
+    assert removed.status == "not_installed"
+    assert removed.unmanaged == (location,)
+    assert removed.unmanaged_after == (location,)
+
+
+@pytest.mark.parametrize(
+    ("host", "data", "before", "after"),
+    [
+        (
+            "cursor",
+            {"version": 1, "hooks": {"postToolUse": [{"command": _MANAGED}, {"command": _BARE}]}},
+            "hooks.postToolUse[1]",
+            "hooks.postToolUse[0]",
+        ),
+        (
+            "kimi",
+            {
+                "hooks": [
+                    {"event": "PostToolUse", "command": _MANAGED},
+                    {"event": "PostToolUse", "command": _BARE},
+                ]
+            },
+            "hooks[1]",
+            "hooks[0]",
+        ),
+    ],
+)
+def test_flat_host_uninstall_shifts_the_look_alike(
+    host: str, data: dict, before: str, after: str, redirect
+) -> None:
+    path = redirect(host)
+    _seed(path, data, HOOK_HOSTS[host].fmt)
+
+    change = plan_uninstall(host)
+
+    assert change.status == "remove"
+    assert (change.unmanaged, change.unmanaged_after) == ((before,), (after,))
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        _h(_MANAGED),  # recognized: install manages it
+        _h("echo hi"),
+        _h("ruff check hooks.py"),
+    ],
+)
+def test_managed_and_unrelated_handlers_are_not_named(handler: dict, redirect) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups([handler]))
+
+    assert plan_install("claude", _MANAGED).unmanaged == ()
+    assert plan_uninstall("claude").unmanaged == ()
+
+
+def test_exec_form_handler_is_named_from_its_args(redirect) -> None:
+    """``command`` alone (``mms``) is not STM's hook; with ``args`` it is."""
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h("mms", args=["hook", "--host", "claude"])]))
+
+    assert plan_install("claude", _MANAGED).unmanaged == ("hooks.PostToolUse[0].hooks[0]",)
+
+
+def test_install_names_positions_before_and_after_the_merge(redirect) -> None:
+    """Two STM-only groups fold into one, so the unmanaged group moves up."""
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(_MANAGED)], [_h("memtomem-stm hook")], [_h(_BARE)]))
+
+    change = plan_install("claude", _MANAGED)
+
+    assert change.unmanaged == ("hooks.PostToolUse[2].hooks[0]",)
+    assert change.unmanaged_after == ("hooks.PostToolUse[1].hooks[0]",)
+    written = json.loads(change.new_text)["hooks"]["PostToolUse"]
+    assert written[1]["hooks"][0]["command"] == _BARE
+
+
+def test_uninstall_names_positions_before_and_after_the_removal(redirect) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(_MANAGED)], [_h(_BARE)]))
+
+    change = plan_uninstall("claude")
+
+    assert change.status == "remove"
+    assert change.unmanaged == ("hooks.PostToolUse[1].hooks[0]",)
+    assert change.unmanaged_after == ("hooks.PostToolUse[0].hooks[0]",)
+    written = json.loads(change.new_text)["hooks"]["PostToolUse"]
+    assert written[0]["hooks"][0]["command"] == _BARE
+
+
+def test_cli_names_the_unmanaged_handler_through_install_and_uninstall(redirect) -> None:
+    """The #1453 reproduction, end to end: every step says the handler is there."""
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(_BARE)]))
+    runner = CliRunner()
+    current = "hooks.PostToolUse[0].hooks[0]"
+
+    preview = runner.invoke(cli, ["hook", "install", "--host", "claude"])
+    assert preview.exit_code == 0, preview.output
+    assert f"in the current file: {current}" in preview.output
+    assert "will stay in the config" in preview.output
+
+    applied = runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    assert "Installed" in applied.output
+    assert f"in the written file: {current}" in applied.output
+    assert "stays in the config" in applied.output
+
+    again = runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    assert "already installed" in again.output
+    assert f"in the current file: {current}" in again.output
+
+    removed = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+    assert "Removed the memtomem-stm hook install manages" in removed.output
+    assert "stays in the config" in removed.output
+    assert f"in the written file: {current}" in removed.output
+
+    nothing = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+    assert "no memtomem-stm hook that uninstall manages" in nothing.output
+    assert f"in the current file: {current}" in nothing.output
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    assert [h["command"] for g in groups for h in g["hooks"]] == [_BARE]
+
+
+def test_cli_without_unmanaged_handlers_prints_no_notice(redirect) -> None:
+    redirect("claude")
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+    assert "like memtomem-stm's hook" not in result.output
+
+
+def test_cli_notice_never_shows_command_text(redirect) -> None:
+    path = redirect("claude")
+    # A fake value, assembled at run time so no key-shaped literal sits in
+    # the source for secret scanners to flag.
+    value = "-".join(["sk", "lf", "fake", "value"])
+    _seed(path, _claude_groups([_h(f"MEMTOMEM_STM_LANGFUSE__SECRET_KEY={value} mms hook")]))
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+
+    assert "hooks.PostToolUse[0].hooks[0]" in result.output
+    assert value not in result.output
+    assert "SECRET_KEY" not in result.output
+
+
+def _notices(output: str) -> list[str]:
+    return [line for line in output.splitlines() if "like memtomem-stm's hook" in line]
+
+
+@pytest.mark.parametrize(
+    ("action", "groups", "before", "after"),
+    [
+        # Two STM-only groups fold into one, so the look-alike moves up.
+        (
+            "install",
+            ([_h(_MANAGED)], [_h("memtomem-stm hook")], [_h(_BARE)]),
+            "hooks.PostToolUse[2].hooks[0]",
+            "hooks.PostToolUse[1].hooks[0]",
+        ),
+        # The STM group goes, so the look-alike moves up.
+        (
+            "uninstall",
+            ([_h(_MANAGED)], [_h(_BARE)]),
+            "hooks.PostToolUse[1].hooks[0]",
+            "hooks.PostToolUse[0].hooks[0]",
+        ),
+    ],
+)
+def test_cli_preview_names_the_current_file_and_apply_the_written_one(
+    action: str, groups: tuple, before: str, after: str, redirect
+) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups(*groups))
+    runner = CliRunner()
+
+    preview = runner.invoke(cli, ["hook", action, "--host", "claude"])
+    applied = runner.invoke(cli, ["hook", action, "--host", "claude", "--apply"])
+
+    assert _notices(preview.output) == [_notices(preview.output)[0]]
+    assert f"(in the current file: {before})" in preview.output
+    assert _notices(applied.output) == [_notices(applied.output)[0]]
+    assert f"(in the written file: {after})" in applied.output
+
+
+def test_uninstall_of_only_empty_entries_does_not_claim_a_removal(redirect) -> None:
+    """An empty matcher group is pruned, but no hook goes, so neither the
+    preview nor the apply may say one was removed."""
+    path = redirect("claude")
+    _seed(path, _claude_groups([], [_h(_BARE)]))
+    runner = CliRunner()
+
+    assert plan_uninstall("claude").status == "prune"
+    preview = runner.invoke(cli, ["hook", "uninstall", "--host", "claude"])
+    applied = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+
+    only = "empty hook entries only (no memtomem-stm hook that uninstall manages)."
+    assert f"Would remove {only}" in preview.output
+    assert f"Removed {only}" in applied.output
+    assert "hook install manages" not in preview.output + applied.output
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    assert [h["command"] for g in groups for h in g["hooks"]] == [_BARE]
+
+
+@pytest.mark.parametrize(
+    ("host", "data", "location"),
+    [
+        (
+            "cursor",
+            {"version": 1, "hooks": {"postToolUse": [{"command": _BARE, "type": "x"}]}},
+            "hooks.postToolUse[0]",
+        ),
+        ("kimi", {"hooks": [{"event": "PostToolUse", "command": _BARE, "type": "x"}]}, "hooks[0]"),
+    ],
+)
+def test_flat_host_entry_with_its_own_type_is_still_named(
+    host: str, data: dict, location: str, redirect
+) -> None:
+    """Cursor and Kimi run an entry's ``command`` whatever else it holds."""
+    path = redirect(host)
+    _seed(path, data, HOOK_HOSTS[host].fmt)
+
+    assert plan_install(host, _CMD.format(host=host)).unmanaged == (location,)
+
+
+def test_dry_run_no_change_paths_name_the_current_file(redirect) -> None:
+    """``already`` and ``not_installed`` return early; a preview of either
+    must still print the notice, once."""
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(_BARE)]))
+    runner = CliRunner()
+    current = "(in the current file: hooks.PostToolUse[0].hooks[0])"
+
+    nothing = runner.invoke(cli, ["hook", "uninstall", "--host", "claude"])
+    assert "not installed (no memtomem-stm hook that uninstall manages)." in nothing.output
+    assert len(_notices(nothing.output)) == 1 and current in nothing.output
+
+    runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    already = runner.invoke(cli, ["hook", "install", "--host", "claude"])
+    assert "already installed" in already.output
+    assert len(_notices(already.output)) == 1 and current in already.output
+
+
+def test_kimi_look_alike_on_another_event_is_named(redirect) -> None:
+    """Kimi's install loop reads every entry whatever its ``event``, so the
+    scan does too."""
+    path = redirect("kimi")
+    _seed(
+        path,
+        {
+            "hooks": [
+                {"event": "PostToolUse", "matcher": "Bash", "command": "echo hi"},
+                {"event": "PostToolUseFailure", "command": _BARE},
+            ]
+        },
+        "toml",
+    )
+
+    assert plan_install("kimi", _CMD.format(host="kimi")).unmanaged == ("hooks[1]",)
+    assert plan_uninstall("kimi").unmanaged == ("hooks[1]",)
+
+
+def test_notice_agrees_with_the_number_of_handlers(redirect) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(_BARE), _h("mms --verbose hook")]))
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+
+    assert (
+        "2 other handlers look like memtomem-stm's hook but are not ones install manages, "
+        "so they stay in the config (in the written file: hooks.PostToolUse[0].hooks[0], "
+        "hooks.PostToolUse[0].hooks[1]). Check them by hand"
+    ) in result.output
