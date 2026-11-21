@@ -1346,6 +1346,54 @@ def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
     assert "updatedMCPToolOutput" in native_hooks
 
 
+def test_hook_compression_docs_require_explicit_claude_host() -> None:
+    """Enabling the env var alone does not compress: replacement needs a
+    registration with ``--host claude`` (#1437). Every surface that tells an
+    operator how to turn compression on must say so, and the one hand-written
+    registration example must carry the flag."""
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli import hook_cmd
+    from memtomem_stm.cli.hook_cmd import hook_command
+
+    import re
+
+    def flat(relative: str) -> str:
+        # Join wrapped lines (and `#`-comment continuations in shell blocks)
+        # so a sentence is matched whole wherever the doc wraps it.
+        lines = (re.sub(r"^\s*#\s?", "", line) for line in _read(relative).splitlines())
+        return " ".join(" ".join(lines).split())
+
+    # One sentence per surface, each new in #1437: a bare `--host claude`
+    # substring would also match the install commands these docs already had.
+    requirement = {
+        "README.md": "guarded Bash compression, which needs the hook registered with "
+        "`--host claude`",
+        "docs/cli.md": "It runs only when the registration passes `--host claude`",
+        "docs/configuration.md": "It also needs a registration that passes `--host claude`",
+        "docs/guides/native-hooks.md": "Replacement also requires the hook command to pass "
+        "`--host claude`",
+        "docs/guides/vibe-coding-getting-started-ko.md": "hook 명령에 `--host claude`가 "
+        "있어야 합니다",
+        "docs/reference/cli-hooks.md": "It also requires a registration with `--host claude`",
+    }
+    for relative, sentence in requirement.items():
+        assert sentence in flat(relative), f"{relative} lost the --host claude requirement"
+    env_row = next(
+        line
+        for line in _read("docs/reference/environment-variables.md").splitlines()
+        if line.startswith("| `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` |")
+    )
+    assert "--host claude" in env_row
+
+    module_doc = hook_cmd.__doc__ or ""
+    assert '"command": "mms hook --host claude"' in module_doc
+    assert '"command": "mms hook"}' not in module_doc
+    result = CliRunner().invoke(hook_command, ["--help"], terminal_width=200)
+    assert result.exit_code == 0
+    assert "--host claude" in result.output
+
+
 def test_vibe_coding_guide_pins_client_registration_and_hook_boundaries() -> None:
     """Keep the Korean first-user journey aligned with live host contracts."""
     from click import Choice

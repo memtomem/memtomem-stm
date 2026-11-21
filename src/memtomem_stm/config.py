@@ -329,7 +329,8 @@ class HookCompressionConfig(BaseModel):
     """Opt-in (default ``False``), mirroring ``proxy.enabled``. Because
     compression *replaces* model-visible output it ships dormant; enable with
     ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`` after the empirical hook test
-    confirms the host honors ``updatedToolOutput`` for Bash."""
+    confirms the host honors ``updatedToolOutput`` for Bash. Takes effect only
+    for a hook registered with an explicit ``--host claude``."""
     max_chars: int = Field(default=16000, gt=0)
     """Target character budget for the replacement ``stdout`` channel, and the
     threshold below which output is left untouched (only stdout longer than this

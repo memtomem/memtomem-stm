@@ -10,7 +10,11 @@ so the host appends them next to the tool result the model reads.
 Two stages, two hook fields. *Surfacing* appends ``additionalContext`` (the
 side-effect-free play). *Compression* (P1a) *replaces* a built-in tool's output
 via ``updatedToolOutput`` and is **Bash-only and opt-in**
-(``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``): for the built-in Bash tool the
+(``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``) and runs only when the hook is
+registered as ``mms hook --host claude`` (an ``auto`` registration cannot tell
+Claude from Codex, so it never replaces output; on a call compression would
+have attempted it reports the refusal through ``systemMessage`` instead, #1437):
+for the built-in Bash tool the
 value must be a structured object mirroring the tool result, so we clone the
 original ``tool_response`` and shrink only its ``stdout`` channel (preserving
 ``stderr`` / exit / ``interrupted`` / ``isImage`` verbatim). Compression stays
@@ -33,15 +37,22 @@ loop, cross-session dedup, and a privacy gate for ingestion arrive with the
 daemon stage (P2/Stage D).
 
 Hard rule — a hook must never disrupt the host. This command **always exits
-0** and, on any malformed input, disabled surfacing, timeout, or internal
-error, emits an empty object ``{}`` so the original tool result passes through
-untouched.
+0** and, on any malformed input, timeout, or internal error, emits an empty
+object ``{}`` so the original tool result passes through untouched. Disabled
+surfacing only drops ``additionalContext``; the compression stage, and its
+refusal notice, still run. The one addition is a ``systemMessage`` reporting a compression
+refusal found before a failure that the per-call barrier catches, a timeout
+included (#1437); the tool result still passes through. A ``BaseException``
+that reaches the outermost barrier still emits ``{}``.
 
 Register in Claude Code ``settings.json``::
 
     {"hooks": {"PostToolUse": [
       {"matcher": "Read|Grep|Glob|Bash",
-       "hooks": [{"type": "command", "command": "mms hook"}]}]}}
+       "hooks": [{"type": "command", "command": "mms hook --host claude"}]}]}}
+
+``mms hook install --host claude --apply`` writes this block (without
+``--apply`` it previews it).
 
 Performance — daemon by default: surfacing routes through the local daemon
 (``HookConfig.use_daemon`` defaults ``True``), a warm LTM connection that turns
@@ -286,6 +297,60 @@ class BuiltinCompressionOutcome:
     compressed_chars: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _CompressionCandidate:
+    """A shell result that passed every gate :func:`compress_builtin` checks
+    before it runs the compressor: what remains is the compressor itself and
+    the ``min_retention`` guard on its result."""
+
+    stdout: str
+    original: dict[str, Any]
+
+
+_COMPRESS_PREFIX = f"{_COMPRESS_SENTINEL}\n"
+
+
+def _compression_candidate(
+    call: "CanonicalHookCall", cfg: "HookCompressionConfig"
+) -> BuiltinCompressionOutcome | _CompressionCandidate:
+    """The gates of :func:`compress_builtin` that need no compressor run.
+
+    Returns the early outcome when a gate stops the call, otherwise the
+    candidate. Cost is bounded by the size checks — it never scans ``stdout``
+    beyond the sentinel prefix — so the refused-replacement path in
+    :func:`_orchestrate` can ask "would compression have been attempted?"
+    without paying for an attempt. Unguarded itself: both callers
+    (:func:`compress_builtin`, :func:`_would_attempt_compression`) catch.
+    """
+    if not cfg.enabled:
+        return BuiltinCompressionOutcome("disabled")
+    if call.event_type != "PostToolUse":
+        return BuiltinCompressionOutcome("ineligible_event")
+    if call.canonical_tool != "shell":
+        return BuiltinCompressionOutcome("ineligible_tool")
+    extracted = _bash_stdout(call.tool_response)
+    if extracted is None:
+        return BuiltinCompressionOutcome("unsupported_shape")
+    stdout, original = extracted
+    explicit_error = original.get("isError") is True or original.get("is_error") is True
+    interrupted = original.get("interrupted") is True
+    image = original.get("isImage") is True or original.get("is_image") is True
+    exit_code = original.get("exitCode", original.get("exit_code"))
+    nonzero_exit = isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
+    if explicit_error or interrupted or image or nonzero_exit:
+        return BuiltinCompressionOutcome("unsafe_result", original_chars=len(stdout))
+    if len(stdout) <= cfg.max_chars or _already_compressed(stdout):
+        status = "already_compressed" if _already_compressed(stdout) else "below_threshold"
+        return BuiltinCompressionOutcome(status, original_chars=len(stdout))
+    if cfg.max_chars <= len(_COMPRESS_PREFIX):
+        # A budget that cannot even hold the sentinel cannot produce a
+        # meaningful replacement — prepending anyway would EXPAND the
+        # configured cap many-fold (max_chars=1 → ~18 chars of sentinel).
+        # Leave the output unchanged instead.
+        return BuiltinCompressionOutcome("budget_too_small", original_chars=len(stdout))
+    return _CompressionCandidate(stdout, original)
+
+
 def compress_builtin(
     call: "CanonicalHookCall", cfg: "HookCompressionConfig"
 ) -> BuiltinCompressionOutcome:
@@ -297,9 +362,11 @@ def compress_builtin(
     Only structured shell results are handled (see :func:`_bash_stdout`).
     **Never raises.**
 
-    Gate: ``cfg.enabled`` + PostToolUse + ``canonical_tool == "shell"`` + ``stdout``
-    longer than ``cfg.max_chars`` + not already compressed. The strategy is fixed
-    to :class:`TruncateCompressor` (self-contained — no chunk-store callback,
+    Gate (:func:`_compression_candidate`): ``cfg.enabled`` + PostToolUse +
+    ``canonical_tool == "shell"`` + a safe result + ``stdout`` longer than
+    ``cfg.max_chars`` + not already compressed + a budget that holds the
+    sentinel. The strategy is fixed to :class:`TruncateCompressor`
+    (self-contained — no chunk-store callback,
     unlike SELECTIVE/HYBRID/PROGRESSIVE, whose retrieval tools live in the
     separate ``mms`` server process). ``cfg.max_chars`` budgets the *whole*
     replacement stdout: the sentinel prefix is reserved out of the compressor's
@@ -308,28 +375,10 @@ def compress_builtin(
     Claude), so this is reached only for a host that honors ``updatedToolOutput``.
     """
     try:
-        if not cfg.enabled:
-            return BuiltinCompressionOutcome("disabled")
-        if call.event_type != "PostToolUse":
-            return BuiltinCompressionOutcome("ineligible_event")
-        if call.canonical_tool != "shell":
-            return BuiltinCompressionOutcome("ineligible_tool")
-        extracted = _bash_stdout(call.tool_response)
-        if extracted is None:
-            return BuiltinCompressionOutcome("unsupported_shape")
-        stdout, original = extracted
-        explicit_error = original.get("isError") is True or original.get("is_error") is True
-        interrupted = original.get("interrupted") is True
-        image = original.get("isImage") is True or original.get("is_image") is True
-        exit_code = original.get("exitCode", original.get("exit_code"))
-        nonzero_exit = (
-            isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
-        )
-        if explicit_error or interrupted or image or nonzero_exit:
-            return BuiltinCompressionOutcome("unsafe_result", original_chars=len(stdout))
-        if len(stdout) <= cfg.max_chars or _already_compressed(stdout):
-            status = "already_compressed" if _already_compressed(stdout) else "below_threshold"
-            return BuiltinCompressionOutcome(status, original_chars=len(stdout))
+        candidate = _compression_candidate(call, cfg)
+        if isinstance(candidate, BuiltinCompressionOutcome):
+            return candidate
+        stdout, original = candidate.stdout, candidate.original
 
         # Lazy import: keep ``mms hook --help`` and the no-op path off the
         # compression module's import cost.
@@ -338,16 +387,9 @@ def compress_builtin(
         # Reserve the sentinel prefix out of the budget so sentinel + body stays
         # at/near ``max_chars`` (TruncateCompressor's own suffix may still add a
         # small, bounded overage — the budget is a target, not a hard cap).
-        prefix = f"{_COMPRESS_SENTINEL}\n"
-        if cfg.max_chars <= len(prefix):
-            # A budget that cannot even hold the sentinel cannot produce a
-            # meaningful replacement — prepending anyway would EXPAND the
-            # configured cap many-fold (max_chars=1 → ~18 chars of sentinel).
-            # Leave the output unchanged instead.
-            return BuiltinCompressionOutcome("budget_too_small", original_chars=len(stdout))
-        body_budget = cfg.max_chars - len(prefix)
+        body_budget = cfg.max_chars - len(_COMPRESS_PREFIX)
         compressed = TruncateCompressor().compress(stdout, max_chars=body_budget)
-        replacement_text = prefix + compressed
+        replacement_text = _COMPRESS_PREFIX + compressed
         if len(stdout) and len(replacement_text) / len(stdout) < cfg.min_retention:
             return BuiltinCompressionOutcome(
                 "retention_guard",
@@ -367,6 +409,38 @@ def compress_builtin(
             "builtin output compression failed — leaving tool output unchanged", exc_info=True
         )
         return BuiltinCompressionOutcome("error")
+
+
+# Shown to the user (``systemMessage``) and logged to stderr when replacement
+# is refused for a call compression would have attempted (#1437). Conditional
+# on Claude Code because ``auto`` resolves an ambiguous Codex payload (no
+# ``turn_id``) to the Claude adapter too, and for Codex the fix is
+# ``--host codex``, not ``--host claude``.
+# The fix it names is the edit itself, not ``mms hook install``: install
+# rewrites only the user settings file, and drops inline ``env`` compression
+# settings when it does.
+HOST_NOT_EXPLICIT_NOTICE = (
+    "memtomem-stm: Bash output compression is enabled, but this hook was not "
+    "registered with --host claude, so compression was not attempted and the "
+    "output was passed through. If this is Claude Code, add --host claude to "
+    "the hook command where it is registered."
+)
+
+
+def _would_attempt_compression(call: "CanonicalHookCall", cfg: "HookCompressionConfig") -> bool:
+    """Whether :func:`compress_builtin` would have run its compressor on
+    ``call``, for a registration that did not authorize replacement
+    (``--host`` other than ``claude``). **Never raises.**
+
+    Runs only the cheap gates: the compressor and the retention guard are
+    skipped, which is why the notice says the attempt was not made rather
+    than that output would have shrunk.
+    """
+    try:
+        return isinstance(_compression_candidate(call, cfg), _CompressionCandidate)
+    except Exception:
+        logger.debug("compression gate failed on the refused path", exc_info=True)
+        return False
 
 
 def maybe_compress_builtin(
@@ -777,6 +851,7 @@ async def _orchestrate(
     adapter: "HostHookAdapter",
     *,
     allow_output_replacement: bool | None = None,
+    notices: list[str] | None = None,
 ) -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
     LTM *surfacing*, as one host-shaped output.
@@ -827,12 +902,23 @@ async def _orchestrate(
     # ``disabled`` comes first: a hook that never enabled compression must not
     # read as one that is missing ``--host claude``. ``allow_output_replacement``
     # is tri-state — ``None`` (direct callers) defers to the adapter.
+    notice = False
     if not config.hook.compression.enabled:
         compression = BuiltinCompressionOutcome("disabled")
     elif not adapter.can_replace_output:
         compression = BuiltinCompressionOutcome("unsupported_host")
     elif allow_output_replacement is False:
         compression = BuiltinCompressionOutcome("replacement_not_requested")
+        # The status above covers every call of such a registration; the
+        # notice only the ones compression would have attempted (#1437).
+        # Reported before surfacing starts: if surfacing then runs past the
+        # outer hook deadline, the caller still has the notice to emit
+        # (``notices``), and stderr already carries it.
+        notice = _would_attempt_compression(call, config.hook.compression)
+        if notice:
+            logger.warning("%s", HOST_NOT_EXPLICIT_NOTICE)
+            if notices is not None:
+                notices.append(HOST_NOT_EXPLICIT_NOTICE)
     else:
         compression = compress_builtin(call, config.hook.compression)
     logger.debug(
@@ -852,7 +938,14 @@ async def _orchestrate(
     _record_hook_metrics(
         call, updated, additional_context, config, adapter.host_tag, compression.status
     )
-    return adapter.render(updated_tool_output=updated, additional_context=additional_context)
+    rendered = adapter.render(updated_tool_output=updated, additional_context=additional_context)
+    if notice:
+        # ``systemMessage`` is a top-level field of the JSON output that both
+        # Claude Code and Codex document as a warning shown to the user.
+        # Reachable only through a replacement-capable adapter, which is a
+        # JSON host.
+        rendered = {**rendered, "systemMessage": HOST_NOT_EXPLICIT_NOTICE}
+    return rendered
 
 
 def _resolve_host_tag(host: str, payload: dict[str, Any] | None) -> str:
@@ -986,12 +1079,14 @@ def hook_command(
     Bare ``mms hook`` (no subcommand) is the *runtime* bridge: it reads the hook
     JSON payload on stdin and prints a hook response that may carry
     ``updatedToolOutput`` (compressed Bash output — opt-in via
-    ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``) and/or ``additionalContext``
+    ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``, and only with an explicit
+    ``--host claude``) and/or ``additionalContext``
     (relevant LTM memories, for read-like tools). Surfacing runs in the warm
     ``mms daemon`` by default (no per-call cold start), auto-spawned on first
     use; set ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` for the legacy cold in-process
     path. Always exits 0; on any problem the tool output passes through unchanged
-    (prints ``{}``).
+    (prints ``{}``, or only a ``systemMessage`` when compression was refused for
+    the call before a timeout or other caught failure, #1437).
 
     ``--host`` selects the adapter, which owns both the output *shape*
     (``render``) and its *stdout serialization* (``serialize`` — JSON for
@@ -1052,6 +1147,7 @@ def hook_command(
             host_tag = _resolve_host_tag(host, payload)
             adapter = get_adapter(host_tag)
             output: dict[str, Any] = {}
+            notices: list[str] = []
             if payload is not None:
                 try:
                     output = asyncio.run(
@@ -1061,7 +1157,8 @@ def hook_command(
                                 adapter,
                                 # Automatic/ambiguous routing must never enable the
                                 # sole destructive capability (native output replace).
-                                allow_output_replacement=host.strip() == "claude",
+                                allow_output_replacement=host_authorizes_replacement(host),
+                                notices=notices,
                             ),
                             timeout=_hook_budget_seconds(),
                         )
@@ -1070,7 +1167,10 @@ def hook_command(
                     logger.warning(
                         "hook processing failed — passing tool output through", exc_info=True
                     )
-                    output = {}
+                    # A refusal found before the failure (typically a surfacing
+                    # timeout) is still reported; nothing else of the partial
+                    # run is kept.
+                    output = render_notices(adapter, notices)
             serialized = adapter.serialize(output)
         # ``serialize`` returns "" only when nothing is emitted (Kimi's raw-stdout
         # channel with nothing surfaced). An unconditional ``click.echo`` would
@@ -1120,6 +1220,23 @@ def hook_command(
             except BaseException:  # noqa: BLE001
                 with suppress(BaseException):
                     logger.warning("hook fallback emit failed — emitting nothing")
+
+
+def host_authorizes_replacement(host: str) -> bool:
+    """Whether a runtime ``--host`` value lets ``mms hook`` replace tool output.
+
+    Only an explicit ``claude`` does: ``auto`` and an unrecognized value both
+    resolve by payload shape, which cannot tell Codex from Claude (#1437)."""
+    return host.strip() == "claude"
+
+
+def render_notices(adapter: "HostHookAdapter", notices: list[str]) -> dict[str, Any]:
+    """The pass-through output, plus ``systemMessage`` when a notice was
+    raised and the host's channel is JSON (Kimi's raw stdout has no field
+    for it, and cannot raise one: it cannot replace output)."""
+    if not notices or not adapter.can_replace_output:
+        return {}
+    return {"systemMessage": notices[0]}
 
 
 def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:
