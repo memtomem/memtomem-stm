@@ -1901,6 +1901,33 @@ def test_cli_auto_detected_kimi_gets_no_refusal_notice(monkeypatch: pytest.Monke
     assert HOST_NOT_EXPLICIT_NOTICE not in result.stderr
 
 
+_CURSOR_BIG_SHELL_PAYLOAD = {
+    "hook_event_name": "postToolUse",
+    "tool_name": "Shell",
+    "tool_input": {"command": "seq 1 4000"},
+    "tool_output": _BIG_STDOUT,
+}
+
+
+@pytest.mark.parametrize("argv", [["hook"], ["hook", "--host", "cursor"]], ids=["auto", "explicit"])
+def test_cli_cursor_shell_payload_gets_no_refusal_notice(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, argv: list[str]
+):
+    """Outcome pin, not a pin of the capability gate: with the gate removed
+    this still passes, because the compression gates stop Cursor's call first
+    (its event stays camelCase ``postToolUse``). The Kimi control is silenced
+    the same way (``tool_output`` is not a structured result); the Codex
+    controls are the ones that fail without the gate."""
+    _refused_env(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        result = CliRunner().invoke(cli, argv, input=json.dumps(_CURSOR_BIG_SHELL_PAYLOAD))
+
+    assert result.exit_code == 0
+    assert "systemMessage" not in result.stdout
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_cli_auto_detected_codex_gets_no_refusal_notice(monkeypatch: pytest.MonkeyPatch):
     _refused_env(monkeypatch)
     payload = {**_bash_payload({"stdout": _BIG_STDOUT}), "turn_id": "turn-1"}

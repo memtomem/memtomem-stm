@@ -1337,16 +1337,29 @@ def test_hook_compression_docs_require_explicit_claude_host() -> None:
     from memtomem_stm.cli import hook_cmd
     from memtomem_stm.cli.hook_cmd import hook_command
 
-    for relative in (
-        "README.md",
-        "docs/cli.md",
-        "docs/configuration.md",
-        "docs/guides/native-hooks.md",
-        "docs/guides/vibe-coding-getting-started-ko.md",
-        "docs/reference/cli-hooks.md",
-        "docs/reference/environment-variables.md",
-    ):
-        assert "--host claude" in _read(relative), f"{relative} lost the --host claude requirement"
+    import re
+
+    def flat(relative: str) -> str:
+        # Join wrapped lines (and `#`-comment continuations in shell blocks)
+        # so a sentence is matched whole wherever the doc wraps it.
+        lines = (re.sub(r"^\s*#\s?", "", line) for line in _read(relative).splitlines())
+        return " ".join(" ".join(lines).split())
+
+    # One sentence per surface, each new in #1437: a bare `--host claude`
+    # substring would also match the install commands these docs already had.
+    requirement = {
+        "README.md": "guarded Bash compression, which needs the hook registered with "
+        "`--host claude`",
+        "docs/cli.md": "It runs only when the registration passes `--host claude`",
+        "docs/configuration.md": "It also needs a registration that passes `--host claude`",
+        "docs/guides/native-hooks.md": "Replacement also requires the hook command to pass "
+        "`--host claude`",
+        "docs/guides/vibe-coding-getting-started-ko.md": "hook 명령에 `--host claude`가 "
+        "있어야 합니다",
+        "docs/reference/cli-hooks.md": "It also requires a registration with `--host claude`",
+    }
+    for relative, sentence in requirement.items():
+        assert sentence in flat(relative), f"{relative} lost the --host claude requirement"
     env_row = next(
         line
         for line in _read("docs/reference/environment-variables.md").splitlines()

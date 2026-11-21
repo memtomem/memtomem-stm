@@ -193,8 +193,9 @@ export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # rating prompt / feedbac
 # Built-in Bash stdout compression is opt-in, separate from surfacing, and
 # Claude Code only — native output replacement ports to no other host. It also
 # needs a registration that passes `--host claude` (what
-# `mms hook install --host claude --apply` writes); a bare `mms hook` never
-# replaces output and says so in a `systemMessage` and on stderr. Unsafe
+# `mms hook install --host claude --apply` writes). A bare `mms hook` never
+# replaces output; on a call compression would have attempted it says so in a
+# `systemMessage` and on stderr. Unsafe
 # or failed results and replacements retaining under 65% of the original are
 # passed through unchanged.
 # With defaults, replacement is therefore possible only while the compressed

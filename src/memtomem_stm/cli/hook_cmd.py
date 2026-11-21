@@ -925,8 +925,9 @@ async def _orchestrate(
     if compression.status == "host_not_explicit":
         logger.warning("%s", HOST_NOT_EXPLICIT_NOTICE)
         # ``systemMessage`` is a top-level field of the JSON output that both
-        # Claude Code and Codex show to the user, not the model. Reachable only
-        # through a replacement-capable adapter, which is a JSON host.
+        # Claude Code and Codex document as a warning shown to the user.
+        # Reachable only through a replacement-capable adapter, which is a
+        # JSON host.
         rendered = {**rendered, "systemMessage": HOST_NOT_EXPLICIT_NOTICE}
     return rendered
 
