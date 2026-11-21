@@ -42,6 +42,18 @@ mms hook install --host claude --no-daemon --apply
 mms hook install --host claude --inherit-runtime-env --apply
 ```
 
+Every host config above is user-scope, so the command install writes runs for
+every project. Its launcher depends on the nearest `pyproject.toml` in the
+directory install runs from or one of its four parents (the search stops at the
+first one found). When that file is STM's own (`name = "memtomem-stm"`) or
+lists `memtomem-stm` as a dependency or optional dependency, the launcher is
+`uv run --directory <that directory> memtomem-stm`; otherwise it is the bare
+`memtomem-stm` console script. Unless that directory is STM's source checkout
+(a `memtomem-stm` project with `src/memtomem_stm/__init__.py`), every hook call
+then runs from that project's environment, and install says so in its output.
+To get the bare launcher (for example with `uv tool install memtomem-stm`),
+re-run install from a directory where no such `pyproject.toml` is found.
+
 Reinstalling recognizes and migrates older POSIX commands that began with
 `env MEMTOMEM_STM_...`; the replacement uses cross-platform runtime flags and
 retains the existing managed timeout. The flags are listed in the
