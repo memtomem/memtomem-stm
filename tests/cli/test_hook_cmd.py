@@ -1759,7 +1759,8 @@ def test_refused_replacement_reports_notice_without_running_the_compressor(
 
     assert out == {"systemMessage": HOST_NOT_EXPLICIT_NOTICE}
     assert "--host claude" in HOST_NOT_EXPLICIT_NOTICE
-    assert "mms hook install --host claude --apply" in HOST_NOT_EXPLICIT_NOTICE
+    assert "add --host claude to the hook command" in HOST_NOT_EXPLICIT_NOTICE
+    assert "mms hook install" not in HOST_NOT_EXPLICIT_NOTICE
     assert calls == []
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings == [HOST_NOT_EXPLICIT_NOTICE]
@@ -1939,33 +1940,114 @@ def test_cli_auto_detected_codex_gets_no_refusal_notice(monkeypatch: pytest.Monk
     assert "systemMessage" not in result.stdout
 
 
-@pytest.mark.parametrize(
-    ("command", "expected"),
-    [
-        ("mms hook", "auto"),
-        ("mms hook --host claude", "claude"),
-        ("mms hook --host=claude", "claude"),
-        ("mms hook --host ' claude '", " claude "),
-        ("mms hook --host claude --host auto", "auto"),
-        ("mms hook --host", "auto"),
-        ("mms hook --help", "auto"),
-        ("mms hook --host codex", "codex"),
-        (
-            "uv run --directory /src/memtomem-stm memtomem-stm hook --host claude "
-            "--use-daemon --surfacing-timeout-seconds 12",
-            "claude",
-        ),
-        ("env MEMTOMEM_STM_HOOK__USE_DAEMON=0 memtomem-stm-proxy hook", "auto"),
-        ("echo hook && mms status", None),
-        ("mms status", None),
-    ],
-)
-def test_registered_hook_host_reads_the_flag_the_runtime_reads(
-    command: str, expected: str | None
-):
-    from memtomem_stm.cli.hook_cmd import registered_hook_host
+_REGISTRATIONS = [
+    # (command, host, runs_bridge, inline_compression_env)
+    ("mms hook", "auto", True, False),
+    ("mms hook --host claude", "claude", True, False),
+    ("mms hook --host=claude", "claude", True, False),
+    ("mms hook --host ' claude '", " claude ", True, False),
+    ("mms hook --host claude --host auto", "auto", True, False),
+    ("mms hook --host", "auto", True, False),
+    ("mms hook --host codex", "codex", True, False),
+    ("mms hook --host claude --help", "claude", False, False),
+    ("mms hook --host claude --typo", "claude", False, False),
+    ("mms hook --host claude extra", "claude", False, False),
+    ("mms hook --host claude --surfacing-timeout-seconds", "claude", False, False),
+    (
+        "uv run --directory /src/memtomem-stm memtomem-stm hook --host claude "
+        "--use-daemon --surfacing-timeout-seconds 12",
+        "claude",
+        True,
+        False,
+    ),
+    ("env MEMTOMEM_STM_HOOK__USE_DAEMON=0 memtomem-stm-proxy hook", "auto", True, False),
+    ("env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook", "auto", True, True),
+]
 
-    assert registered_hook_host(command) == expected
+
+@pytest.mark.parametrize(("command", "host", "runs_bridge", "inline_compression"), _REGISTRATIONS)
+def test_inspect_hook_registration_reads_the_command_the_runtime_runs(
+    command: str, host: str, runs_bridge: bool, inline_compression: bool
+):
+    from memtomem_stm.cli.hook_cmd import HookRegistration, inspect_hook_registration
+
+    assert inspect_hook_registration(command) == HookRegistration(
+        host=host, runs_bridge=runs_bridge, inline_compression_env=inline_compression
+    )
+
+
+@pytest.mark.parametrize(("command", "host", "runs_bridge", "inline_compression"), _REGISTRATIONS)
+def test_runs_bridge_matches_what_the_runtime_does(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    host: str,
+    runs_bridge: bool,
+    inline_compression: bool,
+):
+    """Checks the table, not the function: run each registered argv and see
+    whether the bridge answered (exit 0, a JSON object on stdout). The test
+    above holds :func:`inspect_hook_registration` to the same table, so the
+    two together pin the function to what the runtime does."""
+    import shlex
+
+    from memtomem_stm.cli import hook_hosts
+
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "0")
+    split = hook_hosts.stm_hook_args(command)
+    assert split is not None
+    result = CliRunner().invoke(cli, ["hook", *split[1]], input="{}")
+    answered = result.exit_code == 0 and result.stdout.strip().startswith("{")
+    assert answered is runs_bridge, shlex.join(split[1])
+
+
+@pytest.mark.parametrize("command", ["echo hook && mms status", "mms status"])
+def test_inspect_hook_registration_ignores_non_stm_commands(command: str):
+    from memtomem_stm.cli.hook_cmd import inspect_hook_registration
+
+    assert inspect_hook_registration(command) is None
+
+
+def test_surfacing_timeout_keeps_the_refusal_notice(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """The refusal is known before surfacing starts, so a surfacing call that
+    outlives the outer hook deadline must not erase it."""
+    _refused_env(monkeypatch)
+
+    async def stalled(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", stalled)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda: 0.2)
+    stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        result = CliRunner().invoke(cli, ["hook"], input=stdin)
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {"systemMessage": HOST_NOT_EXPLICIT_NOTICE}
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert messages[0] == HOST_NOT_EXPLICIT_NOTICE
+    assert any("hook processing failed" in m for m in messages[1:])
+
+
+def test_surfacing_timeout_without_a_refusal_still_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _refused_env(monkeypatch)
+
+    async def stalled(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", stalled)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda: 0.2)
+    stdin = json.dumps(_bash_payload({"stdout": "short"}))
+
+    result = CliRunner().invoke(cli, ["hook"], input=stdin)
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {}
 
 
 @pytest.mark.parametrize(

@@ -124,9 +124,11 @@ def _is_stm_hook_command(command: str) -> bool:
     return stm_hook_args(command) is not None
 
 
-def stm_hook_args(command: str) -> list[str] | None:
-    """The tokens after ``hook`` when ``command`` is an STM ``mms hook``
-    invocation (see :func:`_is_stm_hook_command`), else ``None``.
+def stm_hook_args(command: str) -> tuple[list[str], list[str]] | None:
+    """``(prefix, args)`` when ``command`` is an STM ``mms hook`` invocation
+    (see :func:`_is_stm_hook_command`), else ``None``: the tokens before the
+    executable (a ``uv run`` launcher or an inline ``env`` wrapper) and the
+    tokens after ``hook``.
 
     Lets a reader evaluate the registered flags (``mms doctor``'s
     ``--host`` check, #1437) on exactly the commands install and uninstall
@@ -146,7 +148,7 @@ def stm_hook_args(command: str) -> list[str] | None:
     if len(starts) != 1:
         return None
     i = starts[0]
-    prefix = tokens[:i]
+    launcher = prefix = tokens[:i]
     # Pre-runtime-flag installs commonly used POSIX ``env`` to pin timeout
     # values in the host command.  Recognize only a leading env executable
     # followed exclusively by MEMTOMEM_STM_* assignments; an arbitrary env
@@ -163,7 +165,7 @@ def stm_hook_args(command: str) -> list[str] | None:
         prefix = prefix[j:]
     if prefix and not (prefix[:2] == ["uv", "run"] and all(token != "--" for token in prefix)):
         return None
-    return tokens[i + 2 :]
+    return launcher, tokens[i + 2 :]
 
 
 def _is_stm_command_handler(handler: Any) -> bool:

@@ -65,7 +65,81 @@ def test_bare_registration_warns_with_the_install_fix(
     check = _doctor_checks(tmp_path)["hook_registration"]
 
     assert check["status"] == "WARN"
-    assert check["detail"].startswith(f"1 of 2 STM hook command(s) in {path} lack --host claude")
+    assert check["detail"] == (
+        f"1 of 2 STM hook command(s) in {path} lack --host claude, "
+        "so hook compression never replaces their output"
+    )
+    assert check["next_action"] == "mms hook install --host claude --apply"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mms hook --host claude --help",
+        "mms hook --host claude --typo",
+        "mms hook --host claude install",
+        "mms hook --host claude --surfacing-timeout-seconds",
+    ],
+)
+def test_command_that_never_runs_the_hook_warns(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch, command: str
+):
+    """``--host claude`` alone is not a PASS: these print help, exit 2, or run
+    a subcommand, so the host gets no hook output at all."""
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    path = _write_hooks(claude_dir, command)
+
+    check = _doctor_checks(tmp_path)["hook_registration"]
+
+    assert check["status"] == "WARN"
+    assert check["detail"] == (
+        f"1 of 1 STM hook command(s) in {path} do not run the hook "
+        "(a usage error, --help, or a subcommand)"
+    )
+    assert check["next_action"] == "mms hook install --host claude --apply"
+
+
+def test_both_problems_are_reported(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    path = _write_hooks(claude_dir, "mms hook", "mms hook --host claude --typo")
+
+    check = _doctor_checks(tmp_path)["hook_registration"]
+
+    assert check["detail"] == (
+        f"1 of 2 STM hook command(s) in {path} lack --host claude, "
+        "so hook compression never replaces their output; "
+        f"1 of 2 STM hook command(s) in {path} do not run the hook "
+        "(a usage error, --help, or a subcommand)"
+    )
+
+
+def test_inline_compression_env_gets_a_hand_edit_instead_of_install(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Install would rewrite the command without the inline opt-in, leaving
+    compression off; the advice must not send the operator there."""
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    _write_hooks(claude_dir, "env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook")
+
+    check = _doctor_checks(tmp_path)["hook_registration"]
+
+    assert check["status"] == "WARN"
+    assert check["next_action"] == (
+        "add --host claude to those commands by hand: `mms hook install --host "
+        "claude --apply` does not keep their inline MEMTOMEM_STM_* compression settings"
+    )
+
+
+def test_inline_env_without_compression_settings_keeps_the_install_advice(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    _write_hooks(claude_dir, "env MEMTOMEM_STM_HOOK__USE_DAEMON=0 mms hook")
+
+    check = _doctor_checks(tmp_path)["hook_registration"]
+
     assert check["next_action"] == "mms hook install --host claude --apply"
 
 
@@ -151,3 +225,22 @@ def test_no_check_while_compression_is_off(tmp_path: Path, claude_dir: Path):
     _write_hooks(claude_dir, "mms hook")
 
     assert "hook_registration" not in _doctor_checks(tmp_path)
+
+
+def test_install_still_drops_inline_compression_settings():
+    """The premise of the hand-edit advice above. If install starts carrying
+    these assignments over, this fails and the advice should go back to the
+    install command."""
+    import shlex
+
+    from memtomem_stm.cli.hook_cmd import _hook_install_command_argv
+    from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
+
+    existing = "env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook"
+    policy = resolve_host_runtime_policy(
+        existing_command=existing, use_daemon=None, surfacing_timeout_seconds=None
+    )
+    rewritten = shlex.join(_hook_install_command_argv("claude", policy=policy))
+
+    assert "--host claude" in rewritten
+    assert "MEMTOMEM_STM_HOOK__COMPRESSION__" not in rewritten

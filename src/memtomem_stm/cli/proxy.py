@@ -10916,14 +10916,13 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     than costing the rest of the report.
     """
     from memtomem_stm.cli import hook_hosts
-    from memtomem_stm.cli.hook_cmd import host_authorizes_replacement, registered_hook_host
+    from memtomem_stm.cli.hook_cmd import host_authorizes_replacement, inspect_hook_registration
 
     label = "hook registration"
-    next_action = "mms hook install --host claude --apply"
     try:
         path = hook_hosts.hook_config_path("claude")
         commands = hook_hosts.installed_stm_hook_commands("claude")
-        hosts = [registered_hook_host(command) for command in commands]
+        registrations = [inspect_hook_registration(command) for command in commands]
     except Exception as exc:
         check(
             "hook_registration",
@@ -10943,17 +10942,14 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
             "(project and local Claude Code settings are not checked)",
         )
         return
-    refused = sum(1 for host in hosts if host is None or not host_authorizes_replacement(host))
-    if refused:
-        check(
-            "hook_registration",
-            label,
-            "WARN",
-            f"{refused} of {len(commands)} STM hook command(s) in {path} lack --host claude; "
-            "hook compression is enabled but never replaces their output",
-            next_action,
-        )
-    else:
+    total = len(commands)
+    broken = [r for r in registrations if r is None or not r.runs_bridge]
+    lacking = [
+        r
+        for r in registrations
+        if r is not None and r.runs_bridge and not host_authorizes_replacement(r.host)
+    ]
+    if not broken and not lacking:
         check(
             "hook_registration",
             label,
@@ -10961,6 +10957,29 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
             f"every STM hook command in {path} passes --host claude "
             "(project and local Claude Code settings are not checked)",
         )
+        return
+    problems = []
+    if lacking:
+        problems.append(
+            f"{len(lacking)} of {total} STM hook command(s) in {path} lack --host claude, "
+            "so hook compression never replaces their output"
+        )
+    if broken:
+        problems.append(
+            f"{len(broken)} of {total} STM hook command(s) in {path} do not run the hook "
+            "(a usage error, --help, or a subcommand)"
+        )
+    # Install rewrites every STM command in that file, which fixes both kinds,
+    # but it drops an inline ``env`` wrapper's compression settings: such a
+    # command gets a hand-edit instruction instead.
+    if any(r is not None and r.inline_compression_env for r in [*lacking, *broken]):
+        next_action = (
+            "add --host claude to those commands by hand: `mms hook install --host "
+            "claude --apply` does not keep their inline MEMTOMEM_STM_* compression settings"
+        )
+    else:
+        next_action = "mms hook install --host claude --apply"
+    check("hook_registration", label, "WARN", "; ".join(problems), next_action)
 
 
 @cli.command()

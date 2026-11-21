@@ -77,6 +77,7 @@ import sys
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, TextIO
 
 import click
@@ -412,11 +413,14 @@ def compress_builtin(
 # on Claude Code because ``auto`` resolves an ambiguous Codex payload (no
 # ``turn_id``) to the Claude adapter too, and for Codex the fix is
 # ``--host codex``, not ``--host claude``.
+# The fix it names is the edit itself, not ``mms hook install``: install
+# rewrites only the user settings file, and drops inline ``env`` compression
+# settings when it does.
 HOST_NOT_EXPLICIT_NOTICE = (
     "memtomem-stm: Bash output compression is enabled, but this hook was not "
     "registered with --host claude, so compression was not attempted and the "
-    "output was passed through. If this is Claude Code, run "
-    "`mms hook install --host claude --apply`."
+    "output was passed through. If this is Claude Code, add --host claude to "
+    "the hook command where it is registered."
 )
 
 
@@ -846,6 +850,7 @@ async def _orchestrate(
     adapter: "HostHookAdapter",
     *,
     allow_output_replacement: bool | None = None,
+    notices: list[str] | None = None,
 ) -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
     LTM *surfacing*, as one host-shaped output.
@@ -904,6 +909,13 @@ async def _orchestrate(
         # ``--host claude``: the auto-detect refusal stays, and is reported
         # when it cost an attempt (#1437).
         compression = _refused_replacement_outcome(call, config.hook.compression)
+        if compression.status == "host_not_explicit":
+            # Reported before surfacing starts: if surfacing then runs past the
+            # outer hook deadline, the caller still has the notice to emit
+            # (``notices``), and stderr already carries it.
+            logger.warning("%s", HOST_NOT_EXPLICIT_NOTICE)
+            if notices is not None:
+                notices.append(HOST_NOT_EXPLICIT_NOTICE)
     else:
         compression = BuiltinCompressionOutcome("unsupported_host")
     logger.debug(
@@ -923,7 +935,6 @@ async def _orchestrate(
     _record_hook_metrics(call, updated, additional_context, config, adapter.host_tag)
     rendered = adapter.render(updated_tool_output=updated, additional_context=additional_context)
     if compression.status == "host_not_explicit":
-        logger.warning("%s", HOST_NOT_EXPLICIT_NOTICE)
         # ``systemMessage`` is a top-level field of the JSON output that both
         # Claude Code and Codex document as a warning shown to the user.
         # Reachable only through a replacement-capable adapter, which is a
@@ -1130,6 +1141,7 @@ def hook_command(
             host_tag = _resolve_host_tag(host, payload)
             adapter = get_adapter(host_tag)
             output: dict[str, Any] = {}
+            notices: list[str] = []
             if payload is not None:
                 try:
                     output = asyncio.run(
@@ -1140,6 +1152,7 @@ def hook_command(
                                 # Automatic/ambiguous routing must never enable the
                                 # sole destructive capability (native output replace).
                                 allow_output_replacement=host_authorizes_replacement(host),
+                                notices=notices,
                             ),
                             timeout=_hook_budget_seconds(),
                         )
@@ -1148,7 +1161,10 @@ def hook_command(
                     logger.warning(
                         "hook processing failed — passing tool output through", exc_info=True
                     )
-                    output = {}
+                    # A refusal found before the failure (typically a surfacing
+                    # timeout) is still reported; nothing else of the partial
+                    # run is kept.
+                    output = render_notices(adapter, notices)
             serialized = adapter.serialize(output)
         # ``serialize`` returns "" only when nothing is emitted (Kimi's raw-stdout
         # channel with nothing surfaced). An unconditional ``click.echo`` would
@@ -1209,25 +1225,79 @@ def host_authorizes_replacement(host: str) -> bool:
     return host.strip() == "claude"
 
 
-def registered_hook_host(command: str) -> str | None:
-    """The ``--host`` value ``mms hook`` runs with for a registered command
-    string, or ``None`` when the string is not an STM hook command.
+def render_notices(adapter: "HostHookAdapter", notices: list[str]) -> dict[str, Any]:
+    """The pass-through output, plus ``systemMessage`` when a notice was
+    raised and the host's channel is JSON (Kimi's raw stdout has no field
+    for it, and cannot raise one: it cannot replace output)."""
+    if not notices or not adapter.can_replace_output:
+        return {}
+    return {"systemMessage": notices[0]}
+
+
+@dataclass(frozen=True, slots=True)
+class HookRegistration:
+    """How ``mms hook`` would run for a registered command string."""
+
+    host: str
+    """The ``--host`` value, read as the runtime reads it."""
+    runs_bridge: bool
+    """Whether the command reaches the runtime bridge at all: ``False`` for a
+    usage error (exit 2), ``--help``, or a subcommand such as ``install``."""
+    inline_compression_env: bool
+    """Whether an inline ``env`` wrapper sets ``MEMTOMEM_STM_HOOK__COMPRESSION__*``.
+    ``mms hook install`` turns an older wrapper's daemon, timeout and
+    query-text assignments into flags, but drops these."""
+
+
+def inspect_hook_registration(command: str) -> HookRegistration | None:
+    """Read a registered command the way ``mms hook`` would, or ``None`` when
+    the string is not an STM hook command.
 
     Parsed by :func:`hook_command`'s own Click options rather than by matching
     tokens, so ``--host=claude``, a repeated ``--host`` (the last wins) and a
-    value-less ``--host`` (``auto``) read the way the runtime reads them.
-    ``resilient_parsing`` keeps an eager ``--help`` from printing and a parse
-    error from raising; an unknown option makes the runtime exit 2 before the
-    bridge runs, so the value reported for such a command is moot.
+    value-less ``--host`` (``auto``) read the way the runtime reads them. A
+    strict parse decides ``runs_bridge``; what Click would print for
+    ``--help`` or a usage error is captured, never shown. ``host`` comes from
+    a resilient parse, so it is reported even for a command that fails.
     """
+    import contextlib
+    import io
+    import warnings
+
     from memtomem_stm.cli import hook_hosts
 
-    args = hook_hosts.stm_hook_args(command)
-    if args is None:
+    split = hook_hosts.stm_hook_args(command)
+    if split is None:
         return None
-    ctx = hook_command.make_context("hook", list(args), resilient_parsing=True)
-    value = ctx.params.get("host")
-    return value if isinstance(value, str) else "auto"
+    launcher, args = split
+    resilient = hook_command.make_context("hook", list(args), resilient_parsing=True)
+    value = resilient.params.get("host")
+    host = value if isinstance(value, str) else "auto"
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            strict = hook_command.make_context("hook", list(args))
+    except Exception:  # click.UsageError, or click.exceptions.Exit from --help
+        runs_bridge = False
+    else:
+        # Leftover tokens name a subcommand (``install``) or fail as an
+        # unknown one; either way the bridge does not run. Click 8.x keeps the
+        # first in ``protected_args`` (deprecated, folded into ``args`` in 9).
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            leftover = [*getattr(strict, "protected_args", ()), *strict.args]
+        runs_bridge = not leftover
+    inline_compression_env = (
+        bool(launcher)
+        and Path(launcher[0]).name == "env"
+        and any(
+            token.partition("=")[0].startswith("MEMTOMEM_STM_HOOK__COMPRESSION__")
+            for token in launcher[1:]
+        )
+    )
+    return HookRegistration(
+        host=host, runs_bridge=runs_bridge, inline_compression_env=inline_compression_env
+    )
 
 
 def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:

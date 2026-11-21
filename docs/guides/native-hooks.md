@@ -149,11 +149,16 @@ structured, over `max_chars`, not already compressed, and a budget larger than
 the sentinel), the hook still passes the output through, prints a warning to
 stderr, and returns it as `systemMessage`, which Claude Code and Codex document
 as a warning shown to the user. Claude Code does not show the stderr of a hook
-that exits 0 outside its debug log. With compression enabled, `mms doctor` also
-warns about STM hook commands that lack `--host claude` in the file
-`mms hook install --host claude` writes (`$CLAUDE_CONFIG_DIR/settings.json`,
-otherwise `~/.claude/settings.json`). It does not read Claude Code's project or
-local settings.
+that exits 0 outside its debug log.
+
+To fix it, add `--host claude` to the hook command where it is registered.
+`mms hook install --host claude --apply` does that for the user settings file
+(`$CLAUDE_CONFIG_DIR/settings.json`, otherwise `~/.claude/settings.json`), but
+not for Claude Code's project or local settings, and it does not keep
+`MEMTOMEM_STM_HOOK__COMPRESSION__*` variables set inline with `env` in the old
+command. With compression enabled, `mms doctor` checks the user settings file:
+it warns about STM hook commands that lack `--host claude` and about ones that
+never run the hook (a usage error, `--help`, or a subcommand).
 
 See the [hook CLI reference](../reference/cli-hooks.md) and the complete
 [environment-variable reference](../reference/environment-variables.md).
