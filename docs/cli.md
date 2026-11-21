@@ -1009,7 +1009,10 @@ for read-like built-ins (`Read`/`Grep`/`Glob`/`Bash` and their per-host
 equivalents). Bash stdout compression is separate, Claude-only, requires Claude
 Code 2.1.121+, and is opt-in via
 `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning `updatedToolOutput` while
-preserving stderr, exit status, interruption state, and image markers.
+preserving stderr, exit status, interruption state, and image markers. It runs
+only when the registration passes `--host claude`: under `auto` the hook never
+replaces output, and on a call routed to the Claude adapter that compression
+would have attempted it reports that through `systemMessage` and stderr instead.
 
 Runtime `--host TEXT` selects the adapter; `auto` (the default) recognizes
 Cursor and Kimi shapes and a non-empty Codex `turn_id`. A payload that remains

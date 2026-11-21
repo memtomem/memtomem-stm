@@ -13,6 +13,36 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook` no longer ignores `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED`
+  silently when the hook is registered without `--host claude`. Output
+  replacement still runs only for an explicit `--host claude`, because
+  auto-detection cannot tell Claude from Codex. A bare `mms hook`, the form the
+  `hook_cmd` module docstring used to show, therefore passed every Bash result
+  through, and nothing said why at the time it happened (since #1441,
+  `mms stats` counts the retained rows of such calls, with compression
+  enabled and routed to the Claude adapter, as `replacement_not_requested`).
+  Now, on a call
+  routed to the Claude adapter (auto-detection's fallback; a payload with a
+  non-empty Codex `turn_id` goes to the Codex adapter and gets no warning) that
+  compression would have attempted (a Bash result that passes every check made
+  before the compressor runs: safe, structured, over `max_chars`, not already
+  compressed, and a budget larger than the sentinel and its newline), the hook
+  still passes the output through, writes a warning to stderr, and returns it
+  as a top-level `systemMessage`, which Claude Code and Codex document as a warning
+  shown to the user. The warning is raised before surfacing runs, so a
+  surfacing call that outlives the hook deadline does not erase it. It says
+  the attempt was not made, and does not claim the output would have shrunk,
+  because the refused path skips the compressor and so the retention guard.
+  It asks for `--host claude` to be added where the hook is registered rather
+  than naming `mms hook install`, which rewrites only the user settings file,
+  leaves a registration it does not recognize in place, and keeps only the
+  daemon, timeout and query-text settings of an inline `env` wrapper. The docstring example and the docs now state the
+  `--host claude` requirement (#1437).
+  **Behavior change**: a bare `mms hook` with compression enabled prints a
+  warning for each such call, and its JSON output gains `systemMessage` on
+  those calls, including when surfacing times out. The tool output itself and
+  the metrics row are unchanged. Registering with `--host claude` removes the
+  warning and turns compression on.
 - `mms daemon status` and `mms daemon start` escape for display the values
   they print from a daemon that answers. On `start`'s "daemon already
   running" and "daemon started" lines (which `restart` prints too) those are

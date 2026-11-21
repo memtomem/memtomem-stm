@@ -218,7 +218,7 @@ Status meanings:
 | `MEMTOMEM_STM_HOOK__FALLBACK` | `skip / cold` | `skip` | Behavior when the daemon is unavailable; a daemon that answers busy or out of time skips either way. | Bundled |
 | `MEMTOMEM_STM_HOOK__AUTO_SPAWN` | boolean | `true` | Start a missing daemon. | Bundled |
 | `MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS` | boolean | `false` | Enable rating prompts, durable-demotion reads, and auto-tune feedback processing. Surfacing telemetry rows still persist when false. | Bundled |
-| `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` | boolean | `false` | Enable guarded Claude Bash output replacement. | Bundled |
+| `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` | boolean | `false` | Enable guarded Claude Bash output replacement; applies only to a hook registered with `--host claude`. | Bundled |
 | `MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS` | positive integer | `16000` | Hook compression target size. | Bundled |
 | `MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION` | float `0..1` | `0.65` | Minimum allowed native-output retained fraction. | Bundled |
 | `MEMTOMEM_STM_HOOK__METRICS_ENABLED` | boolean | `true` | Record size/timing-only native-hook metrics. | Bundled |
