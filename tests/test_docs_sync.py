@@ -1288,10 +1288,11 @@ def test_cli_md_stats_documents_source_filter() -> None:
 
 
 def test_cli_md_stats_documents_the_hook_status_scope() -> None:
-    """The hook status breakdown is retained-only even under ``--all-time``
-    (the daily rollup keeps no status, #1438). Pin the JSON key, every status
-    name the hook can write, and the retained-only scope, so the prose cannot
-    drift into describing all-time counts or a status that no longer exists."""
+    """The hook status breakdown covers trimmed rows under ``--all-time`` once
+    the status rollup exists (#1442), and retained rows otherwise. Pin the JSON
+    keys, both scopes, every status name the hook can write, the status table
+    and the reset that must clear it, so the prose cannot drift back to
+    retained-only or omit the table a reset has to empty."""
     from memtomem_stm.proxy.metrics import HOOK_COMPRESSION_STATUSES
 
     cli_md = _read("docs/cli.md")
@@ -1301,7 +1302,20 @@ def test_cli_md_stats_documents_the_hook_status_scope() -> None:
     section = section_match.group(1)
     assert "`hook_status`" in section
     assert '"scope": "retained"' in section
-    assert "retained rows only, also under `--all-time`" in section
+    assert "`scope` is `all_time` when the trimmed rows are counted too" in section
+    assert '"status_not_kept_calls"' in section
+    assert "`status not kept N`" in section
+    assert (
+        "BEGIN IMMEDIATE; DELETE FROM proxy_metrics; DELETE FROM proxy_metrics_daily; COMMIT;"
+    ) in section
+    # The two-statement reset is complete only because deleting daily rows
+    # clears their status rows; the docs must say so, and the trigger must exist.
+    from memtomem_stm.proxy import metrics_store
+
+    assert f"reset `{metrics_store._STATUS_DAILY_TABLE}` too" in section
+    assert f"DELETE FROM {metrics_store._STATUS_DAILY_TABLE}" in (
+        metrics_store._STATUS_RESET_TRIGGER_DDL
+    )
     missing = sorted(name for name in HOOK_COMPRESSION_STATUSES if f"`{name}`" not in section)
     assert not missing, f"docs/cli.md `stats` must name every hook status: {missing}"
 

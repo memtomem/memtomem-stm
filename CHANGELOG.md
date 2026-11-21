@@ -124,10 +124,9 @@ changes inline only. See the deprecation policy in
   `hook_status`. With hook compression enabled, a Claude Code hook registered
   without `--host claude`, which never replaces output (#1437), now shows as
   `replacement_not_requested` instead of being folded in with hosts that
-  cannot replace output (with compression off it shows as `disabled`). The
-  daily rollup keeps no status, so the counts cover retained rows only, also
-  under `--all-time`; rows written before this version count as `not
-  recorded` (#1438).
+  cannot replace output (with compression off it shows as `disabled`). Rows
+  written before this version count as `not recorded`; under `--all-time`
+  the counts also cover trimmed rows, see the next entry (#1438).
   **Behavior change**: `proxy_metrics` gains a nullable
   `hook_compression_status` column, added the first time this version opens
   the metrics DB for writing (the MCP server, `mms tune` or `mms hook`; `mms
@@ -137,6 +136,33 @@ changes inline only. See the deprecation policy in
   about 0.2 ms more per open, measured on one 10,451-row DB that already had
   the column and no concurrent writer. The `mms stats` text output gains the
   `status:` lines; existing lines and `--json` keys are unchanged.
+- `mms stats --all-time` keeps the hook status counts of trimmed rows. The
+  daily rollup is keyed by day, source, server and tool, so once trimming
+  removed the last retained row with a given status that status vanished
+  from the breakdown, while its calls still weighed on the host's all-time
+  ratio; on a machine with two hosts registered the retained hook window was
+  under a day. The status of each trimmed `hook` row is now kept in a second
+  never-pruned table, `proxy_metrics_hook_status_daily`, fed by its own
+  database trigger, so rows trimmed by an older STM version sharing the file
+  are counted too. Hook calls already in the daily rollup when this version
+  first opens the DB were trimmed with no status kept: they are counted once,
+  at that point, and the line ends with `status not kept N`. `--json`
+  `hook_status` reports `"scope": "all_time"` and a per-host
+  `status_not_kept_calls` (`null` under the `retained` scope) (#1442).
+  **Behavior change**: the metrics DB gains the table, a second `AFTER
+  DELETE` trigger on `proxy_metrics` and one on `proxy_metrics_daily` (a
+  deleted daily bucket takes its status rows with it, so the documented
+  two-table reset still clears everything), created the first time this
+  version opens the DB for writing. Each trimmed hook row now costs one more
+  insert: deleting 10,000 hook rows at once took a median of 61–63 ms
+  instead of 47–49 ms, while the mean write at the cap, trims included,
+  stayed within run-to-run spread (58–65 µs on both), measured on one
+  machine. The schema check that runs each time two versions open the file
+  in turn rose from a median of 0.68–0.78 ms to 0.86–0.96 ms on a
+  10,000-row DB. `docs/cli.md` now runs the reset in one transaction. Under
+  `--all-time` the `status:` line no longer says `(retained rows)` unless
+  the status rollup is unavailable (not installed yet, or its table or a
+  trigger is missing).
 
 ## [0.7.9] — 2026-11-15
 
