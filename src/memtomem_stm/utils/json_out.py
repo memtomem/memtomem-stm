@@ -41,9 +41,12 @@ _LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 def dumps(payload: Any, **kwargs: Any) -> str:
     """``json.dumps`` whose result is always encodable to UTF-8 (#757).
 
-    ``ensure_ascii=False`` — which every caller passes, so CJK and emoji
-    stay readable rather than escaping into ``\\uXXXX`` soup (the #750/#754
-    line) — leaves a lone surrogate *raw* in the returned ``str``. ``dumps``
+    ``ensure_ascii=False`` — which most callers pass, so CJK and emoji stay
+    readable rather than escaping into ``\\uXXXX`` soup (the #750/#754 line) —
+    leaves a lone surrogate *raw* in the returned ``str``. (``mms hook``'s
+    stdout passes ``ensure_ascii=True`` instead: only a host parser reads it,
+    and ASCII encodes in any ASCII-compatible stdout encoding, #1444. With
+    that, ``json.dumps`` escapes the surrogate itself.) ``dumps``
     itself does not raise; the ``UnicodeEncodeError`` lands later, when
     ``click.echo`` or ``atomic_write_text`` encodes that string. On a
     mutating command that is the worst possible timing: the config write has

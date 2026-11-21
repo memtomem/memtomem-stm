@@ -1515,7 +1515,12 @@ drift is an observation rather than a CI failure signal. (A `~/.mms` state
 file it cannot read is exit `1`.) `sync` is the ongoing
 reconciliation path: `--plan` previews, `--apply` writes, `--apply --force`
 adopts entries marked changed (under `--plan`, `--force` only previews that),
-and `--yes` bypasses confirmation prompts for scripts.
+and `--yes` bypasses confirmation prompts for scripts. The text preview shows
+the `mms host sync --apply` command to run when that run has changes to make,
+and says ``Nothing for `<command>` to do.`` when it has none: no entry to add,
+remove, backfill or re-stamp, no sidecar row to re-key or clean up. Entries
+that command skips, such as a changed entry without `--force` or one that
+moved to another host, do not count as changes.
 
 `sync --apply` shares the same project-local config gate as `mms import`: new
 (ADD-bucket) entries, and — only under `--force` — RESTAMP-bucket entries,

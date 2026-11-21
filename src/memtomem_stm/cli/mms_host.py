@@ -131,6 +131,12 @@ _SYNC_CHANGED_FOOTER_TEMPLATE = (
 
 _SYNC_PLAN_CLOSING_TEMPLATE = "Run `{command}` to execute."
 
+# The plan's closing line when that ``--apply`` run would write nothing (#1402).
+# Not ``_SYNC_NO_OP_MSG``: with an in-place changed entry and no ``--force``,
+# "Already synchronized" would contradict the "differ in shape at host" footer
+# printed above it. It names the command so the claim is about that run only.
+_SYNC_PLAN_NOTHING_TEMPLATE = "Nothing for `{command}` to do."
+
 # Cross-host drift footer (Lock-down 6). Used in two contexts:
 #   - Sub-line under ``_SYNC_CHANGED_FOOTER_TEMPLATE`` when ``--force``
 #     is *not* set and some changed entries are cross-host (so users
@@ -864,6 +870,7 @@ def _render_sync_text(
     apply_outcome: str | None = None,
     yes: bool = False,
     allow_project_configs: bool = False,
+    apply_writes: bool = True,
 ) -> None:
     """Default human-readable sync renderer.
 
@@ -883,6 +890,10 @@ def _render_sync_text(
     ``yes`` / ``allow_project_configs`` are the flags the user supplied;
     both ``mms host sync --apply`` hints (changed-entry footer, plan
     closing line) carry them (see ``_sync_apply_command``).
+
+    ``apply_writes`` (plan mode only) is whether the ``--apply`` run the
+    closing line names would write anything; when it would not, the line
+    says so instead of telling the user to run it (#1402).
     """
     add_rows = plan_payload["add"]
     remove_rows = plan_payload["remove"]
@@ -994,8 +1005,9 @@ def _render_sync_text(
 
     if mode == "plan":
         w("")
+        template = _SYNC_PLAN_CLOSING_TEMPLATE if apply_writes else _SYNC_PLAN_NOTHING_TEMPLATE
         w(
-            _SYNC_PLAN_CLOSING_TEMPLATE.format(
+            template.format(
                 command=_sync_apply_command(
                     force=force_active, yes=yes, allow_project_configs=allow_project_configs
                 )
@@ -1315,6 +1327,27 @@ def sync_cmd(
             row["_new_server"] = cand.server
             row["_new_source_label"] = cand.source_label
 
+    # ``--force`` activates the ``changed`` bucket as a mutator
+    # (Lock-down 3). The cross-host slice (Lock-down 6) is excluded —
+    # surfaced in the CHANGED footer for manual review only.
+    restamp_rows = restamp_eligible_rows if force else []
+
+    # Whether the ``--apply`` run with these flags writes anything, gates aside.
+    # One expression for both modes: the plan's closing line says whether that
+    # run has something to do (#1402), and the apply no-op gate below is the
+    # same test, so the two cannot disagree. ``cleanup_names`` counts: orphan
+    # sidecar entries are filtered on the next save, which is how
+    # ``sidecar.keys() ⊆ registry.servers.keys()`` self-heals; so does
+    # ``rekey_names``, a sidecar rewrite with nothing else pending.
+    apply_writes = bool(
+        new
+        or removed_at_host_rows
+        or no_baseline_with_cand
+        or restamp_rows
+        or cleanup_names
+        or rekey_names
+    )
+
     if is_plan:
         if json_output:
             _render_sync_json("plan", plan_payload, summary, aborted=False)
@@ -1324,22 +1357,18 @@ def sync_cmd(
                 plan_payload,
                 summary,
                 new=new,
-                restamp_rows=restamp_eligible_rows if force else [],
+                restamp_rows=restamp_rows,
                 cross_host_count=len(cross_host_changed_rows),
                 force_active=force,
                 yes=yes,
                 allow_project_configs=allow_project_configs,
+                apply_writes=apply_writes,
             )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
             _render_not_inspected_footer(not_inspected_rows, indent="  ")
         return
 
     # ----- --apply -----
-
-    # ``--force`` activates the ``changed`` bucket as a mutator
-    # (Lock-down 3). The cross-host slice (Lock-down 6) is excluded —
-    # surfaced in the CHANGED footer for manual review only.
-    restamp_rows = restamp_eligible_rows if force else []
 
     # Project-config gate. Both registry-writing buckets — ADD (``new``) and,
     # under --force, RESTAMP — can adopt candidates read from project-local
@@ -1391,14 +1420,8 @@ def sync_cmd(
             click.echo(_SYNC_DECLINE_MSG, err=True)
             sys.exit(2)
 
-    # No-op gate. ``cleanup_names`` non-empty counts as a mutation
-    # (orphan sidecar entries get filtered on the next save). Without
-    # this, orphans would never be cleaned up by a "boring" sync and
-    # the post-condition ``sidecar.keys() ⊆ registry.servers.keys()``
-    # would not self-heal.
-    no_mutations = not (new or removed_at_host_rows or no_baseline_with_cand or restamp_rows)
-    no_orphans = not cleanup_names
-    if no_mutations and no_orphans and not rekey_names:
+    # No-op gate: the predicate the plan's closing line reads (see ``apply_writes``).
+    if not apply_writes:
         if json_output:
             _render_sync_json("apply", plan_payload, summary, aborted=False)
         else:
