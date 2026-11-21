@@ -225,7 +225,7 @@ changes inline only. See the deprecation policy in
   continuation), gets only the raw-text search as before, which can miss it
   and still let the row PASS. A plain command whose `hook` is only part of a
   word, such as `mms status --config /tmp/hook.json`, is no longer counted
-  as an STM hook (issue #1450).
+  as an STM hook (#1455, issue #1450).
 
 ## [0.7.9] — 2026-11-15
 
