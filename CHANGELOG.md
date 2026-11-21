@@ -53,7 +53,7 @@ changes inline only. See the deprecation policy in
 ### Changed
 
 - `mms hook install` says when the user-scope hook it writes is bound to a
-  project (issue #1379). When the nearest `pyproject.toml` (the current
+  project (#1464, issue #1379). When the nearest `pyproject.toml` (the current
   directory or one of its four parents) lists `memtomem-stm` as a dependency,
   install writes `uv run --directory <project> memtomem-stm hook …` into a
   config every project shares, so every hook call runs from that project's

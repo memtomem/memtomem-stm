@@ -2466,7 +2466,7 @@ class TestInstallProjectBindingNotice:
     install output names the binding in every outcome — preview, ``--apply``
     and an already-identical reinstall. No real PATH lookup is involved."""
 
-    MARK = "runs STM through `uv run --directory`"
+    MARK = "STM through `uv run --directory`"
 
     @staticmethod
     def _project(tmp_path: Path) -> Path:
@@ -2495,14 +2495,22 @@ class TestInstallProjectBindingNotice:
             "preview": self._install(),
             "apply": self._install("--apply"),
             "already": self._install("--apply"),
+            # A dry run over the installed hook: unchanged, so present tense
+            # even without --apply (the tense follows the change, not the flag).
+            "already_preview": self._install(),
         }
 
         assert "already installed" in outcomes["already"].output
+        assert "already installed" in outcomes["already_preview"].output
         for name, result in outcomes.items():
             assert result.exit_code == 0, (name, result.output)
             notice = [line for line in result.output.splitlines() if self.MARK in line]
             assert len(notice) == 1, (name, result.output)
             assert str(project) in notice[0], (name, notice)
+            # A dry run that changes the config describes the hook it would
+            # write; every other outcome describes the hook that is installed.
+            tense = "hook would run STM" if name == "preview" else "hook runs STM"
+            assert tense in notice[0], (name, notice)
         # The written command is the project-bound one, unchanged by #1379.
         settings = json.loads((config_dir / "settings.json").read_text(encoding="utf-8"))
         commands = [

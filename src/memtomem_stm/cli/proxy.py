@@ -909,13 +909,6 @@ def _project_table_references_stm(data: dict[str, Any]) -> bool:
     return False
 
 
-def _pyproject_references_stm(pyp: Path) -> bool:
-    """True if ``pyp`` is STM's own pyproject.toml, or lists memtomem-stm as
-    a dep (see :func:`_project_table_references_stm`)."""
-    data = _load_pyproject(pyp)
-    return data is not None and _project_table_references_stm(data)
-
-
 class _StmProject(NamedTuple):
     """The project a user-scope hook launcher binds to.
 

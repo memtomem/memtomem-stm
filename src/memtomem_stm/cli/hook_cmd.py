@@ -1343,8 +1343,11 @@ def _emit_hook_change(
     def _echo_binding() -> None:
         if project_binding is None or change.action != "install":
             return
+        # A dry run that would change the config describes the hook it would
+        # write; until --apply the installed one may still use another launcher.
+        runs = "would run" if change.changed and not apply_ else "runs"
         click.echo(
-            f"  {_warn('•')} This user-scope hook runs STM through `uv run --directory` "
+            f"  {_warn('•')} This user-scope hook {runs} STM through `uv run --directory` "
             f"in {_disp(str(project_binding))}, for every project. For the bare "
             "`memtomem-stm` launcher (e.g. after `uv tool install memtomem-stm`), "
             "re-run this command from a directory where the nearest pyproject.toml "
