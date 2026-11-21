@@ -33,9 +33,9 @@ _SHELL_SYNTAX = "not checked because of shell syntax (quotes, $, ~, # or operato
 _OTHER = "not checked (an unknown launcher or an unsupported handler field): "
 # What the row can miss, at the end of each detail that reports on commands (#1457).
 _SCOPE = (
-    "an STM hook is recognized by an STM name and a later hook in the command text, so one "
-    "behind a wrapper script or with its name split by shell syntax can be missed; project, "
-    "local and managed Claude Code settings are not read"
+    "STM hooks are recognized from the command text by a heuristic, so one behind a wrapper "
+    "script or spelled with shell syntax can be missed; project, local and managed Claude "
+    "Code settings are not read"
 )
 _NEXT_RUN = "fix the arguments of the commands that do not run the hook"
 _NEXT_HOST = (
@@ -322,6 +322,14 @@ def test_known_misses_outside_the_quote_tier(command: str) -> None:
     assert not hr.is_candidate({"type": "command", "command": command})
 
 
+# The three misses #1457 lists. The first two are also pinned above.
+_ISSUE_MISSES = [
+    {"type": "command", "command": 'm"m"s hook --host claude # comment'},
+    {"type": "command", "command": "m\\\nms hook --host claude"},
+    # ``,`` is outside the quote tier's characters, and quoting splits the name
+    # for the raw search.
+    {"type": "command", "command": "'/opt/tools,v2/bin/'m\"m\"s hook --host claude"},
+]
 _MORE_KNOWN_MISSES = [
     # Quote removal leaves the inner script as one word, which names nothing.
     {"type": "command", "command": "sh -c 'm\"m\"s hook --host claude'"},
@@ -334,7 +342,7 @@ _MORE_KNOWN_MISSES = [
 ]
 
 
-@pytest.mark.parametrize("handler", _MORE_KNOWN_MISSES)
+@pytest.mark.parametrize("handler", _ISSUE_MISSES + _MORE_KNOWN_MISSES)
 def test_known_misses_recognition_cannot_close(handler: dict[str, Any]) -> None:
     """#1457: each of these runs (or can run) the hook bridge and is not
     recognized. Recognition is by the command text, so the class is open-ended;
@@ -460,7 +468,7 @@ def test_registration_with_host_claude_passes(tmp_path: Path, claude_dir: Path) 
     }
 
 
-@pytest.mark.parametrize("missed", _MORE_KNOWN_MISSES)
+@pytest.mark.parametrize("missed", _ISSUE_MISSES + _MORE_KNOWN_MISSES)
 def test_pass_says_it_covers_recognized_commands_only(
     tmp_path: Path, claude_dir: Path, missed: dict[str, Any]
 ) -> None:
@@ -483,7 +491,9 @@ def test_text_output_states_the_recognition_limit(tmp_path: Path, claude_dir: Pa
 
     result = CliRunner().invoke(cli, ["doctor", "--config", str(tmp_path / "absent.json")])
 
-    line = next(line for line in result.output.splitlines() if "hook registration" in line)
+    lines = [line for line in result.output.splitlines() if "hook registration" in line]
+    assert len(lines) == 1
+    line = lines[0]
     detail = f"{_PREFIX}1 recognized, all passing --host claude to mms hook — in {path}; {_SCOPE}"
     assert line.endswith(detail)
     assert line.count("can be missed") == 1

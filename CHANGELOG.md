@@ -256,8 +256,8 @@ changes inline only. See the deprecation policy in
   it reads the same values as before. Hook input is read as UTF-8
   whatever the locale, with a leading byte-order mark ignored.
 - `mms doctor`'s `hook registration` row counts more STM hooks spelled with
-  quotes. In shell form, a line made only of plain words (letters, digits
-  and `_./:=+-`) and quotes, up to 4,096 characters and with balanced quotes,
+  quotes. In shell form, a line made only of plain words (ASCII letters and
+  digits, and `_./:=+-`) and quotes, up to 4,096 characters and with balanced quotes,
   is now also matched on the words left after quote removal. So `m"m"s hook`
   next to `mms hook --host claude` is counted, marked not checked, and the
   row WARNs instead of reporting PASS. That example is for shell-form
@@ -269,13 +269,13 @@ changes inline only. See the deprecation policy in
   word, such as `mms status --config /tmp/hook.json`, is no longer counted
   as an STM hook (#1455, issue #1450).
 - `mms doctor`'s `hook registration` row now says what it can miss. It
-  recognizes an STM hook by a search of the command text (in exec form, the
-  command and its `args`) for an STM name and a later `hook`. That is a
-  heuristic, so some hooks are not counted: a wrapper script whose command
-  names neither word, and spellings such as `m"m"s hook # note`,
+  recognizes an STM hook from the command text (in exec form, the command and
+  its `args`) by a heuristic, the matching the previous entry describes. So
+  some hooks are not counted: a wrapper script whose command names neither
+  an STM executable nor `hook`, and spellings such as `m"m"s hook # note`,
   `sh -c 'm"m"s hook'` and `python -mmemtomem_stm hook`. (Others are counted,
-  for example `m"m"s hook` and `sh -c "mms hook"`.) Next to a passing handler,
-  the row still reports PASS for a file with a hook it did not count. The
+  for example `m"m"s hook` and `sh -c "mms hook"`.) A hook that is not counted
+  does not by itself keep the row from PASS; the other handlers decide. The
   PASS now reads `N recognized, all passing --host claude to mms hook`, and
   the PASS and WARN details that report on commands end by saying such hooks
   can be missed (the WARN for a settings file that cannot be used does not).
