@@ -810,12 +810,14 @@ class TestStatsHookStatus:
                         {"status": "ineligible_tool", "calls": 1, "original_chars": 4_000},
                         {"status": None, "calls": 1, "original_chars": 300},
                     ],
+                    "status_not_kept_calls": None,
                 },
                 {
                     "host": "codex",
                     "statuses": [
                         {"status": "unsupported_host", "calls": 2, "original_chars": 60_000}
                     ],
+                    "status_not_kept_calls": None,
                 },
             ],
         }
@@ -858,7 +860,11 @@ class TestStatsHookStatus:
         assert "    status: not recorded 1" in result.output.splitlines()
         data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
         assert data["hook_status"]["by_host"] == [
-            {"host": "claude", "statuses": [{"status": None, "calls": 1, "original_chars": 300}]}
+            {
+                "host": "claude",
+                "statuses": [{"status": None, "calls": 1, "original_chars": 300}],
+                "status_not_kept_calls": None,
+            }
         ]
 
     def test_rows_with_neither_host_nor_status_add_no_line(self, runner, tmp_path, monkeypatch):
@@ -936,13 +942,15 @@ class TestStatsHookStatus:
             {
                 "server": f"builtin:{host}",
                 "status": "unsupported_host",
+                "not_kept": False,
                 "calls": 1,
                 "original_chars": 1,
             }
             for host in ("kimi", "codex", "cursor")
         ]
         hosts = [
-            [e["host"] for e in _hook_status(order)["by_host"]] for order in (rows, rows[::-1])
+            [e["host"] for e in _hook_status({"scope": "retained", "rows": order})["by_host"]]
+            for order in (rows, rows[::-1])
         ]
         assert hosts == [["codex", "cursor", "kimi"]] * 2
 
@@ -993,7 +1001,7 @@ class TestStatsHookStatus:
         assert "\x1b" not in result.output and "31mred" not in result.output
         assert "    status: compressed 1, other 1" in result.output.splitlines()
 
-    def test_all_time_keeps_the_status_on_retained_rows(self, runner, tmp_path, monkeypatch):
+    def test_all_time_keeps_the_status_of_trimmed_rows(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)
         db = tmp_path / ".memtomem" / "proxy_metrics.db"
         _seed_hook_statuses(
@@ -1011,34 +1019,104 @@ class TestStatsHookStatus:
             retained = raw.execute("SELECT server FROM proxy_metrics").fetchall()
         finally:
             raw.close()
-        assert retained == [("builtin:kimi",)]  # the others live only in the rollup
+        assert retained == [("builtin:kimi",)]  # the others live only in the rollups
 
         data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
 
         assert [entry["host"] for entry in data["hook_by_host"]] == ["codex", "claude", "kimi"]
-        # No bucket at all for hosts whose rows were all trimmed.
         assert data["hook_status"] == {
-            "scope": "retained",
+            "scope": "all_time",
             "by_host": [
+                {
+                    "host": "claude",
+                    "statuses": [
+                        {"status": "below_threshold", "calls": 1, "original_chars": 900},
+                        {"status": "compressed", "calls": 1, "original_chars": 20_000},
+                    ],
+                    "status_not_kept_calls": 0,
+                },
+                {
+                    "host": "codex",
+                    "statuses": [
+                        {"status": "unsupported_host", "calls": 1, "original_chars": 30_000}
+                    ],
+                    "status_not_kept_calls": 0,
+                },
                 {
                     "host": "kimi",
                     "statuses": [
                         {"status": "unsupported_host", "calls": 1, "original_chars": 7_000}
                     ],
-                }
+                    "status_not_kept_calls": 0,
+                },
             ],
         }
-        human = runner.invoke(cli, ["stats", "--all-time"]).output
-        assert "status:" not in human  # claude's rows are gone from the raw table
+        lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+        assert "      status: below_threshold 1, compressed 1" in lines
 
-    def test_all_time_labels_the_status_line(self, runner, tmp_path, monkeypatch):
+    def test_all_time_labels_the_status_line_only_without_the_status_rollup(
+        self, runner, tmp_path, monkeypatch
+    ):
         set_home(monkeypatch, tmp_path)
         db = tmp_path / ".memtomem" / "proxy_metrics.db"
         _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
 
         lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+        assert "    status: compressed 1" in lines
 
+        # A DB an earlier build last stamped has the daily rollup only.
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute("DROP TRIGGER proxy_metrics_hook_status_follow_daily_delete_v1")
+            raw.execute("DROP TRIGGER proxy_metrics_hook_status_rollup_on_delete_v1")
+            raw.execute("DROP TABLE proxy_metrics_hook_status_daily")
+            raw.commit()
+        finally:
+            raw.close()
+        lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
         assert "    status: compressed 1  (retained rows)" in lines
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+        assert data["hook_status"]["scope"] == "retained"
+        assert data["hook_status"]["by_host"][0]["status_not_kept_calls"] is None
+
+    def test_all_time_counts_calls_trimmed_without_their_status(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """Calls trimmed while only the daily rollup existed keep their place in
+        the totals but not their status; the line says how many."""
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                ("builtin", "Bash", 500, None),
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+                ("builtin:claude", "Bash", 900, "below_threshold"),
+                ("builtin:claude", "Bash", 800, "below_threshold"),
+            ],
+        )
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute("DROP TRIGGER proxy_metrics_hook_status_follow_daily_delete_v1")
+            raw.execute("DROP TRIGGER proxy_metrics_hook_status_rollup_on_delete_v1")
+            raw.execute("DROP TABLE proxy_metrics_hook_status_daily")
+            raw.execute("DELETE FROM proxy_metrics WHERE id <= 2")
+            raw.execute("UPDATE metrics_meta SET value = 'older' WHERE key = 'schema_fingerprint'")
+            raw.commit()
+        finally:
+            raw.close()
+        MetricsStore(db).initialize()  # this version opens it: installs and seeds
+
+        lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+
+        assert "      status: below_threshold 2, status not kept 1" in lines
+        # The unrecorded host has nothing but a trimmed call without a status:
+        # that is still worth a line, since it explains part of the total.
+        unrecorded = next(i for i, line in enumerate(lines) if "(host not recorded)" in line)
+        assert lines[unrecorded + 1] == "      status: status not kept 1"
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+        not_kept = {e["host"]: e["status_not_kept_calls"] for e in data["hook_status"]["by_host"]}
+        assert not_kept == {"claude": 1, None: 1}
 
     @pytest.mark.parametrize(
         ("argv", "expected"),
@@ -1052,6 +1130,7 @@ class TestStatsHookStatus:
                         "statuses": [
                             {"status": "ineligible_tool", "calls": 1, "original_chars": 4_000}
                         ],
+                        "status_not_kept_calls": None,
                     }
                 ],
             ),

@@ -2642,21 +2642,31 @@ def _hook_by_host(hook_summary: dict[str, Any] | None) -> list[dict[str, Any]] |
     return hosts
 
 
-def _hook_status(rows: list[dict[str, Any]] | None) -> dict[str, Any] | None:
-    """The ``hook_status`` JSON value: retained hook rows by host, then status.
+def _hook_status(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The ``hook_status`` JSON value: hook rows by host, then status.
 
-    ``rows`` is a summary's ``hook_status`` (``None`` when it was not read or
-    could not be). Hosts are grouped with :func:`hook_host_of`, as in
-    :func:`_hook_by_host`; ``host`` and ``status`` are ``None`` where the row
-    recorded none. Always retained rows: the daily rollup keeps no status.
+    ``value`` is a summary's ``hook_status`` (``None`` when it was not read or
+    could not be): ``{"scope", "rows"}`` from ``_read_hook_status``. Hosts are
+    grouped with :func:`hook_host_of`, as in :func:`_hook_by_host`; ``host``
+    and ``status`` are ``None`` where the row recorded none. ``scope`` is
+    ``all_time`` once the status rollup counts the trimmed rows too; each
+    host's ``status_not_kept_calls`` then counts its trimmed calls whose
+    status was not kept, and is ``None`` under ``retained``.
     """
-    if rows is None:
+    if value is None:
         return None
     from memtomem_stm.proxy.metrics import hook_host_of
 
+    all_time = value["scope"] == "all_time"
     grouped: dict[str | None, dict[str | None, dict[str, int]]] = {}
-    for row in rows:
-        statuses = grouped.setdefault(hook_host_of(str(row["server"])), {})
+    not_kept: dict[str | None, int] = {}
+    for row in value["rows"]:
+        host = hook_host_of(str(row["server"]))
+        statuses = grouped.setdefault(host, {})
+        not_kept.setdefault(host, 0)
+        if row["not_kept"]:
+            not_kept[host] += row["calls"]
+            continue
         entry = statuses.setdefault(row["status"], {"calls": 0, "original_chars": 0})
         entry["calls"] += row["calls"]
         entry["original_chars"] += row["original_chars"]
@@ -2666,7 +2676,7 @@ def _hook_status(rows: list[dict[str, Any]] | None) -> dict[str, Any] | None:
         grouped.items(),
         key=lambda item: (
             item[0] is None,
-            -sum(e["calls"] for e in item[1].values()),
+            -(sum(e["calls"] for e in item[1].values()) + not_kept[item[0]]),
             item[0] or "",
         ),
     ):
@@ -2674,38 +2684,49 @@ def _hook_status(rows: list[dict[str, Any]] | None) -> dict[str, Any] | None:
             statuses.items(), key=lambda item: (item[0] is None, -item[1]["calls"], item[0] or "")
         )
         by_host.append(
-            {"host": host, "statuses": [{"status": name, **entry} for name, entry in ordered]}
+            {
+                "host": host,
+                "statuses": [{"status": name, **entry} for name, entry in ordered],
+                "status_not_kept_calls": not_kept[host] if all_time else None,
+            }
         )
-    return {"scope": "retained", "by_host": by_host}
+    return {"scope": value["scope"], "by_host": by_host}
 
 
 def _hook_status_line(
     hook_status: dict[str, Any] | None, host: str | None, indent: str, all_time: bool
 ) -> list[str]:
-    """``status:`` counts for one host's retained rows, or nothing to add.
+    """``status:`` counts for one host's rows, or nothing to add.
 
-    Nothing to add: no status was read, the host has no retained rows (all of
-    them rolled up), or the host itself was not recorded and neither was any
-    status — those rows predate both and the line would only repeat
+    Nothing to add: no status was read, the host has no rows in scope, or the
+    host itself was not recorded and neither was any status nor a trimmed
+    call without one — those rows predate both and the line would only repeat
     ``(host not recorded)``. A known host whose rows all predate the status
     still gets ``not recorded N``, which is the answer for it. Status names
     come from :data:`HOOK_COMPRESSION_STATUSES` or are ``other`` (the reader
     folds anything else), so they print as they are. Counts are in descending
-    order with ``not recorded`` last.
+    order with ``not recorded`` last, then ``status not kept`` (trimmed calls
+    whose status was not kept). Under ``--all-time`` a DB without the status
+    rollup counts the retained rows only, and the line says so.
     """
     if not hook_status:
         return []
     for entry in hook_status["by_host"]:
         if entry["host"] == host:
             statuses = entry["statuses"]
+            not_kept = entry["status_not_kept_calls"] or 0
             break
     else:
         return []
-    if host is None and all(item["status"] is None for item in statuses):
+    if host is None and not not_kept and all(item["status"] is None for item in statuses):
         return []
-    counts = ", ".join(f"{item['status'] or 'not recorded'} {item['calls']:,}" for item in statuses)
-    scope = "  (retained rows)" if all_time else ""
-    return [f"{indent}status: {counts}{scope}"]
+    parts = [f"{item['status'] or 'not recorded'} {item['calls']:,}" for item in statuses]
+    if not_kept:
+        parts.append(f"status not kept {not_kept:,}")
+    if not parts:
+        return []
+    scope = "  (retained rows)" if all_time and hook_status["scope"] == "retained" else ""
+    return [f"{indent}status: {', '.join(parts)}{scope}"]
 
 
 def _hook_host_lines(
@@ -3001,7 +3022,8 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     is_flag=True,
     help="Report compression over all rows ever recorded since the daily rollup was "
     "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only. "
-    "The hook status counts stay retained-only: the rollup keeps no status.",
+    "The hook status counts include trimmed rows once the status rollup is installed; "
+    "before that they cover retained rows only.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def stats(
