@@ -44,7 +44,7 @@ changes inline only. See the deprecation policy in
   of each handler that looks like STM's hook and is not one they manage,
   never its text. They look where install itself looks in the host's
   config file: `PostToolUse` for Claude Code and Codex, `postToolUse` for
-  Cursor, and every entry for Kimi (issue #1453).
+  Cursor, and every entry for Kimi (#1456, issue #1453).
   **Behavior change**: when such a handler is present, both commands print a
   `!` line naming its location: in the written file after an `--apply` that
   writes, otherwise in the current file. Uninstall's status line then says it
