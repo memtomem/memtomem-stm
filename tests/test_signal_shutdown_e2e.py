@@ -15,7 +15,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import IO
 
 import pytest
 
@@ -26,11 +28,18 @@ pytestmark = [
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FAKE_UPSTREAM = Path(__file__).resolve().parent / "_fake_memtomem_server.py"
+_GATED_SERVER = Path(__file__).resolve().parent / "_gated_stm_server.py"
 _EXIT_BUDGET_SECONDS = 30.0
 _HANDSHAKE_BUDGET_SECONDS = 30.0
 
 
-def _start_server(tmp_path: Path, *, log_level: str = "WARNING") -> subprocess.Popen[bytes]:
+def _start_server(
+    tmp_path: Path,
+    *,
+    log_level: str = "WARNING",
+    argv: list[str] | None = None,
+    stderr: IO[bytes] | int = subprocess.PIPE,
+) -> subprocess.Popen[bytes]:
     # A real proxied upstream, so the server owns a real stdio child: without
     # one the "leaves nothing behind" assertion has nothing to assert on.
     upstreams = {
@@ -49,10 +58,10 @@ def _start_server(tmp_path: Path, *, log_level: str = "WARNING") -> subprocess.P
         PYTHONPATH=str(_REPO_ROOT / "src"),
     )
     return subprocess.Popen(
-        [sys.executable, "-m", "memtomem_stm.server"],
+        argv if argv is not None else [sys.executable, "-m", "memtomem_stm.server"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=stderr,
         env=env,
         cwd=str(_REPO_ROOT),
     )
@@ -91,26 +100,20 @@ def _initialize(proc: subprocess.Popen[bytes]) -> None:
     proc.stdin.flush()
 
 
-def _wait_for_stderr(proc: subprocess.Popen[bytes], needle: bytes) -> bool:
-    """Wait until *needle* appears on the child's stderr, under a deadline."""
-    assert proc.stderr is not None
-    seen: list[bool] = []
-
-    def _scan() -> None:
-        assert proc.stderr is not None
-        for line in proc.stderr:
-            if needle in line:
-                seen.append(True)
-                return
-
-    scanner = threading.Thread(target=_scan, daemon=True)
-    scanner.start()
-    scanner.join(timeout=_HANDSHAKE_BUDGET_SECONDS)
-    return bool(seen)
+def _wait_until(condition: Callable[[], bool]) -> bool:
+    """Poll *condition* under the handshake deadline."""
+    deadline = time.monotonic() + _HANDSHAKE_BUDGET_SECONDS
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
 
 
 def _children(pid: int) -> set[int]:
-    out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
+    out = subprocess.run(
+        ["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=10.0
+    ).stdout
     return {int(tok) for tok in out.split() if tok.isdigit()}
 
 
@@ -163,20 +166,48 @@ def test_a_twice_signalled_server_exits_with_the_signal_status(tmp_path: Path) -
     """The conventional 128+signum, so a supervisor reading the status sees what
     actually happened rather than a generic failure.
 
-    The second signal is sent only once the first has been *handled* — POSIX
-    does not queue signals, so firing both immediately can collapse into one
-    delivery and let the graceful path satisfy the assertion, which would hide
-    a broken second-signal handler entirely.
+    Two waits come before the second signal. The log line shows the first
+    signal was *handled*: a SIGINT sent while another is still pending
+    coalesces with it, so two sent back to back can arrive as one. The gate
+    (see ``_gated_stm_server.py``) holds the teardown open: its
+    ``gate-entered`` file only marks entry, and the absence of ``gate-left``
+    after the exit is what shows the hold never unwound before the second
+    signal ended the process. Without the gate, an idle server can finish its
+    teardown and exit 0 soon after the log line (121-182 ms in local macOS
+    runs), and a second signal sent later than that never reaches a handler
+    (#1434).
     """
-    proc = _start_server(tmp_path, log_level="INFO")
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    # A file, not a pipe: polling it needs no reader thread, and nothing waits
+    # for EOF on a stream the proxied upstream also inherits.
+    stderr_path = tmp_path / "stderr.log"
+    with stderr_path.open("wb") as stderr_file:
+        proc = _start_server(
+            tmp_path,
+            log_level="INFO",
+            argv=[sys.executable, str(_GATED_SERVER), str(gate_dir)],
+            stderr=stderr_file,
+        )
+
+    def log_tail() -> str:
+        return stderr_path.read_bytes().decode(errors="replace")[-2000:]
+
     try:
         _initialize(proc)
+        assert _children(proc.pid), "expected the proxied upstream to be running as a child"
         proc.send_signal(signal.SIGINT)
-        assert _wait_for_stderr(proc, b"Signal again to exit immediately"), (
-            "the first signal was never handled"
+        assert _wait_until(
+            lambda: b"Signal again to exit immediately" in stderr_path.read_bytes()
+        ), "the first signal was never handled\n" + log_tail()
+        assert _wait_until((gate_dir / "gate-entered").exists), (
+            "teardown never reached ProxyManager.stop()\n" + log_tail()
         )
         proc.send_signal(signal.SIGINT)
-        assert proc.wait(timeout=_EXIT_BUDGET_SECONDS) == 128 + int(signal.SIGINT)
+        returncode = proc.wait(timeout=_EXIT_BUDGET_SECONDS)
+        assert returncode == 128 + int(signal.SIGINT), log_tail()
+        # The exit came while the gate still held the teardown, not after it.
+        assert not (gate_dir / "gate-left").exists(), log_tail()
     finally:
         if proc.poll() is None:
             proc.kill()
