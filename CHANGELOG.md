@@ -216,6 +216,16 @@ changes inline only. See the deprecation policy in
   for a character outside the Basic Multilingual Plane); a host that parses
   it reads the same values as before. Hook input is read as UTF-8
   whatever the locale, with a leading byte-order mark ignored.
+- `mms doctor`'s `hook registration` row counts more STM hooks spelled with
+  quotes. A line made only of plain words and quotes, up to 4,096 characters,
+  is now also matched on the words left after quote removal, so `m"m"s hook`
+  next to `mms hook --host claude` is counted, marked not checked, and the
+  row WARNs instead of reporting PASS. A quoted hook in a longer line, or in
+  a line with other shell syntax (a comment, an operator, a line
+  continuation), gets only the raw-text search as before, which can miss it
+  and still let the row PASS. A plain command whose `hook` is only part of a
+  word, such as `mms status --config /tmp/hook.json`, is no longer counted
+  as an STM hook (issue #1450).
 
 ## [0.7.9] — 2026-11-15
 

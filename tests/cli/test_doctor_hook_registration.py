@@ -174,6 +174,13 @@ def test_measured_exit_codes_match_the_reading() -> None:
         "mms hook --host claude; echo done",
         "mms hook --host claude | tee /tmp/x",
         "mms hook --host 'claude'",
+        # #1450: quote removal joins these into ``mms hook``, so they are STM's
+        # hook (counted), but quoted words are still never read.
+        'm"m"s hook --host claude',
+        'mms ho"ok" --host claude',
+        "'mms' 'hook' --host claude",
+        # Quote-only, and the regex (not the word test) is what catches it.
+        'sh -c "mms hook --host claude"',
     ],
 )
 def test_shell_syntax_is_not_checked(command: str) -> None:
@@ -278,10 +285,64 @@ def test_windows_rules() -> None:
         {"command": "mms hook --host claude"},
         {"type": "command", "command": ["mms", "hook"]},
         "mms hook",
+        # #1450: plain words are the argv, so ``hook`` must be a word of its own.
+        {"type": "command", "command": "mms status --config /tmp/hook.json"},
+        {"type": "command", "command": "echo /opt/bin/mms/hook.log"},
+        # Shell syntax beyond quotes is never lexed, so none of these become
+        # candidates by joining words: a comment, a second command, a
+        # redirection target, and exec form (no shell, quotes are literal).
+        {"type": "command", "command": 'true # m"m"s hook'},
+        {"type": "command", "command": 'echo m"m"s\nhook'},
+        {"type": "command", "command": 'true > /m"m"s hook'},
+        {"type": "command", "command": "echo", "args": ['m"m"s', "hook"]},
+        # Plain exec form gets the word rule too, not the raw search.
+        {"type": "command", "command": "mms", "args": ["status", "--config", "/tmp/hook.json"]},
     ],
 )
 def test_non_candidates(handler: Any) -> None:
     assert not hr.is_candidate(handler)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'm"m"s hook --host claude # comment',  # a comment keeps the line out of the quote tier
+        "m\\\nms hook --host claude",  # so does a backslash line continuation
+    ],
+)
+def test_known_misses_outside_the_quote_tier(command: str) -> None:
+    """Known limit: the shell runs ``mms hook`` here, but only quote removal is
+    modelled, so these are still missed (and can still let the row PASS next to
+    a passing handler). A fix for them has to change this test on purpose."""
+    assert not hr.is_candidate({"type": "command", "command": command})
+
+
+def test_quote_tier_over_matches_a_printed_name() -> None:
+    """Known, harmless over-match: ``echo`` only prints ``mms hook``, but the
+    quote tier does not know what ``echo`` does. The handler is counted and
+    reported as not checked, never given a verdict."""
+    assert _read('echo m"m"s ho"ok"') == hr.HookRegistration(hr.NOT_PLAIN)
+
+
+def test_quote_tier_is_skipped_above_its_length_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The quote tier's lexer is never reached for a line over the cap, which
+    still gets the raw search; a line under it does reach the lexer."""
+    calls: list[str] = []
+
+    def spy(text: str) -> list[str] | None:
+        calls.append(text)
+        return None
+
+    monkeypatch.setattr(hr, "_quoted_words", spy)
+    # Fixed lengths, not the constant: a 4,096-character line is lexed, one
+    # more character is not, and still gets the raw search.
+    at_cap = 'm"m"s hook' + " " * (4096 - len('m"m"s hook'))
+    over_cap = '"x" mms hook' + " " * (4097 - len('"x" mms hook'))
+    assert (len(at_cap), len(over_cap)) == (4096, 4097)
+    assert not hr.is_candidate({"type": "command", "command": at_cap})
+    assert calls == [at_cap]
+    assert hr.is_candidate({"type": "command", "command": over_cap})
+    assert calls == [at_cap]
 
 
 def test_candidate_scan_is_linear() -> None:
@@ -289,10 +350,12 @@ def test_candidate_scan_is_linear() -> None:
     import time
 
     # Measured: the single-pattern scan took 7.1 s here, two searches 0.6 ms.
-    handler = {"type": "command", "command": "mms " * 20_000}
-    start = time.perf_counter()
-    assert not hr.is_candidate(handler)
-    assert time.perf_counter() - start < 2.0
+    # The plain-word path, and (``#`` is shell syntax) the raw-text search.
+    for command in ("mms " * 20_000, "mms " * 20_000 + "# note"):
+        handler = {"type": "command", "command": command}
+        start = time.perf_counter()
+        assert not hr.is_candidate(handler)
+        assert time.perf_counter() - start < 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +468,22 @@ def test_mixed_handlers_report_each_category_by_location(tmp_path: Path, claude_
     # Cases 6/7: install rewrites every STM handler and drops inline settings,
     # and does not recognize a ``NAME=value mms hook`` line at all.
     assert "install" not in row["next_action"]
+
+
+@pytest.mark.parametrize("quoted", ['m"m"s hook', 'sh -c "mms hook"'])
+def test_quoted_hook_beside_a_passing_one_warns(
+    tmp_path: Path, claude_dir: Path, quoted: str
+) -> None:
+    """#1450: a quoted STM hook next to a passing one must not let the file
+    PASS. ``m"m"s hook`` was missed before; ``sh -c "mms hook"`` guards the
+    regex fallback."""
+    path = _write(claude_dir, _cmd("mms hook --host claude"), _cmd(quoted))
+
+    row = _row(tmp_path)
+
+    assert row["status"] == "WARN"
+    assert row["detail"] == f"{_PREFIX}1 {_SHELL_SYNTAX}{_LOC1} — in {path}; {_SCOPE}"
+    assert row["next_action"] == _NEXT_PLAIN
 
 
 def test_this_macs_registration_shape_is_not_checked(tmp_path: Path, claude_dir: Path) -> None:
