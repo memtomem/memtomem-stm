@@ -2642,16 +2642,93 @@ def _hook_by_host(hook_summary: dict[str, Any] | None) -> list[dict[str, Any]] |
     return hosts
 
 
-def _hook_host_lines(hosts: list[dict[str, Any]] | None, indent: str) -> list[str]:
+def _hook_status(rows: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """The ``hook_status`` JSON value: retained hook rows by host, then status.
+
+    ``rows`` is a summary's ``hook_status`` (``None`` when it was not read or
+    could not be). Hosts are grouped with :func:`hook_host_of`, as in
+    :func:`_hook_by_host`; ``host`` and ``status`` are ``None`` where the row
+    recorded none. Always retained rows: the daily rollup keeps no status.
+    """
+    if rows is None:
+        return None
+    from memtomem_stm.proxy.metrics import hook_host_of
+
+    grouped: dict[str | None, dict[str | None, dict[str, int]]] = {}
+    for row in rows:
+        statuses = grouped.setdefault(hook_host_of(str(row["server"])), {})
+        entry = statuses.setdefault(row["status"], {"calls": 0, "original_chars": 0})
+        entry["calls"] += row["calls"]
+        entry["original_chars"] += row["original_chars"]
+    by_host = []
+    # Recorded hosts by calls, ties by name; the unrecorded remainder last.
+    for host, statuses in sorted(
+        grouped.items(),
+        key=lambda item: (
+            item[0] is None,
+            -sum(e["calls"] for e in item[1].values()),
+            item[0] or "",
+        ),
+    ):
+        ordered = sorted(
+            statuses.items(), key=lambda item: (item[0] is None, -item[1]["calls"], item[0] or "")
+        )
+        by_host.append(
+            {"host": host, "statuses": [{"status": name, **entry} for name, entry in ordered]}
+        )
+    return {"scope": "retained", "by_host": by_host}
+
+
+def _hook_status_line(
+    hook_status: dict[str, Any] | None, host: str | None, indent: str, all_time: bool
+) -> list[str]:
+    """``status:`` counts for one host's retained rows, or nothing to add.
+
+    Nothing to add: no status was read, the host has no retained rows (all of
+    them rolled up), or the host itself was not recorded and neither was any
+    status — those rows predate both and the line would only repeat
+    ``(host not recorded)``. A known host whose rows all predate the status
+    still gets ``not recorded N``, which is the answer for it. Status names
+    come from :data:`HOOK_COMPRESSION_STATUSES` or are ``other`` (the reader
+    folds anything else), so they print as they are. Counts are in descending
+    order with ``not recorded`` last.
+    """
+    if not hook_status:
+        return []
+    for entry in hook_status["by_host"]:
+        if entry["host"] == host:
+            statuses = entry["statuses"]
+            break
+    else:
+        return []
+    if host is None and all(item["status"] is None for item in statuses):
+        return []
+    counts = ", ".join(f"{item['status'] or 'not recorded'} {item['calls']:,}" for item in statuses)
+    scope = "  (retained rows)" if all_time else ""
+    return [f"{indent}status: {counts}{scope}"]
+
+
+def _hook_host_lines(
+    hosts: list[dict[str, Any]] | None,
+    indent: str,
+    hook_status: dict[str, Any] | None = None,
+    all_time: bool = False,
+    lone_status: dict[str, Any] | None = None,
+) -> list[str]:
     """One line per host, or none when a split would add nothing.
 
     Nothing to split: a single host that can replace output (its ratio is the
-    hook ratio already) or only rows with no recorded host.
+    hook ratio already) or only rows with no recorded host. Each host that can
+    replace output also gets its ``status:`` line (under the hook line itself
+    when the host lines are left out — then from ``lone_status`` when given,
+    the read behind the line it hangs under); for a host that cannot, the
+    "measured only" note already says why nothing was compressed.
     """
     if not hosts:
         return []
     if len(hosts) == 1 and hosts[0]["can_replace_output"] is not False:
-        return []
+        lone = lone_status if lone_status is not None else hook_status
+        return _hook_status_line(lone, hosts[0]["host"], indent, all_time)
     lines = []
     for entry in hosts:
         name = _disp(entry["host"]) if entry["host"] else "(host not recorded)"
@@ -2661,6 +2738,7 @@ def _hook_host_lines(hosts: list[dict[str, Any]] | None, indent: str) -> list[st
         else:
             saved = f"saved {float(entry['saved_ratio']) * 100:.1f}%"
             lines.append(f"{head} -> {entry['compressed_chars']:,}  ({saved})")
+            lines.extend(_hook_status_line(hook_status, entry["host"], indent + "  ", all_time))
     return lines
 
 
@@ -2669,7 +2747,12 @@ def _render_compression_block(
     by_source: dict[str, dict[str, Any]] | None = None,
     max_history: int | None = None,
     hook_by_host: list[dict[str, Any]] | None = None,
+    hook_status: dict[str, Any] | None = None,
+    total_hook_status: dict[str, Any] | None = None,
 ) -> None:
+    """``hook_status`` is read with the hook summary, ``total_hook_status`` with
+    ``summary``: a line printed under a figure has to come from that figure's
+    snapshot, or a write between the reads shows more statuses than calls."""
     raw_rollup = summary.get("rollup")
     rollup: dict[str, Any] | None = raw_rollup if isinstance(raw_rollup, dict) else None
     click.echo(_hdr("Proxy / Compression" if rollup is None else "Proxy / Compression (all time)"))
@@ -2721,12 +2804,16 @@ def _render_compression_block(
                 line += f"  [{src_structured} structured, separate accounting]"
             click.echo(line)
             if src == "hook":
-                for host_line in _hook_host_lines(hook_by_host, "      "):
+                for host_line in _hook_host_lines(
+                    hook_by_host, "      ", hook_status, rollup is not None
+                ):
                     click.echo(host_line)
     else:
         # No per-source lines (``--source hook``, or the hook is the only
         # source with rows), so the hosts hang off the total.
-        for host_line in _hook_host_lines(hook_by_host, "    "):
+        for host_line in _hook_host_lines(
+            hook_by_host, "    ", hook_status, rollup is not None, lone_status=total_hook_status
+        ):
             click.echo(host_line)
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
     if rollup is not None:
@@ -2913,7 +3000,8 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     "all_time",
     is_flag=True,
     help="Report compression over all rows ever recorded since the daily rollup was "
-    "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only.",
+    "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only. "
+    "The hook status counts stay retained-only: the rollup keeps no status.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def stats(
@@ -3004,13 +3092,23 @@ def stats(
 
     read_compression = read_compression_all_time if all_time else read_compression_summary
     compression = read_compression(
-        proxy_cfg.metrics.db_path, tool=tool_filter, source=source_filter
+        proxy_cfg.metrics.db_path,
+        tool=tool_filter,
+        source=source_filter,
+        # Also unfiltered: a lone host's status line hangs under this total,
+        # so it has to come from the same snapshot.
+        with_hook_status=source_filter in (None, "hook"),
     )
     # ``--source`` scopes the compression rows only; unset, report each source
     # beside the aggregate so one high-volume source cannot hide another's ratio.
     compression_by_source = (
         {
-            src: read_compression(proxy_cfg.metrics.db_path, tool=tool_filter, source=src)
+            src: read_compression(
+                proxy_cfg.metrics.db_path,
+                tool=tool_filter,
+                source=src,
+                with_hook_status=src == "hook",
+            )
             for src in ("mcp", "hook")
         }
         if source_filter is None
@@ -3018,10 +3116,20 @@ def stats(
     )
     # The hook summary to split by host: its own line when every source is
     # reported, the whole block under ``--source hook``, nothing under ``mcp``.
-    if compression_by_source is not None:
-        hook_by_host = _hook_by_host(compression_by_source["hook"])
-    else:
-        hook_by_host = _hook_by_host(compression if source_filter == "hook" else None)
+    # The status groups were read in the same snapshot as that summary; they
+    # leave it here so ``--json`` reports them once, under ``hook_status``.
+    hook_summary = (
+        compression_by_source["hook"]
+        if compression_by_source is not None
+        else compression
+        if source_filter == "hook"
+        else None
+    )
+    hook_by_host = _hook_by_host(hook_summary)
+    status_rows: Any = hook_summary.pop("hook_status", None) if hook_summary else None
+    hook_status = _hook_status(status_rows)
+    total_rows: Any = compression.pop("hook_status", None)
+    total_hook_status = hook_status if compression is hook_summary else _hook_status(total_rows)
     progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
@@ -3051,6 +3159,7 @@ def stats(
                     "compression": compression,
                     "compression_by_source": compression_by_source,
                     "hook_by_host": hook_by_host,
+                    "hook_status": hook_status,
                     "progressive": progressive,
                     "surfacing": surfacing,
                 },
@@ -3074,6 +3183,8 @@ def stats(
         compression_by_source,
         max_history=proxy_cfg.metrics.max_history,
         hook_by_host=hook_by_host,
+        hook_status=hook_status,
+        total_hook_status=total_hook_status,
     )
     click.echo("")
     _render_progressive_block(

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from memtomem_stm.proxy.metrics import (
+    HOOK_COMPRESSION_STATUSES,
     METADATA_BYPASS_STRATEGY,
     STRUCTURED_BYPASS_STRATEGY,
     CallMetrics,
@@ -120,6 +121,12 @@ _MIGRATIONS: dict[str, str] = {
     # backfill default is ``'mcp'``; ``mms hook`` writes ``'hook'`` for
     # native built-in tools. NOT NULL + DEFAULT keeps old rows readable.
     "source": "ALTER TABLE proxy_metrics ADD COLUMN source TEXT NOT NULL DEFAULT 'mcp'",
+    # ``mms hook`` rows only (``CallMetrics.hook_compression_status``). NULL on
+    # MCP rows and on hook rows written before the column, which readers report
+    # as "not recorded" rather than guess.
+    "hook_compression_status": (
+        "ALTER TABLE proxy_metrics ADD COLUMN hook_compression_status TEXT DEFAULT NULL"
+    ),
 }
 
 # Schema bookkeeping in a table of our own rather than in ``PRAGMA
@@ -439,7 +446,11 @@ _MEASUREMENT_MIXED = (
 
 
 def read_compression_summary(
-    db_path: Path, tool: str | None = None, source: str | None = None
+    db_path: Path,
+    tool: str | None = None,
+    source: str | None = None,
+    *,
+    with_hook_status: bool = False,
 ) -> dict[str, object]:
     """Aggregate per-``(server, tool)`` compression stats read-only from disk.
 
@@ -462,12 +473,25 @@ def read_compression_summary(
     built-in tools). On a pre-``source`` DB the column is absent: a request for
     any source other than the legacy ``'mcp'`` default returns an empty (but
     ``available``) summary, since no row can carry that source.
+
+    ``with_hook_status`` adds a ``hook_status`` key: the retained
+    ``source='hook'`` rows grouped by ``(server, status)`` — see
+    :func:`_read_hook_status` — read in the same snapshot as the totals, so
+    the two describe the same rows. Under ``source=None`` they are the hook
+    share of the totals. ``source='mcp'``, an unavailable summary or a failed
+    read leaves it ``None``.
     """
-    return _read_compression(db_path, tool=tool, source=source, all_time=False)
+    return _read_compression(
+        db_path, tool=tool, source=source, all_time=False, with_hook_status=with_hook_status
+    )
 
 
 def read_compression_all_time(
-    db_path: Path, tool: str | None = None, source: str | None = None
+    db_path: Path,
+    tool: str | None = None,
+    source: str | None = None,
+    *,
+    with_hook_status: bool = False,
 ) -> dict[str, object]:
     """All-time compression totals: retained rows plus the daily rollup (#1316).
 
@@ -489,8 +513,13 @@ def read_compression_all_time(
       installation and the counted rows reach back before it, else ``None``)
       and ``unknown_date_calls`` (rows whose ``created_at`` was not a
       convertible timestamp; counted, but undated).
+
+    ``with_hook_status`` behaves as in :func:`read_compression_summary` and
+    still counts **retained rows only**: the daily rollup keeps no status.
     """
-    return _read_compression(db_path, tool=tool, source=source, all_time=True)
+    return _read_compression(
+        db_path, tool=tool, source=source, all_time=True, with_hook_status=with_hook_status
+    )
 
 
 def _rollup_markers(db: sqlite3.Connection) -> tuple[float, int | None] | None:
@@ -528,8 +557,69 @@ def _rollup_markers(db: sqlite3.Connection) -> tuple[float, int | None] | None:
     return installed_at, lost
 
 
+def _read_hook_status(
+    db: sqlite3.Connection, cols: Collection[str], tool: str | None
+) -> list[dict[str, object]]:
+    """Retained ``source='hook'`` rows grouped by ``(server, status)``.
+
+    Each entry has ``server``, ``status``, ``calls`` and ``original_chars``.
+    ``status`` is a name from ``HOOK_COMPRESSION_STATUSES``, ``None`` for a row
+    that recorded none (written before the column existed), or ``"other"`` for
+    any value outside the set — folded in SQL, before anything is decoded, so
+    no caller renders a stored value verbatim and an undecodable one cannot
+    fail the read. Sizes pass through the same ``_finite`` guard and
+    ``SUM``→``TOTAL`` fallback as the totals they sit beside. A DB that
+    predates ``source`` has no hook rows.
+    """
+    if "source" not in cols:
+        return []
+    if "hook_compression_status" in cols:
+        # The names are fixed identifiers, so interpolating them is safe.
+        known = ", ".join(f"'{name}'" for name in sorted(HOOK_COMPRESSION_STATUSES))
+        status = (
+            "CASE WHEN hook_compression_status IS NULL THEN NULL "
+            # BINARY: an outside table may declare the column NOCASE, which
+            # would let ``COMPRESSED`` through and print its own spelling.
+            f"WHEN hook_compression_status COLLATE BINARY IN ({known}) "
+            "THEN hook_compression_status "
+            "ELSE 'other' END"
+        )
+    else:
+        status = "NULL"
+    where = "source = 'hook'"
+    params: list[object] = []
+    if tool is not None:
+        where += " AND tool = ?"
+        params.append(tool)
+    statement = (
+        f"SELECT server, {status} AS status, COUNT(*), "
+        f"{{agg}}({_finite('original_chars')}) "
+        f"FROM proxy_metrics WHERE {where} GROUP BY server, status"
+    )
+    try:
+        rows = db.execute(statement.replace("{agg}", "SUM"), params).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "integer overflow" not in str(exc):
+            raise
+        rows = db.execute(statement.replace("{agg}", "TOTAL"), params).fetchall()
+    return [
+        {
+            "server": str(server),
+            "status": value,
+            "calls": _count(calls),
+            "original_chars": _count(orig),
+        }
+        for server, value, calls, orig in rows
+    ]
+
+
 def _read_compression(
-    db_path: Path, *, tool: str | None, source: str | None, all_time: bool
+    db_path: Path,
+    *,
+    tool: str | None,
+    source: str | None,
+    all_time: bool,
+    with_hook_status: bool = False,
 ) -> dict[str, object]:
     resolved = db_path.expanduser().resolve()
     summary: dict[str, object] = {
@@ -564,6 +654,12 @@ def _read_compression(
     }
     if all_time:
         summary["rollup"] = rollup
+    if with_hook_status:
+        summary["hook_status"] = None
+    # The hook rows among these totals: all of them under ``source='hook'``,
+    # the hook share under no filter. Under ``'mcp'`` there are none, so the
+    # value stays ``None`` rather than describing rows the totals exclude.
+    want_status = with_hook_status and source in (None, "hook")
     if not resolved.exists():
         return summary
 
@@ -574,6 +670,10 @@ def _read_compression(
         return summary
 
     try:
+        if want_status:
+            # One read transaction, so the status groups below see the same
+            # rows as the totals even while a writer appends or trims.
+            db.execute("BEGIN")
         cols = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
         if "original_chars" not in cols:
             # Missing file would have returned above; an empty column set here
@@ -607,6 +707,8 @@ def _read_compression(
             # ``mms stats`` refuses this at the CLI boundary; direct callers of
             # this reader still land here.
             summary["available"] = True
+            if want_status:
+                summary["hook_status"] = []
             return summary
 
         if source is not None and not has_source and source != "mcp":
@@ -614,6 +716,8 @@ def _read_compression(
             # request for any other provenance matches nothing. Report an empty
             # but available summary rather than over-counting every legacy row.
             summary["available"] = True
+            if want_status:
+                summary["hook_status"] = []
             return summary
 
         conditions: list[str] = []
@@ -685,6 +789,7 @@ def _read_compression(
             if "integer overflow" not in str(exc):
                 raise
             rows = db.execute(statement.replace("{agg}", "TOTAL"), inner_params).fetchall()
+        hook_status = _read_hook_status(db, cols, tool) if want_status else None
     except sqlite3.Error as exc:
         summary["error"] = exception_summary(exc)
         return summary
@@ -760,6 +865,8 @@ def _read_compression(
     summary["saved_chars"] = total_orig - total_comp
     summary["saved_ratio"] = _saved_ratio(total_orig, total_comp)
     summary["by_tool"] = by_tool
+    if with_hook_status:
+        summary["hook_status"] = hook_status
     if all_time:
         rollup["earliest_created_at"] = earliest
         rollup["unknown_date_calls"] = unknown_dates
@@ -1079,6 +1186,7 @@ class MetricsStore:
         require_utf8_identifier(metrics.compression_strategy, "compression_strategy")
         require_utf8_identifier(metrics.source, "source")
         require_utf8_identifier(metrics.compression_accounting, "compression_accounting")
+        require_utf8_identifier(metrics.hook_compression_status, "hook_compression_status")
         now = time.time()
         with self._lock:
             cursor = self._db.execute(
@@ -1090,9 +1198,10 @@ class MetricsStore:
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
                 "surfacing_on_progressive_ok, surface_error, source, created_at, "
-                "compression_accounting, delivery_format, wire_bytes) "
+                "compression_accounting, delivery_format, wire_bytes, "
+                "hook_compression_status) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -1136,6 +1245,7 @@ class MetricsStore:
                     metrics.compression_accounting,
                     metrics.delivery_format,
                     metrics.wire_bytes,
+                    metrics.hook_compression_status,
                 ),
             )
             # One transaction for the insert and the trim it may trigger. If the

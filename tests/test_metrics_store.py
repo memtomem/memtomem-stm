@@ -34,6 +34,7 @@ from memtomem_stm.proxy.metrics_store import (
     _SOURCE_INDEX,
     MetricsStore,
     _schema_fingerprint,
+    read_compression_all_time,
     read_compression_summary,
 )
 
@@ -2031,3 +2032,386 @@ def test_hook_server_label_round_trips_every_registered_host():
     # No tag to record degrades to the label that reads back as "not recorded".
     assert hook_server_label("") == HOOK_SERVER
     assert hook_host_of(hook_server_label("")) is None
+
+
+# ── hook compression status (#1438) ─────────────────────────────────────────
+
+_STATUS_COL = "hook_compression_status"
+
+
+def _hook_row(status: str | None, *, host: str = "claude", tool: str = "Bash", size: int = 100):
+    return CallMetrics(
+        server=hook_server_label(host),
+        tool=tool,
+        original_chars=size,
+        compressed_chars=size,
+        source="hook",
+        hook_compression_status=status,
+    )
+
+
+def _raw_insert(db_path, **cols) -> None:
+    """One row through plain SQL, as an older writer or an outside tool would."""
+    values = {
+        "server": "builtin:claude",
+        "tool": "Bash",
+        "original_chars": 100,
+        "compressed_chars": 100,
+        "source": "hook",
+        "created_at": time.time(),
+        **cols,
+    }
+    db = sqlite3.connect(str(db_path))
+    try:
+        names = ", ".join(values)
+        marks = ", ".join("?" for _ in values)
+        db.execute(f"INSERT INTO proxy_metrics ({names}) VALUES ({marks})", list(values.values()))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _read_meta(db_path) -> dict[str, str]:
+    db = sqlite3.connect(str(db_path))
+    try:
+        return dict(db.execute("SELECT key, value FROM metrics_meta").fetchall())
+    finally:
+        db.close()
+
+
+def _without_status_column(monkeypatch) -> str:
+    """Make this process the binary before the column: returns its fingerprint."""
+    monkeypatch.delitem(metrics_store_module._MIGRATIONS, _STATUS_COL)
+    old = metrics_store_module._schema_fingerprint()
+    monkeypatch.setattr(metrics_store_module, "_SCHEMA_FINGERPRINT", old)
+    return old
+
+
+def _statuses(summary) -> dict[tuple[str, str | None], tuple[int, int]]:
+    return {
+        (row["server"], row["status"]): (row["calls"], row["original_chars"])
+        for row in summary["hook_status"]
+    }
+
+
+class TestHookCompressionStatus:
+    def test_status_is_stored_and_mcp_rows_stay_null(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        try:
+            store.record(_hook_row("retention_guard"))
+            store.record(CallMetrics(server="lf", tool="t", original_chars=1, compressed_chars=1))
+        finally:
+            store.close()
+        db = sqlite3.connect(str(db_path))
+        try:
+            rows = db.execute(f"SELECT source, {_STATUS_COL} FROM proxy_metrics").fetchall()
+        finally:
+            db.close()
+        assert sorted(rows) == [("hook", "retention_guard"), ("mcp", None)]
+
+    def test_a_db_from_before_the_column_migrates_with_null_history(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "m.db"
+        with monkeypatch.context() as patch:
+            old = _without_status_column(patch)
+            store = MetricsStore(db_path)
+            store.initialize()
+            store.close()
+        _raw_insert(db_path)  # the previous release's insert names no status
+        assert _read_schema_stamp(db_path) == old
+        db = sqlite3.connect(str(db_path))
+        try:
+            assert _STATUS_COL not in _column_names(db)
+        finally:
+            db.close()
+
+        store = MetricsStore(db_path)
+        store.initialize()
+        try:
+            store.record(_hook_row("compressed"))
+        finally:
+            store.close()
+
+        assert _read_schema_stamp(db_path) == _SCHEMA_FINGERPRINT != old
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert _statuses(summary) == {
+            ("builtin:claude", None): (1, 100),
+            ("builtin:claude", "compressed"): (1, 100),
+        }
+
+    def test_the_column_does_not_change_the_rollup_trigger(self, monkeypatch):
+        """The trigger is ``IF NOT EXISTS``, so a body that changed with the
+        column would silently never be installed on an existing DB."""
+        current = metrics_store_module._rollup_trigger_ddl()
+        monkeypatch.delitem(metrics_store_module._MIGRATIONS, _STATUS_COL)
+        assert metrics_store_module._rollup_trigger_ddl() == current
+
+    def test_old_and_new_binaries_alternating_lose_and_double_count_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "m.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        store.close()
+        installed = _read_meta(db_path)["rollup_installed_at"]
+        with monkeypatch.context() as patch:
+            old = _without_status_column(patch)
+        assert old != _SCHEMA_FINGERPRINT
+        for i in range(3):
+            # The previous release opens a DB this version stamped: it must take
+            # its own slow path, restamp, and insert naming only its columns.
+            with monkeypatch.context() as patch:
+                _without_status_column(patch)
+                prior = MetricsStore(db_path)
+                prior.initialize()
+                prior.close()
+            assert _read_schema_stamp(db_path) == old
+            _raw_insert(db_path, tool=f"old{i}")
+            store = MetricsStore(db_path)  # slow path: restamps
+            store.initialize()
+            try:
+                store.record(_hook_row("below_threshold", tool=f"new{i}"))
+            finally:
+                store.close()
+            assert _read_schema_stamp(db_path) == _SCHEMA_FINGERPRINT
+
+        before = read_compression_summary(db_path, source="hook")
+        assert before["total_calls"] == 6
+        db = sqlite3.connect(str(db_path))
+        try:
+            db.execute("DELETE FROM proxy_metrics")
+            db.commit()
+            triggers = db.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchone()[0]
+        finally:
+            db.close()
+        assert triggers == 1
+        assert _read_meta(db_path)["rollup_installed_at"] == installed
+        after = read_compression_all_time(db_path, source="hook")
+        assert (after["total_calls"], after["total_original_chars"]) == (6, 600)
+
+
+class TestReadHookStatus:
+    def _seed(self, db_path):
+        store = MetricsStore(db_path)
+        store.initialize()
+        try:
+            for row in (
+                _hook_row("compressed", size=30_000),
+                _hook_row("below_threshold", size=500),
+                _hook_row("below_threshold", size=700),
+                _hook_row("unsupported_host", host="codex", size=9_000),
+                _hook_row(None, tool="Read", size=40),
+            ):
+                store.record(row)
+            # An upstream MCP server may carry the hook's label as its name.
+            store.record(
+                CallMetrics(
+                    server="builtin:claude", tool="Bash", original_chars=5, compressed_chars=5
+                )
+            )
+        finally:
+            store.close()
+
+    def test_groups_retained_hook_rows_by_server_and_status(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        self._seed(db_path)
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert _statuses(summary) == {
+            ("builtin:claude", "compressed"): (1, 30_000),
+            ("builtin:claude", "below_threshold"): (2, 1_200),
+            ("builtin:codex", "unsupported_host"): (1, 9_000),
+            ("builtin:claude", None): (1, 40),
+        }
+        assert sum(r["calls"] for r in summary["hook_status"]) == summary["total_calls"]
+
+    def test_tool_filter_applies(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        self._seed(db_path)
+        summary = read_compression_summary(
+            db_path, tool="Read", source="hook", with_hook_status=True
+        )
+        assert _statuses(summary) == {("builtin:claude", None): (1, 40)}
+
+    def test_values_outside_the_set_fold_into_other(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        MetricsStore(db_path).initialize()
+        _raw_insert(db_path, **{_STATUS_COL: "\x1b[31mred"})
+        _raw_insert(db_path, **{_STATUS_COL: "future_status"})
+        _raw_insert(db_path, **{_STATUS_COL: "compressed"})
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert _statuses(summary) == {
+            ("builtin:claude", "other"): (2, 200),
+            ("builtin:claude", "compressed"): (1, 100),
+        }
+
+    def test_an_mcp_summary_carries_no_statuses(self, tmp_path):
+        """Hook statuses beside MCP totals would describe rows they exclude."""
+        db_path = tmp_path / "m.db"
+        self._seed(db_path)
+        summary = read_compression_summary(db_path, source="mcp", with_hook_status=True)
+        assert (summary["available"], summary["total_calls"]) == (True, 1)
+        assert summary["hook_status"] is None
+
+    def test_an_unfiltered_summary_carries_its_hook_share(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        self._seed(db_path)
+        unfiltered = read_compression_summary(db_path, with_hook_status=True)
+        hook = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert unfiltered["total_calls"] == hook["total_calls"] + 1  # plus the MCP row
+        assert _statuses(unfiltered) == _statuses(hook)
+
+    def test_a_nocase_column_cannot_pass_another_spelling(self, tmp_path):
+        """An outside table may declare the column NOCASE; the allowlist must
+        still compare bytes, or ``COMPRESSED`` prints as itself."""
+        db_path = tmp_path / "m.db"
+        db = sqlite3.connect(str(db_path))
+        try:
+            db.execute(
+                "CREATE TABLE proxy_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "server TEXT, tool TEXT, original_chars INTEGER, compressed_chars INTEGER, "
+                "cleaned_chars INTEGER DEFAULT 0, created_at REAL, source TEXT, "
+                f"{_STATUS_COL} TEXT COLLATE NOCASE)"
+            )
+            db.commit()
+        finally:
+            db.close()
+        _raw_insert(db_path, **{_STATUS_COL: "COMPRESSED"})
+        _raw_insert(db_path, **{_STATUS_COL: "compressed"})
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert _statuses(summary) == {
+            ("builtin:claude", "compressed"): (1, 100),
+            ("builtin:claude", "other"): (1, 100),
+        }
+
+    def test_an_undecodable_status_counts_as_other_without_losing_the_totals(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        MetricsStore(db_path).initialize()
+        _raw_insert(db_path, **{_STATUS_COL: "compressed"})
+        db = sqlite3.connect(str(db_path))
+        try:
+            # Stored as TEXT, but not valid UTF-8: Python cannot decode it.
+            db.execute(
+                f"INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+                f"source, created_at, {_STATUS_COL}) "
+                "VALUES ('builtin:claude', 'Bash', 100, 100, 'hook', 0, CAST(X'FF61' AS TEXT))"
+            )
+            db.commit()
+        finally:
+            db.close()
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert summary["available"] is True, summary["error"]
+        assert summary["total_calls"] == 2
+        assert _statuses(summary) == {
+            ("builtin:claude", "compressed"): (1, 100),
+            ("builtin:claude", "other"): (1, 100),
+        }
+
+    def test_not_requested_means_no_key(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        self._seed(db_path)
+        assert "hook_status" not in read_compression_summary(db_path, source="hook")
+
+    def test_missing_db_reports_none(self, tmp_path):
+        summary = read_compression_summary(
+            tmp_path / "absent.db", source="hook", with_hook_status=True
+        )
+        assert summary["available"] is False
+        assert summary["hook_status"] is None
+
+    def test_pre_source_db_has_no_hook_groups(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "CREATE TABLE proxy_metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT, tool TEXT, "
+            "original_chars INTEGER, compressed_chars INTEGER, "
+            "cleaned_chars INTEGER DEFAULT 0, created_at REAL)"
+        )
+        db.execute(
+            "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+            "created_at) VALUES ('builtin:claude', 'Bash', 100, 40, 0)"
+        )
+        db.commit()
+        db.close()
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert summary["available"] is True
+        assert summary["hook_status"] == []
+        # Unfiltered, nothing returns early: the status read itself must not ask
+        # for a column the DB lacks, or the totals beside it go down too.
+        unfiltered = read_compression_summary(db_path, with_hook_status=True)
+        assert unfiltered["available"] is True, unfiltered["error"]
+        assert (unfiltered["total_calls"], unfiltered["hook_status"]) == (1, [])
+
+    def test_pre_status_db_reads_as_not_recorded_without_writing(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "m.db"
+        with monkeypatch.context() as patch:
+            _without_status_column(patch)
+            store = MetricsStore(db_path)
+            store.initialize()
+            store.close()
+        _raw_insert(db_path)
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert _statuses(summary) == {("builtin:claude", None): (1, 100)}
+        db = sqlite3.connect(str(db_path))
+        try:
+            assert _STATUS_COL not in _column_names(db)  # read-only: nothing migrated
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize(
+        ("size", "expected"),
+        [
+            # In range per row, past int64 together: SUM overflows → TOTAL.
+            (5 * 10**18, 10**19),
+            # Out of the per-row range: contributes 0, as in the totals beside it.
+            (1e308, 0),
+        ],
+        ids=["int64-overflow", "non-finite-row"],
+    )
+    def test_sizes_follow_the_totals_guard(self, tmp_path, size, expected):
+        db_path = tmp_path / "m.db"
+        MetricsStore(db_path).initialize()
+        for _ in range(2):
+            _raw_insert(db_path, original_chars=size, compressed_chars=0, **{_STATUS_COL: "error"})
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert summary["available"] is True, summary["error"]
+        assert _statuses(summary) == {("builtin:claude", "error"): (2, expected)}
+        assert summary["total_original_chars"] == expected
+
+    def test_all_time_counts_statuses_over_retained_rows_only(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        store = MetricsStore(db_path, max_history=2)
+        store.initialize()
+        try:
+            for status in ("compressed", "below_threshold", "below_threshold", "error", "error"):
+                store.record(_hook_row(status))
+        finally:
+            store.close()
+        db = sqlite3.connect(str(db_path))
+        try:
+            retained = db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0]
+            rolled = db.execute("SELECT SUM(calls) FROM proxy_metrics_daily").fetchone()[0]
+        finally:
+            db.close()
+        assert retained < 5 and rolled == 5 - retained  # the trim really ran
+
+        summary = read_compression_all_time(db_path, source="hook", with_hook_status=True)
+        assert summary["total_calls"] == 5
+        assert sum(r["calls"] for r in summary["hook_status"]) == retained
+
+    def test_status_groups_share_the_totals_snapshot(self, tmp_path, monkeypatch):
+        """A row committed between the totals and the status read is in neither."""
+        db_path = tmp_path / "m.db"
+        self._seed(db_path)
+        real = metrics_store_module._read_hook_status
+
+        def _write_then_read(db, cols, tool):
+            _raw_insert(db_path, **{_STATUS_COL: "compressed"})
+            return real(db, cols, tool)
+
+        monkeypatch.setattr(metrics_store_module, "_read_hook_status", _write_then_read)
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert sum(r["calls"] for r in summary["hook_status"]) == summary["total_calls"] == 5
