@@ -655,10 +655,20 @@ async def _quiet_async(coro: Any, what: str) -> None:
 
 
 def _read_payload(stream: TextIO) -> dict[str, Any] | None:
-    """Read and JSON-parse the hook payload from ``stream``; ``None`` if absent
-    or malformed (caller treats that as a clean no-op)."""
+    """Read and JSON-parse the hook payload from ``stream``; ``None`` if absent,
+    not UTF-8, or malformed (caller treats that as a clean no-op).
+
+    The payload is JSON, whose interchange encoding is UTF-8, so the bytes under
+    a text stream are decoded as UTF-8 (a leading BOM tolerated), not in the
+    stream's configured encoding, which need not be UTF-8 (#1444).
+
+    Reading ``.buffer`` bypasses anything the text layer has already buffered,
+    so ``stream`` must not have been read from: true for the one caller, which
+    passes a fresh ``sys.stdin``. A stream without ``.buffer`` is read as text.
+    """
     try:
-        raw = stream.read()
+        buffer = getattr(stream, "buffer", None)
+        raw = buffer.read().decode("utf-8-sig") if buffer is not None else stream.read()
     except Exception:
         return None
     if not raw or not raw.strip():
@@ -1108,8 +1118,7 @@ def hook_command(
     """
     # A subcommand (install/uninstall) was invoked — don't run the runtime bridge
     # (and never read stdin). The bare ``mms hook`` invocation, where
-    # ``invoked_subcommand`` is None, falls through to the payload path below,
-    # byte-identical to the pre-group command.
+    # ``invoked_subcommand`` is None, falls through to the payload path below.
     if ctx.invoked_subcommand is not None:
         return
     # Top-level always-exit-0 barrier (#865). The inner ``except Exception``
@@ -1177,16 +1186,17 @@ def hook_command(
         # still append a newline, making stdout "\n" — non-empty, which Kimi
         # injects into the model context — so the "empty stdout" pass-through
         # contract requires suppressing the newline on an empty payload. JSON
-        # hosts always serialize to a non-empty string ("{}" or more), so their
-        # trailing newline (and the pre-seam byte-identity) is unchanged.
+        # hosts always serialize to a non-empty string ("{}" or more), so they
+        # keep their trailing newline.
         wrote = True
         try:
             click.echo(serialized, nl=bool(serialized))
         except UnicodeEncodeError:
             # Last resort for the always-exit-0 contract (#757). The JSON hosts'
-            # payload is escaped by the writer in ``serialize``, but Kimi's
-            # channel is raw stdout — surfaced text, not a JSON document — so
-            # nothing escapes an unencodable code unit there. Degrade to
+            # payload is ASCII (``serialize`` escapes every non-ASCII code unit,
+            # #1444), so it encodes on any ASCII-compatible stdout. A raw-stdout
+            # adapter such as Kimi's writes surfaced text, not a JSON document,
+            # so nothing escapes an unencodable character there. Degrade to
             # "nothing surfaced" rather than let the final write become a hook
             # failure the host reads as a broken tool call.
             logger.warning("hook output was not encodable — passing tool output through")

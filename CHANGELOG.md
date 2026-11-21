@@ -163,6 +163,22 @@ changes inline only. See the deprecation policy in
   `--all-time` the `status:` line no longer says `(retained rows)` unless
   the status rollup is unavailable (not installed yet, or its table or a
   trigger is missing).
+- `mms hook` no longer drops the JSON it writes for Claude Code, Codex and
+  Cursor when its stdout is not UTF-8 but another ASCII-compatible encoding,
+  such as cp1252 on a Windows pipe. That JSON held non-ASCII text as it was: the
+  `⟦stm-compressed⟧` marker that starts every compressed Bash output, `…`,
+  or Korean in surfaced memories. Writing it failed, the hook logged `hook
+  output was not encodable` and printed nothing, so the tool output was never
+  compressed and the surfaced memories in the same reply were lost. The hook
+  also decoded its stdin in that encoding, which turned non-ASCII tool output
+  into mojibake; it now decodes the payload as UTF-8, the encoding JSON is
+  exchanged in, and treats bytes that are not UTF-8 as a malformed payload,
+  passing the tool output through (#1444).
+  **Behavior change**: the hook's stdout JSON for Claude Code, Codex and
+  Cursor is ASCII-only, with non-ASCII text written as `\uXXXX` escapes (two
+  for a character outside the Basic Multilingual Plane); a host that parses
+  it reads the same values as before. Hook input is read as UTF-8
+  whatever the locale, with a leading byte-order mark ignored.
 
 ## [0.7.9] — 2026-11-15
 

@@ -42,6 +42,7 @@ from memtomem_stm.cli.hook_cmd import (
     _daemon_enabled,
     _extract_surfaced_block,
     _orchestrate,
+    _read_payload,
     _record_hook_metrics,
     _resolve_host_tag,
     _run_hook,
@@ -2201,12 +2202,6 @@ def test_bare_hook_process_writes_the_notice_to_stderr(tmp_path: Path):
             "MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED": "1",
             "MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS": "2000",
             "MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION": "0",
-            # The replaced output starts with the non-ASCII sentinel and is
-            # written with ``ensure_ascii=False``; on a Windows pipe (cp1252)
-            # that write fails and the hook emits nothing. That is a
-            # separate, pre-existing limit of the compression path, not what
-            # this test is about, so pin the child's stdout encoding.
-            "PYTHONIOENCODING": "utf-8",
         }
     )
     stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
@@ -2324,3 +2319,134 @@ def test_refused_status_and_notice_are_separate_decisions(
     finally:
         db.close()
     assert rows == [("replacement_not_requested",)]
+
+
+# ── Non-UTF-8 hook streams (#1444) ───────────────────────────────────────────
+# cp1252 stands in for a stream encoding that is not UTF-8 (a Windows pipe can
+# be one). The JSON hosts' stdout must not depend on it (ASCII JSON), and the
+# payload on stdin is UTF-8 JSON whatever the stream's encoding.
+
+_KO_CONTEXT = "<surfaced-memories>\n한국어 메모 … 끝\n</surfaced-memories>"
+
+
+@pytest.mark.parametrize(
+    "host, output",
+    [
+        (
+            "claude",
+            ClaudeHookAdapter().render(
+                updated_tool_output={"stdout": f"{_COMPRESS_SENTINEL}\n한국어 로그\n"},
+                additional_context=_KO_CONTEXT,
+            ),
+        ),
+        (
+            "codex",
+            CodexHookAdapter().render(updated_tool_output=None, additional_context=_KO_CONTEXT),
+        ),
+    ],
+)
+def test_cli_json_host_output_survives_a_cp1252_stdout(
+    monkeypatch: pytest.MonkeyPatch, host: str, output: dict
+):
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(return_value=output))
+    stdin = json.dumps(_READ_PAYLOAD).encode("ascii")
+
+    result = CliRunner(charset="cp1252").invoke(cli, ["hook", "--host", host], input=stdin)
+
+    assert result.exit_code == 0
+    assert result.stdout_bytes.isascii()
+    assert json.loads(result.stdout_bytes) == output
+
+
+def test_cli_decodes_stdin_as_utf8_under_a_cp1252_locale(monkeypatch: pytest.MonkeyPatch):
+    seen: list[dict] = []
+
+    async def _capture(payload, adapter, **_kwargs):
+        seen.append(payload)
+        return {}
+
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", _capture)
+    payload = _bash_payload({"stdout": "한국어 로그\n"})
+    stdin = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    result = CliRunner(charset="cp1252").invoke(cli, ["hook", "--host", "claude"], input=stdin)
+
+    assert result.exit_code == 0
+    assert seen == [payload]
+
+
+def test_read_payload_decodes_the_byte_stream_as_utf8():
+    import io
+
+    doc = {"k": "한국어"}
+    raw = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+
+    def wrapped(data: bytes, encoding: str = "cp1252") -> io.TextIOWrapper:
+        return io.TextIOWrapper(io.BytesIO(data), encoding=encoding)
+
+    assert _read_payload(wrapped(raw)) == doc
+    assert _read_payload(wrapped(b"\xef\xbb\xbf" + raw)) == doc  # leading BOM
+    # Not UTF-8 → the malformed-payload no-op, even where the locale would
+    # have decoded it (latin-1 maps every byte).
+    assert _read_payload(wrapped(b'{"k": "\xff"}', encoding="latin-1")) is None
+    # A text-only stream (no ``.buffer``) keeps the text read.
+    assert _read_payload(io.StringIO(json.dumps(doc))) == doc
+
+
+@pytest.mark.parametrize("host", ["claude", "kimi"])
+def test_cli_invalid_utf8_stdin_passes_through(monkeypatch: pytest.MonkeyPatch, host: str):
+    # Under cp1252 the byte 0xff decodes (to "ÿ"), so a regression to
+    # stream-encoding decoding would parse this payload and run the pipeline.
+    orchestrate = AsyncMock(return_value={})
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", orchestrate)
+    stdin = b'{"hook_event_name": "PostToolUse", "tool_name": "Read", "x": "\xff"}'
+
+    result = CliRunner(charset="cp1252").invoke(cli, ["hook", "--host", host], input=stdin)
+
+    assert result.exit_code == 0
+    orchestrate.assert_not_called()
+    if host == "kimi":
+        assert result.stdout == ""
+    else:
+        assert json.loads(result.stdout) == {}
+
+
+def test_hook_process_delivers_compressed_output_through_a_cp1252_pipe(tmp_path: Path):
+    """The real streams, as a Windows pipe gives them to the hook: compressed
+    output with non-ASCII content arrives intact — not dropped, not mojibake."""
+    import subprocess
+    import sys
+
+    env = {key: value for key, value in os.environ.items() if not key.startswith("MEMTOMEM_STM_")}
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "USERPROFILE": str(tmp_path / "home"),
+            "MEMTOMEM_STM_DATA_DIR": str(tmp_path / "daemon"),
+            "MEMTOMEM_STM_PROXY__METRICS__DB_PATH": str(tmp_path / "metrics.db"),
+            "MEMTOMEM_STM_HOOK__METRICS_ENABLED": "0",
+            "MEMTOMEM_STM_SURFACING__ENABLED": "0",
+            "MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED": "1",
+            "MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS": "2000",
+            "MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION": "0",
+            "PYTHONIOENCODING": "cp1252:strict",
+        }
+    )
+    stdout = "".join(f"한국어 로그 {i}\n" for i in range(4000))
+    stdin = json.dumps(_bash_payload({"stdout": stdout}), ensure_ascii=False).encode("utf-8")
+    argv = [sys.executable, "-c", "from memtomem_stm.cli.proxy import cli; cli()", "hook"]
+
+    proc = subprocess.run(
+        [*argv, "--host", "claude"],
+        input=stdin,
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert b"not encodable" not in proc.stderr
+    assert proc.stdout.isascii()
+    replaced = json.loads(proc.stdout)["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+    assert replaced.startswith(f"{_COMPRESS_SENTINEL}\n한국어 로그 0\n")
