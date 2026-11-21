@@ -1158,7 +1158,13 @@ class TestInitializeFastPath:
         assert epoch.isdigit()
         assert set(columns.split(",")) == set(_MIGRATIONS) | set(_BASE_COLUMNS)
         assert set(indexes.split(",")) == set(_INDEX_NAMES)
-        assert rollup.split(",") == ["proxy_metrics_daily", "proxy_metrics_rollup_on_delete_v1"]
+        assert rollup.split(",") == [
+            "proxy_metrics_daily",
+            "proxy_metrics_rollup_on_delete_v1",
+            "proxy_metrics_hook_status_daily",
+            "proxy_metrics_hook_status_rollup_on_delete_v1",
+            "proxy_metrics_hook_status_follow_daily_delete_v1",
+        ]
 
     def test_base_columns_match_the_create_statement(self):
         """``_BASE_COLUMNS`` is hand-written beside ``_CREATE``; this is what
@@ -2080,18 +2086,34 @@ def _read_meta(db_path) -> dict[str, str]:
 
 
 def _without_status_column(monkeypatch) -> str:
-    """Make this process the binary before the column: returns its fingerprint."""
+    """Make this process the binary before the column: returns its fingerprint.
+
+    That binary also predates the status rollup (#1442), so it neither names
+    those objects in its stamp nor installs them.
+    """
     monkeypatch.delitem(metrics_store_module._MIGRATIONS, _STATUS_COL)
+    monkeypatch.setattr(
+        metrics_store_module,
+        "_ROLLUP_OBJECT_NAMES",
+        (metrics_store_module._DAILY_TABLE, metrics_store_module._ROLLUP_TRIGGER),
+    )
+    monkeypatch.setattr(MetricsStore, "_install_status_rollup", staticmethod(lambda db: None))
     old = metrics_store_module._schema_fingerprint()
     monkeypatch.setattr(metrics_store_module, "_SCHEMA_FINGERPRINT", old)
     return old
 
 
 def _statuses(summary) -> dict[tuple[str, str | None], tuple[int, int]]:
+    """Kept statuses by ``(server, status)``; ``not_kept`` rows are left out."""
     return {
         (row["server"], row["status"]): (row["calls"], row["original_chars"])
-        for row in summary["hook_status"]
+        for row in summary["hook_status"]["rows"]
+        if not row["not_kept"]
     }
+
+
+def _status_calls(summary) -> int:
+    return sum(row["calls"] for row in summary["hook_status"]["rows"])
 
 
 class TestHookCompressionStatus:
@@ -2182,15 +2204,27 @@ class TestHookCompressionStatus:
         try:
             db.execute("DELETE FROM proxy_metrics")
             db.commit()
-            triggers = db.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'"
-            ).fetchone()[0]
+            triggers = {
+                row[0]
+                for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            }
         finally:
             db.close()
-        assert triggers == 1
+        assert triggers == {
+            "proxy_metrics_rollup_on_delete_v1",
+            "proxy_metrics_hook_status_rollup_on_delete_v1",
+            "proxy_metrics_hook_status_follow_daily_delete_v1",
+        }
         assert _read_meta(db_path)["rollup_installed_at"] == installed
-        after = read_compression_all_time(db_path, source="hook")
+        after = read_compression_all_time(db_path, source="hook", with_hook_status=True)
         assert (after["total_calls"], after["total_original_chars"]) == (6, 600)
+        # The older binary's rows carry no status; each delete is counted once.
+        assert after["hook_status"]["scope"] == "all_time"
+        assert _statuses(after) == {
+            ("builtin:claude", None): (3, 300),
+            ("builtin:claude", "below_threshold"): (3, 300),
+        }
+        assert _status_calls(after) == 6
 
 
 class TestReadHookStatus:
@@ -2225,7 +2259,7 @@ class TestReadHookStatus:
             ("builtin:codex", "unsupported_host"): (1, 9_000),
             ("builtin:claude", None): (1, 40),
         }
-        assert sum(r["calls"] for r in summary["hook_status"]) == summary["total_calls"]
+        assert _status_calls(summary) == summary["total_calls"]
 
     def test_tool_filter_applies(self, tmp_path):
         db_path = tmp_path / "m.db"
@@ -2338,12 +2372,13 @@ class TestReadHookStatus:
         db.close()
         summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
         assert summary["available"] is True
-        assert summary["hook_status"] == []
+        assert summary["hook_status"] == {"scope": "retained", "rows": []}
         # Unfiltered, nothing returns early: the status read itself must not ask
         # for a column the DB lacks, or the totals beside it go down too.
         unfiltered = read_compression_summary(db_path, with_hook_status=True)
         assert unfiltered["available"] is True, unfiltered["error"]
-        assert (unfiltered["total_calls"], unfiltered["hook_status"]) == (1, [])
+        assert unfiltered["total_calls"] == 1
+        assert unfiltered["hook_status"] == {"scope": "retained", "rows": []}
 
     def test_pre_status_db_reads_as_not_recorded_without_writing(self, tmp_path, monkeypatch):
         db_path = tmp_path / "m.db"
@@ -2381,7 +2416,20 @@ class TestReadHookStatus:
         assert _statuses(summary) == {("builtin:claude", "error"): (2, expected)}
         assert summary["total_original_chars"] == expected
 
-    def test_all_time_counts_statuses_over_retained_rows_only(self, tmp_path):
+        # Trimmed, the same sizes sit in one status bucket (turned REAL past
+        # int64 by the trigger's ``+``) and must read the same under --all-time.
+        db = sqlite3.connect(str(db_path))
+        try:
+            db.execute("DELETE FROM proxy_metrics")
+            db.commit()
+        finally:
+            db.close()
+        all_time = read_compression_all_time(db_path, source="hook", with_hook_status=True)
+        assert all_time["hook_status"]["scope"] == "all_time"
+        assert _statuses(all_time) == {("builtin:claude", "error"): (2, expected)}
+        assert all_time["total_original_chars"] == expected
+
+    def test_all_time_counts_statuses_over_trimmed_rows_too(self, tmp_path):
         db_path = tmp_path / "m.db"
         store = MetricsStore(db_path, max_history=2)
         store.initialize()
@@ -2400,7 +2448,16 @@ class TestReadHookStatus:
 
         summary = read_compression_all_time(db_path, source="hook", with_hook_status=True)
         assert summary["total_calls"] == 5
-        assert sum(r["calls"] for r in summary["hook_status"]) == retained
+        assert summary["hook_status"]["scope"] == "all_time"
+        assert _statuses(summary) == {
+            ("builtin:claude", "compressed"): (1, 100),
+            ("builtin:claude", "below_threshold"): (2, 200),
+            ("builtin:claude", "error"): (2, 200),
+        }
+        # The retained window alone still reads retained rows only.
+        retained_only = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert retained_only["hook_status"]["scope"] == "retained"
+        assert _status_calls(retained_only) == retained
 
     def test_status_groups_share_the_totals_snapshot(self, tmp_path, monkeypatch):
         """A row committed between the totals and the status read is in neither."""
@@ -2408,10 +2465,10 @@ class TestReadHookStatus:
         self._seed(db_path)
         real = metrics_store_module._read_hook_status
 
-        def _write_then_read(db, cols, tool):
+        def _write_then_read(db, cols, tool, **kwargs):
             _raw_insert(db_path, **{_STATUS_COL: "compressed"})
-            return real(db, cols, tool)
+            return real(db, cols, tool, **kwargs)
 
         monkeypatch.setattr(metrics_store_module, "_read_hook_status", _write_then_read)
         summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
-        assert sum(r["calls"] for r in summary["hook_status"]) == summary["total_calls"] == 5
+        assert _status_calls(summary) == summary["total_calls"] == 5

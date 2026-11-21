@@ -391,7 +391,133 @@ def _rollup_trigger_ddl() -> str:
 
 _ROLLUP_TRIGGER_DDL = _rollup_trigger_ddl()
 
-_ROLLUP_OBJECT_NAMES = (_DAILY_TABLE, _ROLLUP_TRIGGER)
+# ── Hook status rollup (#1442) ──────────────────────────────────────────────
+#
+# ``proxy_metrics_daily`` keeps no ``hook_compression_status``, so once a hook
+# row is trimmed its status would be gone while its call still counts toward
+# the all-time totals. A second, separately named table and trigger keep the
+# status of every trimmed ``source='hook'`` row, per ``(UTC day, server, tool,
+# kind, status)``. They sit beside the daily rollup rather than changing it:
+# a new ``_v1`` body would need a new trigger name, and an older binary
+# re-running its slow path recreates the old one beside it, counting each
+# delete twice. Everything the rollup notes above say applies here too —
+# rolled up on delete, so exact and fed by older binaries' deletes; ANY delete
+# from ``proxy_metrics`` is rolled up; the trigger must be unable to fail, so
+# the counters are nullable, every key has a non-NULL fallback, and sizes pass
+# through ``_finite``; and never ``DROP`` the table while its trigger exists.
+#
+# ``kind`` separates three things without a sentinel string (``''`` is a value
+# a writer can store, which the reader reports as ``other``):
+#
+# - ``_STATUS_KIND_VALUE``: a stored status, kept verbatim in ``status``.
+#   Folding unknown names into ``other`` happens on read, not here: the
+#   trigger body is fixed once installed, so folding here would turn a status
+#   name a later version adds into ``other`` for good.
+# - ``_STATUS_KIND_NULL``: a row that recorded no status (written before the
+#   column existed, or by an older writer); ``status`` is ``''``.
+# - ``_STATUS_KIND_NOT_KEPT``: hook calls already in ``proxy_metrics_daily``
+#   when this table was created, whose status was not kept anywhere;
+#   ``status`` is ``''``. Seeded once, in the transaction that creates the
+#   table, so the status counts add up to the hook calls of the daily rollup.
+#   If the table is ever recreated after a ``DROP``, the reseed also covers
+#   calls whose status this table had held — hence "not kept", not "before
+#   installation".
+#
+# The source match is ``COLLATE BINARY`` so the trigger takes exactly the rows
+# that ``proxy_metrics_daily`` files under ``'hook'`` (its key columns are
+# BINARY), whatever collation an outside schema gave ``source``.
+#
+# The status buckets are subordinate to the daily ones: a third trigger,
+# ``AFTER DELETE ON proxy_metrics_daily``, removes the status rows of a deleted
+# hook bucket. That keeps the reset documented before this table existed
+# (``DELETE FROM proxy_metrics``, then ``DELETE FROM proxy_metrics_daily``)
+# complete — without it, a reset by those instructions would leave status
+# counts for calls the totals no longer have. Nothing in STM deletes from the
+# daily table (the rollup trigger only upserts, which fires no delete
+# trigger), so this runs on manual resets only; it can fail only when the
+# status table is gone, which is the ``DROP`` hazard above.
+
+_STATUS_DAILY_TABLE = "proxy_metrics_hook_status_daily"
+_STATUS_ROLLUP_TRIGGER = "proxy_metrics_hook_status_rollup_on_delete_v1"
+_STATUS_RESET_TRIGGER = "proxy_metrics_hook_status_follow_daily_delete_v1"
+_STATUS_COLUMN = "hook_compression_status"
+_STATUS_KIND_VALUE = 0
+_STATUS_KIND_NULL = 1
+_STATUS_KIND_NOT_KEPT = 2
+
+_STATUS_DAILY_CREATE = (
+    f"CREATE TABLE IF NOT EXISTS {_STATUS_DAILY_TABLE} (\n"
+    "    day TEXT NOT NULL,\n"
+    "    server TEXT NOT NULL,\n"
+    "    tool TEXT NOT NULL,\n"
+    "    kind INTEGER NOT NULL,\n"
+    "    status TEXT NOT NULL,\n"
+    # Nullable on purpose — see the rollup notes above.
+    "    calls INTEGER DEFAULT 0,\n"
+    "    original_chars INTEGER DEFAULT 0,\n"
+    "    PRIMARY KEY (day, server, tool, kind, status)\n"
+    ") WITHOUT ROWID"
+)
+
+
+def _status_rollup_trigger_ddl() -> str:
+    day, _epoch = _created_at_terms("OLD.")
+    status = f"OLD.{_STATUS_COLUMN}"
+    kind = f"CASE WHEN {status} IS NULL THEN {_STATUS_KIND_NULL} ELSE {_STATUS_KIND_VALUE} END"
+    values = ", ".join(
+        (
+            day,
+            "COALESCE(OLD.server, '')",
+            "COALESCE(OLD.tool, '')",
+            kind,
+            f"COALESCE({status}, '')",
+            "1",
+            _finite("OLD.original_chars"),
+        )
+    )
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {_STATUS_ROLLUP_TRIGGER} "
+        "AFTER DELETE ON proxy_metrics FOR EACH ROW "
+        "WHEN OLD.source = 'hook' COLLATE BINARY BEGIN "
+        f"INSERT INTO {_STATUS_DAILY_TABLE} "
+        "(day, server, tool, kind, status, calls, original_chars) "
+        f"VALUES ({values}) "
+        "ON CONFLICT (day, server, tool, kind, status) DO UPDATE SET "
+        "calls = COALESCE(calls, 0) + excluded.calls, "
+        "original_chars = COALESCE(original_chars, 0) + excluded.original_chars; END"
+    )
+
+
+_STATUS_ROLLUP_TRIGGER_DDL = _status_rollup_trigger_ddl()
+
+_STATUS_RESET_TRIGGER_DDL = (
+    f"CREATE TRIGGER IF NOT EXISTS {_STATUS_RESET_TRIGGER} "
+    f"AFTER DELETE ON {_DAILY_TABLE} FOR EACH ROW "
+    "WHEN OLD.source = 'hook' COLLATE BINARY BEGIN "
+    f"DELETE FROM {_STATUS_DAILY_TABLE} "
+    "WHERE day = OLD.day AND server = OLD.server AND tool = OLD.tool; END"
+)
+
+# One copy per daily row: ``proxy_metrics_daily`` has exactly one row per
+# ``(day, 'hook', server, tool)``, so nothing is aggregated and nothing can
+# overflow into an error that would fail the installation. The ``WHERE`` also
+# keeps ``INSERT ... SELECT ... ON CONFLICT`` unambiguous to the parser.
+_STATUS_SEED = (
+    f"INSERT INTO {_STATUS_DAILY_TABLE} "
+    "(day, server, tool, kind, status, calls, original_chars) "
+    f"SELECT day, server, tool, {_STATUS_KIND_NOT_KEPT}, '', {_finite_total('calls')}, "
+    f"{_finite_total('legacy_original_chars')} + {_finite_total('structured_original_chars')} "
+    f"FROM {_DAILY_TABLE} WHERE source = 'hook' COLLATE BINARY "
+    "ON CONFLICT (day, server, tool, kind, status) DO NOTHING"
+)
+
+_ROLLUP_OBJECT_NAMES = (
+    _DAILY_TABLE,
+    _ROLLUP_TRIGGER,
+    _STATUS_DAILY_TABLE,
+    _STATUS_ROLLUP_TRIGGER,
+    _STATUS_RESET_TRIGGER,
+)
 
 
 def _schema_fingerprint() -> str:
@@ -475,7 +601,8 @@ def read_compression_summary(
     ``available``) summary, since no row can carry that source.
 
     ``with_hook_status`` adds a ``hook_status`` key: the retained
-    ``source='hook'`` rows grouped by ``(server, status)`` — see
+    ``source='hook'`` rows grouped by ``(server, status)``, as
+    ``{"scope": "retained", "rows": [...]}`` — see
     :func:`_read_hook_status` — read in the same snapshot as the totals, so
     the two describe the same rows. Under ``source=None`` they are the hook
     share of the totals. ``source='mcp'``, an unavailable summary or a failed
@@ -514,8 +641,11 @@ def read_compression_all_time(
       and ``unknown_date_calls`` (rows whose ``created_at`` was not a
       convertible timestamp; counted, but undated).
 
-    ``with_hook_status`` behaves as in :func:`read_compression_summary` and
-    still counts **retained rows only**: the daily rollup keeps no status.
+    ``with_hook_status`` behaves as in :func:`read_compression_summary`, and
+    once the hook status rollup (#1442) is installed it also counts the
+    trimmed hook rows, under ``"scope": "all_time"`` — including ``not_kept``
+    rows for trimmed calls whose status was not kept. A DB whose status
+    rollup is missing reports the retained rows, under ``"scope": "retained"``.
     """
     return _read_compression(
         db_path, tool=tool, source=source, all_time=True, with_hook_status=with_hook_status
@@ -557,44 +687,95 @@ def _rollup_markers(db: sqlite3.Connection) -> tuple[float, int | None] | None:
     return installed_at, lost
 
 
-def _read_hook_status(
-    db: sqlite3.Connection, cols: Collection[str], tool: str | None
-) -> list[dict[str, object]]:
-    """Retained ``source='hook'`` rows grouped by ``(server, status)``.
+def _status_rollup_installed(db: sqlite3.Connection) -> bool:
+    """Whether the hook status rollup (#1442) is wired: its table AND triggers.
 
-    Each entry has ``server``, ``status``, ``calls`` and ``original_chars``.
-    ``status`` is a name from ``HOOK_COMPRESSION_STATUSES``, ``None`` for a row
-    that recorded none (written before the column existed), or ``"other"`` for
-    any value outside the set — folded in SQL, before anything is decoded, so
-    no caller renders a stored value verbatim and an undecodable one cannot
-    fail the read. Sizes pass through the same ``_finite`` guard and
+    A table with no trigger feeding it would under-count while looking
+    complete, as for ``_rollup_markers``; without the one that follows daily
+    deletes, a reset could leave counts the totals no longer have. No marker
+    is needed: the calls trimmed before the table existed are rows of the
+    table itself (``_STATUS_KIND_NOT_KEPT``), written in the transaction that
+    created it.
+    """
+    names = {
+        row[0]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE (type = 'table' AND name = ?) "
+            "OR (type = 'trigger' AND name IN (?, ?))",
+            (_STATUS_DAILY_TABLE, _STATUS_ROLLUP_TRIGGER, _STATUS_RESET_TRIGGER),
+        )
+    }
+    return names == {_STATUS_DAILY_TABLE, _STATUS_ROLLUP_TRIGGER, _STATUS_RESET_TRIGGER}
+
+
+def _fold_status(expr: str) -> str:
+    """SQL mapping a stored status to a known name, ``'other'`` or NULL."""
+    # The names are fixed identifiers, so interpolating them is safe.
+    known = ", ".join(f"'{name}'" for name in sorted(HOOK_COMPRESSION_STATUSES))
+    return (
+        f"CASE WHEN {expr} IS NULL THEN NULL "
+        # BINARY: an outside table may declare the column NOCASE, which
+        # would let ``COMPRESSED`` through and print its own spelling.
+        f"WHEN {expr} COLLATE BINARY IN ({known}) THEN {expr} "
+        "ELSE 'other' END"
+    )
+
+
+def _read_hook_status(
+    db: sqlite3.Connection, cols: Collection[str], tool: str | None, *, all_time: bool
+) -> dict[str, object]:
+    """``source='hook'`` rows grouped by ``(server, status)``.
+
+    Returns ``{"scope": ..., "rows": [...]}``. ``scope`` is ``"all_time"`` when
+    ``all_time`` is asked for and the status rollup is installed — the
+    retained rows plus ``proxy_metrics_hook_status_daily``, in one statement
+    as ``_read_compression`` reads the totals — and ``"retained"`` otherwise.
+
+    Each row has ``server``, ``status``, ``not_kept``, ``calls`` and
+    ``original_chars``. ``status`` is a name from ``HOOK_COMPRESSION_STATUSES``,
+    ``None`` for a row that recorded none (written before the column existed),
+    or ``"other"`` for any value outside the set — folded in SQL, before
+    anything is decoded, so no caller renders a stored value verbatim and an
+    undecodable one cannot fail the read. ``not_kept`` rows (all-time only)
+    count trimmed calls whose status was not kept; their ``status`` is
+    ``None``. Sizes pass through the same ``_finite`` guards and
     ``SUM``→``TOTAL`` fallback as the totals they sit beside. A DB that
     predates ``source`` has no hook rows.
+
+    The filters match as the totals reader's do — the column's own collation
+    on the retained half, the rollup table's BINARY keys on the other — so the
+    counts describe the rows of the figure they are printed under.
     """
+    scope = "all_time" if all_time and _status_rollup_installed(db) else "retained"
+    result: dict[str, object] = {"scope": scope, "rows": []}
     if "source" not in cols:
-        return []
-    if "hook_compression_status" in cols:
-        # The names are fixed identifiers, so interpolating them is safe.
-        known = ", ".join(f"'{name}'" for name in sorted(HOOK_COMPRESSION_STATUSES))
-        status = (
-            "CASE WHEN hook_compression_status IS NULL THEN NULL "
-            # BINARY: an outside table may declare the column NOCASE, which
-            # would let ``COMPRESSED`` through and print its own spelling.
-            f"WHEN hook_compression_status COLLATE BINARY IN ({known}) "
-            "THEN hook_compression_status "
-            "ELSE 'other' END"
-        )
-    else:
-        status = "NULL"
+        return result
+    status = _fold_status(_STATUS_COLUMN) if _STATUS_COLUMN in cols else "NULL"
     where = "source = 'hook'"
     params: list[object] = []
     if tool is not None:
         where += " AND tool = ?"
         params.append(tool)
+    inner = (
+        f"SELECT server, {status} AS status, 0 AS not_kept, 1 AS calls, "
+        f"{_finite('original_chars')} AS original_chars FROM proxy_metrics WHERE {where}"
+    )
+    if scope == "all_time":
+        daily_where = " WHERE tool = ?" if tool is not None else ""
+        inner += (
+            " UNION ALL SELECT server, "
+            # Only the two kinds that store no status read as NULL; any other
+            # kind (none is written) is judged by its status like a value.
+            f"CASE WHEN kind IN ({_STATUS_KIND_NULL}, {_STATUS_KIND_NOT_KEPT}) THEN NULL "
+            f"ELSE {_fold_status('status')} END, "
+            f"CASE WHEN kind = {_STATUS_KIND_NOT_KEPT} THEN 1 ELSE 0 END, "
+            f"{_finite_total('calls')}, {_finite_total('original_chars')} "
+            f"FROM {_STATUS_DAILY_TABLE}{daily_where}"
+        )
+        params = [*params, *params]
     statement = (
-        f"SELECT server, {status} AS status, COUNT(*), "
-        f"{{agg}}({_finite('original_chars')}) "
-        f"FROM proxy_metrics WHERE {where} GROUP BY server, status"
+        "SELECT server, status, not_kept, {agg}(calls), {agg}(original_chars) "
+        f"FROM ({inner}) GROUP BY server, status, not_kept"
     )
     try:
         rows = db.execute(statement.replace("{agg}", "SUM"), params).fetchall()
@@ -602,15 +783,17 @@ def _read_hook_status(
         if "integer overflow" not in str(exc):
             raise
         rows = db.execute(statement.replace("{agg}", "TOTAL"), params).fetchall()
-    return [
+    result["rows"] = [
         {
             "server": str(server),
-            "status": value,
+            "status": None if not_kept else value,
+            "not_kept": bool(not_kept),
             "calls": _count(calls),
             "original_chars": _count(orig),
         }
-        for server, value, calls, orig in rows
+        for server, value, not_kept, calls, orig in rows
     ]
+    return result
 
 
 def _read_compression(
@@ -708,7 +891,7 @@ def _read_compression(
             # this reader still land here.
             summary["available"] = True
             if want_status:
-                summary["hook_status"] = []
+                summary["hook_status"] = _read_hook_status(db, (), tool, all_time=all_time)
             return summary
 
         if source is not None and not has_source and source != "mcp":
@@ -717,7 +900,7 @@ def _read_compression(
             # but available summary rather than over-counting every legacy row.
             summary["available"] = True
             if want_status:
-                summary["hook_status"] = []
+                summary["hook_status"] = _read_hook_status(db, (), tool, all_time=all_time)
             return summary
 
         conditions: list[str] = []
@@ -789,7 +972,7 @@ def _read_compression(
             if "integer overflow" not in str(exc):
                 raise
             rows = db.execute(statement.replace("{agg}", "TOTAL"), inner_params).fetchall()
-        hook_status = _read_hook_status(db, cols, tool) if want_status else None
+        hook_status = _read_hook_status(db, cols, tool, all_time=all_time) if want_status else None
     except sqlite3.Error as exc:
         summary["error"] = exception_summary(exc)
         return summary
@@ -1051,6 +1234,7 @@ class MetricsStore:
             )
             db.execute(_DAILY_CREATE)
             db.execute(_ROLLUP_TRIGGER_DDL)
+            MetricsStore._install_status_rollup(db)
             installed = db.execute(
                 "INSERT INTO metrics_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
                 (_ROLLUP_INSTALLED_KEY, str(time.time())),
@@ -1077,6 +1261,40 @@ class MetricsStore:
         except BaseException:
             db.rollback()
             raise
+
+    @staticmethod
+    def _install_status_rollup(db: sqlite3.Connection) -> None:
+        """Create the hook status rollup (#1442) inside the caller's transaction.
+
+        The table is seeded only when it did not exist before this
+        transaction, and the trigger is created after the seed: under the
+        caller's ``BEGIN IMMEDIATE`` no trim can land between the two, so each
+        trimmed hook call is either in the seed or rolled up by the trigger,
+        never both. A later pass (an older binary's restamp sends the next
+        opener back here) finds the table and seeds nothing.
+
+        Nothing is created when ``proxy_metrics`` lacks the status column: a
+        trigger that reads a missing ``OLD`` column is accepted at creation and
+        then fails every delete. ``_migrate`` adds the column before this runs,
+        so that case is a guard, not a path.
+        """
+        has_column = any(
+            row[1] == _STATUS_COLUMN for row in db.execute("PRAGMA table_info(proxy_metrics)")
+        )
+        if not has_column:
+            return
+        first = (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (_STATUS_DAILY_TABLE,),
+            ).fetchone()
+            is None
+        )
+        db.execute(_STATUS_DAILY_CREATE)
+        if first:
+            db.execute(_STATUS_SEED)
+        db.execute(_STATUS_ROLLUP_TRIGGER_DDL)
+        db.execute(_STATUS_RESET_TRIGGER_DDL)
 
     def _schema_is_current(self, db: sqlite3.Connection) -> bool:
         """Whether this DB already carries the schema ``initialize`` would build.
