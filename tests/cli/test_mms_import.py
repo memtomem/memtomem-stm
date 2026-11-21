@@ -1033,8 +1033,9 @@ class TestSkippedSources:
 
     @pytest.fixture(autouse=True)
     def _no_host_probe(self, monkeypatch):
-        # The autouse isolation clears this, so a real ``claude`` or ``codex``
-        # on PATH would add its own stderr lines (and could write files).
+        # Skip ``report_host_bypass`` entirely, so stderr holds only this
+        # command's own notes. The conftest stubs already keep the real
+        # ``claude`` and ``codex`` probes from running.
         monkeypatch.setenv("MMS_NO_HOST_PROBE", "1")
 
     def test_every_gap_reason_has_a_case(self):
