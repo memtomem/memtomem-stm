@@ -13,6 +13,21 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms host sync --plan` no longer tells you to run an `--apply` that has
+  nothing to do. The text preview always printed ``Run `mms host sync
+  --apply` to execute.``, even when that run had nothing to write — every
+  entry unchanged, or the only changed entries ones it skips (a changed entry
+  without `--force`, an entry that moved to another host), with no sidecar row
+  to re-key or clean up; following it printed `Already synchronized. No
+  changes.` The closing line is now decided by the
+  same test the apply run uses to decide whether it writes anything: added,
+  removed, backfilled, re-stamped and re-keyed entries and stale sidecar
+  rows (#1402).
+  **Behavior change**: when that run would change nothing, the preview's
+  closing line reads ``Nothing for `mms host sync --apply` to do.`` (with the same
+  flags the old line named). A preview with changes to apply is unchanged,
+  and so are `--json` output and exit codes.
+
 - `mms hook` no longer ignores `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED`
   silently when the hook is registered without `--host claude`. Output
   replacement still runs only for an explicit `--host claude`, because

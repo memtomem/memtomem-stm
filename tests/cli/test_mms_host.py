@@ -2191,8 +2191,11 @@ class TestSyncGuidanceIsFollowable:
         old_baseline = state.load_import_state().entries["x"].drift_hash
         res = _sync(runner, "--plan", "--force")
         assert res.exit_code == 0, res.output
+        # A RESTAMP is a write: the plan names the run, never "Nothing" (#1402).
+        assert "to do." not in res.output
         res = _sync(runner, *_closing_command(res.output), "--yes")
         assert res.exit_code == 0, res.output
+        assert "Already synchronized" not in res.output
         _assert_restamped("x", ["v2"], old_baseline)
 
     def test_apply_footer_carries_yes(self, runner, sandbox):
@@ -3161,6 +3164,9 @@ class TestRekey:
 
         plan = _sync(runner, "--plan")
         assert "REKEY     1 sidecar baseline" in plan.output
+        # A re-key is a write, so the plan still names the run (#1402).
+        assert _closing_command(plan.output) == ["--apply"]
+        assert "to do." not in plan.output
         assert not drift.drift_key_path().exists()
 
         res = _sync(runner, "--apply")
@@ -3411,3 +3417,207 @@ class TestDriftKeyFile:
         assert res.exit_code == 1, res.output
         assert "Error:" in res.output and "import_state.toml.key" in res.output
         assert "Traceback" not in res.output
+
+
+# ---------------------------------------------------------------------------
+# The plan's closing line names a command only when it has something to do (#1402)
+# ---------------------------------------------------------------------------
+
+_NOTHING_LINE_RE = re.compile(r"^Nothing for `([^`]+)` to do\.$")
+
+
+def _plan_closing(output: str) -> tuple[str, list[str]]:
+    """``("run", argv)`` or ``("nothing", argv)`` — exactly one closing line.
+
+    Matched by content, not position: orphan and not-inspected footers print
+    after it.
+    """
+    found = []
+    for ln in output.splitlines():
+        if m := _CLOSING_LINE_RE.match(ln):
+            found.append(("run", m.group(1)))
+        elif m := _NOTHING_LINE_RE.match(ln):
+            found.append(("nothing", m.group(1)))
+    assert len(found) == 1, output
+    kind, command = found[0]
+    return kind, _hint_argv(command)
+
+
+def _case_unchanged(runner, sandbox):
+    _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+    _apply_claude_code(runner)
+    return [], None
+
+
+def _case_in_place_changed_without_force(runner, sandbox):
+    _drift_changed(
+        sandbox,
+        runner,
+        original={"command": "npx", "args": ["v1"]},
+        drifted={"command": "npx", "args": ["v2"]},
+    )
+    return [], None
+
+
+def _case_cross_host_changed_with_force(runner, sandbox):
+    _seed_claude_code(sandbox, {"shared": {"command": "npx", "args": ["claude-args"]}})
+    _apply_claude_code(runner)
+    _seed_claude_code(sandbox, {})
+    _seed_cursor_user(sandbox, {"shared": {"command": "npx", "args": ["cursor-args"]}})
+    return ["--force"], None
+
+
+def _case_orphan_no_baseline(runner, sandbox):
+    _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+    _apply_claude_code(runner)
+    s = state.load_import_state()
+    s.entries.pop("a")
+    state.save_import_state(s)
+    _seed_claude_code(sandbox, {})
+    return [], None
+
+
+def _case_not_inspected(runner, sandbox):
+    _seed_claude_code(sandbox, {"kept": {"command": "npx"}})
+    _apply_claude_code(runner)
+    (sandbox["home"] / ".claude.json").write_text("{not json", encoding="utf-8")
+    return [], None
+
+
+def _case_add(runner, sandbox):
+    _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+    return [], lambda: "a" in state.load_registry().servers
+
+
+def _case_project_local_add_acknowledged(runner, sandbox):
+    _seed_dot_mcp_json(sandbox, {"local": {"command": "npx"}})
+    return ["--allow-project-configs"], lambda: "local" in state.load_registry().servers
+
+
+def _case_remove(runner, sandbox):
+    _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+    _apply_claude_code(runner)
+    _seed_claude_code(sandbox, {})
+    return [], lambda: "a" not in state.load_registry().servers
+
+
+def _case_backfill(runner, sandbox):
+    _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+    _apply_claude_code(runner)
+    s = state.load_import_state()
+    s.entries.pop("a")
+    state.save_import_state(s)
+    return [], lambda: "a" in state.load_import_state().entries
+
+
+def _case_cleanup(runner, sandbox):
+    _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+    _apply_claude_code(runner)
+    s = state.load_import_state()
+    s.entries["ghost"] = s.entries["a"]
+    state.save_import_state(s)
+    return [], lambda: "ghost" not in state.load_import_state().entries
+
+
+# Each setup returns the plan's extra flags and a read-back of what the named
+# --apply writes, or None when it writes nothing. RESTAMP under ``--force`` and
+# a REKEY-only run are covered by the existing follow-through tests
+# (``TestSyncGuidanceIsFollowable.test_following_plan_force_closing_line_restamps``,
+# ``TestRekey.test_a_rekey_is_a_write_even_when_nothing_else_is_pending``).
+_PLAN_CLOSING_CASES = {
+    "unchanged": _case_unchanged,
+    "in-place-changed-without-force": _case_in_place_changed_without_force,
+    "cross-host-changed-with-force": _case_cross_host_changed_with_force,
+    "orphan-no-baseline": _case_orphan_no_baseline,
+    "not-inspected": _case_not_inspected,
+    "add": _case_add,
+    "project-local-add-acknowledged": _case_project_local_add_acknowledged,
+    "remove": _case_remove,
+    "backfill": _case_backfill,
+    "cleanup": _case_cleanup,
+}
+
+
+class TestSyncPlanNothingToApply:
+    """The plan names `--apply` as the next step only when that run writes
+    something; otherwise it says there is nothing for it to do (#1402)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_live_claude_desktop(self, sandbox, monkeypatch):
+        # Claude Desktop's config is under %APPDATA% on Windows, which the
+        # sandbox's HOME/USERPROFILE do not cover; a real one would add an
+        # ADD bucket to the no-op cases.
+        monkeypatch.setenv("APPDATA", str(sandbox["home"]))
+
+    @pytest.mark.parametrize("case", sorted(_PLAN_CLOSING_CASES))
+    def test_the_closing_line_matches_what_the_named_apply_does(self, runner, sandbox, case):
+        plan_args, wrote = _PLAN_CLOSING_CASES[case](runner, sandbox)
+
+        plan = _sync(runner, "--plan", *plan_args)
+        assert plan.exit_code == 0, plan.output
+        kind, argv = _plan_closing(plan.output)
+        # The command names the same flags the run previewed, either way.
+        assert argv == ["--apply", *plan_args], plan.output
+        # ``~/.mms`` does not exist yet when nothing was imported (the ADD cases).
+        files = _mms_files() if state.mms_home().is_dir() else None
+
+        res = _sync(runner, *argv, "--yes")
+
+        # A gate refusal (exit 2) is neither side of the comparison.
+        assert res.exit_code == 0, res.output
+        if wrote is None:
+            assert kind == "nothing", plan.output
+            assert "Already synchronized. No changes." in res.output.splitlines()
+            assert _mms_files() == files
+        else:
+            assert kind == "run", plan.output
+            assert "Already synchronized" not in res.output
+            assert wrote(), res.output
+
+    def test_the_nothing_line_is_exact(self, runner, sandbox):
+        _case_unchanged(runner, sandbox)
+
+        res = _sync(runner)
+
+        assert res.exit_code == 0, res.output
+        assert res.output.splitlines()[-1] == "Nothing for `mms host sync --apply` to do."
+        assert "to execute." not in res.output
+
+    def test_the_nothing_line_keeps_the_flags_the_run_was_given(self, runner, sandbox):
+        _case_unchanged(runner, sandbox)
+
+        res = _sync(runner, "--plan", "--force", "--yes", "--allow-project-configs")
+
+        assert res.exit_code == 0, res.output
+        assert _plan_closing(res.output) == (
+            "nothing",
+            ["--apply", "--force", "--yes", "--allow-project-configs"],
+        )
+
+    def test_the_changed_footer_still_names_force_above_the_nothing_line(self, runner, sandbox):
+        _case_in_place_changed_without_force(runner, sandbox)
+
+        res = _sync(runner)
+
+        assert res.exit_code == 0, res.output
+        assert _footer_command(res.output) == ["--apply", "--force"]
+        assert _plan_closing(res.output) == ("nothing", ["--apply"])
+        lines = res.output.splitlines()
+        footer_at = next(i for i, ln in enumerate(lines) if "differ in shape at host" in ln)
+        assert footer_at < lines.index("Nothing for `mms host sync --apply` to do."), res.output
+
+    @pytest.mark.parametrize("case", ["orphan-no-baseline", "not-inspected"])
+    def test_skip_footers_print_after_the_nothing_line(self, runner, sandbox, case):
+        _PLAN_CLOSING_CASES[case](runner, sandbox)
+
+        res = _sync(runner)
+
+        assert res.exit_code == 0, res.output
+        lines = res.output.splitlines()
+        nothing_at = lines.index("Nothing for `mms host sync --apply` to do.")
+        footer = (
+            "in registry without baseline"
+            if case == "orphan-no-baseline"
+            else "not inspected (kept)"
+        )
+        assert any(footer in ln for ln in lines[nothing_at + 1 :]), res.output
