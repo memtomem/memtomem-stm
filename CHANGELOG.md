@@ -11,6 +11,21 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- `mms hook install` says when the user-scope hook it writes is bound to a
+  project (#1464, issue #1379). When the nearest `pyproject.toml` (the current
+  directory or one of its four parents) lists `memtomem-stm` as a dependency,
+  install writes `uv run --directory <project> memtomem-stm hook …` into a
+  config every project shares, so every hook call runs from that project's
+  environment. The output now names the project and how to get the bare
+  launcher instead, in the preview, after `--apply`, and when the hook is
+  already installed. STM's own source checkout (a `memtomem-stm` project with
+  `src/memtomem_stm/__init__.py`) and directories where no such file is found
+  get no notice; a project that is only named `memtomem-stm` does. **Behavior
+  change**: one more line of install output in those cases; the written
+  command is unchanged.
+
 ## [0.7.10] — 2026-11-21
 
 ### Upgrade notes
@@ -144,21 +159,6 @@ changes inline only. See the deprecation policy in
   whose path cannot be inspected. The extractor, `--freeze` and `--purge`
   behave as before when spelled out; `--stat`, which abbreviated
   `--stats-retention-days`, is now ambiguous with `--status` and refused.
-
-### Changed
-
-- `mms hook install` says when the user-scope hook it writes is bound to a
-  project (#1464, issue #1379). When the nearest `pyproject.toml` (the current
-  directory or one of its four parents) lists `memtomem-stm` as a dependency,
-  install writes `uv run --directory <project> memtomem-stm hook …` into a
-  config every project shares, so every hook call runs from that project's
-  environment. The output now names the project and how to get the bare
-  launcher instead, in the preview, after `--apply`, and when the hook is
-  already installed. STM's own source checkout (a `memtomem-stm` project with
-  `src/memtomem_stm/__init__.py`) and directories where no such file is found
-  get no notice; a project that is only named `memtomem-stm` does. **Behavior
-  change**: one more line of install output in those cases; the written
-  command is unchanged.
 
 ### Fixed
 - `mms hook install` and `mms hook uninstall` no longer keep quiet about an
