@@ -37,10 +37,11 @@ changes inline only. See the deprecation policy in
   (`$CLAUDE_CONFIG_DIR/settings.json`, otherwise `~/.claude/settings.json`),
   each read by `mms hook`'s own option parser. It WARNs for a command whose
   effective `--host` is not `claude`, and for one that never runs the hook (a
-  usage error, `--help`, or a subcommand). The suggested fix is
-  `mms hook install --host claude --apply`, or a hand edit when a flagged
-  command sets compression inline. Project and local Claude Code settings are
-  not read. The docstring example and the docs now state the `--host claude`
+  usage error, `--help`, a subcommand, or an unmatched quote). The suggested
+  fix is `mms hook install --host claude --apply`, or a hand edit of the
+  flagged commands when any STM command in that file sets compression inline,
+  because install replaces them all with one command and keeps none of those
+  settings. Project and local Claude Code settings are not read. The docstring example and the docs now state the `--host claude`
   requirement (#1437).
   **Behavior change**: a bare `mms hook` with compression enabled prints a
   warning for each call compression would have attempted, and its JSON output

@@ -158,7 +158,9 @@ not for Claude Code's project or local settings, and it does not keep
 `MEMTOMEM_STM_HOOK__COMPRESSION__*` variables set inline with `env` in the old
 command. With compression enabled, `mms doctor` checks the user settings file:
 it warns about STM hook commands that lack `--host claude` and about ones that
-never run the hook (a usage error, `--help`, or a subcommand).
+never run the hook (a usage error, `--help`, a subcommand, or an unmatched
+quote). Its suggested fix is the install command unless some STM command in
+that file sets compression inline; then it asks for a hand edit.
 
 See the [hook CLI reference](../reference/cli-hooks.md) and the complete
 [environment-variable reference](../reference/environment-variables.md).

@@ -1080,7 +1080,8 @@ def hook_command(
     ``mms daemon`` by default (no per-call cold start), auto-spawned on first
     use; set ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` for the legacy cold in-process
     path. Always exits 0; on any problem the tool output passes through unchanged
-    (prints ``{}``).
+    (prints ``{}``, or only a ``systemMessage`` when compression was refused for
+    the call before the problem, #1437).
 
     ``--host`` selects the adapter, which owns both the output *shape*
     (``render``) and its *stdout serialization* (``serialize`` — JSON for
@@ -1242,7 +1243,8 @@ class HookRegistration:
     """The ``--host`` value, read as the runtime reads it."""
     runs_bridge: bool
     """Whether the command reaches the runtime bridge at all: ``False`` for a
-    usage error (exit 2), ``--help``, or a subcommand such as ``install``."""
+    usage error (exit 2), ``--help``, a subcommand such as ``install``, or a
+    command line the shell cannot even split (an unmatched quote)."""
     inline_compression_env: bool
     """Whether an inline ``env`` wrapper sets ``MEMTOMEM_STM_HOOK__COMPRESSION__*``.
     ``mms hook install`` turns an older wrapper's daemon, timeout and
@@ -1256,7 +1258,8 @@ def inspect_hook_registration(command: str) -> HookRegistration | None:
     Parsed by :func:`hook_command`'s own Click options rather than by matching
     tokens, so ``--host=claude``, a repeated ``--host`` (the last wins) and a
     value-less ``--host`` (``auto``) read the way the runtime reads them. A
-    strict parse decides ``runs_bridge``; what Click would print for
+    strict parse decides ``runs_bridge``, after the command must lex as a
+    shell line; what Click would print for
     ``--help`` or a usage error is captured, never shown. ``host`` comes from
     a resilient parse, so it is reported even for a command that fails.
     """
@@ -1270,6 +1273,15 @@ def inspect_hook_registration(command: str) -> HookRegistration | None:
     if split is None:
         return None
     launcher, args = split
+    # ``stm_hook_args`` falls back to whitespace splitting when the command
+    # does not lex (an unmatched quote), which is what install needs to
+    # recognize it; the host's shell rejects such a line before ``mms`` runs.
+    try:
+        list(shlex.shlex(command, posix=True, punctuation_chars="|&;<>"))
+    except ValueError:
+        lexes = False
+    else:
+        lexes = True
     resilient = hook_command.make_context("hook", list(args), resilient_parsing=True)
     value = resilient.params.get("host")
     host = value if isinstance(value, str) else "auto"
@@ -1286,7 +1298,7 @@ def inspect_hook_registration(command: str) -> HookRegistration | None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             leftover = [*getattr(strict, "protected_args", ()), *strict.args]
-        runs_bridge = not leftover
+        runs_bridge = not leftover and lexes
     inline_compression_env = (
         bool(launcher)
         and Path(launcher[0]).name == "env"

@@ -79,6 +79,7 @@ def test_bare_registration_warns_with_the_install_fix(
         "mms hook --host claude --typo",
         "mms hook --host claude install",
         "mms hook --host claude --surfacing-timeout-seconds",
+        'mms hook --host claude --daemon-timeout-seconds "10',
     ],
 )
 def test_command_that_never_runs_the_hook_warns(
@@ -94,7 +95,7 @@ def test_command_that_never_runs_the_hook_warns(
     assert check["status"] == "WARN"
     assert check["detail"] == (
         f"1 of 1 STM hook command(s) in {path} do not run the hook "
-        "(a usage error, --help, or a subcommand)"
+        "(a usage error, --help, a subcommand, or an unmatched quote)"
     )
     assert check["next_action"] == "mms hook install --host claude --apply"
 
@@ -111,7 +112,7 @@ def test_both_problems_are_reported(
         f"1 of 2 STM hook command(s) in {path} lack --host claude, "
         "so hook compression never replaces their output; "
         f"1 of 2 STM hook command(s) in {path} do not run the hook "
-        "(a usage error, --help, or a subcommand)"
+        "(a usage error, --help, a subcommand, or an unmatched quote)"
     )
 
 
@@ -127,9 +128,68 @@ def test_inline_compression_env_gets_a_hand_edit_instead_of_install(
 
     assert check["status"] == "WARN"
     assert check["next_action"] == (
-        "add --host claude to those commands by hand: `mms hook install --host "
-        "claude --apply` does not keep their inline MEMTOMEM_STM_* compression settings"
+        "add --host claude to the commands that lack it, by hand: "
+        "`mms hook install --host claude --apply` would replace every STM hook command "
+        "in that file and drop their inline MEMTOMEM_STM_HOOK__COMPRESSION__* settings"
     )
+
+
+def test_inline_compression_on_an_unflagged_command_still_blocks_the_install_advice(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Install consolidates every STM handler into one fresh command, so the
+    `8000` override on the passing command would be lost too."""
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    _write_hooks(
+        claude_dir,
+        "mms hook",
+        "env MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS=8000 mms hook --host claude",
+    )
+
+    check = _doctor_checks(tmp_path)["hook_registration"]
+
+    assert check["detail"].startswith("1 of 2 STM hook command(s)")
+    assert check["next_action"].startswith("add --host claude to the commands that lack it")
+    assert "drop their inline MEMTOMEM_STM_HOOK__COMPRESSION__* settings" in check["next_action"]
+
+
+def test_broken_inline_command_is_told_to_drop_the_bad_argument(
+    tmp_path: Path, claude_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """It already has --host claude; asking for it again would leave it
+    printing help."""
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    _write_hooks(
+        claude_dir, "env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook --host claude --help"
+    )
+
+    check = _doctor_checks(tmp_path)["hook_registration"]
+
+    assert check["next_action"].startswith(
+        "remove the invalid argument, --help, subcommand or unmatched quote "
+        "from the commands that do not run the hook, by hand:"
+    )
+    assert "add --host claude" not in check["next_action"]
+
+
+def test_install_consolidates_every_stm_handler(claude_dir: Path):
+    """The premise of the cross-command check above, against the real planner."""
+    import json as _json
+    import os
+
+    from memtomem_stm.cli import hook_hosts
+
+    assert Path(os.environ["CLAUDE_CONFIG_DIR"]) == claude_dir
+    _write_hooks(
+        claude_dir,
+        "mms hook",
+        "env MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS=8000 mms hook --host claude",
+    )
+
+    change = hook_hosts.plan_install("claude", "mms hook --host claude")
+
+    handlers = _json.loads(change.new_text)["hooks"]["PostToolUse"][0]["hooks"]
+    assert [h["command"] for h in handlers] == ["mms hook --host claude"]
 
 
 def test_inline_env_without_compression_settings_keeps_the_install_advice(

@@ -1962,7 +1962,20 @@ _REGISTRATIONS = [
     ),
     ("env MEMTOMEM_STM_HOOK__USE_DAEMON=0 memtomem-stm-proxy hook", "auto", True, False),
     ("env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook", "auto", True, True),
+    ('mms hook --host claude --daemon-timeout-seconds "10', "claude", False, False),
 ]
+
+
+def _shell_splits(command: str) -> bool:
+    """The shell's first step, modelled with POSIX shlex: an unmatched quote
+    fails here, before ``mms`` runs. (That bash agrees is checked below.)"""
+    import shlex
+
+    try:
+        shlex.split(command)
+    except ValueError:
+        return False
+    return True
 
 
 @pytest.mark.parametrize(("command", "host", "runs_bridge", "inline_compression"), _REGISTRATIONS)
@@ -1997,8 +2010,28 @@ def test_runs_bridge_matches_what_the_runtime_does(
     split = hook_hosts.stm_hook_args(command)
     assert split is not None
     result = CliRunner().invoke(cli, ["hook", *split[1]], input="{}")
-    answered = result.exit_code == 0 and result.stdout.strip().startswith("{")
+    answered = (
+        _shell_splits(command)
+        and result.exit_code == 0
+        and result.stdout.strip().startswith("{")
+    )
     assert answered is runs_bridge, shlex.join(split[1])
+
+
+def test_bash_rejects_an_unmatched_quote_before_running_anything():
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available")
+    line = 'mms hook --host claude --daemon-timeout-seconds "10'
+    result = subprocess.run(
+        [bash, "-n", "-c", line], capture_output=True, text=True, timeout=30, check=False
+    )
+
+    assert result.returncode != 0
+    assert not _shell_splits(line)
 
 
 @pytest.mark.parametrize("command", ["echo hook && mms status", "mms status"])

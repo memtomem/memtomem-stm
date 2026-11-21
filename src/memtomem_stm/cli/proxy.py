@@ -10967,15 +10967,25 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     if broken:
         problems.append(
             f"{len(broken)} of {total} STM hook command(s) in {path} do not run the hook "
-            "(a usage error, --help, or a subcommand)"
+            "(a usage error, --help, a subcommand, or an unmatched quote)"
         )
-    # Install rewrites every STM command in that file, which fixes both kinds,
-    # but it drops an inline ``env`` wrapper's compression settings: such a
-    # command gets a hand-edit instruction instead.
-    if any(r is not None and r.inline_compression_env for r in [*lacking, *broken]):
+    # Install replaces every STM command in that file with one fresh command,
+    # which fixes both kinds but drops any inline ``env`` compression setting,
+    # including one on a command this check did not flag. Then only a hand
+    # edit of the flagged commands keeps the operator's configuration.
+    if any(r is not None and r.inline_compression_env for r in registrations):
+        steps = []
+        if lacking:
+            steps.append("add --host claude to the commands that lack it")
+        if broken:
+            steps.append(
+                "remove the invalid argument, --help, subcommand or unmatched quote "
+                "from the commands that do not run the hook"
+            )
         next_action = (
-            "add --host claude to those commands by hand: `mms hook install --host "
-            "claude --apply` does not keep their inline MEMTOMEM_STM_* compression settings"
+            "; ".join(steps) + ", by hand: `mms hook install --host claude --apply` would "
+            "replace every STM hook command in that file and drop their inline "
+            "MEMTOMEM_STM_HOOK__COMPRESSION__* settings"
         )
     else:
         next_action = "mms hook install --host claude --apply"
