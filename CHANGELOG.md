@@ -52,7 +52,7 @@ changes inline only. See the deprecation policy in
   than naming `mms hook install`, which rewrites only the user settings file,
   leaves a registration it does not recognize in place, and keeps only the
   daemon, timeout and query-text settings of an inline `env` wrapper. The docstring example and the docs now state the
-  `--host claude` requirement (#1437).
+  `--host claude` requirement (#1440, issue #1437).
   **Behavior change**: a bare `mms hook` with compression enabled prints a
   warning for each such call, and its JSON output gains `systemMessage` on
   those calls, including when surfacing times out. The tool output itself and
@@ -70,7 +70,7 @@ changes inline only. See the deprecation policy in
   the host config in place?`, sending the user to look for a file STM had not
   looked at. Each skipped source now gets one `Note: <source> not inspected:
   <reason>.` line on stderr, ahead of the skipped-entry notes and the result,
-  with the reason wording `mms host scan` uses (#1407).
+  with the reason wording `mms host scan` uses (#1445, issue #1407).
   **Behavior change**: those notes are new stderr lines in `--plan` and
   `--apply` alike, and an empty result with a skipped source now reads `No MCP
   definitions found from --from=<host>; <n> sources were not inspected.` (`1
@@ -89,7 +89,7 @@ changes inline only. See the deprecation policy in
   handshake `pid` (a file in the operator's own `data_dir`) ended the command
   with `UnicodeEncodeError` where the output stream encodes strictly. Each of
   those lines is now escaped as a whole, so a field added to one later is
-  covered too (#1431).
+  covered too (#1435, issue #1431).
   **Behavior change**: on those lines such a character is written as
   `\uXXXX`. A value without one prints as before, and `--json` output is
   unchanged.
@@ -102,7 +102,7 @@ changes inline only. See the deprecation policy in
   non-secret and printed as it was. The key patterns also gain `COOKIE`,
   `BEARER` and `DSN`. A URL with a user and no password (`git@…`) is still
   non-secret, and a URL inside a longer value (`--db=postgresql://…`) is
-  not parsed as one (#1345).
+  not parsed as one (#1436, issue #1345).
   **Behavior change**: such values are now shown as `<REDACTED>` in the
   human-readable output of `mms import` and `mms host sync`, in both `--plan`
   and `--apply` (`mms import --show-imported` still reveals them, in either
@@ -121,7 +121,7 @@ changes inline only. See the deprecation policy in
   host as `(host not recorded)`. `--json` carries the same split as
   `hook_by_host`. The split also holds under `--all-time`, for rows recorded
   from this version on; earlier rows carry no host and cannot be attributed.
-  Why a host's own ratio is low is recorded too; see the next entry (#1438).
+  Why a host's own ratio is low is recorded too; see the next entry (#1439, issue #1438).
   **Behavior change**: `mms hook` writes `builtin:<host>` (for example
   `builtin:claude`) instead of `builtin` in the `server` column of
   `proxy_metrics` and, as rows are trimmed, of `proxy_metrics_daily`. The
@@ -141,7 +141,7 @@ changes inline only. See the deprecation policy in
   `replacement_not_requested` instead of being folded in with hosts that
   cannot replace output (with compression off it shows as `disabled`). Rows
   written before this version count as `not recorded`; under `--all-time`
-  the counts also cover trimmed rows, see the next entry (#1438).
+  the counts also cover trimmed rows, see the next entry (#1441, issue #1438).
   **Behavior change**: `proxy_metrics` gains a nullable
   `hook_compression_status` column, added the first time this version opens
   the metrics DB for writing (the MCP server, `mms tune` or `mms hook`; `mms
@@ -163,7 +163,7 @@ changes inline only. See the deprecation policy in
   first opens the DB were trimmed with no status kept: they are counted once,
   at that point, and the line ends with `status not kept N`. `--json`
   `hook_status` reports `"scope": "all_time"` and a per-host
-  `status_not_kept_calls` (`null` under the `retained` scope) (#1442).
+  `status_not_kept_calls` (`null` under the `retained` scope) (#1446, issue #1442).
   **Behavior change**: the metrics DB gains the table, a second `AFTER
   DELETE` trigger on `proxy_metrics` and one on `proxy_metrics_daily` (a
   deleted daily bucket takes its status rows with it, so the documented
@@ -188,7 +188,7 @@ changes inline only. See the deprecation policy in
   also decoded its stdin in that encoding, which turned non-ASCII tool output
   into mojibake; it now decodes the payload as UTF-8, the encoding JSON is
   exchanged in, and treats bytes that are not UTF-8 as a malformed payload,
-  passing the tool output through (#1444).
+  passing the tool output through (#1447, issue #1444).
   **Behavior change**: the hook's stdout JSON for Claude Code, Codex and
   Cursor is ASCII-only, with non-ASCII text written as `\uXXXX` escapes (two
   for a character outside the Basic Multilingual Plane); a host that parses
