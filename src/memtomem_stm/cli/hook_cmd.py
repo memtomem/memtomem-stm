@@ -102,6 +102,8 @@ from memtomem_stm.cli.host_runtime import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from memtomem_stm.cli.hook_adapter import CanonicalHookCall, HostHookAdapter
     from memtomem_stm.config import HookCompressionConfig, STMConfig
 
@@ -1249,21 +1251,31 @@ def render_notices(adapter: "HostHookAdapter", notices: list[str]) -> dict[str, 
     return {"systemMessage": notices[0]}
 
 
-def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:
+def _hook_install_command_argv(
+    host: str,
+    *,
+    policy: HostRuntimePolicy | None = None,
+    launcher: tuple[str, list[str]] | None = None,
+) -> list[str]:
     """The argv a host should fire on PostToolUse: ``<entrypoint> hook --host <host>``.
 
-    Reuses the MCP-registration entry-point detection (``_detect_install_type``):
-    a source/editable checkout registers ``uv run --directory <root>
-    memtomem-stm hook --host <host>`` and a global install the bare
-    ``memtomem-stm hook --host <host>`` console script. ``--host`` is always
+    The launcher is the user-scope hook launcher (``_detect_install_type``,
+    or ``launcher`` when the caller already resolved it): a source checkout or
+    a project that depends on memtomem-stm registers ``uv run --directory
+    <root> memtomem-stm hook --host <host>`` and a global install the bare
+    ``memtomem-stm hook --host <host>`` console script; ``mms hook install``
+    reports the dependent-project case from the same lookup (#1379).
+    ``--host`` is always
     written explicitly so raw-stdout (Kimi) and Codex routing are unambiguous (a
     bare ``mms hook`` would auto-detect, which cannot tell Codex from Claude)."""
-    # Lazy import: ``cli.proxy`` resolves this module lazily to register the
-    # group (#862), so importing it here (only on the install path) avoids a
-    # cycle and keeps it off the latency-sensitive bare-hook path.
-    from memtomem_stm.cli.proxy import _detect_install_type
+    if launcher is None:
+        # Lazy import: ``cli.proxy`` resolves this module lazily to register
+        # the group (#862), so importing it here (only on the install path)
+        # avoids a cycle and keeps it off the latency-sensitive bare-hook path.
+        from memtomem_stm.cli.proxy import _detect_install_type
 
-    server_cmd, server_args = _detect_install_type()
+        launcher = _detect_install_type()
+    server_cmd, server_args = launcher
     argv = [server_cmd, *server_args, "hook", "--host", host]
     if policy is not None:
         argv.extend(policy.hook_args())
@@ -1305,21 +1317,39 @@ def _emit_unmanaged(
 
 
 def _emit_hook_change(
-    change: Any, *, apply_: bool, backup: Any, apply_hint: str | None = None
+    change: Any,
+    *,
+    apply_: bool,
+    backup: Any,
+    apply_hint: str | None = None,
+    project_binding: Path | None = None,
 ) -> None:
     """Render a planned (or applied) install/uninstall to the terminal.
 
     Pure output: the caller has already applied the change when ``apply_`` and
     passes the resulting ``backup`` path (or ``None``). Dry-run (the default)
-    shows what *would* happen and how to apply it."""
+    shows what *would* happen and how to apply it. ``project_binding`` is the
+    project an install's launcher is tied to (``_hook_project_binding``); it is
+    reported for every install outcome, an unchanged one included (#1379)."""
     from memtomem_stm.cli.proxy import _hdr, _ok, _warn
 
-    # `change.path` and the backup beside it are filesystem paths; a
-    # directory name can hold anything the filesystem allows. `label`,
+    # `change.path`, the backup beside it and `project_binding` are filesystem
+    # paths; a directory name can hold anything the filesystem allows. `label`,
     # `action`, `host_tag` and `notes` are literals this package writes
     # itself and stay raw. Escape the value, never the styled line (#760).
     click.echo(f"{_hdr(change.label + ' hook')} — {_disp(str(change.path))}")
     unmanaged = change.unmanaged
+
+    def _echo_binding() -> None:
+        if project_binding is None or change.action != "install":
+            return
+        click.echo(
+            f"  {_warn('•')} This user-scope hook runs STM through `uv run --directory` "
+            f"in {_disp(str(project_binding))}, for every project. For the bare "
+            "`memtomem-stm` launcher (e.g. after `uv tool install memtomem-stm`), "
+            "re-run this command from a directory where the nearest pyproject.toml "
+            "within four parents neither names nor depends on memtomem-stm."
+        )
 
     if not change.changed:
         not_installed = (
@@ -1334,6 +1364,7 @@ def _emit_hook_change(
         }.get(change.status, "no change.")
         click.echo(f"  {_ok(no_change) if change.status == 'already' else no_change}")
         _emit_unmanaged(change, unmanaged, written=False)
+        _echo_binding()
         return
 
     if change.action == "install":
@@ -1396,6 +1427,7 @@ def _emit_hook_change(
 
     for note in change.notes:
         click.echo(f"  {_warn('•')} {note}")
+    _echo_binding()
 
     if not apply_:
         click.echo("")
@@ -1474,6 +1506,7 @@ def hook_install_command(
     # this module is imported on the per-tool-call hook hot path.
     from memtomem_stm.cli import hook_hosts
     from memtomem_stm.cli._write_lock import hook_hosts_write_lock
+    from memtomem_stm.cli.proxy import _binding_for, _launcher_for, _stm_project
 
     if inherit_runtime_env and (surfacing_timeout is not None or daemon_mode is not None):
         raise click.UsageError(
@@ -1490,7 +1523,13 @@ def hook_install_command(
                     use_daemon=daemon_mode,
                     surfacing_timeout_seconds=surfacing_timeout,
                 )
-            command = shlex.join(_hook_install_command_argv(host, policy=policy))
+            # One lookup feeds both the written command and its binding
+            # notice, so the two cannot disagree (#1379).
+            project = _stm_project()
+            command = shlex.join(
+                _hook_install_command_argv(host, policy=policy, launcher=_launcher_for(project))
+            )
+            project_binding = _binding_for(project)
             change = hook_hosts.plan_install(host, command)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
@@ -1527,6 +1566,7 @@ def hook_install_command(
             apply_=apply_,
             backup=backup,
             apply_hint=shlex.join(hint),
+            project_binding=project_binding,
         )
 
 
