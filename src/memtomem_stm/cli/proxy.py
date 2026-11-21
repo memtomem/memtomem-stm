@@ -19,7 +19,7 @@ import subprocess
 import sys
 import textwrap
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -11037,6 +11037,160 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
     return checks
 
 
+_HOOK_REGISTRATION_SCOPE = "project, local and managed Claude Code settings are not read"
+
+
+def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
+    """``hook_registration``: Claude Code hook commands that keep hook
+    compression from replacing output (#1437, #1443).
+
+    ``mms hook`` replaces Bash output only when its ``--host`` is ``claude``.
+    This reads the PostToolUse handlers in the file ``mms hook install --host
+    claude`` writes and reports, by location, the STM hook commands that lack
+    it, that do not run the hook, or that it cannot read safely
+    (:mod:`memtomem_stm.cli.hook_registration`). Command text is never shown:
+    inline assignments can carry credentials.
+
+    Not gated on compression being enabled: the hook process's environment
+    cannot be established from here, and ``--host claude`` is the right
+    registration for Claude Code either way. WARN only, like the other hook
+    checks; no row when the file holds no STM hook command.
+    """
+    from memtomem_stm.cli import hook_hosts
+    from memtomem_stm.cli.hook_cmd import host_authorizes_replacement
+    from memtomem_stm.cli.hook_registration import (
+        NOT_PLAIN,
+        WINDOWS_SHELL,
+        inspect_hook_registration,
+        is_candidate,
+        running_on_windows,
+    )
+
+    label = "hook registration"
+    try:
+        path, handlers = hook_hosts.claude_post_tool_handlers()
+    except Exception as exc:
+        detail, action = _hook_settings_read_failure(exc)
+        check(
+            "hook_registration",
+            label,
+            "WARN",
+            f"{detail}; STM hook registrations were not checked",
+            action,
+        )
+        return
+    if not handlers:
+        return
+    windows = running_on_windows()
+    readings = [
+        (location, inspect_hook_registration(handler, windows=windows))
+        for location, handler in handlers
+        if is_candidate(handler)
+    ]
+    if not readings:
+        return
+    checked = [(loc, r) for loc, r in readings if not r.not_checked]
+    stopped = [loc for loc, r in checked if not r.runs_bridge]
+    lacking = [
+        loc for loc, r in checked if r.host is not None and not host_authorizes_replacement(r.host)
+    ]
+    lacking_set = set(lacking)
+    passing = [loc for loc, r in checked if r.runs_bridge and loc not in lacking_set]
+    shell_syntax = [loc for loc, r in readings if r.not_checked == NOT_PLAIN]
+    # Shell form on Windows is never read, so even install's own output lands
+    # here. It still WARNs, because nothing was verified, but with advice that
+    # fits: rewriting it as plain words would not make it checkable.
+    windows_shell = [loc for loc, r in readings if r.not_checked == WINDOWS_SHELL]
+    other = [
+        f"{loc} ({r.not_checked})"
+        for loc, r in readings
+        if r.not_checked and r.not_checked not in (NOT_PLAIN, WINDOWS_SHELL)
+    ]
+    where = f"in {path}; {_HOOK_REGISTRATION_SCOPE}"
+    if not (stopped or lacking or shell_syntax or windows_shell or other):
+        check(
+            "hook_registration",
+            label,
+            "PASS",
+            f"STM hook commands: {len(passing)} pass --host claude to mms hook — {where}",
+        )
+        return
+    problems = []
+    steps = []
+    if stopped:
+        problems.append(
+            f"{len(stopped)} not running the hook (--help, a usage error or a subcommand): "
+            + ", ".join(stopped)
+        )
+        steps.append("fix the arguments of the commands that do not run the hook")
+    if lacking:
+        problems.append(
+            f"{len(lacking)} without --host claude, so hook compression, if enabled, "
+            "never replaces their output: " + ", ".join(lacking)
+        )
+        steps.append(
+            "add --host claude where Claude Code routing is intended (or make the last "
+            "--host claude), before any standalone --, keeping each command's other settings"
+        )
+    if shell_syntax:
+        problems.append(
+            f"{len(shell_syntax)} not checked because of shell syntax (quotes, $, ~, # or "
+            "operators): " + ", ".join(shell_syntax)
+        )
+        steps.append(
+            "check the commands with shell syntax by hand, or spell them as plain words "
+            "where that keeps their behavior (e.g. an absolute path instead of $HOME or ~)"
+        )
+    if windows_shell:
+        problems.append(
+            f"{len(windows_shell)} in shell form, which is not checked on Windows (Claude "
+            "Code may run it under Git Bash or PowerShell): " + ", ".join(windows_shell)
+        )
+        steps.append(
+            "check by hand that each Windows shell-form command runs mms hook with --host claude"
+        )
+    if other:
+        problems.append(
+            f"{len(other)} not checked (an unknown launcher or an unsupported handler "
+            "field): " + ", ".join(other)
+        )
+        steps.append("check the other not-checked commands by hand")
+    check(
+        "hook_registration",
+        label,
+        "WARN",
+        f"STM hook commands: {'; '.join(problems)} — {where}",
+        "; then ".join(steps),
+    )
+
+
+def _hook_settings_read_failure(exc: Exception) -> tuple[str, str]:
+    """``(detail, next action)`` for a Claude Code settings file doctor could not
+    read. Messages are never shown: they can quote the path's directory."""
+    from memtomem_stm.cli import hook_hosts
+
+    if isinstance(exc, hook_hosts.HookConfigLocationUnknown):
+        return (
+            "CLAUDE_CONFIG_DIR does not name a usable directory",
+            "set CLAUDE_CONFIG_DIR to an absolute directory, or unset it",
+        )
+    if isinstance(exc, hook_hosts.HookConfigNotRegularFile):
+        return (
+            "the Claude Code user settings path is not a regular file",
+            "replace it with the settings JSON file, then rerun mms doctor",
+        )
+    if isinstance(exc, hook_hosts.HookConfigNotAnObject):
+        return (
+            "the Claude Code user settings are valid JSON but not an object",
+            "make the settings file's top level a JSON object, then rerun mms doctor",
+        )
+    kind = type(exc.__cause__ or exc).__name__
+    return (
+        f"the Claude Code user settings could not be read ({kind})",
+        "make the Claude Code settings file readable and valid JSON, then rerun mms doctor",
+    )
+
+
 @cli.command()
 @click.option(
     "--config",
@@ -11075,7 +11229,8 @@ def doctor(
     """Diagnose the proxy setup end-to-end (passive unless measuring LTM).
 
     Runs the existing status/health/config checks as one PASS/WARN/FAIL
-    report with a copy-paste next action per failing check. Exit code is 1
+    report with a next action per failing check: a command to copy and run,
+    or an edit to make by hand. Exit code is 1
     when any check FAILs; WARN-only runs exit 0 — `mms doctor` passing is
     the quickstart success gate, so it must be scriptable. `health` stays
     the always-exit-0 inspection command; strict config linting stays in
@@ -12029,6 +12184,8 @@ def doctor(
             "PASS",
             "bare STMConfig() constructs — hook/daemon env path healthy",
         )
+
+    _doctor_hook_registration_check(check)
 
     counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}
     overall = "fail" if counts["FAIL"] else ("warn" if counts["WARN"] else "pass")

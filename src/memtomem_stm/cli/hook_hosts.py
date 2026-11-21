@@ -68,6 +68,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -100,6 +101,20 @@ class HookInstallError(Exception):
     must always exit 0. Refusing to touch a config we cannot parse avoids
     clobbering valid-but-unusual contents (the ``.bak`` backup only helps if we
     got far enough to write one)."""
+
+
+class HookConfigNotRegularFile(HookInstallError):
+    """The host config path exists but is not a regular file (a directory, a
+    FIFO, a device). Reading a FIFO would block until a writer appears."""
+
+
+class HookConfigNotAnObject(HookInstallError):
+    """The host config parses but its root is not an object/table."""
+
+
+class HookConfigLocationUnknown(HookInstallError):
+    """The host's home override (``CLAUDE_CONFIG_DIR``, …) does not name a
+    usable directory, so no config file can be chosen."""
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +572,7 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
             "modify it. Fix or remove the file, then re-run."
         ) from exc
     if not isinstance(data, dict):
-        raise HookInstallError(
+        raise HookConfigNotAnObject(
             f"{path} is valid {fmt.upper()} but not a top-level "
             f"{'object' if fmt == 'json' else 'table'}; refusing to modify it."
         )
@@ -598,6 +613,68 @@ def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:
         if isinstance(entries, list):
             commands.extend(entry["command"] for entry in entries if _is_stm_command_handler(entry))
     return tuple(commands)
+
+
+def _is_non_directory(path: Path) -> bool:
+    """Whether ``path`` exists and is not a directory (``False`` when it cannot
+    be inspected at all)."""
+    try:
+        return not stat.S_ISDIR(path.stat().st_mode)
+    except OSError:
+        return False
+
+
+def claude_post_tool_handlers() -> tuple[Path, list[tuple[str, Any]] | None]:
+    """Every ``hooks.PostToolUse[i].hooks[j]`` handler in Claude Code's user
+    settings, keyed by that location, read from the file ``mms hook install
+    --host claude`` writes. ``None`` in place of the list when the file is absent.
+
+    Unlike :func:`installed_stm_hook_commands`, nothing is filtered: a reader
+    that judges registrations (``mms doctor``, #1443) must also see the ones
+    install does not recognize, such as ``NAME=value mms hook``.
+
+    Raises :class:`HookConfigLocationUnknown` when ``CLAUDE_CONFIG_DIR`` names
+    no usable directory, :class:`HookConfigNotRegularFile` for a path that is
+    not a regular file (a FIFO would block the read), :class:`HookInstallError`
+    (:class:`HookConfigNotAnObject` for a non-object root) for a file that
+    cannot be read or parsed, and :class:`OSError` when it cannot be
+    inspected. ``stat`` runs first because on Python 3.14 ``Path.exists``
+    reports a file under an unsearchable directory as absent (#1285), which
+    would hide that failure.
+    """
+    spec = HOOK_HOSTS["claude"]
+    try:
+        path = _config_path(spec)
+    except HookInstallError as exc:
+        raise HookConfigLocationUnknown(str(exc)) from None
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        # ``CLAUDE_CONFIG_DIR`` naming a file is the override's fault, not the
+        # settings file's. Checked on the directory itself: below a file, POSIX
+        # raises NotADirectoryError but Windows reports the path as not found.
+        if host_home_override(spec.host_tag) is not None and _is_non_directory(path.parent):
+            raise HookConfigLocationUnknown(
+                f"{spec.label} config directory is not a directory"
+            ) from None
+        if isinstance(exc, FileNotFoundError):
+            return path, None
+        raise
+    if not stat.S_ISREG(mode):
+        raise HookConfigNotRegularFile(f"{path} is not a regular file")
+    current = _read_current(path, spec.fmt)
+    if current is None:
+        return path, None
+    hooks = current[0].get("hooks")
+    entries = hooks.get("PostToolUse") if isinstance(hooks, dict) else None
+    handlers: list[tuple[str, Any]] = []
+    if isinstance(entries, list):
+        for i, entry in enumerate(entries):
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if isinstance(inner, list):
+                for j, handler in enumerate(inner):
+                    handlers.append((f"hooks.PostToolUse[{i}].hooks[{j}]", handler))
+    return path, handlers
 
 
 def _serialize(fmt: str, data: dict[str, Any]) -> str:
