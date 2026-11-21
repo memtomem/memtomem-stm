@@ -11,10 +11,90 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.7.10] — 2026-11-21
+
+### Upgrade notes
+
+- **Register the Claude Code hook with `--host claude`.** Hook compression
+  replaces tool output only under an explicit `--host claude`. With
+  compression enabled, a call routed to the Claude adapter without it now
+  warns, on stderr and as a `systemMessage`, when compression would have
+  attempted it (#1440), and `mms stats` counts its rows as
+  `replacement_not_requested` (#1441). `mms doctor`'s new `hook
+  registration` row reports where such a registration is (#1449, #1455).
+  Add the flag by hand where the hook is registered; the doctor entry below
+  says why `mms hook install --apply` is not the fix. Until then the output
+  passes through unchanged, as in 0.7.9.
+- **`mms doctor` can report WARN on a setup it passed.** It adds a
+  `hook_registration` check (in `--json`, `"id": "hook_registration"`) when
+  Claude Code's user settings hold an STM-looking PostToolUse handler or
+  cannot be read. A handler lacking `--host claude`, one that does not run
+  the hook, one it cannot read as plain words, or unreadable settings make
+  the check WARN, which can turn an overall PASS into WARN. The exit code is
+  unchanged (#1449, #1455).
+- **Hook metrics are labeled by host.** `mms hook` rows record
+  `builtin:<host>` (for example `builtin:claude`), the host whose adapter
+  handled the call, instead of `builtin` in
+  the `server` column of `proxy_metrics` and `proxy_metrics_daily`, and in
+  the `server` of `mms stats --json` `by_tool` rows, which are grouped by
+  server and tool: rows written before the upgrade stay under `builtin`, so
+  one tool can show both. A query or script that selects `server =
+  'builtin'` no longer matches new hook rows; `source = 'hook' AND (server =
+  'builtin' OR server GLOB 'builtin:*')` covers rows from both versions.
+  Surfacing events still record `builtin`.
+  `mms stats --json` gains `hook_by_host` and `hook_status`. The text
+  output prints per-host lines only when the split adds something (more
+  than one host, or a host that cannot replace output); how rows from
+  before the upgrade are shown is in the #1439, #1441 and #1446 entries
+  below. The per-tool table's server column is 14 characters wide instead
+  of 12, MCP rows included. Existing `--json` keys keep their meaning (#1439, #1441,
+  #1446).
+- **The metrics DB changes the first time this version opens it for
+  writing**, which the MCP server, `mms tune` or `mms hook` do when they
+  record metrics or tune from them; `mms stats` only reads. `proxy_metrics` gains a nullable
+  `hook_compression_status` column (#1441), and the DB gains the
+  `proxy_metrics_hook_status_daily` table with `AFTER DELETE` triggers on
+  `proxy_metrics` and `proxy_metrics_daily` (#1446). An older STM version
+  sharing the file keeps writing rows, which read as `not recorded`. The
+  reset in `docs/cli.md` now runs in one transaction.
+- **The hook exchanges JSON as UTF-8 and writes ASCII.** Its stdout JSON
+  for Claude Code, Codex and Cursor is ASCII-only, with non-ASCII text
+  written as `\uXXXX` escapes, so a host that parses it reads the same
+  values, while a tool that searches the raw stdout for non-ASCII text has
+  to decode it first. Its input is read as UTF-8 whatever the locale, and
+  input that fails UTF-8 decoding is handled as a malformed payload: the
+  tool output passes through and nothing is surfaced (#1447).
+- **More values count as secrets.** The classifier shared by `mms
+  import`, `mms host sync` and `mms eject` now also catches values such as
+  a URL with a password, a JWT, a recognized provider token behind a
+  `Bearer ` prefix, a PEM private-key header and a `password=` label, and
+  keys named with `COOKIE`, `BEARER` or `DSN`. It reads the `env` values
+  `mms import` and `mms host sync` display, which now show such values as `<REDACTED>`
+  (`mms import --show-imported` still reveals them), and the `env` and
+  `headers` `mms eject` checks before shelling out to `claude mcp
+  add-json`, which then refuses without `--allow-argv-secrets`, asking
+  only in the interactive TUI, so a script that ejected such an entry needs
+  the flag. Command
+  arguments and a payload's `url` are not checked (#1436).
+- **Some text output reads differently** for scripts that parse it; the
+  `--json` output of `mms host sync` and `mms daemon status` is unchanged.
+  `mms hook install` and `uninstall` print a `!` line for an STM-looking
+  handler they do not manage and reword uninstall's status lines, while
+  config files are written exactly as before (#1456); the `mms host sync
+  --plan` preview's hint reads ``Nothing for `mms host sync --apply` to
+  do.`` (with the same flags) when that run would change nothing (#1448);
+  `mms import` prints a `Note:` line on stderr for each host config source it
+  did not inspect and names their count in its empty-result line (#1445); `mms
+  daemon status` and
+  `start` write control and bidirectional-formatting characters from the
+  daemon's answers as `\uXXXX`, so a lone surrogate in the handshake `pid`
+  no longer ends the command with `UnicodeEncodeError` (#1435). Exit codes
+  are otherwise unchanged.
+
 ### Added
 
-- `mms doctor` has a `hook registration` row (#1449, issue #1443). It reads the PostToolUse
-  handlers in Claude Code's user settings, the file `mms hook install --host
+- `mms doctor` has a `hook registration` row (#1449, issue #1443). It reads the
+  PostToolUse handlers in Claude Code's user settings, the file `mms hook install --host
   claude` writes, and reports by location the STM hook commands that lack
   `--host claude`, so hook compression, if enabled, never replaces their
   output, or that do not run the hook at all (`--help`, a usage error, a
@@ -31,15 +111,29 @@ changes inline only. See the deprecation policy in
   a hand edit rather than `mms hook install --apply`: install merges every STM
   handler it recognizes into one, drops most inline `env` settings, and does
   not recognize a `NAME=value mms hook` line. Project, local and managed Claude
-  Code settings are not read.
-- `scripts/stm_trial.py --status` (#1454, repository only) prints the holdout
+  Code settings are not read. A line made only of plain words and quotes, up
+  to 4,096 characters, is also matched on the words left after quote removal,
+  so `m"m"s hook` next to `mms hook --host claude` is counted, marked not
+  checked, and the row WARNs. A quoted hook in a longer line, or in a line
+  with other shell syntax (a comment, an operator, a line continuation), is
+  found only by a search of the raw text, which can miss it and let the row
+  PASS. A plain command whose `hook` is only part of a word, such as
+  `mms status --config /tmp/hook.json`, is not counted as an STM hook (#1455,
+  issue #1450).
+  **Behavior change**: when the settings hold an STM-looking handler or
+  cannot be read, `mms doctor` prints the new row and `--json` gains a
+  `hook_registration` check, so a setup doctor passed before can now report
+  WARN. The exit code is unchanged.
+- `scripts/stm_trial.py --status` (#1454; a source-tree utility, not in the
+  wheel) prints the holdout
   trial's progress toward its frozen target as one JSON object: copied
   assignments, pre-freeze and rate-excluded rows, and the provisional count of
   analysable assigned eligible memories, with the extractor's coverage:
   finished and unfinished run counts over all runs, a worst-case time since the
-  last copy, and, from the freeze on, the largest uncovered gap between
-  finished runs, the largest worst-case gap (none, with a note, when runs
-  overlap), and the distinct retention settings recorded by runs that finished
+  last copy, and, over gaps whose later run ended at or after the freeze,
+  the largest uncovered gap between finished runs, the largest worst-case gap
+  (none, with a note, when runs overlap), and the distinct retention settings
+  recorded by runs that finished
   at or after it, with a note when a gap outlasts the shortest recorded
   `cleanupPeriodDays`. It applies no retention-gap exclusion and draws no stop
   verdict, because the settings an extractor run recorded cannot prove the
@@ -47,11 +141,11 @@ changes inline only. See the deprecation policy in
   opens both databases read-only (SQLite may still create its WAL `-wal` and
   `-shm` files) and counts from one snapshot, and refuses (exit 1) before the
   freeze, under another HMAC key, or on a trial database it cannot read or
-  whose path cannot be inspected. **Behavior change**: the script gains
-  a `--status` mode; the extractor, `--freeze` and `--purge` behave as before.
+  whose path cannot be inspected. The extractor, `--freeze` and `--purge`
+  behave as before when spelled out; `--stat`, which abbreviated
+  `--stats-retention-days`, is now ambiguous with `--status` and refused.
 
 ### Fixed
-
 - `mms hook install` and `mms hook uninstall` no longer keep quiet about an
   STM hook they do not recognize, such as
   `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook`. Install added its own
@@ -73,7 +167,6 @@ changes inline only. See the deprecation policy in
   only (no memtomem-stm hook that uninstall manages).` instead of `Removed
   memtomem-stm's PostToolUse hook.` Config files are written exactly as
   before.
-
 - `mms host sync --plan` no longer tells you to run an `--apply` that has
   nothing to do. The text preview always printed ``Run `mms host sync
   --apply` to execute.``, even when that run had nothing to write — every
@@ -88,16 +181,15 @@ changes inline only. See the deprecation policy in
   closing line reads ``Nothing for `mms host sync --apply` to do.`` (with the same
   flags the old line named). A preview with changes to apply is unchanged,
   and so are `--json` output and exit codes.
-
 - `mms hook` no longer ignores `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED`
   silently when the hook is registered without `--host claude`. Output
   replacement still runs only for an explicit `--host claude`, because
   auto-detection cannot tell Claude from Codex. A bare `mms hook`, the form the
   `hook_cmd` module docstring used to show, therefore passed every Bash result
-  through, and nothing said why at the time it happened (since #1441,
-  `mms stats` counts the retained rows of such calls, with compression
-  enabled and routed to the Claude adapter, as `replacement_not_requested`).
-  Now, on a call
+  through, and nothing said why. This release adds two signals: `mms stats`
+  counts the retained rows of such calls, with compression enabled and
+  routed to the Claude adapter, as `replacement_not_requested` (#1441), and,
+  on a call
   routed to the Claude adapter (auto-detection's fallback; a payload with a
   non-empty Codex `turn_id` goes to the Codex adapter and gets no warning) that
   compression would have attempted (a Bash result that passes every check made
@@ -112,14 +204,14 @@ changes inline only. See the deprecation policy in
   It asks for `--host claude` to be added where the hook is registered rather
   than naming `mms hook install`, which rewrites only the user settings file,
   leaves a registration it does not recognize in place, and keeps only the
-  daemon, timeout and query-text settings of an inline `env` wrapper. The docstring example and the docs now state the
+  daemon, timeout and query-text settings of an inline `env` wrapper. The
+  docstring example and the docs now state the
   `--host claude` requirement (#1440, issue #1437).
   **Behavior change**: a bare `mms hook` with compression enabled prints a
   warning for each such call, and its JSON output gains `systemMessage` on
   those calls, including when surfacing times out. The tool output itself and
-  the metrics row are unchanged. Registering with `--host claude` removes the
+  its recorded size are unchanged. Registering with `--host claude` removes the
   warning and turns compression on.
-
 - `mms import` names the host config sources it chose not to read instead of
   reporting them as missing. When STM cannot tell which file Claude Code or
   Codex uses (`CLAUDE_CONFIG_DIR` or `CODEX_HOME` relative, a custom OAuth
@@ -137,7 +229,6 @@ changes inline only. See the deprecation policy in
   definitions found from --from=<host>; <n> sources were not inspected.` (`1
   source was` for one). Output with no skipped source is unchanged, and exit
   codes are unchanged.
-
 - `mms daemon status` and `mms daemon start` escape for display the values
   they print from a daemon that answers. On `start`'s "daemon already
   running" and "daemon started" lines (which `restart` prints too) those are
@@ -210,15 +301,16 @@ changes inline only. See the deprecation policy in
   rows without it (they read as `not recorded`), and each time the two
   versions open the file in turn the schema check runs again: a median of
   about 0.2 ms more per open, measured on one 10,451-row DB that already had
-  the column and no concurrent writer. The `mms stats` text output gains the
-  `status:` lines; existing lines and `--json` keys are unchanged.
-- `mms stats --all-time` keeps the hook status counts of trimmed rows. The
-  daily rollup is keyed by day, source, server and tool, so once trimming
-  removed the last retained row with a given status that status vanished
-  from the breakdown, while its calls still weighed on the host's all-time
-  ratio; on a machine with two hosts registered the retained hook window was
-  under a day. The status of each trimmed `hook` row is now kept in a second
-  never-pruned table, `proxy_metrics_hook_status_daily`, fed by its own
+  the column and no concurrent writer, before the next entry's rollup. The `mms
+  stats` text output gains the `status:` lines; existing `--json` keys are
+  unchanged.
+- `mms stats --all-time` counts the hook statuses of trimmed rows too.
+  Trimming folds rows into a daily rollup keyed by day, source, server and
+  tool, with no status, so counts over the retained rows alone would leave
+  out calls that still weigh on the host's all-time ratio; on a machine with
+  two hosts registered the retained hook window was under a day. The status of
+  each trimmed `hook` row is now kept in a second never-pruned table,
+  `proxy_metrics_hook_status_daily`, fed by its own
   database trigger, so rows trimmed by an older STM version sharing the file
   are counted too. Hook calls already in the daily rollup when this version
   first opens the DB were trimmed with no status kept: they are counted once,
@@ -229,16 +321,18 @@ changes inline only. See the deprecation policy in
   DELETE` trigger on `proxy_metrics` and one on `proxy_metrics_daily` (a
   deleted daily bucket takes its status rows with it, so the documented
   two-table reset still clears everything), created the first time this
-  version opens the DB for writing. Each trimmed hook row now costs one more
-  insert: deleting 10,000 hook rows at once took a median of 61–63 ms
-  instead of 47–49 ms, while the mean write at the cap, trims included,
+  version opens the DB for writing. Measured against the schema of the
+  previous entry: each trimmed hook row costs one more insert, deleting 10,000
+  hook rows at once took a median of 61–63 ms instead of 47–49 ms, while the
+  mean write at the cap, trims included,
   stayed within run-to-run spread (58–65 µs on both), measured on one
   machine. The schema check that runs each time two versions open the file
-  in turn rose from a median of 0.68–0.78 ms to 0.86–0.96 ms on a
-  10,000-row DB. `docs/cli.md` now runs the reset in one transaction. Under
-  `--all-time` the `status:` line no longer says `(retained rows)` unless
-  the status rollup is unavailable (not installed yet, or its table or a
-  trigger is missing).
+  in turn rose from a median of
+  0.68–0.78 ms to 0.86–0.96 ms on a 10,000-row DB. `docs/cli.md` now runs the
+  reset in one transaction. Under
+  `--all-time` the `status:` line says `(retained rows)` only when the status
+  rollup is unavailable (not installed yet, or its table or a trigger is
+  missing).
 - `mms hook` no longer drops the JSON it writes for Claude Code, Codex and
   Cursor when its stdout is not UTF-8 but another ASCII-compatible encoding,
   such as cp1252 on a Windows pipe. That JSON held non-ASCII text as it was: the
@@ -255,16 +349,6 @@ changes inline only. See the deprecation policy in
   for a character outside the Basic Multilingual Plane); a host that parses
   it reads the same values as before. Hook input is read as UTF-8
   whatever the locale, with a leading byte-order mark ignored.
-- `mms doctor`'s `hook registration` row counts more STM hooks spelled with
-  quotes. A line made only of plain words and quotes, up to 4,096 characters,
-  is now also matched on the words left after quote removal, so `m"m"s hook`
-  next to `mms hook --host claude` is counted, marked not checked, and the
-  row WARNs instead of reporting PASS. A quoted hook in a longer line, or in
-  a line with other shell syntax (a comment, an operator, a line
-  continuation), gets only the raw-text search as before, which can miss it
-  and still let the row PASS. A plain command whose `hook` is only part of a
-  word, such as `mms status --config /tmp/hook.json`, is no longer counted
-  as an STM hook (#1455, issue #1450).
 
 ## [0.7.9] — 2026-11-15
 
