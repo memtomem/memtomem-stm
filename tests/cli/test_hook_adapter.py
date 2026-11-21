@@ -677,24 +677,23 @@ def test_cursor_parse_delegates_flattening_to_shared_helper():
 
 
 @pytest.mark.parametrize("adapter", [_CLAUDE, _CODEX, _CURSOR])
-def test_json_hosts_serialize_is_json_dumps_byte_identical(adapter):
-    # The default serialize() must stay byte-identical to the pre-seam emit
-    # (`json.dumps(output, ensure_ascii=False)`) for every JSON host — both the
-    # nested Claude/Codex envelope and Cursor's flat keys. The non-ASCII payload
-    # pins the ``ensure_ascii=False`` half: with only-ASCII inputs a regression to
-    # ``ensure_ascii=True`` is invisible, yet it would `\uXXXX`-escape the Korean
-    # LTM blocks this project routinely surfaces.
+def test_json_hosts_serialize_is_ascii_json(adapter):
+    # Every JSON host — the nested Claude/Codex envelope and Cursor's flat keys —
+    # writes ASCII JSON, so the hook's stdout encoding (cp1252 on a Windows pipe)
+    # can always write it (#1444). The non-ASCII payloads pin that half: with
+    # only-ASCII inputs a regression to ``ensure_ascii=False`` is invisible. The
+    # host decodes the ``\uXXXX`` escapes back to the same values.
     for rendered in (
         {},
         {"additional_context": "<surfaced-memories>\nMEM\n</surfaced-memories>"},
-        {"additional_context": "<surfaced-memories>\n한국어 메모\n</surfaced-memories>"},
+        {"additional_context": "<surfaced-memories>\n한국어 메모 …\n</surfaced-memories>"},
+        {"hookSpecificOutput": {"updatedToolOutput": {"stdout": "⟦stm-compressed⟧\nx"}}},
         {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "x"}},
     ):
-        assert adapter.serialize(rendered) == json.dumps(rendered, ensure_ascii=False)
-        # Guard the escape directly: a non-ASCII block must NOT be \uXXXX-escaped.
-        if "한국어" in str(rendered):
-            assert "한국어" in adapter.serialize(rendered)
-            assert "\\ud55c" not in adapter.serialize(rendered)
+        serialized = adapter.serialize(rendered)
+        assert serialized == json.dumps(rendered, ensure_ascii=True)
+        assert serialized.isascii()
+        assert json.loads(serialized) == rendered
 
 
 def test_hook_emit_fails_open_when_the_payload_cannot_be_encoded(monkeypatch):
@@ -775,7 +774,7 @@ def test_kimi_serialize_is_raw_not_json_vs_claude():
     rendered = {"additional_context": block}
     # Kimi emits the block verbatim; the JSON hosts emit json.dumps of the dict.
     assert _KIMI.serialize(rendered) == block
-    assert _CLAUDE.serialize(rendered) == json.dumps(rendered, ensure_ascii=False)
+    assert _CLAUDE.serialize(rendered) == json.dumps(rendered)
     assert _CLAUDE.serialize(rendered).startswith("{")
 
 
