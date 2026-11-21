@@ -18,8 +18,10 @@ changes inline only. See the deprecation policy in
   replacement still runs only for an explicit `--host claude`, because
   auto-detection cannot tell Claude from Codex. A bare `mms hook`, the form the
   `hook_cmd` module docstring used to show, therefore passed every Bash result
-  through, and nothing said why at the time it happened (`mms stats` now
-  counts those rows as `replacement_not_requested`, #1441). Now, on a call
+  through, and nothing said why at the time it happened (since #1441,
+  `mms stats` counts the retained rows of such calls, with compression
+  enabled and routed to the Claude adapter, as `replacement_not_requested`).
+  Now, on a call
   routed to the Claude adapter (auto-detection's fallback; a payload with a
   non-empty Codex `turn_id` goes to the Codex adapter and gets no warning) that
   compression would have attempted (a Bash result that passes every check made

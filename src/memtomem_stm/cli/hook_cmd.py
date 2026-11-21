@@ -37,9 +37,10 @@ loop, cross-session dedup, and a privacy gate for ingestion arrive with the
 daemon stage (P2/Stage D).
 
 Hard rule — a hook must never disrupt the host. This command **always exits
-0** and, on any malformed input, disabled surfacing, timeout, or internal
-error, emits an empty object ``{}`` so the original tool result passes through
-untouched. The one addition is a ``systemMessage`` reporting a compression
+0** and, on any malformed input, timeout, or internal error, emits an empty
+object ``{}`` so the original tool result passes through untouched. Disabled
+surfacing only drops ``additionalContext``; the compression stage, and its
+refusal notice, still run. The one addition is a ``systemMessage`` reporting a compression
 refusal found before a failure that the per-call barrier catches, a timeout
 included (#1437); the tool result still passes through. A ``BaseException``
 that reaches the outermost barrier still emits ``{}``.
