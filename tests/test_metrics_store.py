@@ -2086,8 +2086,18 @@ def _read_meta(db_path) -> dict[str, str]:
 
 
 def _without_status_column(monkeypatch) -> str:
-    """Make this process the binary before the column: returns its fingerprint."""
+    """Make this process the binary before the column: returns its fingerprint.
+
+    That binary also predates the status rollup (#1442), so it neither names
+    those objects in its stamp nor installs them.
+    """
     monkeypatch.delitem(metrics_store_module._MIGRATIONS, _STATUS_COL)
+    monkeypatch.setattr(
+        metrics_store_module,
+        "_ROLLUP_OBJECT_NAMES",
+        (metrics_store_module._DAILY_TABLE, metrics_store_module._ROLLUP_TRIGGER),
+    )
+    monkeypatch.setattr(MetricsStore, "_install_status_rollup", staticmethod(lambda db: None))
     old = metrics_store_module._schema_fingerprint()
     monkeypatch.setattr(metrics_store_module, "_SCHEMA_FINGERPRINT", old)
     return old
@@ -2405,6 +2415,19 @@ class TestReadHookStatus:
         assert summary["available"] is True, summary["error"]
         assert _statuses(summary) == {("builtin:claude", "error"): (2, expected)}
         assert summary["total_original_chars"] == expected
+
+        # Trimmed, the same sizes sit in one status bucket (turned REAL past
+        # int64 by the trigger's ``+``) and must read the same under --all-time.
+        db = sqlite3.connect(str(db_path))
+        try:
+            db.execute("DELETE FROM proxy_metrics")
+            db.commit()
+        finally:
+            db.close()
+        all_time = read_compression_all_time(db_path, source="hook", with_hook_status=True)
+        assert all_time["hook_status"]["scope"] == "all_time"
+        assert _statuses(all_time) == {("builtin:claude", "error"): (2, expected)}
+        assert all_time["total_original_chars"] == expected
 
     def test_all_time_counts_statuses_over_trimmed_rows_too(self, tmp_path):
         db_path = tmp_path / "m.db"

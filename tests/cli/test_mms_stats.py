@@ -954,6 +954,25 @@ class TestStatsHookStatus:
         ]
         assert hosts == [["codex", "cursor", "kimi"]] * 2
 
+    def test_status_not_kept_comes_last_whatever_its_count(self):
+        from memtomem_stm.cli.proxy import _hook_status, _hook_status_line
+
+        def row(status, calls, not_kept=False):
+            return {
+                "server": "builtin:claude",
+                "status": status,
+                "not_kept": not_kept,
+                "calls": calls,
+                "original_chars": calls,
+            }
+
+        value = {
+            "scope": "all_time",
+            "rows": [row(None, 9, not_kept=True), row(None, 2), row("compressed", 1)],
+        }
+        lines = _hook_status_line(_hook_status(value), "claude", "  ", True)
+        assert lines == ["  status: compressed 1, not recorded 2, status not kept 9"]
+
     def test_json_status_for_unreadable_and_pre_source_stores(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)
         db = tmp_path / ".memtomem" / "proxy_metrics.db"

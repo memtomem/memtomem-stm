@@ -1071,8 +1071,25 @@ class TestHookStatusRollup:
             f"UPDATE {_DAILY} SET calls = NULL WHERE tool = 'Read'",
         )
         _open(path).close()
-        assert [row[:3] for row in _status_table(path)] == [("Bash", 2, ""), ("Read", 2, "")]
+        # Text, NULL and inf counters seed as 0; the finite size beside them stays.
+        assert _status_table(path) == [("Bash", 2, "", 0, 0), ("Read", 2, "", 0, 100)]
         assert ("trigger", _STATUS_TRIGGER) in _objects(path)
+
+    def test_null_server_and_tool_in_an_outside_schema_survive_a_raw_delete(self, tmp_path):
+        """The stock schema declares both NOT NULL; an outside one may not, and
+        the status table's key columns cannot hold NULL."""
+        path = tmp_path / "m.db"
+        _sql(
+            path,
+            "CREATE TABLE proxy_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "server TEXT, tool TEXT, original_chars INTEGER NOT NULL, "
+            "compressed_chars INTEGER NOT NULL, cleaned_chars INTEGER NOT NULL DEFAULT 0, "
+            "created_at REAL NOT NULL)",
+        )
+        _open(path).close()
+        _insert_raw(path, created_at=0.0, source="hook", server=None, tool=None)
+        _sql(path, "DELETE FROM proxy_metrics")
+        assert _status_table(path) == [("", 1, "", 1, 100)]
 
     def test_a_table_recreated_after_a_drop_reseeds_as_not_kept(self, tmp_path):
         path = tmp_path / "m.db"
