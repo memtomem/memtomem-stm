@@ -5686,7 +5686,7 @@ class ProxyManager:
         post-lock double-check so concurrent duplicate requests return
         through the same hit pipeline as a single call would.
         """
-        self.tracker.record_cache_hit(chars=len(cached))
+        self.tracker.record_cache_hit(chars=len(cached), server=server, tool=tool)
         context_query = arguments.get("_context_query") if arguments else None
         with traced("proxy_call_cache_hit", metadata={"server": server, "tool": tool}):
             surfaced = await self._apply_surfacing(
@@ -6132,7 +6132,7 @@ class ProxyManager:
             # above deliberately record NOTHING — no lookup was attempted, and
             # counting a forced-forward writer (or a ``cache: false`` tool) as a
             # miss would skew the hit-rate diagnostics.
-            self.tracker.record_cache_miss()
+            self.tracker.record_cache_miss(server=server, tool=tool)
             return await self._call_tool_inner(
                 server,
                 tool,
@@ -7787,7 +7787,7 @@ class ProxyManager:
             return
         if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
             return
-        self.tracker.record_cache_unstorable()
+        self.tracker.record_cache_unstorable(server=server, tool=tool)
 
     def _store_cache(
         self,
@@ -7900,7 +7900,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.credential_store_refused:
-            self.tracker.record_cache_unstorable()
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
             logger.debug(
                 "Skipping cache store for %s/%s: a persistent pending store "
                 "refused this credential-bearing response",
@@ -7908,7 +7908,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.progressive_passthrough_on_error:
-            self.tracker.record_cache_unstorable()
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
             logger.debug(
                 "Skipping cache store for %s/%s: progressive passthrough "
                 "degradation (transient store failure)",
@@ -7916,7 +7916,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.selective_store_error:
-            self.tracker.record_cache_unstorable()
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
             logger.debug(
                 "Skipping cache store for %s/%s: selective/hybrid truncate "
                 "degradation (transient store failure)",
@@ -7928,7 +7928,7 @@ class ProxyManager:
             or comp.progressive_key_issued
             or response_carries_transient_key(comp.compressed)
         ):
-            self.tracker.record_cache_unstorable()
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
             logger.debug(
                 "Skipping cache store for %s/%s: response carries a transient "
                 "retrieval key (progressive/selective TOC)",

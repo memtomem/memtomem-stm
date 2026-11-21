@@ -1161,3 +1161,52 @@ class TestHotReloadedOverrides:
 
         assert session.call_tool.await_count == 1
         detect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestPersistedCacheCounts:
+    """#1329: the counts above also reach ``proxy_cache_daily``, attributed to
+    the dispatched server and tool, through the production call sites — a hit,
+    an eligible miss, an unstorable response refused by the store and one
+    passed through — and nothing for a call that attempted no lookup."""
+
+    async def test_dispatch_persists_attributed_counts(self, build, tmp_path):
+        import sqlite3
+
+        mgr, _, _ = build(
+            tools=[
+                _tool("reader", _ann(read_only=True)),
+                _tool("mixed", _ann(read_only=True)),
+                _tool("empty", _ann(read_only=True)),
+                _tool("writer", _ann(read_only=False)),
+            ]
+        )
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # eligible miss
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # hit
+        session.call_tool.return_value = _mixed_result()
+        await mgr.call_tool("srv", "mixed", {"q": "a"})  # miss + unstorable
+        session.call_tool.return_value = _empty_result()
+        await mgr.call_tool("srv", "empty", {})  # miss + unstorable
+        session.call_tool.return_value = _text_result("done")
+        await mgr.call_tool("srv", "writer", {"x": 1})  # no lookup, nothing
+        mgr.tracker.flush_cache_counts()
+
+        db = sqlite3.connect(tmp_path / "m.db")
+        try:
+            rows = {
+                row[0]: row[1:]
+                for row in db.execute(
+                    "SELECT tool, server, hits, hit_chars > 0, misses, unstorable "
+                    "FROM proxy_cache_daily"
+                )
+            }
+        finally:
+            db.close()
+        assert rows == {
+            "reader": ("srv", 1, 1, 1, 0),
+            "mixed": ("srv", 0, 0, 1, 1),
+            "empty": ("srv", 0, 0, 1, 1),
+        }

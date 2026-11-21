@@ -1581,3 +1581,164 @@ class TestMmsStatsAllTime:
             runner.invoke(cli, ["stats", "--json", "--all-time"]).output, parse_constant=_reject
         )
         assert data["compression"]["total_original_chars"] == 3010
+
+
+class TestStatsCache:
+    """#1329: cache counts persisted in ``proxy_cache_daily`` are reported."""
+
+    @staticmethod
+    def _seed(home: Path, counts: dict[tuple[str, str, str], list[int]]) -> Path:
+        db = _seed_metrics(home)
+        store = MetricsStore(db)
+        store.initialize()
+        try:
+            store.record_cache_counts(counts)
+        finally:
+            store.close()
+        return db
+
+    def test_text_and_json_report_the_persisted_counts(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed(
+            tmp_path,
+            {
+                ("2026-11-20", "c7", "query-docs"): [3, 900, 2, 1],
+                ("2026-11-21", "c7", "resolve"): [1, 100, 0, 0],
+            },
+        )
+
+        text = runner.invoke(cli, ["stats"])
+        assert text.exit_code == 0, text.output
+        block = text.output.split("Proxy / Cache", 1)[1].split("Progressive delivery", 1)[0]
+        assert "lookups: 4 hits, 2 misses (1 unstorable)" in block
+        assert "hit rate: 80.0% of storable lookups" in block
+        assert "served from cache: 1,000 chars" in block
+        assert "Coverage: since " in block
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        cache = data["cache"]
+        assert cache["available"] is True
+        assert (cache["hits"], cache["hit_chars"], cache["misses"], cache["unstorable"]) == (
+            4,
+            1000,
+            2,
+            1,
+        )
+        assert cache["storable_hit_rate"] == 0.8
+        assert isinstance(cache["installed_at"], float)
+
+        filtered = json.loads(runner.invoke(cli, ["stats", "--json", "--tool", "resolve"]).output)
+        assert (filtered["cache"]["hits"], filtered["cache"]["storable_hit_rate"]) == (1, 1.0)
+
+    def test_huge_buckets_report_an_exact_count_in_strict_json(self, runner, tmp_path, monkeypatch):
+        """Two outside-written ``1e308`` buckets: a float total would be inf.
+        The reader adds whole numbers as ints, so the block renders the exact
+        count and --json stays strict JSON with a finite rate."""
+        set_home(monkeypatch, tmp_path)
+        db = self._seed(tmp_path, {("2026-11-21", "s", "t"): [1, 1, 0, 0]})
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO proxy_cache_daily VALUES ('2026-11-21', 's', 'a', 1e308, 0, 0, 0), "
+            "('2026-11-21', 's', 'b', 1e308, 0, 0, 0)"
+        )
+        conn.commit()
+        conn.close()
+
+        text = runner.invoke(cli, ["stats"])
+        assert text.exit_code == 0, text.output
+        block = text.output.split("Proxy / Cache", 1)[1].split("Progressive delivery", 1)[0]
+        hits = 2 * int(1e308) + 1
+        assert "unreadable" not in block
+        assert f"lookups: {hits:,} hits, 0 misses (0 unstorable)" in block
+        assert "hit rate: 100.0% of storable lookups" in block
+
+        def _reject(token: str) -> None:
+            raise AssertionError(f"non-JSON constant {token}")
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output, parse_constant=_reject)
+        assert data["cache"]["available"] is True
+        assert data["cache"]["error"] is None
+        assert data["cache"]["hits"] == hits
+        assert data["cache"]["storable_hit_rate"] == 1.0
+
+    def test_zero_counts_still_show_the_coverage_start(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed(tmp_path, {("2026-11-21", "s", "t"): [1, 1, 0, 0]})
+        result = runner.invoke(cli, ["stats", "--tool", "no-such-tool"])
+        assert result.exit_code == 0, result.output
+        block = result.output.split("Proxy / Cache", 1)[1].split("Progressive delivery", 1)[0]
+        assert "No cache lookups recorded yet." in block
+        assert "Coverage: since " in block
+        assert "an unknown start" not in block
+
+    def test_unstorable_only_tool_is_shown(self, runner, tmp_path, monkeypatch):
+        """An unstorable count with no miss in the same bucket is a supported
+        state (eligibility can change mid-call); it must not read as empty."""
+        set_home(monkeypatch, tmp_path)
+        self._seed(
+            tmp_path,
+            {
+                ("2026-11-21", "s", "flip"): [0, 0, 0, 1],
+                ("2026-11-21", "s", "other"): [2, 2, 1, 0],
+            },
+        )
+        result = runner.invoke(cli, ["stats", "--tool", "flip"])
+        assert result.exit_code == 0, result.output
+        block = result.output.split("Proxy / Cache", 1)[1].split("Progressive delivery", 1)[0]
+        assert "No cache lookups recorded yet." not in block
+        assert "lookups: 0 hits, 0 misses (1 unstorable)" in block
+        assert "Coverage: since " in block
+
+    def test_no_storable_lookups_renders_na(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed(tmp_path, {("2026-11-21", "s", "t"): [0, 0, 2, 3]})
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert "hit rate: n/a (no storable lookups) of storable lookups" in result.output
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert data["cache"]["storable_hit_rate"] is None
+
+    def test_source_hook_omits_the_cache_block(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed(tmp_path, {("2026-11-21", "s", "t"): [1, 1, 0, 0]})
+        result = runner.invoke(cli, ["stats", "--source", "hook"])
+        assert result.exit_code == 0, result.output
+        assert "Proxy / Cache" not in result.output
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--source", "hook"]).output)
+        assert data["cache"] is None
+
+    def test_pre_cache_db_reports_nothing_recorded_and_stays_untouched(
+        self, runner, tmp_path, monkeypatch
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE proxy_cache_daily")
+        conn.commit()
+        conn.close()
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert "No cache lookups recorded yet." in result.output
+        conn = sqlite3.connect(db)
+        try:
+            assert (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'proxy_cache_daily'"
+                ).fetchone()
+                is None
+            )
+        finally:
+            conn.close()
+
+    def test_coverage_start_outside_pythons_date_range_renders(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._seed(tmp_path, {("2026-11-21", "s", "t"): [1, 1, 0, 0]})
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE metrics_meta SET value = '1e300' WHERE key = 'cache_rollup_installed_at'"
+        )
+        conn.commit()
+        conn.close()
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert "Coverage: since an unknown start" in result.output

@@ -39,6 +39,7 @@ _TRIGGER = "proxy_metrics_rollup_on_delete_v1"
 _STATUS_DAILY = "proxy_metrics_hook_status_daily"
 _STATUS_TRIGGER = "proxy_metrics_hook_status_rollup_on_delete_v1"
 _STATUS_RESET_TRIGGER = "proxy_metrics_hook_status_follow_daily_delete_v1"
+_CACHE_DAILY = "proxy_cache_daily"
 
 # The per-source trim exactly as an older STM build issues it. Copied, not
 # imported: an old binary has its own copy, and the point is that the rollup
@@ -419,6 +420,7 @@ class TestInstallation:
         assert ("table", _STATUS_DAILY) not in objects
         assert ("trigger", _STATUS_TRIGGER) not in objects
         assert ("trigger", _STATUS_RESET_TRIGGER) not in objects
+        assert ("table", _CACHE_DAILY) not in objects
         assert ("table", "metrics_meta") not in objects
 
         _open(path).close()
@@ -428,11 +430,16 @@ class TestInstallation:
             ("table", _STATUS_DAILY),
             ("trigger", _STATUS_TRIGGER),
             ("trigger", _STATUS_RESET_TRIGGER),
+            ("table", _CACHE_DAILY),
         } <= _objects(path)
+        assert "cache_rollup_installed_at" in _meta(path)
 
     def test_restamp_by_an_older_binary_keeps_the_first_install(self, tmp_path):
         path = tmp_path / "m.db"
         _record_all(path, _mixed_metrics(), max_history=1_000_000)
+        store = _open(path)
+        store.record_cache_counts({("2026-11-21", "s", "t"): [2, 20, 1, 0]})
+        store.close()
         first = _meta(path)
         before = read_compression_summary(path)
 
@@ -446,8 +453,12 @@ class TestInstallation:
 
         after = _meta(path)
         assert after["rollup_installed_at"] == first["rollup_installed_at"]
+        assert after["cache_rollup_installed_at"] == first["cache_rollup_installed_at"]
         assert after["rollup_rows_lost_before_install"] == "0"
         assert _triggers(path) == {_TRIGGER, _STATUS_TRIGGER, _STATUS_RESET_TRIGGER}
+        db = sqlite3.connect(str(path))
+        assert db.execute(f"SELECT hits, hit_chars FROM {_CACHE_DAILY}").fetchall() == [(2, 20)]
+        db.close()
         assert _comparable(read_compression_all_time(path)) == _comparable(before)
 
     def test_racing_first_openers_install_once(self, tmp_path, monkeypatch):

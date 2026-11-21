@@ -816,6 +816,13 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                     await close_store_on_worker(feedback_tracker.close)
                 except Exception:
                     logger.warning("Failed to close feedback_tracker", exc_info=True)
+            # Cache counts buffered since the last recorded call go out before
+            # the store closes (#1329). The manager has stopped, so no call is
+            # still adding to them. One synchronous write; failure is logged.
+            try:
+                tracker.flush_cache_counts()
+            except Exception:
+                logger.warning("Failed to flush cache counts", exc_info=True)
             for resource, name in [
                 (proxy_cache, "proxy_cache"),
                 (metrics_store, "metrics_store"),

@@ -2944,6 +2944,44 @@ def _render_compression_block(
             )
 
 
+def _render_cache_block(summary: dict[str, Any], *, collecting: bool) -> None:
+    """Response-cache counts from :func:`read_cache_summary` (#1329)."""
+    click.echo(_hdr("Proxy / Cache"))
+    click.echo("=" * 30)
+    if summary.get("error"):
+        click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
+        return
+    if not collecting:
+        click.echo(
+            "  Not collecting (proxy.enabled, proxy.cache.enabled or proxy.metrics.enabled "
+            "is false)."
+        )
+    if not summary.get("available"):
+        click.echo("  No cache lookups recorded yet.")
+        return
+    hits, misses = int(summary.get("hits") or 0), int(summary.get("misses") or 0)
+    unstorable = int(summary.get("unstorable") or 0)
+    if hits or misses or unstorable:
+        click.echo(f"  lookups: {hits:,} hits, {misses:,} misses ({unstorable:,} unstorable)")
+        rate = summary.get("storable_hit_rate")
+        rate_text = f"{float(rate) * 100:.1f}%" if rate is not None else "n/a (no storable lookups)"
+        click.echo(f"  hit rate: {rate_text} of storable lookups")
+        click.echo(f"  served from cache: {int(summary.get('hit_chars') or 0):,} chars")
+    else:
+        click.echo("  No cache lookups recorded yet.")
+    since = "an unknown start"
+    installed_at = summary.get("installed_at")
+    if installed_at is not None:
+        try:
+            since = datetime.fromtimestamp(float(installed_at), tz=UTC).strftime("%Y-%m-%d UTC")
+        except (OverflowError, OSError, ValueError):
+            pass
+    click.echo(
+        f"  Coverage: since {since}, from STM processes that persist cache counts;\n"
+        "    each tries to write them with its next metrics row and at MCP server stop."
+    )
+
+
 def _render_progressive_block(
     summary: dict[str, Any], *, collecting: bool, retention_days: int
 ) -> None:
@@ -3084,7 +3122,8 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     type=click.Choice(["mcp", "hook"]),
     default=None,
     help="Filter compression rows by provenance: 'mcp' (proxied upstream tools) "
-    "or 'hook' (native built-in tools recorded by 'mms hook').",
+    "or 'hook' (native built-in tools recorded by 'mms hook'). 'hook' also omits the "
+    "cache block, since only proxied tools are cached.",
 )
 @click.option(
     "--all-time",
@@ -3111,15 +3150,18 @@ def stats(
     (``proxy.metrics.max_history`` per source, ``retention_days`` for
     progressive reads and surfacing), not all-time totals. ``--all-time`` switches
     the compression section alone to the never-pruned daily rollup plus retained
-    rows (#1316); progressive and surfacing stay retained-window. The live MCP server
-    keeps additional in-memory counters that a separate CLI process cannot see,
-    so the numbers here reflect only what has been written to disk. An explicit
+    rows (#1316); progressive and surfacing stay retained-window. The cache block
+    reads ``proxy_cache_daily``, which is never pruned and covers everything
+    written since it was created (#1329). The live MCP server keeps additional
+    in-memory counters that a separate CLI process cannot see, so the numbers
+    here reflect only what has been written to disk. An explicit
     ``--config`` also steers the STMConfig-backed feedback-DB location (#839).
     """
     config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.config import STMConfig, stm_config_for_cli
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
     from memtomem_stm.proxy.metrics_store import (
+        read_cache_summary,
         read_compression_all_time,
         read_compression_summary,
     )
@@ -3222,17 +3264,26 @@ def stats(
     hook_status = _hook_status(status_rows)
     total_rows: Any = compression.pop("hook_status", None)
     total_hook_status = hook_status if compression is hook_summary else _hook_status(total_rows)
+    # Only proxied tools are cached, so ``--source hook`` has no cache block.
+    cache = (
+        read_cache_summary(proxy_cfg.metrics.db_path, tool=tool_filter)
+        if source_filter != "hook"
+        else None
+    )
     progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
     # These numbers come only from the on-disk stores; the live MCP server
-    # keeps additional in-memory-only counters (cache hits, latency, reconnects,
-    # …) that a separate CLI process cannot see. Name the source and point at
-    # the live tool so a user comparing the two doesn't read the gap as a bug.
-    # Wording is generic (not the default filenames) because metrics.db_path and
-    # surfacing.feedback_db_path are both configurable.
+    # keeps additional in-memory-only counters (latency, reconnects, cache counts
+    # not yet written, …) that a separate CLI process cannot see. Name the
+    # source and point at the live tool so a user comparing the two doesn't
+    # read the gap as a bug. Wording is generic (not the default filenames)
+    # because metrics.db_path and surfacing.feedback_db_path are both
+    # configurable.
     data_source = (
-        "on-disk stores only (metrics DB + surfacing-feedback DB); "
+        "on-disk stores only (metrics DB + surfacing-feedback DB; each proxy tries to "
+        "write its pending cache counts with its next metrics write and during an "
+        "orderly MCP server stop); "
         "live in-memory counters via the stm_admin MCP tool (action proxy_stats)"
     )
 
@@ -3252,6 +3303,7 @@ def stats(
                     "compression_by_source": compression_by_source,
                     "hook_by_host": hook_by_host,
                     "hook_status": hook_status,
+                    "cache": cache,
                     "progressive": progressive,
                     "surfacing": surfacing,
                 },
@@ -3278,6 +3330,12 @@ def stats(
         hook_status=hook_status,
         total_hook_status=total_hook_status,
     )
+    if cache is not None:
+        click.echo("")
+        _render_cache_block(
+            cache,
+            collecting=proxy_cfg.enabled and proxy_cfg.cache.enabled and proxy_cfg.metrics.enabled,
+        )
     click.echo("")
     _render_progressive_block(
         progressive,
