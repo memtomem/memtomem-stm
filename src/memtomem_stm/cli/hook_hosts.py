@@ -68,6 +68,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -100,6 +101,11 @@ class HookInstallError(Exception):
     must always exit 0. Refusing to touch a config we cannot parse avoids
     clobbering valid-but-unusual contents (the ``.bak`` backup only helps if we
     got far enough to write one)."""
+
+
+class HookConfigNotRegularFile(HookInstallError):
+    """The host config path exists but is not a regular file (a directory, a
+    FIFO, a device). Reading a FIFO would block until a writer appears."""
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +604,45 @@ def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:
         if isinstance(entries, list):
             commands.extend(entry["command"] for entry in entries if _is_stm_command_handler(entry))
     return tuple(commands)
+
+
+def claude_post_tool_handlers() -> tuple[Path, list[tuple[str, Any]] | None]:
+    """Every ``hooks.PostToolUse[i].hooks[j]`` handler in Claude Code's user
+    settings, keyed by that location, read from the file ``mms hook install
+    --host claude`` writes. ``None`` in place of the list when the file is absent.
+
+    Unlike :func:`installed_stm_hook_commands`, nothing is filtered: a reader
+    that judges registrations (``mms doctor``, #1443) must also see the ones
+    install does not recognize, such as ``NAME=value mms hook``.
+
+    Raises :class:`HookInstallError` for a config that cannot be located or
+    parsed, :class:`HookConfigNotRegularFile` for a path that is not a regular
+    file (a FIFO would block the read), and :class:`OSError` when the file
+    cannot be inspected. ``stat`` runs first because on Python 3.14
+    ``Path.exists`` reports a file under an unsearchable directory as absent
+    (#1285), which would hide that failure.
+    """
+    spec = HOOK_HOSTS["claude"]
+    path = _config_path(spec)
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return path, None
+    if not stat.S_ISREG(mode):
+        raise HookConfigNotRegularFile(f"{path} is not a regular file")
+    current = _read_current(path, spec.fmt)
+    if current is None:
+        return path, None
+    hooks = current[0].get("hooks")
+    entries = hooks.get("PostToolUse") if isinstance(hooks, dict) else None
+    handlers: list[tuple[str, Any]] = []
+    if isinstance(entries, list):
+        for i, entry in enumerate(entries):
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if isinstance(inner, list):
+                for j, handler in enumerate(inner):
+                    handlers.append((f"hooks.PostToolUse[{i}].hooks[{j}]", handler))
+    return path, handlers
 
 
 def _serialize(fmt: str, data: dict[str, Any]) -> str:

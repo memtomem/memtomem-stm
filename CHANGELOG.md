@@ -11,6 +11,27 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms doctor` has a `hook registration` row (#1443). It reads the PostToolUse
+  handlers in Claude Code's user settings, the file `mms hook install --host
+  claude` writes, and reports by location the STM hook commands that lack
+  `--host claude`, so hook compression, if enabled, never replaces their
+  output, or that do not run the hook at all (`--help`, a usage error, a
+  subcommand). It reads only commands made of plain words (in exec form, only
+  the `args` must be), and marks anything else as not checked instead of
+  guessing how the shell would run it. That covers quotes, `$HOME` or `~`,
+  settings other than `MEMTOMEM_STM_*` before the executable, a launcher other
+  than `env` or `uv run --directory`, and on Windows shell form and the `env`
+  launcher. It never shows command text. A
+  settings file it cannot read is a WARN naming only the exception type. It is
+  not gated on compression being enabled, and it is WARN-only, so doctor's
+  exit code does not change. The suggested fix is a hand edit rather than
+  `mms hook install --apply`: install merges every STM handler it recognizes
+  into one, drops most inline `env` settings, and does not recognize a
+  `NAME=value mms hook` line. Project, local and managed Claude Code settings
+  are not read.
+
 ### Fixed
 
 - `mms hook` no longer ignores `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED`
