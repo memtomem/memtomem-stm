@@ -10,6 +10,7 @@ a separate pseudonymous database::
 
     uv run python scripts/stm_trial.py                 # daily, from launchd/cron
     uv run python scripts/stm_trial.py --freeze --holdout-rate 0.2 --target 6225
+    uv run python scripts/stm_trial.py --status        # progress; never an outcome
     uv run python scripts/stm_trial.py --purge --yes   # after the report
 
 Every id, path and text item is stored as a keyed hash under the HMAC key in
@@ -18,7 +19,8 @@ Every id, path and text item is stored as a keyed hash under the HMAC key in
 hashes them. Extraction is incremental per transcript file (transcripts are
 append-only; a file that shrank or whose first line changed is halted, never
 re-extracted) and idempotent. ``--freeze`` ends the burn-in by writing the trial
-record with the frozen snippet stoplist; ``--purge`` deletes the database.
+record with the frozen snippet stoplist; ``--status`` reports progress toward the
+frozen target without reading any outcome; ``--purge`` deletes the database.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ import time
 from collections.abc import Callable, Iterable
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -1025,6 +1027,149 @@ def freeze(
     }
 
 
+def _iso(ts: float | None) -> str | None:
+    return None if ts is None else datetime.fromtimestamp(ts, UTC).isoformat(timespec="seconds")
+
+
+def _day(ts: float | None) -> str | None:
+    return None if ts is None else datetime.fromtimestamp(ts, UTC).date().isoformat()
+
+
+def _days(seconds: float | None) -> float | None:
+    return None if seconds is None else round(seconds / 86400, 2)
+
+
+def status(
+    trial_db: Path, feedback_db: Path, *, now: Callable[[], float] = time.time
+) -> dict[str, object]:
+    """Progress toward the frozen target, read without touching any outcome.
+
+    The count is the protocol's stopping unit — an eligible memory row of a copied
+    assignment, dated at or after ``frozen_at``, drawn at the record's rate — but
+    it is **provisional**: no retention-gap exclusion is applied, and none is
+    judged. Whether a gap lost assignments depends on the retention the daemon
+    actually pruned with, which the settings each extractor run recorded cannot
+    prove, so the coverage facts are reported raw and the stopping decision is
+    left to the analysis. Nothing here is per arm and no outcome table is read,
+    so a status reading is never an interim look.
+    """
+    try:
+        key = load_hmac_key(feedback_db)
+        path = trial_db.expanduser()
+        present = path.exists()
+        # absolute(), not resolve(): a symlink loop then fails in SQLite (a refusal
+        # naming only the error type) instead of raising with the path in hand
+        uri = f"{path.absolute().as_uri()}?mode=ro"
+    except OSError as exc:  # e.g. a parent directory that cannot be searched
+        raise TrialError(f"cannot inspect the database paths ({type(exc).__name__})") from exc
+    if not present:
+        raise TrialError("no trial database yet; the extractor has not run")
+    try:
+        with closing(sqlite3.connect(uri, uri=True)) as db:
+            # one read snapshot, so a run committing between two counts cannot
+            # make them disagree
+            db.execute("BEGIN")
+            record = db.execute(
+                "SELECT frozen_at, holdout_rate, target_count, key_fingerprint FROM trial_record"
+            ).fetchone()
+            if record is None:
+                raise TrialError(
+                    "the trial record is not frozen yet; run --freeze after the burn-in"
+                )
+            frozen_at, rate, target, fingerprint = record
+            if fingerprint != key_fingerprint(key):
+                raise TrialError(
+                    "the HMAC key differs from the one the trial record was frozen under"
+                )
+
+            def count(sql: str, args: tuple[object, ...] = ()) -> int:
+                return int(db.execute(sql, args).fetchone()[0])
+
+            eligible = (
+                "SELECT COUNT(*) FROM assignment_memories m "
+                "JOIN assignments a ON a.event_key = m.event_key WHERE m.eligible = 1"
+            )
+            assigned = count("SELECT COUNT(*) FROM assignments")
+            pre_freeze = count(
+                "SELECT COUNT(*) FROM assignments WHERE created_at < ?", (frozen_at,)
+            )
+            eligible_rows = count(eligible)
+            rate_excluded = count(eligible + " AND a.holdout_rate IS NOT ?", (rate,))
+            candidates = count(
+                eligible + " AND a.created_at >= ? AND a.holdout_rate IS ?", (frozen_at, rate)
+            )
+            first, last = db.execute(
+                "SELECT MIN(created_at), MAX(created_at) FROM assignments"
+            ).fetchone()
+            runs = db.execute(
+                "SELECT started_at, ended_at, stats_retention_days, cleanup_period_days "
+                "FROM coverage ORDER BY started_at, run_id"
+            ).fetchall()
+            db.execute("COMMIT")
+    except sqlite3.Error as exc:
+        raise TrialError(f"cannot read the trial database ({type(exc).__name__})") from exc
+
+    at = now()
+    completed = [r for r in runs if r[1] is not None]
+    unfinished = [r[0] for r in runs if r[1] is None]
+    # a gap wholly before the freeze holds no assignment
+    pairs = [(p, n) for p, n in zip(completed, completed[1:]) if n[1] >= frozen_at]
+    observed = max((n[0] - p[1] for p, n in pairs), default=None)
+    worst = max((n[1] - p[0] for p, n in pairs), default=None)
+    since_freeze = [r for r in completed if r[1] >= frozen_at]
+    last_completed = max((r[1] for r in completed), default=None)
+    since_copy = None if not completed else at - completed[-1][0]
+    cleanups = [r[3] for r in since_freeze if r[3] and r[3] > 0]
+    notes: list[str] = []
+    widest = max((g for g in (worst, since_copy) if g is not None), default=None)
+    if cleanups and widest is not None and widest > min(cleanups) * 86400:
+        notes.append(
+            f"a worst-case gap since the freeze ({widest / 86400:.1f} days) is longer than the "
+            f"shortest recorded cleanupPeriodDays ({min(cleanups)}); outcomes from that span "
+            "may be missing"
+        )
+    if pre_freeze:
+        notes.append(f"{pre_freeze} assignment(s) predate frozen_at; the analysis will refuse")
+    if unfinished:
+        notes.append(f"{len(unfinished)} coverage run(s) never finished (running or crashed)")
+    if last_completed is None:
+        notes.append("no extractor run has finished")
+    elif at - last_completed > STALE_RUN_SECONDS:
+        notes.append(
+            f"the last finished extractor run was {(at - last_completed) / 86400:.1f} days ago"
+        )
+    return {
+        "frozen_at": _iso(frozen_at),
+        "holdout_rate": rate,
+        "target_count": target,
+        "assigned_events": assigned,
+        "pre_freeze_events": pre_freeze,
+        "eligible_rows": eligible_rows,
+        "rate_excluded_rows": rate_excluded,
+        "analysable_candidates": candidates,
+        "progress": round(candidates / target, 4) if target else None,
+        "first_assignment_day": _day(first),
+        "last_assignment_day": _day(last),
+        "coverage": {
+            "completed_runs": len(completed),
+            "unfinished_runs": len(unfinished),
+            "newest_unfinished_start": _iso(max(unfinished, default=None)),
+            "last_completed_run": _iso(last_completed),
+            "days_since_last_completed_run": _days(
+                None if last_completed is None else at - last_completed
+            ),
+            # the copy happens somewhere inside a run, so the time since the last
+            # copy is at most now minus that run's start
+            "worst_case_days_since_last_copy": _days(since_copy),
+            "max_observed_gap_days_since_freeze": _days(observed),
+            "max_worst_case_gap_days_since_freeze": _days(worst),
+            "recorded_stats_retention_days": sorted({r[2] for r in since_freeze}),
+            "recorded_cleanup_period_days": sorted({r[3] for r in since_freeze}),
+        },
+        "notes": notes,
+    }
+
+
 def _hex_set(blob: bytes | None) -> frozenset[str]:
     return frozenset(unpack_grams(blob)) if blob else frozenset()
 
@@ -1137,6 +1282,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument(
         "--freeze", action="store_true", help="end the burn-in; write the trial record"
     )
+    mode.add_argument(
+        "--status", action="store_true", help="progress toward the frozen target (read-only)"
+    )
     mode.add_argument("--purge", action="store_true", help="delete the trial DB (needs --yes)")
     parser.add_argument("--yes", action="store_true", help="confirm --purge")
     parser.add_argument("--holdout-rate", type=float, help="planned holdout_rate (--freeze)")
@@ -1155,6 +1303,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{verb}: {target}")
             if not targets:
                 print("nothing to delete")
+            return 0
+        if args.status:
+            print(json.dumps(status(args.trial_db, args.feedback_db), sort_keys=True))
             return 0
         if args.freeze:
             if args.holdout_rate is None or args.target is None:
