@@ -477,8 +477,9 @@ def read_compression_summary(
     ``with_hook_status`` adds a ``hook_status`` key: the retained
     ``source='hook'`` rows grouped by ``(server, status)`` — see
     :func:`_read_hook_status` — read in the same snapshot as the totals, so
-    the two describe the same rows. Only with ``source='hook'``; any other
-    ``source``, an unavailable summary or a failed read leaves it ``None``.
+    the two describe the same rows. Under ``source=None`` they are the hook
+    share of the totals. ``source='mcp'``, an unavailable summary or a failed
+    read leaves it ``None``.
     """
     return _read_compression(
         db_path, tool=tool, source=source, all_time=False, with_hook_status=with_hook_status
@@ -567,15 +568,20 @@ def _read_hook_status(
     any value outside the set — folded in SQL, before anything is decoded, so
     no caller renders a stored value verbatim and an undecodable one cannot
     fail the read. Sizes pass through the same ``_finite`` guard and
-    ``SUM``→``TOTAL`` fallback as the totals they sit beside. Called only for a
-    DB that has ``source``.
+    ``SUM``→``TOTAL`` fallback as the totals they sit beside. A DB that
+    predates ``source`` has no hook rows.
     """
+    if "source" not in cols:
+        return []
     if "hook_compression_status" in cols:
         # The names are fixed identifiers, so interpolating them is safe.
         known = ", ".join(f"'{name}'" for name in sorted(HOOK_COMPRESSION_STATUSES))
         status = (
             "CASE WHEN hook_compression_status IS NULL THEN NULL "
-            f"WHEN hook_compression_status IN ({known}) THEN hook_compression_status "
+            # BINARY: an outside table may declare the column NOCASE, which
+            # would let ``COMPRESSED`` through and print its own spelling.
+            f"WHEN hook_compression_status COLLATE BINARY IN ({known}) "
+            "THEN hook_compression_status "
             "ELSE 'other' END"
         )
     else:
@@ -650,9 +656,10 @@ def _read_compression(
         summary["rollup"] = rollup
     if with_hook_status:
         summary["hook_status"] = None
-    # Hook rows only: beside any other source's totals the counts would
-    # describe different rows, so another ``source`` keeps ``None``.
-    want_status = with_hook_status and source == "hook"
+    # The hook rows among these totals: all of them under ``source='hook'``,
+    # the hook share under no filter. Under ``'mcp'`` there are none, so the
+    # value stays ``None`` rather than describing rows the totals exclude.
+    want_status = with_hook_status and source in (None, "hook")
     if not resolved.exists():
         return summary
 

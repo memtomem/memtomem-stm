@@ -2713,19 +2713,22 @@ def _hook_host_lines(
     indent: str,
     hook_status: dict[str, Any] | None = None,
     all_time: bool = False,
+    lone_status: dict[str, Any] | None = None,
 ) -> list[str]:
     """One line per host, or none when a split would add nothing.
 
     Nothing to split: a single host that can replace output (its ratio is the
     hook ratio already) or only rows with no recorded host. Each host that can
     replace output also gets its ``status:`` line (under the hook line itself
-    when the host lines are left out); for a host that cannot, the "measured
-    only" note already says why nothing was compressed.
+    when the host lines are left out — then from ``lone_status`` when given,
+    the read behind the line it hangs under); for a host that cannot, the
+    "measured only" note already says why nothing was compressed.
     """
     if not hosts:
         return []
     if len(hosts) == 1 and hosts[0]["can_replace_output"] is not False:
-        return _hook_status_line(hook_status, hosts[0]["host"], indent, all_time)
+        lone = lone_status if lone_status is not None else hook_status
+        return _hook_status_line(lone, hosts[0]["host"], indent, all_time)
     lines = []
     for entry in hosts:
         name = _disp(entry["host"]) if entry["host"] else "(host not recorded)"
@@ -2745,7 +2748,11 @@ def _render_compression_block(
     max_history: int | None = None,
     hook_by_host: list[dict[str, Any]] | None = None,
     hook_status: dict[str, Any] | None = None,
+    total_hook_status: dict[str, Any] | None = None,
 ) -> None:
+    """``hook_status`` is read with the hook summary, ``total_hook_status`` with
+    ``summary``: a line printed under a figure has to come from that figure's
+    snapshot, or a write between the reads shows more statuses than calls."""
     raw_rollup = summary.get("rollup")
     rollup: dict[str, Any] | None = raw_rollup if isinstance(raw_rollup, dict) else None
     click.echo(_hdr("Proxy / Compression" if rollup is None else "Proxy / Compression (all time)"))
@@ -2804,7 +2811,9 @@ def _render_compression_block(
     else:
         # No per-source lines (``--source hook``, or the hook is the only
         # source with rows), so the hosts hang off the total.
-        for host_line in _hook_host_lines(hook_by_host, "    ", hook_status, rollup is not None):
+        for host_line in _hook_host_lines(
+            hook_by_host, "    ", hook_status, rollup is not None, lone_status=total_hook_status
+        ):
             click.echo(host_line)
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
     if rollup is not None:
@@ -3086,7 +3095,9 @@ def stats(
         proxy_cfg.metrics.db_path,
         tool=tool_filter,
         source=source_filter,
-        with_hook_status=source_filter == "hook",
+        # Also unfiltered: a lone host's status line hangs under this total,
+        # so it has to come from the same snapshot.
+        with_hook_status=source_filter in (None, "hook"),
     )
     # ``--source`` scopes the compression rows only; unset, report each source
     # beside the aggregate so one high-volume source cannot hide another's ratio.
@@ -3117,6 +3128,8 @@ def stats(
     hook_by_host = _hook_by_host(hook_summary)
     status_rows: Any = hook_summary.pop("hook_status", None) if hook_summary else None
     hook_status = _hook_status(status_rows)
+    total_rows: Any = compression.pop("hook_status", None)
+    total_hook_status = hook_status if compression is hook_summary else _hook_status(total_rows)
     progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
@@ -3171,6 +3184,7 @@ def stats(
         max_history=proxy_cfg.metrics.max_history,
         hook_by_host=hook_by_host,
         hook_status=hook_status,
+        total_hook_status=total_hook_status,
     )
     click.echo("")
     _render_progressive_block(

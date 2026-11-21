@@ -900,6 +900,34 @@ class TestStatsHookStatus:
         assert [entry["host"] for entry in by_host] == ["claude", "codex", "kimi"]
         assert [item["status"] for item in by_host[0]["statuses"]] == ["compressed", None]
 
+    def test_a_lone_host_status_shares_the_snapshot_of_the_total_above_it(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """A row committed after the total was read must not appear in the
+        status line printed under that total (hook-only DB, one host)."""
+        from memtomem_stm.proxy import metrics_store
+
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
+        real = metrics_store.read_compression_summary
+        reads = []
+
+        def _write_after_first_read(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not reads:
+                _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
+            reads.append(kwargs.get("source"))
+            return result
+
+        monkeypatch.setattr(metrics_store, "read_compression_summary", _write_after_first_read)
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        assert reads[0] is None  # the aggregate was read first, then the row landed
+        assert "  calls: 1  (errors: 0)" in lines
+        assert "    status: compressed 1" in lines
+
     def test_host_ties_do_not_depend_on_the_row_order(self):
         # SQLite happens to return groups sorted; the order must not rely on it.
         from memtomem_stm.cli.proxy import _hook_status

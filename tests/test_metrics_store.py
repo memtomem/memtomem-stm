@@ -2247,15 +2247,44 @@ class TestReadHookStatus:
             ("builtin:claude", "compressed"): (1, 100),
         }
 
-    @pytest.mark.parametrize("source", [None, "mcp"])
-    def test_only_a_hook_summary_carries_statuses(self, tmp_path, source):
-        """Hook statuses beside MCP or mixed totals would describe other rows."""
+    def test_an_mcp_summary_carries_no_statuses(self, tmp_path):
+        """Hook statuses beside MCP totals would describe rows they exclude."""
         db_path = tmp_path / "m.db"
         self._seed(db_path)
-        summary = read_compression_summary(db_path, source=source, with_hook_status=True)
-        assert summary["available"] is True
-        assert summary["total_calls"] > 0
+        summary = read_compression_summary(db_path, source="mcp", with_hook_status=True)
+        assert (summary["available"], summary["total_calls"]) == (True, 1)
         assert summary["hook_status"] is None
+
+    def test_an_unfiltered_summary_carries_its_hook_share(self, tmp_path):
+        db_path = tmp_path / "m.db"
+        self._seed(db_path)
+        unfiltered = read_compression_summary(db_path, with_hook_status=True)
+        hook = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert unfiltered["total_calls"] == hook["total_calls"] + 1  # plus the MCP row
+        assert _statuses(unfiltered) == _statuses(hook)
+
+    def test_a_nocase_column_cannot_pass_another_spelling(self, tmp_path):
+        """An outside table may declare the column NOCASE; the allowlist must
+        still compare bytes, or ``COMPRESSED`` prints as itself."""
+        db_path = tmp_path / "m.db"
+        db = sqlite3.connect(str(db_path))
+        try:
+            db.execute(
+                "CREATE TABLE proxy_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "server TEXT, tool TEXT, original_chars INTEGER, compressed_chars INTEGER, "
+                "cleaned_chars INTEGER DEFAULT 0, created_at REAL, source TEXT, "
+                f"{_STATUS_COL} TEXT COLLATE NOCASE)"
+            )
+            db.commit()
+        finally:
+            db.close()
+        _raw_insert(db_path, **{_STATUS_COL: "COMPRESSED"})
+        _raw_insert(db_path, **{_STATUS_COL: "compressed"})
+        summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
+        assert _statuses(summary) == {
+            ("builtin:claude", "compressed"): (1, 100),
+            ("builtin:claude", "other"): (1, 100),
+        }
 
     def test_an_undecodable_status_counts_as_other_without_losing_the_totals(self, tmp_path):
         db_path = tmp_path / "m.db"
@@ -2310,11 +2339,11 @@ class TestReadHookStatus:
         summary = read_compression_summary(db_path, source="hook", with_hook_status=True)
         assert summary["available"] is True
         assert summary["hook_status"] == []
-        # Unfiltered, the totals are not hook rows, so no status rides along —
-        # and asking for one must not take those totals down.
+        # Unfiltered, nothing returns early: the status read itself must not ask
+        # for a column the DB lacks, or the totals beside it go down too.
         unfiltered = read_compression_summary(db_path, with_hook_status=True)
         assert unfiltered["available"] is True, unfiltered["error"]
-        assert (unfiltered["total_calls"], unfiltered["hook_status"]) == (1, None)
+        assert (unfiltered["total_calls"], unfiltered["hook_status"]) == (1, [])
 
     def test_pre_status_db_reads_as_not_recorded_without_writing(self, tmp_path, monkeypatch):
         db_path = tmp_path / "m.db"
