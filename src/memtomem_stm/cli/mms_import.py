@@ -68,8 +68,9 @@ from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.mms import drift, state
 from memtomem_stm.mms.import_hosts import (
     ALL_HOSTS,
+    SOURCE_GAP_REASONS,
     ImportCandidate,
-    discover,
+    discover_with_gaps,
     project_local_gate_message,
 )
 from memtomem_stm.mms.secrets import redact_for_plan
@@ -256,7 +257,15 @@ def import_command(
     from memtomem_stm.cli.host_bypass import report_host_bypass
 
     report_host_bypass(cwd, from_host.lower())
-    candidates = discover(from_host, cwd)
+    candidates, gaps = discover_with_gaps(from_host, cwd)
+    # A source in ``gaps`` was skipped, not found empty: STM cannot tell which
+    # file the host reads (#1271, #1404) or could not read it. Name each one
+    # before the UTF-8 refusals and the result, so an empty result is not
+    # mistaken for a missing config (#1407). Labels are package literals and
+    # reasons fixed strings — no value from the environment or the file
+    # reaches the text.
+    for label, reason in gaps.items():
+        click.echo(f"Note: {_disp(label)} not inspected: {SOURCE_GAP_REASONS[reason]}.", err=True)
 
     # Drop entries that cannot survive being stored, BEFORE anything hashes or
     # renders them. A host config is plain `json.loads` with no character
@@ -286,9 +295,17 @@ def import_command(
         )
 
     if not candidates:
-        click.echo(
-            f"No MCP definitions found from --from={from_host}. Is the host config in place?"
-        )
+        if gaps:
+            # Self-contained: stdout may be read without the notes above.
+            n = len(gaps)
+            noun = "source was" if n == 1 else "sources were"
+            click.echo(
+                f"No MCP definitions found from --from={from_host}; {n} {noun} not inspected."
+            )
+        else:
+            click.echo(
+                f"No MCP definitions found from --from={from_host}. Is the host config in place?"
+            )
         return
 
     registry = state.load_registry()

@@ -15,6 +15,7 @@ from click.testing import CliRunner
 from memtomem_stm.cli.mms_import import import_command
 from memtomem_stm.mms import drift, state
 from memtomem_stm.mms.drift import compute_drift_hash
+from memtomem_stm.mms.import_hosts import SOURCE_GAP_REASONS
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
 from helpers import claude_key, set_home
 
@@ -934,3 +935,217 @@ class TestUnencodableEntryGate:
         assert res.exit_code == 0, res.output
         assert "not valid UTF-8" not in res.output
         assert set(state.load_registry().servers) == {"a", "b"}
+
+
+# ---------------------------------------------------------------------------
+# Sources the scan skipped (#1407)
+# ---------------------------------------------------------------------------
+
+_CC_USER = "Claude Code (user)"
+_CC_PROJECT = "Claude Code (project)"
+_MCP_JSON = ".mcp.json (project)"
+_CODEX_USER = "Codex CLI"
+_CODEX_PROJECT = "Codex CLI (project)"
+_NOT_FOUND_HINT = "Is the host config in place?"
+_OAUTH_SENTINEL = "https://oauth-sentinel-1407.invalid/authorize"
+
+
+def _note(label: str, reason: str) -> str:
+    return f"Note: {label} not inspected: {SOURCE_GAP_REASONS[reason]}."
+
+
+def _gap_notes(text: str) -> list[str]:
+    return [line for line in text.splitlines() if " not inspected: " in line]
+
+
+def _empty_line(text: str) -> str:
+    [line] = [line for line in text.splitlines() if line.startswith("No MCP definitions found")]
+    return line
+
+
+def _gap_custom_oauth(sandbox, monkeypatch):
+    _seed_claude_code(sandbox, {"stale": {"command": "npx"}})
+    monkeypatch.setenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", _OAUTH_SENTINEL)
+    return [(_CC_USER, "custom_oauth"), (_CC_PROJECT, "custom_oauth")]
+
+
+def _gap_home(sandbox, monkeypatch):
+    monkeypatch.setenv("HOME", "rel")
+    monkeypatch.setenv("USERPROFILE", "rel")
+    return [(_CC_USER, "home"), (_CC_PROJECT, "home")]
+
+
+def _gap_config_dir(sandbox, monkeypatch):
+    _seed_claude_code(sandbox, {"stale": {"command": "npx"}})
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative")
+    return [(_CC_USER, "config_dir"), (_CC_PROJECT, "config_dir")]
+
+
+def _gap_legacy_config(sandbox, monkeypatch):
+    _seed_claude_code(sandbox, {"stale": {"command": "npx"}})
+    (sandbox["home"] / ".claude").mkdir()
+    (sandbox["home"] / ".claude" / ".config.json").write_text("{}", encoding="utf-8")
+    return [(_CC_USER, "legacy_config"), (_CC_PROJECT, "legacy_config")]
+
+
+def _gap_unreadable(sandbox, monkeypatch):
+    (sandbox["home"] / ".claude.json").write_text("{not json", encoding="utf-8")
+    return [(_CC_USER, "unreadable"), (_CC_PROJECT, "unreadable")]
+
+
+def _gap_no_key(sandbox, monkeypatch):
+    # A linked worktree's ``.git`` is a file. The config has no ``projects``
+    # key at all: any non-empty config object is enough for the note.
+    (sandbox["cwd"] / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+    _seed_claude_code(sandbox, {})
+    return [(_CC_PROJECT, "no_key")]
+
+
+def _gap_mcp_json_unreadable(sandbox, monkeypatch):
+    (sandbox["cwd"] / ".mcp.json").write_text("{not json", encoding="utf-8")
+    return [(_MCP_JSON, "mcp_json_unreadable")]
+
+
+def _gap_codex_home(sandbox, monkeypatch):
+    (sandbox["home"] / ".codex").mkdir()
+    (sandbox["home"] / ".codex" / "config.toml").write_text(
+        '[mcp_servers.from_home]\ncommand = "npx"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", "rel")
+    return [(_CODEX_USER, "codex_home"), (_CODEX_PROJECT, "codex_home")]
+
+
+_GAP_CASES = {
+    "custom_oauth": ("claude-code", _gap_custom_oauth),
+    "home": ("claude-code", _gap_home),
+    "config_dir": ("claude-code", _gap_config_dir),
+    "legacy_config": ("claude-code", _gap_legacy_config),
+    "unreadable": ("claude-code", _gap_unreadable),
+    "no_key": ("claude-code", _gap_no_key),
+    "mcp_json_unreadable": ("claude-code", _gap_mcp_json_unreadable),
+    "codex_home": ("codex", _gap_codex_home),
+}
+
+
+class TestSkippedSources:
+    """A source the scanner chose not to read is named, with the reason, instead
+    of being reported as a missing host config (#1407)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_host_probe(self, monkeypatch):
+        # The autouse isolation clears this, so a real ``claude`` or ``codex``
+        # on PATH would add its own stderr lines (and could write files).
+        monkeypatch.setenv("MMS_NO_HOST_PROBE", "1")
+
+    def test_every_gap_reason_has_a_case(self):
+        assert set(_GAP_CASES) == set(SOURCE_GAP_REASONS)
+
+    @pytest.mark.parametrize("reason", sorted(_GAP_CASES))
+    def test_each_skipped_source_is_named_on_stderr(self, runner, sandbox, monkeypatch, reason):
+        from_host, setup = _GAP_CASES[reason]
+        expected = [_note(label, code) for label, code in setup(sandbox, monkeypatch)]
+
+        res = runner.invoke(import_command, ["--from", from_host, "--plan"])
+
+        assert res.exit_code == 0, res.output
+        assert _gap_notes(res.stderr) == expected
+        assert _gap_notes(res.stdout) == []
+        n = len(expected)
+        noun = "source was" if n == 1 else "sources were"
+        assert _empty_line(res.stdout) == (
+            f"No MCP definitions found from --from={from_host}; {n} {noun} not inspected."
+        )
+        assert _NOT_FOUND_HINT not in res.output
+        result_at = res.output.index("No MCP definitions found")
+        assert all(res.output.index(note) < result_at for note in expected)
+        assert _OAUTH_SENTINEL not in res.output
+
+    @pytest.mark.parametrize("seed", ["empty_object", "missing"])
+    def test_a_readable_or_missing_config_keeps_the_original_hint(self, runner, sandbox, seed):
+        if seed == "empty_object":
+            _seed_claude_code(sandbox, {})
+
+        res = runner.invoke(import_command, ["--from", "claude-code"])
+
+        assert res.exit_code == 0, res.output
+        assert _gap_notes(res.output) == []
+        assert _empty_line(res.stdout) == (
+            f"No MCP definitions found from --from=claude-code. {_NOT_FOUND_HINT}"
+        )
+
+    def test_an_empty_config_object_gives_no_project_note(self, runner, sandbox):
+        # Same linked-worktree cwd as the ``no_key`` case: with nothing in the
+        # config there is no entry to miss, so the project source is not named.
+        (sandbox["cwd"] / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        (sandbox["home"] / ".claude.json").write_text("{}", encoding="utf-8")
+
+        res = runner.invoke(import_command, ["--from", "claude-code"])
+
+        assert res.exit_code == 0, res.output
+        assert _gap_notes(res.output) == []
+        assert _empty_line(res.stdout) == (
+            f"No MCP definitions found from --from=claude-code. {_NOT_FOUND_HINT}"
+        )
+
+    def test_default_from_all_lists_every_host_in_scan_order(self, runner, sandbox, monkeypatch):
+        # Claude Desktop reads %APPDATA% on Windows, which HOME does not cover.
+        monkeypatch.setenv("APPDATA", str(sandbox["home"]))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative")
+        monkeypatch.setenv("CODEX_HOME", "rel")
+
+        res = runner.invoke(import_command, [])
+
+        assert res.exit_code == 0, res.output
+        assert _gap_notes(res.stderr) == [
+            _note(_CC_USER, "config_dir"),
+            _note(_CC_PROJECT, "config_dir"),
+            _note(_CODEX_USER, "codex_home"),
+            _note(_CODEX_PROJECT, "codex_home"),
+        ]
+        assert _empty_line(res.stdout) == (
+            "No MCP definitions found from --from=all; 4 sources were not inspected."
+        )
+
+    def test_apply_with_only_skipped_sources_names_them_and_writes_nothing(
+        self, runner, sandbox, monkeypatch
+    ):
+        _gap_codex_home(sandbox, monkeypatch)
+
+        res = runner.invoke(import_command, ["--from", "codex", "--apply"])
+
+        assert res.exit_code == 0, res.output
+        assert _gap_notes(res.stderr) == [
+            _note(_CODEX_USER, "codex_home"),
+            _note(_CODEX_PROJECT, "codex_home"),
+        ]
+        assert not (sandbox["home"] / ".mms" / "registry.toml").exists()
+
+    def _seed_gap_beside_candidates(self, sandbox):
+        (sandbox["cwd"] / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        _seed_claude_code(sandbox, {"user": {"command": "npx"}, "bad": {"command": "np\ud800x"}})
+
+    def test_a_gap_beside_found_entries_comes_first_and_the_plan_still_renders(
+        self, runner, sandbox
+    ):
+        self._seed_gap_beside_candidates(sandbox)
+
+        res = runner.invoke(import_command, ["--from", "claude-code"])
+
+        assert res.exit_code == 0, res.output
+        note = _note(_CC_PROJECT, "no_key")
+        refusal = "Note: skipping 'bad' from Claude Code (user)"
+        found = "Found 1 MCP definition(s) from --from=claude-code:"
+        assert _gap_notes(res.stderr) == [note]
+        assert refusal in res.stderr
+        assert found in res.stdout
+        assert note not in res.stdout
+        assert res.output.index(note) < res.output.index(refusal) < res.output.index(found)
+
+    def test_a_gap_beside_found_entries_does_not_stop_apply(self, runner, sandbox):
+        self._seed_gap_beside_candidates(sandbox)
+
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert res.exit_code == 0, res.output
+        assert _gap_notes(res.stderr) == [_note(_CC_PROJECT, "no_key")]
+        assert set(state.load_registry().servers) == {"user"}
