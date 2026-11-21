@@ -67,11 +67,12 @@ def exit_after_signal_shutdown() -> None:
     shape this whole change is about.
 
     The status says which of those two things happened. A teardown that ran to
-    the end earned a 0; one cut short — a ``CancelledError`` out of a step whose
-    guard only catches ``Exception`` skips every later close — did not, and
-    reporting success there would be this code asserting something it does not
-    know. ``os._exit`` skips atexit hooks and finalizers either way, so the
-    difference is exactly whether the explicit close sequence completed.
+    the end — its close sequence reached the last step and the leaked-child
+    sweep returned — earned a 0; one cut short — a ``CancelledError`` out of a
+    step whose guard only catches ``Exception`` skips every later close — did
+    not, and reporting success there would be this code asserting something it
+    does not know. ``os._exit`` skips atexit hooks and finalizers either way, so
+    the difference is exactly whether the explicit teardown completed.
     """
     if not _teardown_completed:
         logger.warning(
@@ -160,8 +161,9 @@ class ShutdownSignals:
     def install(self) -> None:
         """Take over SIGTERM/SIGINT. Never raises: a server that cannot install
         a handler still has to serve."""
-        global _signalled
+        global _signalled, _teardown_completed
         _signalled = False  # per-run: a previous run's signal is not ours
+        _teardown_completed = False  # nor is its completed teardown
         # Tasks that predate us belong to whoever is hosting this lifespan, the
         # same way children that predate us do. Cancelling those would be this
         # module reaching outside its own process ownership.

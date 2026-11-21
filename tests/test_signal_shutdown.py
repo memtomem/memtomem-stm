@@ -250,3 +250,18 @@ def test_a_finished_signal_shutdown_takes_the_exit(rec: _Recorder) -> None:
     signal_shutdown.teardown_completed()
     signal_shutdown.exit_after_signal_shutdown()
     assert rec.exits == [0]
+
+
+async def test_a_new_run_does_not_inherit_the_last_runs_completion(rec: _Recorder) -> None:
+    """Completion is process-wide state, so it has to be reset where the
+    signalled flag is: at install, the start of a run. A host that mounts the
+    lifespan twice would otherwise let a run cut short report the success of
+    the run before it (#1459)."""
+    signal_shutdown.teardown_completed()
+    handler = _signals(rec)
+    handler.install()
+    try:
+        signal_shutdown.exit_after_signal_shutdown()
+    finally:
+        handler.remove()
+    assert rec.exits == [1]
