@@ -42,12 +42,14 @@ Design choices (all surfaced to the operator before any write):
 
 * **Idempotent.** :func:`plan_install` recognizes STM's own block by command
   shape (:func:`_is_stm_hook_command`: an ``mms`` / ``memtomem-stm`` executable
-  immediately followed by a ``hook`` token), so re-running updates that block in
-  place rather than appending a duplicate, regardless of whether it was
-  registered global (``memtomem-stm hook …``) or source
-  (``uv run … memtomem-stm hook …``). A handler that only *looks* like STM's
-  hook (``NAME=value mms hook``) is not recognized; it is left alone and named
-  by location (:func:`unmanaged_stm_like`), never silently duplicated (#1453).
+  immediately followed by a ``hook`` token whose arguments run the hook bridge),
+  so re-running updates that block in place rather than appending a duplicate,
+  regardless of whether it was registered global (``memtomem-stm hook …``) or
+  source (``uv run --directory … memtomem-stm hook …``). A handler that only
+  *looks* like STM's hook (``NAME=value mms hook``, ``mms hook uninstall``) is
+  not recognized; it is left alone and named by location
+  (:func:`unmanaged_stm_like`), never silently rewritten or deleted (#1453,
+  #1460).
 * **Symmetric uninstall.** :func:`plan_uninstall` removes the blocks
   :func:`_is_stm_hook_command` recognizes, the shapes :func:`plan_install`
   writes, and names the look-alikes it leaves. Install is equally
@@ -71,6 +73,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import stat
 import tomllib
 from collections.abc import Callable
@@ -138,7 +141,25 @@ def _is_stm_hook_command(command: str) -> bool:
     Adjacency (exe→``hook``) — not "a ``hook`` token anywhere *and* an STM exe
     token anywhere" — is what keeps a compound user command like
     ``echo hook && memtomem-stm status`` from matching: ``status`` is not ``hook``,
-    so install/uninstall leave it alone."""
+    so install/uninstall leave it alone.
+
+    Three more token checks keep out lines that would not run the hook
+    bridge (#1460): the executable word has no ``=`` or control character
+    and its last component as written is not empty or ``.`` (so
+    ``OTHER=/mms hook`` and ``mms/ hook`` do not match); a ``uv`` launcher is
+    exactly ``uv run --directory <dir> <entry point>`` with a non-empty
+    ``<dir>`` that does not start with ``-``; and the words after ``hook``
+    parse with ``mms hook``'s own options into a bridge run, not help, a
+    usage error or a subcommand (``mms hook uninstall``). That parse is the
+    one ``mms doctor`` uses
+    (:func:`memtomem_stm.cli.hook_registration.runs_hook_bridge`); the other
+    checks are this function's own. All of them read ``shlex`` words, an
+    approximation of the shell, not its exact reading: a ``# comment``'s words
+    usually fail the parse, so a commented line usually does not match, but
+    ``--host # --no-daemon`` matches, reading ``#`` as the host value."""
+    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
+    from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE, runs_hook_bridge
+
     tokens = _shell_tokens(command)
     if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
         return False
@@ -154,12 +175,30 @@ def _is_stm_hook_command(command: str) -> bool:
     if len(starts) != 1:
         return False
     i = starts[0]
+    executable = tokens[i]
+
+    def names_a_file(word: str) -> bool:
+        # The last component as written: ``mms/`` and ``mms/.`` name
+        # directories, which ``Path`` would shorten to ``mms``; ``OTHER=/mms``
+        # is an assignment, not a command name. A drive
+        # prefix (Windows ``C:mms``) is part of that component and leaves it a
+        # file name.
+        return not _NOT_EXECUTABLE.search(word) and re.split(r"[\\/]", word)[-1] not in {"", "."}
+
+    if not names_a_file(executable):
+        return False
     prefix = tokens[:i]
     # Pre-runtime-flag installs commonly used POSIX ``env`` to pin timeout
     # values in the host command.  Recognize only a leading env executable
     # followed exclusively by MEMTOMEM_STM_* assignments; an arbitrary env
     # wrapper (or flags such as ``env -i``) is not ours to rewrite/remove.
     if prefix and Path(prefix[0]).name == "env":
+        # The ``env`` word must name a file too: ``/tmp/env/`` is a
+        # directory, and after ``OTHER=/env`` the shell reads the next words
+        # as assignments as well, so the line is a bare assignment prefix
+        # (#1453), not an ``env`` launcher.
+        if not names_a_file(prefix[0]):
+            return False
         j = 1
         while j < len(prefix):
             key, sep, _value = prefix[j].partition("=")
@@ -169,9 +208,18 @@ def _is_stm_hook_command(command: str) -> bool:
         if j == 1:
             return False
         prefix = prefix[j:]
-    if prefix and not (prefix[:2] == ["uv", "run"] and all(token != "--" for token in prefix)):
+    # ``uv run`` resolves a bare entry-point name; with another option, an empty
+    # or option-like directory, or a path target it is not the launcher install
+    # writes (``uv run --help mms hook`` prints uv's help).
+    if prefix and not (
+        len(prefix) == 4
+        and prefix[:3] == ["uv", "run", "--directory"]
+        and prefix[3]
+        and not prefix[3].startswith("-")
+        and executable in _STM_EXECUTABLES
+    ):
         return False
-    return True
+    return runs_hook_bridge(tokens[i + 2 :])
 
 
 def _is_stm_command_handler(handler: Any) -> bool:

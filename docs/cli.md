@@ -1076,8 +1076,21 @@ Options:
 ```
 
 The merge is idempotent: an existing STM block (recognized by command shape,
-so a global or `uv run …` registration with any `--host` is matched) is updated
-in place instead of adding another. Claude Code and Codex also fold any further
+so a global or `uv run --directory <dir> <entry point>` registration with any
+`--host` is matched) is updated in place instead of adding another. Matching is by
+words split with Python's `shlex` (an approximation of the shell, not its
+exact reading), and a command counts only when those words pass three checks:
+the words after `hook` read as a hook run with `mms hook`'s own options, so
+`mms hook uninstall`, `mms hook --help` and a usage error do not count; the
+executable word has no `=` or control character and does not end in `/` or
+`/.` (`OTHER=/mms hook` and `mms/ hook` do not count); and before it only an
+`env` word (held to the same word check) with `MEMTOMEM_STM_*` assignments,
+or exactly `uv run --directory
+<dir>` with a non-empty `<dir>` not starting with `-` and a bare entry-point
+name after it, may appear (`uv run --help mms hook` does not count). A shell
+comment stays in the words: a trailing `# comment` usually makes a command not
+count, but `--host # --no-daemon` counts, reading `#` as the host value.
+Claude Code and Codex also fold any further
 recognized STM handlers into it; Cursor and Kimi update the first one and leave
 the rest as they are. `uninstall` removes every recognized STM handler, prunes
 the emptied containers, and leaves other hooks untouched. A handler that only
