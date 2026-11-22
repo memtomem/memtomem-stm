@@ -49,6 +49,18 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- An unstorable cache miss is now counted only for a call that counted the
+  miss itself (#1474, issue #1473). Whether a call had counted a miss was
+  decided again when it completed, from the tool's cache eligibility at that
+  moment. Eligibility can change while a call is in flight, because tool
+  annotations are refreshed by a reconnect or a `tools/list_changed`
+  notification. A call that skipped the lookup could then still count an
+  unstorable miss, which raised the hit rate over storable lookups in
+  `stm_admin` `proxy_stats` and `mms stats` above the true rate. The reverse
+  flip also dropped the unstorable outcome of a call that had counted its
+  miss, when the store was refused before eligibility is checked (a mixed,
+  non-text, empty or block-metadata response, for example). Both now follow
+  the lookup.
 - A server shutdown started by SIGTERM, SIGINT or the parent-liveness backstop
   no longer exits 0 when its teardown was cut short. The exit status was
   meant to say whether the close sequence ran to the end, but the completion
