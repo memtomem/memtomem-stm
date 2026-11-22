@@ -1170,9 +1170,14 @@ class TestPersistedCacheCounts:
     an eligible miss, an unstorable response refused by the store and one
     passed through — and nothing for a call that attempted no lookup."""
 
-    async def test_dispatch_persists_attributed_counts(self, build, tmp_path):
+    async def test_dispatch_persists_attributed_counts(self, build, tmp_path, monkeypatch):
         import sqlite3
 
+        from memtomem_stm.proxy import metrics as metrics_module
+
+        # One day for every event: rows are keyed by tool below, so a run
+        # crossing UTC midnight would otherwise split a tool across two rows.
+        monkeypatch.setattr(metrics_module, "_utc_day", lambda: "2026-11-21")
         mgr, _, _ = build(
             tools=[
                 _tool("reader", _ann(read_only=True)),
@@ -1210,3 +1215,96 @@ class TestPersistedCacheCounts:
             "mixed": ("srv", 0, 0, 1, 1),
             "empty": ("srv", 0, 0, 1, 1),
         }
+
+
+@pytest.mark.asyncio
+class TestUnstorableRidesItsCallsMetricsWrite:
+    """#1329: once a call completes, its own metrics write carries both its
+    miss and its unstorable outcome, on each path that counts one — the main
+    pipeline (``_store_cache``), the empty-response passthrough and the
+    metadata bypass. Read after each dispatch, with no flush in between."""
+
+    @staticmethod
+    def _counts(path, tool):
+        import sqlite3
+
+        db = sqlite3.connect(path)
+        try:
+            return db.execute(
+                "SELECT misses, unstorable FROM proxy_cache_daily WHERE tool = ?", (tool,)
+            ).fetchall()
+        finally:
+            db.close()
+
+    async def test_each_path_writes_miss_and_unstorable_together(
+        self, build, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        from mcp import types as mcp_types
+
+        from memtomem_stm.proxy import metrics as metrics_module
+        from memtomem_stm.proxy.metrics import METADATA_BYPASS_STRATEGY
+
+        monkeypatch.setattr(metrics_module, "_utc_day", lambda: "2026-11-21")
+        mgr, _, _ = build(
+            tools=[
+                _tool("mixed", _ann(read_only=True)),
+                _tool("empty", _ann(read_only=True)),
+                _tool("meta", _ann(read_only=True)),
+            ]
+        )
+        session = mgr._connections["srv"].session
+        db_path = tmp_path / "m.db"
+
+        session.call_tool.return_value = _mixed_result()
+        await mgr.call_tool("srv", "mixed", {"q": "a"})
+        assert self._counts(db_path, "mixed") == [(1, 1)]
+
+        session.call_tool.return_value = _empty_result()
+        await mgr.call_tool("srv", "empty", {})
+        assert self._counts(db_path, "empty") == [(1, 1)]
+
+        # Two text blocks, one with block-level metadata: the metadata bypass
+        # (a result-level _meta alone does not take it).
+        session.call_tool.return_value = SimpleNamespace(
+            content=[
+                mcp_types.TextContent(type="text", text="first", _meta={"audience": "a"}),
+                mcp_types.TextContent(type="text", text="second"),
+            ],
+            is_error=False,
+        )
+        await mgr.call_tool("srv", "meta", {"q": "a"})
+        assert self._counts(db_path, "meta") == [(1, 1)]
+        db = sqlite3.connect(db_path)
+        try:
+            strategy = db.execute(
+                "SELECT compression_strategy FROM proxy_metrics WHERE tool = 'meta'"
+            ).fetchall()
+        finally:
+            db.close()
+        assert strategy == [(METADATA_BYPASS_STRATEGY,)]
+
+
+@pytest.mark.asyncio
+class TestCacheWriteFollowsTheMetricsWrite:
+    """The store decision runs before the metrics write (so an unstorable
+    count rides it), but the cache entry itself is written after it, so its
+    TTL starts when the response is complete, not before a slow metrics
+    write (#1329)."""
+
+    async def test_entry_is_written_after_the_metrics_row(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+        seen_at_record: list[object] = []
+        real_record = mgr.tracker.record
+
+        def spy(metrics):
+            seen_at_record.append(_get(mgr, cache, "reader", {"q": "a"}))
+            real_record(metrics)
+
+        mgr.tracker.record = spy
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert seen_at_record == [None]
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None

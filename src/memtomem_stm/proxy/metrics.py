@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time as _time
@@ -39,6 +40,17 @@ LATENCY_WINDOW = 10_000
 CacheBucketKey = tuple[str, str, str]
 CacheDeltas = dict[CacheBucketKey, list[int]]
 MAX_CACHE_BUCKETS = 1024
+
+# How often a running proxy tries to write cache counts that no metrics write
+# has carried yet, so a proxy serving only cache hits still reaches
+# ``mms stats``. A process that exits abruptly loses whatever is still
+# buffered: since the last successful write, which a busy loop or a failing
+# store can push past one interval. The write runs on the event loop like every
+# per-call metrics write, through its own connection with a short lock budget:
+# a DB another process holds locked makes it fail fast and retry on the next
+# tick, instead of stalling every call on the loop for the full busy timeout.
+CACHE_FLUSH_INTERVAL_SECONDS = 30.0
+CACHE_FLUSH_BUSY_TIMEOUT_MS = 50
 
 
 def _utc_day() -> str:
@@ -403,10 +415,14 @@ class TokenTracker:
         self._reconnects = 0
         self._metrics_store = metrics_store
         # Attributed cache counts not yet on disk. They ride the next
-        # ``record``/``record_error`` write, or ``flush_cache_counts`` at
-        # shutdown, so the hit path itself never touches SQLite (#1329).
+        # ``record``/``record_error`` write, the periodic flush, or
+        # ``flush_cache_counts`` at shutdown, so the hit path itself never
+        # touches SQLite (#1329).
         self._cache_deltas: CacheDeltas = {}
         self._cache_cap_warned = False
+        # Set by a failed periodic flush, cleared by any committed batch: one
+        # warning per failure streak, not one every tick.
+        self._periodic_flush_warned = False
         self._by_server = _BoundedCounterDict(
             lambda: {"calls": 0, "original_chars": 0, "compressed_chars": 0},
             max_size=max_tracked_keys,
@@ -514,20 +530,49 @@ class TokenTracker:
             return
         if not committed:
             self._restore_cache_deltas(deltas)
+        elif deltas:
+            self._periodic_flush_warned = False
 
-    def flush_cache_counts(self) -> None:
-        """Write the buffered cache counts on their own, for shutdown.
+    def flush_cache_counts(self, *, periodic: bool = False) -> None:
+        """Write the buffered cache counts on their own.
 
-        A failure is logged and the counts stay buffered; nothing raises."""
+        A failure is logged and the counts stay buffered; nothing raises.
+        ``periodic`` is the timer's (and the early teardown) attempt: it uses
+        the short ``CACHE_FLUSH_BUSY_TIMEOUT_MS`` lock budget and warns once
+        per failure streak. The final shutdown attempt keeps the store's full
+        budget and warns every time."""
         store = self._metrics_store
         if store is None or not self._cache_deltas:
             return
         deltas, self._cache_deltas = self._cache_deltas, {}
         try:
-            store.record_cache_counts(deltas)
+            if periodic:
+                store.record_cache_counts(deltas, busy_timeout_ms=CACHE_FLUSH_BUSY_TIMEOUT_MS)
+            else:
+                store.record_cache_counts(deltas)
         except Exception:
             self._restore_cache_deltas(deltas)
-            logger.warning("Failed to persist cache counts", exc_info=True)
+            if not periodic:
+                logger.warning("Failed to persist cache counts", exc_info=True)
+            elif not self._periodic_flush_warned:
+                self._periodic_flush_warned = True
+                logger.warning(
+                    "Failed to persist cache counts; kept for the next write "
+                    "(further periodic failures are not logged until one succeeds)",
+                    exc_info=True,
+                )
+            return
+        self._periodic_flush_warned = False
+
+    async def run_cache_flush_loop(
+        self, interval_seconds: float = CACHE_FLUSH_INTERVAL_SECONDS
+    ) -> None:
+        """Flush the buffered cache counts every ``interval_seconds`` until
+        cancelled. The write is synchronous on the loop, as ``record()`` is;
+        an empty buffer writes nothing."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            self.flush_cache_counts(periodic=True)
 
     def _restore_cache_deltas(self, deltas: CacheDeltas) -> None:
         for key, counts in deltas.items():

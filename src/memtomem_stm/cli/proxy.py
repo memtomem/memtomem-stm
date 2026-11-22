@@ -2978,7 +2978,8 @@ def _render_cache_block(summary: dict[str, Any], *, collecting: bool) -> None:
             pass
     click.echo(
         f"  Coverage: since {since}, from STM processes that persist cache counts;\n"
-        "    each tries to write them with its next metrics row and at MCP server stop."
+        "    each tries to write them with its next metrics row, every 30 s while some\n"
+        "    are waiting, and at MCP server stop."
     )
 
 
@@ -3282,8 +3283,8 @@ def stats(
     # configurable.
     data_source = (
         "on-disk stores only (metrics DB + surfacing-feedback DB; each proxy tries to "
-        "write its pending cache counts with its next metrics write and during an "
-        "orderly MCP server stop); "
+        "write its pending cache counts with its next metrics write, every 30 s, and "
+        "during an orderly MCP server stop); "
         "live in-memory counters via the stm_admin MCP tool (action proxy_stats)"
     )
 

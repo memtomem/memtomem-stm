@@ -19,13 +19,14 @@ changes inline only. See the deprecation policy in
   counts them per UTC day, server and tool, together with the characters
   served from cache, and writes them into a new never-pruned
   `proxy_cache_daily` table in the metrics DB, best-effort, with its next
-  metrics row and during an orderly MCP server stop; the cache hit path
-  itself does no database write. A new `Proxy / Cache` block (`cache` in `--json`) shows hits, misses,
+  metrics row, every 30 seconds while counts are waiting, and during an
+  orderly MCP server stop; the cache hit path itself does no database write. A new `Proxy / Cache` block (`cache` in `--json`) shows hits, misses,
   unstorable misses, the hit rate over storable lookups (the `stm_admin`
   `proxy_stats` formula; `n/a`/`null` when there are none) and the
   characters served, with the date coverage starts; `--tool` filters it and
-  `--source hook` omits it. Counts not yet written are lost if a process is
-  killed, older STM versions sharing the DB write none, and a miss and its
+  `--source hook` omits it. A killed process loses the counts buffered since
+  its last successful write, older STM versions sharing the DB write none,
+  and a miss and its
   unstorable outcome can land on adjacent UTC days. **Behavior change**:
   `mms stats` gains the block and the `cache` key; the metrics DB gains one
   table, so this version's first open rebuilds the schema stamp (and does

@@ -15,6 +15,7 @@ plus once at shutdown, so the hit path itself never touches SQLite. Pinned here:
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import time
 from pathlib import Path
@@ -717,41 +718,288 @@ class TestShutdownFlush:
     async def test_lifespan_exit_writes_the_buffered_counts(self, tmp_path: Path) -> None:
         """Counts buffered after the last recorded call reach disk when the
         server stops, before the store closes."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from memtomem_stm.server import app_lifespan, mcp
+        from unittest.mock import AsyncMock, MagicMock
 
         db_path = tmp_path / "m.db"
         manager = MagicMock()
         manager.start = AsyncMock()
         manager.stop = AsyncMock()
         manager.get_proxy_tools.return_value = []
-        with (
-            patch("memtomem_stm.server.STMConfig") as config_cls,
-            patch("memtomem_stm.server.ProxyManager", return_value=manager),
-        ):
-            cfg = config_cls.return_value
-            cfg.proxy = MagicMock()
-            cfg.proxy.enabled = True
-            cfg.proxy.config_path = tmp_path / "proxy.json"
-            cfg.proxy.metrics.enabled = True
-            cfg.proxy.metrics.db_path = db_path
-            cfg.proxy.metrics.max_history = 1000
-            cfg.proxy.compression_feedback.enabled = False
-            cfg.proxy.progressive_reads.enabled = False
-            cfg.proxy.selection_telemetry.enabled = False
-            cfg.proxy.cache.enabled = False
-            cfg.surfacing = MagicMock()
-            cfg.surfacing.enabled = False
-            cfg.langfuse = MagicMock()
-            cfg.langfuse.enabled = False
-            cfg.otlp = MagicMock()
-            cfg.otlp.enabled = False
-            cfg.parent_liveness_poll_seconds = 0.0
-            cfg.parent_liveness_grace_seconds = 900.0
 
-            async with app_lifespan(mcp) as ctx:
-                ctx.tracker.record_cache_hit(chars=5, server="s", tool="t")
-                assert _rows(db_path) == []
+        async def body(ctx: Any) -> None:
+            ctx.tracker.record_cache_hit(chars=5, server="s", tool="t")
+            assert _rows(db_path) == []
 
+        await _run_lifespan(tmp_path, manager, body)
         assert _rows(db_path) == [(_today(), "s", "t", 1, 5, 0, 0)]
+
+    async def test_counts_reach_disk_before_a_cancelled_stop(self, tmp_path: Path) -> None:
+        """The SDK's cancelled scope can cut teardown short at its first
+        await (#1458); the counts buffered by then are already written."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        db_path = tmp_path / "m.db"
+        manager = MagicMock()
+        manager.start = AsyncMock()
+        manager.stop = AsyncMock(side_effect=asyncio.CancelledError())
+        manager.get_proxy_tools.return_value = []
+
+        async def body(ctx: Any) -> None:
+            ctx.tracker.record_cache_hit(chars=5, server="s", tool="t")
+
+        with pytest.raises(asyncio.CancelledError):
+            await _run_lifespan(tmp_path, manager, body)
+        assert _rows(db_path) == [(_today(), "s", "t", 1, 5, 0, 0)]
+
+    async def test_a_locked_db_does_not_delay_the_stop(self, tmp_path: Path) -> None:
+        """The early teardown flush has the short lock budget: with another
+        connection holding the write lock, the manager's stop starts well
+        within the store's 3 s busy timeout, and the final flush writes the
+        counts once the lock is gone."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        db_path = tmp_path / "m.db"
+        holder: list[sqlite3.Connection] = []
+        timing: dict[str, float] = {}
+
+        async def stop() -> None:
+            timing["stop"] = time.monotonic()
+            holder[0].rollback()  # the other writer finishes
+            holder[0].close()
+
+        manager = MagicMock()
+        manager.start = AsyncMock()
+        manager.stop = AsyncMock(side_effect=stop)
+        manager.get_proxy_tools.return_value = []
+
+        async def body(ctx: Any) -> None:
+            ctx.tracker.record_cache_hit(chars=5, server="s", tool="t")
+            other = sqlite3.connect(db_path)
+            other.execute("BEGIN IMMEDIATE")
+            holder.append(other)
+            timing["exit"] = time.monotonic()
+
+        await _run_lifespan(tmp_path, manager, body)
+        assert timing["stop"] - timing["exit"] < 1.0
+        assert _rows(db_path) == [(_today(), "s", "t", 1, 5, 0, 0)]
+
+
+async def _run_lifespan(tmp_path: Path, manager: Any, body: Any) -> None:
+    """Drive ``app_lifespan`` with a real metrics store at ``tmp_path/m.db``
+    and ``manager`` as the proxy manager; ``body(ctx)`` runs inside it."""
+    from unittest.mock import MagicMock, patch
+
+    from memtomem_stm.server import app_lifespan, mcp
+
+    db_path = tmp_path / "m.db"
+    with (
+        patch("memtomem_stm.server.STMConfig") as config_cls,
+        patch("memtomem_stm.server.ProxyManager", return_value=manager),
+    ):
+        cfg = config_cls.return_value
+        cfg.proxy = MagicMock()
+        cfg.proxy.enabled = True
+        cfg.proxy.config_path = tmp_path / "proxy.json"
+        cfg.proxy.metrics.enabled = True
+        cfg.proxy.metrics.db_path = db_path
+        cfg.proxy.metrics.max_history = 1000
+        cfg.proxy.compression_feedback.enabled = False
+        cfg.proxy.progressive_reads.enabled = False
+        cfg.proxy.selection_telemetry.enabled = False
+        cfg.proxy.cache.enabled = False
+        cfg.surfacing = MagicMock()
+        cfg.surfacing.enabled = False
+        cfg.langfuse = MagicMock()
+        cfg.langfuse.enabled = False
+        cfg.otlp = MagicMock()
+        cfg.otlp.enabled = False
+        cfg.parent_liveness_poll_seconds = 0.0
+        cfg.parent_liveness_grace_seconds = 900.0
+
+        async with app_lifespan(mcp) as ctx:
+            await body(ctx)
+
+
+class TestPeriodicFlush:
+    """The timer writes counts no metrics write has carried, so a proxy that
+    only serves cache hits still reaches ``mms stats`` while it runs."""
+
+    async def test_counts_become_visible_to_another_reader_while_running(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "m.db"
+        store = _open(path)
+        tracker = TokenTracker(metrics_store=store)
+        tracker.record_cache_hit(chars=5, server="s", tool="t")
+        task = asyncio.create_task(tracker.run_cache_flush_loop(0.01))
+        try:
+            deadline = time.monotonic() + 5.0
+            while read_cache_summary(path)["hits"] != 1:
+                assert time.monotonic() < deadline, "the periodic flush never wrote"
+                await asyncio.sleep(0.01)
+            assert not task.done()
+            assert tracker._cache_deltas == {}
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            store.close()
+
+    def test_a_locked_db_fails_fast_and_keeps_the_counts(self, tmp_path: Path) -> None:
+        path = tmp_path / "m.db"
+        store = _open(path)
+        assert store._db is not None
+        before = store._db.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert before >= 1000  # the full budget the timer must not inherit
+        tracker = TokenTracker(metrics_store=store)
+        tracker.record_cache_hit(chars=5, server="s", tool="t")
+        other = sqlite3.connect(path)
+        other.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            tracker.flush_cache_counts(periodic=True)
+            assert time.monotonic() - started < 1.0
+            assert tracker._cache_deltas == {(_today(), "s", "t"): [1, 5, 0, 0]}
+            assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == before
+        finally:
+            other.rollback()
+            other.close()
+        tracker.flush_cache_counts(periodic=True)
+        # Not merely "under 1 s": the timer's connection has the short budget.
+        assert store._fast_db is not None
+        assert (
+            store._fast_db.execute("PRAGMA busy_timeout").fetchone()[0]
+            == metrics_module.CACHE_FLUSH_BUSY_TIMEOUT_MS
+        )
+        store.close()
+        assert _rows(path) == [(_today(), "s", "t", 1, 5, 0, 0)]
+
+    def test_periodic_failures_warn_once_per_streak(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = tmp_path / "m.db"
+        store = _open(path)
+        tracker = TokenTracker(metrics_store=store)
+
+        def warnings() -> int:
+            return sum(1 for r in caplog.records if r.levelname == "WARNING")
+
+        with caplog.at_level("WARNING"):
+            tracker.record_cache_hit(chars=1, server="s", tool="t")
+            store.close()
+            tracker.flush_cache_counts(periodic=True)
+            tracker.flush_cache_counts(periodic=True)
+            assert warnings() == 1
+
+            # Recovery through the timer re-arms the warning.
+            store.initialize()
+            tracker.flush_cache_counts(periodic=True)
+            tracker.record_cache_hit(chars=1, server="s", tool="t")
+            store.close()
+            tracker.flush_cache_counts(periodic=True)
+            assert warnings() == 2
+
+            # So does recovery through a per-call metrics write.
+            store.initialize()
+            tracker.record(_call())
+            tracker.record_cache_hit(chars=1, server="s", tool="t")
+            store.close()
+            tracker.flush_cache_counts(periodic=True)
+            assert warnings() == 3
+        assert _rows(path) == [(_today(), "s", "t", 2, 2, 0, 0)]
+
+    async def test_manager_runs_the_timer_between_start_and_stop(self, tmp_path: Path) -> None:
+        from memtomem_stm.proxy.config import ProxyConfig
+        from memtomem_stm.proxy.manager import ProxyManager
+
+        store = _open(tmp_path / "m.db")
+        manager = ProxyManager(
+            ProxyConfig(config_path=tmp_path / "proxy.json"), TokenTracker(metrics_store=store)
+        )
+        await manager.start()
+        task = manager._cache_flush_task
+        assert task is not None and not task.done()
+        await manager.stop()
+        assert manager._cache_flush_task is None
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+        store.close()
+
+    async def test_no_timer_without_a_metrics_store(self, tmp_path: Path) -> None:
+        from memtomem_stm.proxy.config import ProxyConfig
+        from memtomem_stm.proxy.manager import ProxyManager
+
+        manager = ProxyManager(ProxyConfig(config_path=tmp_path / "proxy.json"), TokenTracker())
+        await manager.start()
+        assert manager._cache_flush_task is None
+        await manager.stop()
+
+    async def test_stop_ends_the_timer_before_its_first_await(self, tmp_path: Path) -> None:
+        """A teardown cancelled at ``stop()``'s first await has still ended
+        the timer, so it cannot write into a store that is about to close,
+        and the synchronous shutdown gates are already set."""
+        from memtomem_stm.proxy.config import ProxyConfig
+        from memtomem_stm.proxy.manager import ProxyManager
+
+        store = _open(tmp_path / "m.db")
+        manager = ProxyManager(
+            ProxyConfig(config_path=tmp_path / "proxy.json"), TokenTracker(metrics_store=store)
+        )
+        await manager.start()
+        task = manager._cache_flush_task
+        assert task is not None
+        # A pending background task makes stop() suspend in its drain; run it
+        # only up to that first suspension, where a cancelled teardown stops.
+        background = asyncio.create_task(asyncio.sleep(60))
+        manager._background_tasks.add(background)
+        stopping = manager.stop()
+        stopping.send(None)
+        stopping.close()
+        assert manager._stopped is True
+        assert manager._background_closed is True
+        assert manager._cache_flush_task is None
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        background.cancel()
+        await manager.stop()
+        store.close()
+
+
+class TestFlushConnection:
+    """The periodic flush writes through its own short-budget connection, so
+    the main connection's lock budget is never changed (#1329)."""
+
+    def test_a_failed_periodic_write_leaves_the_main_budget_alone(self, tmp_path: Path) -> None:
+        path = tmp_path / "m.db"
+        store = _open(path)
+        assert store._db is not None
+        before = store._db.execute("PRAGMA busy_timeout").fetchone()[0]
+        other = sqlite3.connect(path)
+        other.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                store.record_cache_counts(
+                    {("2026-11-21", "s", "t"): [1, 0, 0, 0]}, busy_timeout_ms=50
+                )
+        finally:
+            other.rollback()
+            other.close()
+        assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == before
+        assert store._fast_db is None  # dropped after the failure
+        store.record_cache_counts({("2026-11-21", "s", "t"): [1, 0, 0, 0]}, busy_timeout_ms=50)
+        fast = store._fast_db
+        assert fast is not None
+        # Tuned like the main connection, with the short budget actually set.
+        assert fast.execute("PRAGMA busy_timeout").fetchone()[0] == 50
+        assert (
+            fast.execute("PRAGMA synchronous").fetchone()[0]
+            == (store._db.execute("PRAGMA synchronous").fetchone()[0])
+        )
+        # A different budget on reuse is honoured, not the one it opened with.
+        store.record_cache_counts({("2026-11-21", "s", "t"): [0, 0, 0, 0]}, busy_timeout_ms=20)
+        assert store._fast_db is not None
+        assert store._fast_db.execute("PRAGMA busy_timeout").fetchone()[0] == 20
+        store.close()
+        assert store._fast_db is None
+        assert _rows(path) == [("2026-11-21", "s", "t", 1, 0, 0, 0)]

@@ -519,8 +519,8 @@ _STATUS_SEED = (
 # (a hit runs none of the pipeline, #558), so no trigger can roll them up. The
 # live tracker buffers them per ``(UTC day, server, tool)`` and writes them with
 # a direct UPSERT, inside the transaction of the next metrics row it records
-# (``MetricsStore.record(..., cache_deltas=)``) or once at shutdown
-# (``record_cache_counts``). Never pruned. The UPSERT adds to what is there, so
+# (``MetricsStore.record(..., cache_deltas=)``), or on their own
+# (``record_cache_counts``) from the periodic flush and at shutdown. Never pruned. The UPSERT adds to what is there, so
 # several proxy processes sharing the file count correctly; an older binary
 # writes nothing here, which is why the coverage start is recorded.
 #
@@ -713,7 +713,8 @@ def read_cache_summary(db_path: Path, *, tool: str | None = None) -> dict[str, o
     Read-only (``?mode=ro``); never creates or migrates anything. The totals
     are all-time by construction (the table is never pruned) but cover only
     STM processes with #1329, and only what they wrote: counts are buffered
-    until the next recorded call or shutdown. ``installed_at`` is ``None`` when
+    until the next recorded call, the next periodic flush (every
+    ``CACHE_FLUSH_INTERVAL_SECONDS``) or shutdown. ``installed_at`` is ``None`` when
     the coverage start is unknown (marker missing or unparseable), never a
     made-up time. ``storable_hit_rate`` is the live ``stm_proxy_stats``
     formula — ``hits / (hits + max(0, misses - unstorable))`` — or ``None``
@@ -1242,6 +1243,11 @@ class MetricsStore:
         # ``None`` keeps the long-lived-store default (5 s connect + 3000 ms busy).
         self._busy_timeout_ms = busy_timeout_ms
         self._db: sqlite3.Connection | None = None
+        # A second connection with a short lock budget, for the periodic cache
+        # flush (#1329): opened on first use, closed with the store, so the
+        # main connection's budget is never changed and never needs restoring.
+        self._fast_db: sqlite3.Connection | None = None
+        self._fast_db_budget_ms: int | None = None
         # Readers and writers share ``self._lock`` defensively. Current
         # callers are all asyncio single-thread, but the connection uses
         # ``check_same_thread=False`` so any future move to a thread-pool
@@ -1545,9 +1551,37 @@ class MetricsStore:
         return {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
 
     def close(self) -> None:
+        self._close_fast_db()
         if self._db:
             self._db.close()
             self._db = None
+
+    def _fast_connection(self, busy_timeout_ms: int) -> sqlite3.Connection:
+        """The short-budget connection, (re)opened for this budget and tuned
+        like the main one (WAL, ``synchronous=NORMAL``), so a periodic commit
+        costs what a per-call one does."""
+        if self._fast_db is not None and self._fast_db_budget_ms != busy_timeout_ms:
+            self._close_fast_db()
+        if self._fast_db is None:
+            fast = sqlite3.connect(
+                str(self._db_path), check_same_thread=False, timeout=busy_timeout_ms / 1000.0
+            )
+            try:
+                tune_connection(fast, busy_timeout_ms=busy_timeout_ms)
+            except Exception:
+                fast.close()
+                raise
+            self._fast_db, self._fast_db_budget_ms = fast, busy_timeout_ms
+        return self._fast_db
+
+    def _close_fast_db(self) -> None:
+        fast, self._fast_db = self._fast_db, None
+        self._fast_db_budget_ms = None
+        if fast is not None:
+            try:
+                fast.close()
+            except sqlite3.Error:
+                logger.debug("Failed to close the metrics DB flush connection", exc_info=True)
 
     def record(self, metrics: CallMetrics, *, cache_deltas: CacheDeltas | None = None) -> bool:
         """Persist one per-call metrics row, plus any buffered cache counts.
@@ -1692,20 +1726,34 @@ class MetricsStore:
     def _upsert_cache_counts(self, db: sqlite3.Connection, deltas: CacheDeltas) -> None:
         db.executemany(_CACHE_UPSERT, [(*key, *counts) for key, counts in deltas.items()])
 
-    def record_cache_counts(self, deltas: CacheDeltas) -> None:
-        """Write buffered cache counts in their own transaction (shutdown).
+    def record_cache_counts(
+        self, deltas: CacheDeltas, *, busy_timeout_ms: int | None = None
+    ) -> None:
+        """Write buffered cache counts in their own transaction.
 
-        Raises on failure, after rolling back, so the caller keeps them."""
+        Raises on failure, after rolling back, so the caller keeps them.
+        With ``busy_timeout_ms`` (the periodic flush) the write goes through a
+        second connection opened with that lock budget, so a DB another process
+        holds locked fails fast instead of stalling the event loop; that
+        connection is dropped after any failure and reopened on the next use."""
         if not deltas:
             return
         if self._db is None:
             raise sqlite3.ProgrammingError("metrics store is closed")
         with self._lock:
+            if busy_timeout_ms is None:
+                db = self._db
+            else:
+                db = self._fast_connection(int(busy_timeout_ms))
             try:
-                self._upsert_cache_counts(self._db, deltas)
-                self._db.commit()
+                self._upsert_cache_counts(db, deltas)
+                db.commit()
             except Exception:
-                self._db.rollback()
+                try:
+                    db.rollback()
+                finally:
+                    if db is self._fast_db:
+                        self._close_fast_db()
                 raise
 
     def _trim_interval(self) -> int:
