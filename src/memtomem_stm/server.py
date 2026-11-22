@@ -760,11 +760,11 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         # enclosing scopes, but only while the watchdog is armed: nothing outside
         # the loop guarantees the exit otherwise. Without a deliberate shutdown,
         # cancelling an embedded lifespan is its host's call. The shield does
-        # not block a direct ``Task.cancel()``, so the
-        # per-step ceilings still cancel their waits (a step that resists that
-        # still outlives its ceiling, as before); a second signal still exits
-        # from its loop callback while the loop runs; and the watchdog, on its
-        # own thread, is the hard deadline.
+        # not block a direct ``Task.cancel()``, so the per-step ceilings still
+        # cancel their waits (a step that resists that still outlives its
+        # ceiling, as before); a second signal still exits from its loop
+        # callback while the loop runs; and the watchdog, on its own thread, is
+        # the hard deadline.
         close_scope: AbstractContextManager[object] = (
             anyio.CancelScope(shield=True)
             if watchdog_armed and shutdown_was_signalled()

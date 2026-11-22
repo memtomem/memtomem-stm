@@ -112,9 +112,10 @@ changes inline only. See the deprecation policy in
   the immediate-exit path, and the watchdog remains the hard deadline. Not
   shielded: a teardown with the watchdog disabled
   (`teardown_watchdog_seconds = 0`), or one no deliberate shutdown started,
-  such as a host unmounting an embedded lifespan. A deliberate shutdown whose close sequence is still cut short
-  some other way, and whose teardown then reaches its normal exit, exits 1 as
-  before; a second signal still exits with 128 + the signal number.
+  such as a host unmounting an embedded lifespan. A deliberate shutdown whose
+  close sequence is still cut short some other way, and whose teardown then
+  reaches its normal exit, exits 1 as before; a second signal still exits with
+  128 + the signal number.
 - `mms doctor`'s `hook registration` row now says what it can miss. It
   recognizes an STM hook from the command text (in exec form, the command and
   its `args`) by a heuristic, the matching described with the row under
