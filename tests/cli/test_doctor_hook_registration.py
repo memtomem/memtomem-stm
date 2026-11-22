@@ -107,6 +107,54 @@ def test_help_does_not_run_but_keeps_the_host(command: str, host: str) -> None:
     assert _read(command) == hr.HookRegistration(None, runs_bridge=False, host=host)
 
 
+# Click caches a command's help option on the command object, named by the first
+# context that asks for it (#1471). Each case runs in its own interpreter because
+# that state is process-global: within the suite, test order decides who asks first.
+_FRESH_IMPORTS = (
+    "import click\n"
+    "from click.testing import CliRunner\n"
+    "from memtomem_stm.cli.hook_cmd import hook_command\n"
+    "from memtomem_stm.cli.hook_registration import _read_hook_args\n"
+)
+
+
+def _run_fresh(body: str) -> str:
+    result = subprocess.run(
+        [sys.executable, "-P", "-c", _FRESH_IMPORTS + body],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [
+        # How tests/test_docs_sync.py reads the hook help.
+        'CliRunner().invoke(hook_command, ["--help"])',
+        # How the help-text sweep in tests/cli/test_proxy_cli.py walks the tree.
+        "click.Context(hook_command).get_help()",
+    ],
+)
+def test_reading_minus_h_ignores_an_earlier_help_option_cache(seed: str) -> None:
+    out = _run_fresh(
+        f'{seed}\nr = _read_hook_args(["--host", "claude", "-h"])\nprint(r.runs_bridge, r.host)\n'
+    )
+    assert out == "False claude"
+
+
+def test_reading_leaves_the_commands_help_option_alone() -> None:
+    probe = 'print(CliRunner().invoke(hook_command, ["-h"]).exit_code)\n'
+    untouched = _run_fresh(probe)
+    after_reading = _run_fresh(
+        '_read_hook_args(["--host", "claude"])\n'
+        '_read_hook_args(["--host", "claude", "-h"])\n' + probe
+    )
+    assert after_reading == untouched
+
+
 @pytest.mark.parametrize(
     "command",
     [

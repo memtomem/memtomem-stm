@@ -22,6 +22,7 @@ decide which handlers are STM's own, and :func:`is_candidate` (through
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import re
 import shlex
@@ -225,14 +226,23 @@ def _read_hook_args(args: list[str]) -> HookRegistration:
     from memtomem_stm.cli.proxy import CONTEXT_SETTINGS
 
     help_names = CONTEXT_SETTINGS["help_option_names"]
+    # Click (8.1.8+) builds a command's help option once and caches it on the
+    # command, named by whichever context asked first. Parse on a copy with no
+    # cache, so an earlier ``--help``-only context cannot turn ``-h`` into a
+    # usage error here, and this reading does not hand ``-h`` to later callers
+    # of ``hook_command``. Building the option appends to ``params``, so the
+    # copy gets its own list.
+    reader = copy.copy(hook_command)
+    reader.params = list(hook_command.params)
+    reader._help_option = None
     sink = io.StringIO()
     try:
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            strict = hook_command.make_context("hook", list(args), help_option_names=help_names)
+            strict = reader.make_context("hook", list(args), help_option_names=help_names)
     except click.exceptions.Exit:
         # ``--help``/``-h``: parsing finished before the help callback exited,
         # so a resilient parse of the same words reads the host.
-        resilient = hook_command.make_context(
+        resilient = reader.make_context(
             "hook", list(args), resilient_parsing=True, help_option_names=help_names
         )
         return _registration(resilient, runs_bridge=False)
