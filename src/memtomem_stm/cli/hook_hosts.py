@@ -176,11 +176,16 @@ def _is_stm_hook_command(command: str) -> bool:
         return False
     i = starts[0]
     executable = tokens[i]
-    # The last component as written: ``mms/`` and ``mms/.`` name directories,
-    # which ``Path`` would shorten to ``mms``; ``OTHER=/mms`` is an assignment,
-    # after which the shell runs ``hook``. A drive prefix (Windows ``C:mms``)
-    # is part of that component and leaves it a file name.
-    if _NOT_EXECUTABLE.search(executable) or re.split(r"[\\/]", executable)[-1] in {"", "."}:
+
+    def names_a_file(word: str) -> bool:
+        # The last component as written: ``mms/`` and ``mms/.`` name
+        # directories, which ``Path`` would shorten to ``mms``; ``OTHER=/mms``
+        # is an assignment, not a command name. A drive
+        # prefix (Windows ``C:mms``) is part of that component and leaves it a
+        # file name.
+        return not _NOT_EXECUTABLE.search(word) and re.split(r"[\\/]", word)[-1] not in {"", "."}
+
+    if not names_a_file(executable):
         return False
     prefix = tokens[:i]
     # Pre-runtime-flag installs commonly used POSIX ``env`` to pin timeout
@@ -188,6 +193,12 @@ def _is_stm_hook_command(command: str) -> bool:
     # followed exclusively by MEMTOMEM_STM_* assignments; an arbitrary env
     # wrapper (or flags such as ``env -i``) is not ours to rewrite/remove.
     if prefix and Path(prefix[0]).name == "env":
+        # The ``env`` word must name a file too: ``/tmp/env/`` is a
+        # directory, and after ``OTHER=/env`` the shell reads the next words
+        # as assignments as well, so the line is a bare assignment prefix
+        # (#1453), not an ``env`` launcher.
+        if not names_a_file(prefix[0]):
+            return False
         j = 1
         while j < len(prefix):
             key, sep, _value = prefix[j].partition("=")

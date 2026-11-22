@@ -170,8 +170,10 @@ To fix it, add `--host claude` to the hook command where it is registered.
 (`$CLAUDE_CONFIG_DIR/settings.json`, otherwise `~/.claude/settings.json`), but
 not for Claude Code's project or local settings. It replaces the STM hook
 commands it recognizes in that file (`mms hook …` under any entry-point name,
-`uv run … memtomem-stm hook …`, or either behind an `env` that sets only
-`MEMTOMEM_STM_*` variables) with one new command. It carries settings over from
+`uv run --directory <dir> memtomem-stm hook …`, or either behind an `env` that
+sets only `MEMTOMEM_STM_*` variables, and only when the words after `hook` run
+the hook; see [`mms hook install`](../cli.md)) with one new command. It
+carries settings over from
 the first of them only, and of that command's inline `env` assignments it keeps
 only the daemon, timeout and query-text settings, as flags. A command it does
 not recognize, such as `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook` or

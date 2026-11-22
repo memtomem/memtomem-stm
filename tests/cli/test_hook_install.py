@@ -140,6 +140,10 @@ _NOT_THE_BRIDGE = [
     "uv run --directory '' memtomem-stm hook --host claude",
     "OTHER=/mms hook",
     "mms/ hook",
+    # The same word check on the ``env`` launcher: an assignment (which makes
+    # the line a bare assignment prefix) and a directory.
+    "OTHER=/env MEMTOMEM_STM_X=1 mms hook",
+    "/tmp/env/ MEMTOMEM_STM_X=1 mms hook",
 ]
 
 

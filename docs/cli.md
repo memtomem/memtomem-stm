@@ -1084,7 +1084,8 @@ the words after `hook` read as a hook run with `mms hook`'s own options, so
 `mms hook uninstall`, `mms hook --help` and a usage error do not count; the
 executable word has no `=` or control character and does not end in `/` or
 `/.` (`OTHER=/mms hook` and `mms/ hook` do not count); and before it only an
-`env` word with `MEMTOMEM_STM_*` assignments, or exactly `uv run --directory
+`env` word (held to the same word check) with `MEMTOMEM_STM_*` assignments,
+or exactly `uv run --directory
 <dir>` with a non-empty `<dir>` not starting with `-` and a bare entry-point
 name after it, may appear (`uv run --help mms hook` does not count). A shell
 comment stays in the words: a trailing `# comment` usually makes a command not

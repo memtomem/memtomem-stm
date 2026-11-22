@@ -58,7 +58,8 @@ changes inline only. See the deprecation policy in
   calling them memtomem-stm's hook. Three token checks are added: the words
   after `hook` must read as a hook run with `mms hook`'s own options (not a
   subcommand, `--help` or a usage error); the executable word must have no `=`
-  or control character and not end in `/` or `/.`; and a `uv` launcher must be
+  or control character and not end in `/` or `/.`, and so must an `env`
+  word in front of it; and a `uv` launcher must be
   exactly `uv run --directory <dir> <entry point>` with a non-empty `<dir>`
   that does not start with `-` and a bare entry-point name, the form install
   writes. The words are still split with `shlex`, so the checks approximate
