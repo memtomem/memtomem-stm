@@ -281,8 +281,14 @@ runpy.run_module("memtomem_stm.server", run_name="__main__", alter_sys=True)
 def test_a_signalled_teardown_cut_short_exits_with_a_failure_status(tmp_path: Path) -> None:
     """Exit 0 after a signal says the close sequence ran to the end. One cut
     short by an escaping ``CancelledError`` used to exit 0 too, because the
-    completion was recorded in a ``finally`` (#1459). The leaked-child sweep
-    still collects the upstream the skipped stop() would have closed."""
+    completion was recorded in a ``finally`` (#1459).
+
+    The upstream being gone afterwards does not show what ended it: signal
+    cancellation also unwinds its SDK transport, which closes its stdin, so it
+    can exit on that EOF before the leaked-child sweep looks. That the sweep
+    still runs when stop() is cut short, and that it terminates a real child,
+    is pinned by unit tests in ``test_server_tools.py`` and
+    ``test_child_reaper.py``."""
     stderr_path = tmp_path / "stderr.log"
     with stderr_path.open("wb") as stderr_file:
         proc = _start_server(
