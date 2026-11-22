@@ -3046,6 +3046,7 @@ class TestLifespan:
                 # this test, not hang it.
                 done, _ = await asyncio.wait({task}, timeout=10.0)
             assert done == {task}
+            task.result()  # ``asyncio.wait`` does not raise what the task raised
         finally:
             if not task.done():
                 task.cancel()
