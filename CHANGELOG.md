@@ -41,6 +41,24 @@ changes inline only. See the deprecation policy in
   **Behavior change**: such a shutdown now exits 1 and logs the warning. A
   shutdown whose close sequence and leaked-child sweep both finish still
   exits 0, including one where a step failed inside its own error handling.
+- `mms doctor`'s `hook registration` row now says what it can miss. It
+  recognizes an STM hook from the command text (in exec form, the command and
+  its `args`) by a heuristic, the matching described with the row under
+  0.7.10. So some hooks are not counted: a wrapper script whose command names
+  neither an STM executable nor `hook`, and spellings such as
+  `m"m"s hook # note`, `sh -c 'm"m"s hook'` and `python -mmemtomem_stm hook`.
+  (Others are counted, for example `m"m"s hook` and `sh -c "mms hook"`.) A
+  hook that is not counted does not by itself keep the row from PASS; the
+  other handlers decide. The PASS now reads `N recognized, all passing --host
+  claude to mms hook`, and the PASS and WARN details that report on commands
+  end by saying such hooks can be missed (the WARN for a settings file that
+  cannot be used does not). Recognition itself is unchanged: those hooks are
+  still missed, and a command that only mentions both words, such as `mms
+  version hook`, is still counted and reported as not checked (#1462, issue
+  #1457).
+  **Behavior change**: the row's detail text changes, in the text output and
+  in `checks[].detail` of `mms doctor --json`. Its statuses, the conditions
+  for showing it, and doctor's exit code do not.
 
 ## [0.7.10] — 2026-11-21
 

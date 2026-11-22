@@ -11107,7 +11107,15 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
     return checks
 
 
-_HOOK_REGISTRATION_SCOPE = "project, local and managed Claude Code settings are not read"
+# What the row can miss, stated at the end of each detail that reports on
+# commands (the settings-read failure has none to report). Recognition is a
+# search of the command text (``hook_registration.is_candidate``), and what it
+# misses cannot be listed from that text, so the limit is said instead (#1457).
+_HOOK_REGISTRATION_SCOPE = (
+    "STM hooks are recognized from the command text by a heuristic, so one behind a wrapper "
+    "script or spelled with shell syntax can be missed; project, local and managed Claude "
+    "Code settings are not read"
+)
 
 
 def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
@@ -11124,7 +11132,11 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     Not gated on compression being enabled: the hook process's environment
     cannot be established from here, and ``--host claude`` is the right
     registration for Claude Code either way. WARN only, like the other hook
-    checks; no row when the file holds no STM hook command.
+    checks; no row when the file holds no command recognized as STM's hook.
+
+    A PASS covers the recognized commands only. Recognition is a heuristic, and
+    a hook it does not find (a wrapper script, some shell spellings) is not counted,
+    so a detail that reports on commands ends with that limit (#1457).
     """
     from memtomem_stm.cli import hook_hosts
     from memtomem_stm.cli.hook_cmd import host_authorizes_replacement
@@ -11182,7 +11194,8 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
             "hook_registration",
             label,
             "PASS",
-            f"STM hook commands: {len(passing)} pass --host claude to mms hook — {where}",
+            f"STM hook commands: {len(passing)} recognized, all passing --host claude to "
+            f"mms hook — {where}",
         )
         return
     problems = []
