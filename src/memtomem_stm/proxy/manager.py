@@ -1156,6 +1156,9 @@ class ProxyManager:
         # server -> its in-flight refresh task, so stop() can tell a straggler
         # from a stale ``running`` claim (#868).
         self._tools_refresh_tasks: dict[str, asyncio.Task] = {}
+        # Writes buffered cache counts every CACHE_FLUSH_INTERVAL_SECONDS while
+        # the manager runs (#1329); started by ``start()``, ended by ``stop()``.
+        self._cache_flush_task: asyncio.Task[None] | None = None
         # Per-key stampede guard — identical concurrent ``call_tool``
         # invocations serialize on the same lock — the cache-eligible ones
         # that actually MISS. A disabled cache, a non-positive TTL and an
@@ -1409,6 +1412,27 @@ class ProxyManager:
                 self._refresh_toolgraph_bundle(force=True, startup=True, cfg_live=cfg_start)
             else:
                 await self._consult_toolgraph(cfg_start.toolgraph)
+
+        self._start_cache_flush()
+
+    def _start_cache_flush(self) -> None:
+        """Start the periodic cache-count flush, replacing any earlier one.
+
+        Only with a metrics store: without one the tracker buffers nothing."""
+        self._cancel_cache_flush()
+        if self.tracker.metrics_store is not None:
+            self._cache_flush_task = asyncio.create_task(
+                self.tracker.run_cache_flush_loop(), name="cache-count-flush"
+            )
+
+    def _cancel_cache_flush(self) -> asyncio.Task[None] | None:
+        """Request the periodic flush to stop; synchronous, so a teardown
+        cancelled at its first await has still ended the timer. Returns the
+        task for a caller that wants to wait for it."""
+        task, self._cache_flush_task = self._cache_flush_task, None
+        if task is not None and not task.done():
+            task.cancel()
+        return task
 
     def _reject_toolgraph_bundle(
         self, exc: Exception, *, startup: bool, cfg_live: ProxyConfig | None = None
@@ -3182,6 +3206,12 @@ class ProxyManager:
 
     async def stop(self) -> None:
         self._stopped = True
+        # Before the first await: a teardown cut short there must not leave
+        # the timer writing into a store that is about to close. Only
+        # cancelled, never awaited: it is asleep between ticks and ends on
+        # the next loop iteration, and waiting for it would put a new await
+        # (a cancellation point) ahead of the shutdown steps below.
+        self._cancel_cache_flush()
         self._registered_description_infos.clear()
         self._registered_recovery_snapshots.clear()
         # Close the spawn path first: a stage that schedules its replacement
@@ -5686,7 +5716,7 @@ class ProxyManager:
         post-lock double-check so concurrent duplicate requests return
         through the same hit pipeline as a single call would.
         """
-        self.tracker.record_cache_hit(chars=len(cached))
+        self.tracker.record_cache_hit(chars=len(cached), server=server, tool=tool)
         context_query = arguments.get("_context_query") if arguments else None
         with traced("proxy_call_cache_hit", metadata={"server": server, "tool": tool}):
             surfaced = await self._apply_surfacing(
@@ -6132,7 +6162,7 @@ class ProxyManager:
             # above deliberately record NOTHING — no lookup was attempted, and
             # counting a forced-forward writer (or a ``cache: false`` tool) as a
             # miss would skew the hit-rate diagnostics.
-            self.tracker.record_cache_miss()
+            self.tracker.record_cache_miss(server=server, tool=tool)
             return await self._call_tool_inner(
                 server,
                 tool,
@@ -7787,7 +7817,7 @@ class ProxyManager:
             return
         if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
             return
-        self.tracker.record_cache_unstorable()
+        self.tracker.record_cache_unstorable(server=server, tool=tool)
 
     def _store_cache(
         self,
@@ -7806,9 +7836,16 @@ class ProxyManager:
         source_response_chars: int,
         text_block_metadata: dict[str, Any] | None,
         postprocess_retry_required: bool = False,
-    ) -> None:
+    ) -> Callable[[], None] | None:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
         (so memories stay fresh and surfacing re-runs on a hit).
+
+        Split in two (#1329): the decision runs here and counts an unstorable
+        outcome at once, so the call's metrics write, which runs next, carries
+        it with the miss; the cache write or invalidation it decided on is
+        returned, for the caller to run after that metrics write, so the entry's
+        TTL still starts when the response is complete. ``None`` when there is
+        nothing to write.
 
         Successful text responses may include JSON-safe result-level
         ``structuredContent``/``_meta``; cache v6 stores and reconstructs that
@@ -7855,30 +7892,29 @@ class ProxyManager:
         trace-mutated upstream args; otherwise every entry is keyed on a per-request
         hex and is unreachable by any future lookup (hit rate structurally 0%).
         """
-        if self._cache is None:
-            return
+        cache = self._cache
+        if cache is None:
+            return None
         if not connection_identity_matches:
             # A failed hot edit can deliberately serve the previous connection.
             # That response must not become a cache hit for the requested one.
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
-            self._invalidate_disabled_cache(
+            return lambda: self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
-            return
         if postprocess_retry_required:
             # Cache hits bypass INDEX/EXTRACT. Keep failed sync work and
             # not-yet-resolved background work retryable on the next call.
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
-            return
+            return None
         if non_text_content:
             # A non-text / mixed response is never stored because the cache row
             # contract cannot reproduce arbitrary content blocks and ordering.
             # Text-only result envelopes are handled below.
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
-            self._invalidate_disabled_cache(
+            return lambda: self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
-            return
         cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
         if cache_ttl is not None and cache_ttl <= 0:
             # Caching is disabled (resolved ttl<=0): a text response is never
@@ -7888,10 +7924,9 @@ class ProxyManager:
             # reason (cache-ineligible / progressive passthrough / transient key),
             # not only on the path that happens to reach ``set`` (#541; surfaced
             # by the codex review of #550).
-            self._invalidate_disabled_cache(
+            return lambda: self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
-            return
         if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
             logger.debug(
                 "Skipping cache store for %s/%s: tool is not cache-eligible "
@@ -7900,7 +7935,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.credential_store_refused:
-            self.tracker.record_cache_unstorable()
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
             logger.debug(
                 "Skipping cache store for %s/%s: a persistent pending store "
                 "refused this credential-bearing response",
@@ -7908,7 +7943,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.progressive_passthrough_on_error:
-            self.tracker.record_cache_unstorable()
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
             logger.debug(
                 "Skipping cache store for %s/%s: progressive passthrough "
                 "degradation (transient store failure)",
@@ -7916,7 +7951,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.selective_store_error:
-            self.tracker.record_cache_unstorable()
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
             logger.debug(
                 "Skipping cache store for %s/%s: selective/hybrid truncate "
                 "degradation (transient store failure)",
@@ -7928,7 +7963,7 @@ class ProxyManager:
             or comp.progressive_key_issued
             or response_carries_transient_key(comp.compressed)
         ):
-            self.tracker.record_cache_unstorable()
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
             logger.debug(
                 "Skipping cache store for %s/%s: response carries a transient "
                 "retrieval key (progressive/selective TOC)",
@@ -7936,27 +7971,32 @@ class ProxyManager:
                 tool,
             )
         else:
-            try:
-                self._cache.set(
-                    server,
-                    tool,
-                    cache_args,
-                    comp.compressed,
-                    ttl_seconds=cache_ttl,
-                    context_query=context_query,
-                    config_fingerprint=config_fingerprint,
-                    structured_content=structured_content,
-                    meta=result_meta,
-                    source_response_chars=source_response_chars,
-                    text_block_metadata=text_block_metadata,
-                )
-            except Exception:
-                logger.warning(
-                    "Cache store failed for %s/%s — response unaffected",
-                    server,
-                    tool,
-                    exc_info=True,
-                )
+
+            def _write() -> None:
+                try:
+                    cache.set(
+                        server,
+                        tool,
+                        cache_args,
+                        comp.compressed,
+                        ttl_seconds=cache_ttl,
+                        context_query=context_query,
+                        config_fingerprint=config_fingerprint,
+                        structured_content=structured_content,
+                        meta=result_meta,
+                        source_response_chars=source_response_chars,
+                        text_block_metadata=text_block_metadata,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Cache store failed for %s/%s — response unaffected",
+                        server,
+                        tool,
+                        exc_info=True,
+                    )
+
+            return _write
+        return None
 
     async def _call_tool_inner(
         self,
@@ -8272,6 +8312,9 @@ class ProxyManager:
             # on the initial-response basis — ``delivered_chars`` is the text
             # this one response carried, notice included, and nothing is
             # surfaced or read further — so stats count it as classified.
+            # The unstorable count goes first, so this call's metrics write
+            # carries it together with the miss (#1329).
+            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self.tracker.record(
                 CallMetrics(
                     server=server,
@@ -8292,7 +8335,6 @@ class ProxyManager:
                     compression_accounting="initial_response_v1",
                 )
             )
-            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
@@ -8309,6 +8351,13 @@ class ProxyManager:
             # the ``total_invocations = total_calls + cache_hits + total_errors``
             # reconciliation (#558; deliberately supersedes the R8 "empty
             # records nothing" pin).
+            #
+            # Neither shape is ever stored; count the store refusal against the
+            # miss already recorded (#558) — before the metrics write, so that
+            # write carries both (#1329) — and mirror the mixed-branch
+            # invalidation in ``_store_cache`` so a stale prior text row for
+            # this key is dropped while caching is disabled (#541).
+            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self.tracker.record(
                 CallMetrics(
                     server=server,
@@ -8318,11 +8367,6 @@ class ProxyManager:
                     trace_id=trace_id,
                 )
             )
-            # Neither shape is ever stored; count the store refusal against the
-            # miss already recorded (#558) and mirror the mixed-branch
-            # invalidation in ``_store_cache`` so a stale prior text row for
-            # this key is dropped while caching is disabled (#541).
-            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
@@ -8513,6 +8557,44 @@ class ProxyManager:
                 comp.compressed.descriptor["payload"]["key"], wire_bytes, initial=True
             )
 
+        # ── Stage 5: CACHE STORE (pre-surfacing content, keyed on cache_args) ──
+        # Decided before the metrics write below, so an unstorable outcome it
+        # counts rides that write with this call's miss (#1329); the cache
+        # write itself runs after it, so the entry's TTL starts at completion.
+        pending_cache_write = self._store_cache(
+            server=server,
+            tool=tool,
+            cache_args=cache_args,
+            comp=comp,
+            non_text_content=non_text_content,
+            structured_content=structured_content,
+            result_meta=result_meta,
+            cfg_snap=cfg_snap,
+            context_query=context_query,
+            config_fingerprint=config_fp,
+            connection_identity_matches=fetched.connection_identity == cache_identity,
+            source_response_chars=len(cleaned),
+            text_block_metadata=_text_block_metadata(shaped.first_text_content) or None,
+            postprocess_retry_required=(
+                index_ok is False
+                or extract_ok is False
+                or (
+                    tc.auto_index_enabled
+                    and self._index_engine is not None
+                    and len(cleaned) >= cfg_snap.auto_index.min_chars
+                    and cfg_snap.auto_index.background
+                    and index_ok is None
+                )
+                or (
+                    tc.extraction_enabled
+                    and self._index_engine is not None
+                    and len(cleaned) >= cfg_snap.extraction.min_response_chars
+                    and cfg_snap.extraction.background
+                    and extract_ok is None
+                )
+            ),
+        )
+
         # Record metrics (using pre-surfacing compressed size)
         # When the unicode gate evaluated THIS response, report token counts
         # from the same estimator so the recorded decision and the counts
@@ -8563,41 +8645,8 @@ class ProxyManager:
                 surface_error=surface_error,
             )
         )
-
-        # ── Stage 5: CACHE STORE (pre-surfacing content, keyed on cache_args) ──
-        self._store_cache(
-            server=server,
-            tool=tool,
-            cache_args=cache_args,
-            comp=comp,
-            non_text_content=non_text_content,
-            structured_content=structured_content,
-            result_meta=result_meta,
-            cfg_snap=cfg_snap,
-            context_query=context_query,
-            config_fingerprint=config_fp,
-            connection_identity_matches=fetched.connection_identity == cache_identity,
-            source_response_chars=len(cleaned),
-            text_block_metadata=_text_block_metadata(shaped.first_text_content) or None,
-            postprocess_retry_required=(
-                index_ok is False
-                or extract_ok is False
-                or (
-                    tc.auto_index_enabled
-                    and self._index_engine is not None
-                    and len(cleaned) >= cfg_snap.auto_index.min_chars
-                    and cfg_snap.auto_index.background
-                    and index_ok is None
-                )
-                or (
-                    tc.extraction_enabled
-                    and self._index_engine is not None
-                    and len(cleaned) >= cfg_snap.extraction.min_response_chars
-                    and cfg_snap.extraction.background
-                    and extract_ok is None
-                )
-            ),
-        )
+        if pending_cache_write is not None:
+            pending_cache_write()
 
         return prepared_output
 

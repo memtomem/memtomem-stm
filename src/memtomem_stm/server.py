@@ -764,6 +764,14 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             # the window this exists to survive. From here a signal means
             # "stop waiting" and takes the immediate-exit path.
             shutdown_signals.entering_teardown()
+            # Cache counts buffered so far go out before the first await of
+            # teardown, which a cancelled scope can cut short (#1458). The
+            # short lock budget of the periodic flush keeps a locked shared DB
+            # from delaying the stop; the final flush below retries in full.
+            try:
+                tracker.flush_cache_counts(periodic=True)
+            except Exception:
+                logger.warning("Failed to flush cache counts", exc_info=True)
             # Remove exactly what registration took ownership of (#891). Re-deriving
             # the set with ``get_proxy_tools()`` here would remove whatever the
             # session advertises *now*. Re-advertisement (#917) keeps the owned
@@ -816,6 +824,13 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                     await close_store_on_worker(feedback_tracker.close)
                 except Exception:
                     logger.warning("Failed to close feedback_tracker", exc_info=True)
+            # Cache counts buffered since the last recorded call go out before
+            # the store closes (#1329). The manager has stopped, so no call is
+            # still adding to them. One synchronous write; failure is logged.
+            try:
+                tracker.flush_cache_counts()
+            except Exception:
+                logger.warning("Failed to flush cache counts", exc_info=True)
             for resource, name in [
                 (proxy_cache, "proxy_cache"),
                 (metrics_store, "metrics_store"),

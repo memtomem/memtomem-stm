@@ -1164,6 +1164,7 @@ class TestInitializeFastPath:
             "proxy_metrics_hook_status_daily",
             "proxy_metrics_hook_status_rollup_on_delete_v1",
             "proxy_metrics_hook_status_follow_daily_delete_v1",
+            "proxy_cache_daily",
         ]
 
     def test_base_columns_match_the_create_statement(self):

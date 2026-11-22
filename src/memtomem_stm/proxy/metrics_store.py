@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -14,6 +15,7 @@ from memtomem_stm.proxy.metrics import (
     HOOK_COMPRESSION_STATUSES,
     METADATA_BYPASS_STRATEGY,
     STRUCTURED_BYPASS_STRATEGY,
+    CacheDeltas,
     CallMetrics,
 )
 from memtomem_stm.utils.json_out import (
@@ -511,12 +513,49 @@ _STATUS_SEED = (
     "ON CONFLICT (day, server, tool, kind, status) DO NOTHING"
 )
 
+# ── Response-cache counts (#1329) ──────────────────────────────────────────
+#
+# Cache hits, misses and unstorable misses never become ``proxy_metrics`` rows
+# (a hit runs none of the pipeline, #558), so no trigger can roll them up. The
+# live tracker buffers them per ``(UTC day, server, tool)`` and writes them with
+# a direct UPSERT, inside the transaction of the next metrics row it records
+# (``MetricsStore.record(..., cache_deltas=)``), or on their own
+# (``record_cache_counts``) from the periodic flush and at shutdown. Never pruned. The UPSERT adds to what is there, so
+# several proxy processes sharing the file count correctly; an older binary
+# writes nothing here, which is why the coverage start is recorded.
+#
+# ``cache_rollup_installed_at`` in ``metrics_meta`` is written only in the
+# transaction that first creates the table. A table that already exists without
+# it (the marker was erased) keeps an unknown start: writing "now" would claim
+# its rows began later than they did.
+_CACHE_DAILY_TABLE = "proxy_cache_daily"
+_CACHE_INSTALLED_KEY = "cache_rollup_installed_at"
+_CACHE_COUNTERS = ("hits", "hit_chars", "misses", "unstorable")
+
+_CACHE_DAILY_CREATE = (
+    f"CREATE TABLE IF NOT EXISTS {_CACHE_DAILY_TABLE} (\n"
+    "    day TEXT NOT NULL,\n"
+    "    server TEXT NOT NULL,\n"
+    "    tool TEXT NOT NULL,\n"
+    + "".join(f"    {c} INTEGER DEFAULT 0,\n" for c in _CACHE_COUNTERS)
+    + "    PRIMARY KEY (day, server, tool)\n"
+    ") WITHOUT ROWID"
+)
+
+_CACHE_UPSERT = (
+    f"INSERT INTO {_CACHE_DAILY_TABLE} (day, server, tool, {', '.join(_CACHE_COUNTERS)}) "
+    f"VALUES (?, ?, ?, {', '.join('?' for _ in _CACHE_COUNTERS)}) "
+    "ON CONFLICT (day, server, tool) DO UPDATE SET "
+    + ", ".join(f"{c} = COALESCE({c}, 0) + excluded.{c}" for c in _CACHE_COUNTERS)
+)
+
 _ROLLUP_OBJECT_NAMES = (
     _DAILY_TABLE,
     _ROLLUP_TRIGGER,
     _STATUS_DAILY_TABLE,
     _STATUS_ROLLUP_TRIGGER,
     _STATUS_RESET_TRIGGER,
+    _CACHE_DAILY_TABLE,
 )
 
 
@@ -650,6 +689,116 @@ def read_compression_all_time(
     return _read_compression(
         db_path, tool=tool, source=source, all_time=True, with_hook_status=with_hook_status
     )
+
+
+def _cache_cell(value: object) -> int:
+    """What one ``proxy_cache_daily`` cell adds to its counter.
+
+    The writer only adds non-negative int deltas, so a count is a whole number
+    of at least 0: an ``int``, or a ``float`` for a bucket the UPSERT pushed
+    past int64 (SQLite then stores REAL), which ``int()`` converts exactly.
+    Anything else only an outside write can store — ``NULL``, text, a blob,
+    ``±inf``, ``nan``, a fractional or negative number — adds 0.
+    """
+    if isinstance(value, int):
+        return value if value >= 0 else 0
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return 0
+
+
+def read_cache_summary(db_path: Path, *, tool: str | None = None) -> dict[str, object]:
+    """Response-cache counts persisted since ``proxy_cache_daily`` was created.
+
+    Read-only (``?mode=ro``); never creates or migrates anything. The totals
+    are all-time by construction (the table is never pruned) but cover only
+    STM processes with #1329, and only what they wrote: counts are buffered
+    until the next recorded call, the next periodic flush (every
+    ``CACHE_FLUSH_INTERVAL_SECONDS``) or shutdown. ``installed_at`` is ``None`` when
+    the coverage start is unknown (marker missing or unparseable), never a
+    made-up time. ``storable_hit_rate`` is the live ``stm_proxy_stats``
+    formula — ``hits / (hits + max(0, misses - unstorable))`` — or ``None``
+    when that denominator is 0. ``tool`` matches the raw tool name across
+    servers, like the compression reader's filter.
+
+    The stored values are added exactly, as Python ints, each cell by
+    :func:`_cache_cell`. That does not make a total exact when storage already
+    rounded it: a bucket the UPSERT pushed past int64 is kept as REAL (adding 2
+    to ``2**63 - 1`` stores ``2**63``).
+    """
+    resolved = db_path.expanduser().resolve()
+    summary: dict[str, object] = {
+        "path": str(resolved),
+        "available": False,
+        "installed_at": None,
+        "hits": 0,
+        "hit_chars": 0,
+        "misses": 0,
+        "unstorable": 0,
+        "storable_hit_rate": None,
+        "error": None,
+    }
+    if not resolved.exists():
+        return summary
+    try:
+        db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        summary["error"] = exception_summary(exc)
+        return summary
+    try:
+        db.execute("BEGIN")
+        present = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (_CACHE_DAILY_TABLE,),
+        ).fetchone()
+        if present is None:
+            return summary
+        summary["available"] = True
+        has_meta = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metrics_meta'"
+        ).fetchone()
+        if has_meta is not None:
+            # Read as bytes: a value that is not valid UTF-8 would otherwise
+            # fail the fetch and hide counters that are perfectly readable.
+            row = db.execute(
+                "SELECT CAST(value AS BLOB) FROM metrics_meta WHERE key = ?",
+                (_CACHE_INSTALLED_KEY,),
+            ).fetchone()
+            try:
+                installed_at = float(bytes(row[0]).decode("ascii")) if row is not None else None
+            except (TypeError, ValueError):
+                installed_at = None
+            if installed_at is not None and math.isfinite(installed_at):
+                summary["installed_at"] = installed_at
+        if tool is not None and has_lone_surrogate(tool):
+            return summary
+        # Summed here, not by SQL: ``SUM`` raises past int64 and ``TOTAL`` is a
+        # float that rounds past 2**53 or reaches inf, and either choice is made
+        # for every column at once. The CASE only keeps text and blobs (which
+        # may not even decode) from being fetched.
+        cells = ", ".join(
+            f"CASE WHEN typeof({c}) IN ('integer', 'real') THEN {c} ELSE 0 END"
+            for c in _CACHE_COUNTERS
+        )
+        sql = f"SELECT {cells} FROM {_CACHE_DAILY_TABLE}"
+        params: tuple[str, ...] = ()
+        if tool is not None:
+            sql += " WHERE tool = ?"
+            params = (tool,)
+        totals = [0] * len(_CACHE_COUNTERS)
+        for row in db.execute(sql, params):
+            for i, value in enumerate(row):
+                totals[i] += _cache_cell(value)
+        hits, hit_chars, misses, unstorable = totals
+        summary.update(hits=hits, hit_chars=hit_chars, misses=misses, unstorable=unstorable)
+        storable = hits + max(0, misses - unstorable)
+        summary["storable_hit_rate"] = hits / storable if storable else None
+    except sqlite3.Error as exc:
+        summary["available"] = False
+        summary["error"] = exception_summary(exc)
+    finally:
+        db.close()
+    return summary
 
 
 def _rollup_markers(db: sqlite3.Connection) -> tuple[float, int | None] | None:
@@ -1094,6 +1243,11 @@ class MetricsStore:
         # ``None`` keeps the long-lived-store default (5 s connect + 3000 ms busy).
         self._busy_timeout_ms = busy_timeout_ms
         self._db: sqlite3.Connection | None = None
+        # A second connection with a short lock budget, for the periodic cache
+        # flush (#1329): opened on first use, closed with the store, so the
+        # main connection's budget is never changed and never needs restoring.
+        self._fast_db: sqlite3.Connection | None = None
+        self._fast_db_budget_ms: int | None = None
         # Readers and writers share ``self._lock`` defensively. Current
         # callers are all asyncio single-thread, but the connection uses
         # ``check_same_thread=False`` so any future move to a thread-pool
@@ -1235,6 +1389,7 @@ class MetricsStore:
             db.execute(_DAILY_CREATE)
             db.execute(_ROLLUP_TRIGGER_DDL)
             MetricsStore._install_status_rollup(db)
+            MetricsStore._install_cache_rollup(db)
             installed = db.execute(
                 "INSERT INTO metrics_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
                 (_ROLLUP_INSTALLED_KEY, str(time.time())),
@@ -1295,6 +1450,24 @@ class MetricsStore:
             db.execute(_STATUS_SEED)
         db.execute(_STATUS_ROLLUP_TRIGGER_DDL)
         db.execute(_STATUS_RESET_TRIGGER_DDL)
+
+    @staticmethod
+    def _install_cache_rollup(db: sqlite3.Connection) -> None:
+        """Create ``proxy_cache_daily`` (#1329) inside the caller's transaction,
+        and stamp its coverage start only when this transaction creates it."""
+        first = (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (_CACHE_DAILY_TABLE,),
+            ).fetchone()
+            is None
+        )
+        db.execute(_CACHE_DAILY_CREATE)
+        if first:
+            db.execute(
+                "INSERT INTO metrics_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                (_CACHE_INSTALLED_KEY, str(time.time())),
+            )
 
     def _schema_is_current(self, db: sqlite3.Connection) -> bool:
         """Whether this DB already carries the schema ``initialize`` would build.
@@ -1378,12 +1551,49 @@ class MetricsStore:
         return {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
 
     def close(self) -> None:
+        self._close_fast_db()
         if self._db:
             self._db.close()
             self._db = None
 
-    def record(self, metrics: CallMetrics) -> None:
-        """Persist one per-call metrics row.
+    def _fast_connection(self, busy_timeout_ms: int) -> sqlite3.Connection:
+        """The short-budget connection, (re)opened for this budget and tuned
+        like the main one (WAL, ``synchronous=NORMAL``), so a periodic commit
+        costs what a per-call one does."""
+        if self._fast_db is not None and self._fast_db_budget_ms != busy_timeout_ms:
+            self._close_fast_db()
+        if self._fast_db is None:
+            fast = sqlite3.connect(
+                str(self._db_path), check_same_thread=False, timeout=busy_timeout_ms / 1000.0
+            )
+            try:
+                tune_connection(fast, busy_timeout_ms=busy_timeout_ms)
+            except Exception:
+                fast.close()
+                raise
+            self._fast_db, self._fast_db_budget_ms = fast, busy_timeout_ms
+        return self._fast_db
+
+    def _close_fast_db(self) -> None:
+        fast, self._fast_db = self._fast_db, None
+        self._fast_db_budget_ms = None
+        if fast is not None:
+            try:
+                fast.close()
+            except sqlite3.Error:
+                logger.debug("Failed to close the metrics DB flush connection", exc_info=True)
+
+    def record(self, metrics: CallMetrics, *, cache_deltas: CacheDeltas | None = None) -> bool:
+        """Persist one per-call metrics row, plus any buffered cache counts.
+
+        ``cache_deltas`` (from ``TokenTracker``, #1329) are UPSERTed into
+        ``proxy_cache_daily`` in the same transaction, under a savepoint: a
+        failing cache write is normally rolled back alone and does not cost the
+        metrics row. If SQLite itself rolled the whole transaction back, the
+        error propagates: that metrics row is lost (as any failed metrics write
+        is) and ``TokenTracker`` keeps the cache counts for its next write.
+        Returns whether the cache counts were committed (``True`` when there
+        were none), so the caller can keep them for the next write.
 
         Synchronous sqlite write on the asyncio event loop: while it
         runs, every runnable coroutine stalls — other in-flight proxied
@@ -1397,7 +1607,7 @@ class MetricsStore:
         so this store is lock-ready for that move.
         """
         if self._db is None:
-            return
+            return False
         require_utf8_identifier(metrics.server, "server")
         require_utf8_identifier(metrics.tool, "tool")
         require_utf8_identifier(metrics.trace_id, "trace_id")
@@ -1407,65 +1617,73 @@ class MetricsStore:
         require_utf8_identifier(metrics.hook_compression_status, "hook_compression_status")
         now = time.time()
         with self._lock:
-            cursor = self._db.execute(
-                "INSERT INTO proxy_metrics "
-                "(server, tool, original_chars, compressed_chars, cleaned_chars, "
-                "is_error, error_category, error_code, error_message, trace_id, "
-                "compression_strategy, strategy_auto_selected, "
-                "ratio_violation, scorer_fallback, "
-                "index_ok, index_error, chunks_indexed, "
-                "extract_ok, extract_error, "
-                "surfacing_on_progressive_ok, surface_error, source, created_at, "
-                "compression_accounting, delivery_format, wire_bytes, "
-                "hook_compression_status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    metrics.server,
-                    metrics.tool,
-                    metrics.original_chars,
-                    metrics.compressed_chars,
-                    metrics.cleaned_chars,
-                    int(metrics.is_error),
-                    metrics.error_category.value if metrics.error_category else None,
-                    metrics.error_code,
+            # The INSERT is under the rollback guard too: a statement-level
+            # failure (an AFTER INSERT trigger's RAISE(FAIL)) leaves the row
+            # pending in the open transaction, and the next commit, a cache
+            # flush included, would otherwise publish it.
+            try:
+                cursor = self._db.execute(
+                    "INSERT INTO proxy_metrics "
+                    "(server, tool, original_chars, compressed_chars, cleaned_chars, "
+                    "is_error, error_category, error_code, error_message, trace_id, "
+                    "compression_strategy, strategy_auto_selected, "
+                    "ratio_violation, scorer_fallback, "
+                    "index_ok, index_error, chunks_indexed, "
+                    "extract_ok, extract_error, "
+                    "surfacing_on_progressive_ok, surface_error, source, created_at, "
+                    "compression_accounting, delivery_format, wire_bytes, "
+                    "hook_compression_status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        escape_lone_surrogates(metrics.error_message)
-                        if metrics.error_message is not None
-                        else None
+                        metrics.server,
+                        metrics.tool,
+                        metrics.original_chars,
+                        metrics.compressed_chars,
+                        metrics.cleaned_chars,
+                        int(metrics.is_error),
+                        metrics.error_category.value if metrics.error_category else None,
+                        metrics.error_code,
+                        (
+                            escape_lone_surrogates(metrics.error_message)
+                            if metrics.error_message is not None
+                            else None
+                        ),
+                        metrics.trace_id,
+                        metrics.compression_strategy,
+                        _tristate(metrics.strategy_auto_selected),
+                        int(metrics.ratio_violation),
+                        int(metrics.scorer_fallback),
+                        _tristate(metrics.index_ok),
+                        (
+                            escape_lone_surrogates(metrics.index_error)
+                            if metrics.index_error is not None
+                            else None
+                        ),
+                        metrics.chunks_indexed,
+                        _tristate(metrics.extract_ok),
+                        (
+                            escape_lone_surrogates(metrics.extract_error)
+                            if metrics.extract_error is not None
+                            else None
+                        ),
+                        _tristate(metrics.surfacing_on_progressive_ok),
+                        (
+                            escape_lone_surrogates(metrics.surface_error)
+                            if metrics.surface_error is not None
+                            else None
+                        ),
+                        metrics.source,
+                        now,
+                        metrics.compression_accounting,
+                        metrics.delivery_format,
+                        metrics.wire_bytes,
+                        metrics.hook_compression_status,
                     ),
-                    metrics.trace_id,
-                    metrics.compression_strategy,
-                    _tristate(metrics.strategy_auto_selected),
-                    int(metrics.ratio_violation),
-                    int(metrics.scorer_fallback),
-                    _tristate(metrics.index_ok),
-                    (
-                        escape_lone_surrogates(metrics.index_error)
-                        if metrics.index_error is not None
-                        else None
-                    ),
-                    metrics.chunks_indexed,
-                    _tristate(metrics.extract_ok),
-                    (
-                        escape_lone_surrogates(metrics.extract_error)
-                        if metrics.extract_error is not None
-                        else None
-                    ),
-                    _tristate(metrics.surfacing_on_progressive_ok),
-                    (
-                        escape_lone_surrogates(metrics.surface_error)
-                        if metrics.surface_error is not None
-                        else None
-                    ),
-                    metrics.source,
-                    now,
-                    metrics.compression_accounting,
-                    metrics.delivery_format,
-                    metrics.wire_bytes,
-                    metrics.hook_compression_status,
-                ),
-            )
+                )
+            except Exception:
+                self._db.rollback()
+                raise
             # One transaction for the insert and the trim it may trigger. If the
             # DELETE fails, the crossing row goes with it: left committed it
             # would become the next row's predecessor, land in the same bucket
@@ -1473,11 +1691,69 @@ class MetricsStore:
             # indefinitely. Losing one best-effort metrics row is the cheaper
             # side of that trade. Also one commit instead of two.
             try:
+                cache_committed = True
+                if cache_deltas:
+                    cache_committed = self._upsert_cache_counts_guarded(self._db, cache_deltas)
                 if self._should_trim(metrics.source, cursor.lastrowid):
                     self._trim_statement(self._db, metrics.source)
                 self._db.commit()
             except Exception:
                 self._db.rollback()
+                raise
+        return cache_committed
+
+    def _upsert_cache_counts_guarded(self, db: sqlite3.Connection, deltas: CacheDeltas) -> bool:
+        """The cache UPSERTs under a savepoint of the open transaction.
+
+        A failure rolls back to the savepoint (the metrics row stays) and
+        returns ``False`` so the caller keeps the counts."""
+        db.execute("SAVEPOINT cache_counts")
+        try:
+            self._upsert_cache_counts(db, deltas)
+        except Exception:
+            if not db.in_transaction:
+                # SQLite already rolled the whole transaction back (e.g. a
+                # RAISE(ROLLBACK) trigger), savepoint and metrics row with it:
+                # re-raise the real error rather than "no such savepoint".
+                raise
+            db.execute("ROLLBACK TO cache_counts")
+            db.execute("RELEASE cache_counts")
+            logger.warning("Failed to persist cache counts; kept for the next write", exc_info=True)
+            return False
+        db.execute("RELEASE cache_counts")
+        return True
+
+    def _upsert_cache_counts(self, db: sqlite3.Connection, deltas: CacheDeltas) -> None:
+        db.executemany(_CACHE_UPSERT, [(*key, *counts) for key, counts in deltas.items()])
+
+    def record_cache_counts(
+        self, deltas: CacheDeltas, *, busy_timeout_ms: int | None = None
+    ) -> None:
+        """Write buffered cache counts in their own transaction.
+
+        Raises on failure, after rolling back, so the caller keeps them.
+        With ``busy_timeout_ms`` (the periodic flush) the write goes through a
+        second connection opened with that lock budget, so a DB another process
+        holds locked fails fast instead of stalling the event loop; that
+        connection is dropped after any failure and reopened on the next use."""
+        if not deltas:
+            return
+        if self._db is None:
+            raise sqlite3.ProgrammingError("metrics store is closed")
+        with self._lock:
+            if busy_timeout_ms is None:
+                db = self._db
+            else:
+                db = self._fast_connection(int(busy_timeout_ms))
+            try:
+                self._upsert_cache_counts(db, deltas)
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                finally:
+                    if db is self._fast_db:
+                        self._close_fast_db()
                 raise
 
     def _trim_interval(self) -> int:
