@@ -269,8 +269,10 @@ def test_a_signal_right_after_the_handshake_runs_the_close_sequence(tmp_path: Pa
     and the leaked-child sweep had to terminate the upstream (#1468).
 
     A smoke test against the real SDK, with several runs because the window is
-    a matter of timing. The deterministic check is the lifespan unit test with
-    a cancelled host scope."""
+    a matter of timing. Each run must show in its log that the upstream
+    connected, read after the exit, since a probe before the signal would move
+    it out of the window. The deterministic check is the lifespan unit test
+    with a cancelled host scope."""
     for attempt in range(5):
         run_dir = tmp_path / f"run-{attempt}"
         run_dir.mkdir()
@@ -283,6 +285,11 @@ def test_a_signal_right_after_the_handshake_runs_the_close_sequence(tmp_path: Pa
             returncode = proc.wait(timeout=_EXIT_BUDGET_SECONDS)
             log = stderr_path.read_bytes()
             tail = log.decode(errors="replace")[-2000:]
+            # A run whose upstream never connected has no upstream to close, so the
+            # checks below could pass without exercising the upstream close path.
+            assert b"Connected to 'fake' (" in log, (
+                f"attempt {attempt}: upstream never connected\n{tail}"
+            )
             assert returncode == 0, f"attempt {attempt}\n{tail}"
             assert b"did not run to the end" not in log, f"attempt {attempt}\n{tail}"
             assert b"Terminating leaked child" not in log, f"attempt {attempt}\n{tail}"
