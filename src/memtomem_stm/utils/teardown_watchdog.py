@@ -60,8 +60,14 @@ class TeardownWatchdog:
         self._done = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def arm(self) -> None:
+    def arm(self) -> bool:
         """Start the countdown. Idempotent; harmless when already disarmed.
+
+        Returns whether the backstop is in place after the call: a countdown
+        thread was started, now or by an earlier call, and :meth:`disarm` has
+        not been called. False when the watchdog is disabled, when the thread
+        could not be started, or after a disarm. It stays True past the
+        deadline, while the countdown thread is on its way to the hard exit.
 
         Raises nothing an ``Exception`` covers. Arming is the first thing a
         teardown does, and thread exhaustion is exactly the state a wedged
@@ -70,8 +76,10 @@ class TeardownWatchdog:
         thread mid-arm) still propagates: that is the operator asking to stop,
         not a failure to swallow.
         """
-        if self._timeout <= 0 or self._thread is not None:
-            return
+        if self._timeout <= 0:
+            return False
+        if self._thread is not None:
+            return not self._done.is_set()
         try:
             thread = threading.Thread(
                 target=self._wait_and_fire, name="stm-teardown-watchdog", daemon=True
@@ -84,8 +92,9 @@ class TeardownWatchdog:
                     exc_info=True,
                 )
             )
-            return
+            return False
         self._thread = thread
+        return not self._done.is_set()
 
     def disarm(self) -> None:
         """Teardown finished — stand the countdown down."""

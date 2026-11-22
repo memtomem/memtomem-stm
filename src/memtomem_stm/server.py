@@ -10,12 +10,13 @@ import logging
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, cast
 
+import anyio
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata, func_metadata
@@ -749,7 +750,26 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         # process reaches, and the answer there is a shutdown with no backstop,
         # not no shutdown. Idempotent, so a signal that already armed it (see
         # ``ShutdownSignals``) simply keeps its countdown.
-        watchdog.arm()
+        watchdog_armed = watchdog.arm()
+        # The SDK hosts this lifespan inside ``stdio_server``'s task group. When
+        # that group's scope is cancelled during teardown, AnyIO delivers the
+        # cancellation into the close sequence; measured after a SIGINT sent
+        # right after the handshake, it reached ``ProxyManager.stop()`` and
+        # every close after it was skipped (#1468). A deliberate shutdown (a
+        # signal, or the parent-liveness backstop) shields the sequence from
+        # enclosing scopes, but only while the watchdog is armed: nothing outside
+        # the loop guarantees the exit otherwise. Without a deliberate shutdown,
+        # cancelling an embedded lifespan is its host's call. The shield does
+        # not block a direct ``Task.cancel()``, so the per-step ceilings still
+        # cancel their waits (a step that resists that still outlives its
+        # ceiling, as before); a second signal still exits from its loop
+        # callback while the loop runs; and the watchdog, on its own thread, is
+        # the hard deadline.
+        close_scope: AbstractContextManager[object] = (
+            anyio.CancelScope(shield=True)
+            if watchdog_armed and shutdown_was_signalled()
+            else nullcontext()
+        )
         # Set as the body's last statement, so it is true only when the close
         # sequence reached its end. A ``BaseException`` that escapes a step — a
         # ``CancelledError`` passes every ``except Exception`` guard below —
@@ -759,140 +779,143 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         # does not cut the sequence short.
         teardown_ran_to_end = False
         try:
-            # Not a ``remove()``: handing the signals back would put the
-            # default disposition in charge for the whole of teardown, which is
-            # the window this exists to survive. From here a signal means
-            # "stop waiting" and takes the immediate-exit path.
-            shutdown_signals.entering_teardown()
-            # Cache counts buffered so far go out before the first await of
-            # teardown, which a cancelled scope can cut short (#1458). The
-            # short lock budget of the periodic flush keeps a locked shared DB
-            # from delaying the stop; the final flush below retries in full.
-            try:
-                tracker.flush_cache_counts(periodic=True)
-            except Exception:
-                logger.warning("Failed to flush cache counts", exc_info=True)
-            # Remove exactly what registration took ownership of (#891). Re-deriving
-            # the set with ``get_proxy_tools()`` here would remove whatever the
-            # session advertises *now*. Re-advertisement (#917) keeps the owned
-            # set current for the changes it handles, but not for the ones it
-            # cannot — a republished toolgraph bundle moves the verdict with no
-            # catalogue change to announce, and a re-advertisement that failed
-            # or was never wired leaves the set behind — so a fresh derivation
-            # here would still ask for removals of names never registered, and
-            # the pass rewrites the
-            # advertisement snapshot that health and ranking read during shutdown.
-            # It was also the one call in this block outside a guard, so anything it
-            # raised skipped ``stop()`` and every cleanup below.
-            #
-            # Detach the re-advertisement listener first (#917): a catalogue
-            # change racing teardown would otherwise re-register names into a
-            # server being dismantled, after this loop has read the set to
-            # remove. ``stop()`` below also closes the background paths that
-            # announce, but this is the cheap half and it runs first.
-            if proxy_manager is not None:
-                proxy_manager.set_advertisement_listener(None)
-            for name in registered_proxy_tools:
+            with close_scope:
+                # Not a ``remove()``: handing the signals back would put the
+                # default disposition in charge for the whole of teardown, which is
+                # the window this exists to survive. From here a signal means
+                # "stop waiting" and takes the immediate-exit path.
+                shutdown_signals.entering_teardown()
+                # Cache counts buffered so far go out before the first await of
+                # teardown, which a cancelled scope can cut short (#1458). The
+                # short lock budget of the periodic flush keeps a locked shared DB
+                # from delaying the stop; the final flush below retries in full.
                 try:
-                    server.remove_tool(name)
+                    tracker.flush_cache_counts(periodic=True)
                 except Exception:
-                    logger.debug("Failed to remove proxy tool '%s'", name, exc_info=True)
-            if proxy_manager is not None:
-                try:
-                    await await_or_warn(
-                        proxy_manager.stop(),
-                        timeout=_PROXY_STOP_BUDGET_SECONDS,
-                        what="Proxy manager stop",
-                    )
-                except Exception:
-                    logger.warning("Failed to stop proxy manager", exc_info=True)
-            if surfacing_engine is not None:
-                try:
-                    await await_or_warn(
-                        surfacing_engine.stop(),
-                        timeout=_ENGINE_STOP_BUDGET_SECONDS,
-                        what="Surfacing engine stop",
-                    )
-                except Exception:
-                    logger.warning("Failed to stop surfacing engine", exc_info=True)
-            if feedback_tracker is not None:
-                try:
-                    # Queued on the feedback-I/O worker rather than called
-                    # here: closing from the loop takes the store's writer
-                    # lock, which an in-flight write holds for as long as its
-                    # statement runs (#996).
-                    await close_store_on_worker(feedback_tracker.close)
-                except Exception:
-                    logger.warning("Failed to close feedback_tracker", exc_info=True)
-            # Cache counts buffered since the last recorded call go out before
-            # the store closes (#1329). The manager has stopped, so no call is
-            # still adding to them. One synchronous write; failure is logged.
-            try:
-                tracker.flush_cache_counts()
-            except Exception:
-                logger.warning("Failed to flush cache counts", exc_info=True)
-            for resource, name in [
-                (proxy_cache, "proxy_cache"),
-                (metrics_store, "metrics_store"),
-                (compression_feedback_tracker, "compression_feedback_tracker"),
-                (progressive_reads_tracker, "progressive_reads_tracker"),
-                (selection_log, "selection_log"),
-            ]:
-                if resource is not None:
+                    logger.warning("Failed to flush cache counts", exc_info=True)
+                # Remove exactly what registration took ownership of (#891). Re-deriving
+                # the set with ``get_proxy_tools()`` here would remove whatever the
+                # session advertises *now*. Re-advertisement (#917) keeps the owned
+                # set current for the changes it handles, but not for the ones it
+                # cannot — a republished toolgraph bundle moves the verdict with no
+                # catalogue change to announce, and a re-advertisement that failed
+                # or was never wired leaves the set behind — so a fresh derivation
+                # here would still ask for removals of names never registered, and
+                # the pass rewrites the
+                # advertisement snapshot that health and ranking read during shutdown.
+                # It was also the one call in this block outside a guard, so anything it
+                # raised skipped ``stop()`` and every cleanup below.
+                #
+                # Detach the re-advertisement listener first (#917): a catalogue
+                # change racing teardown would otherwise re-register names into a
+                # server being dismantled, after this loop has read the set to
+                # remove. ``stop()`` below also closes the background paths that
+                # announce, but this is the cheap half and it runs first.
+                if proxy_manager is not None:
+                    proxy_manager.set_advertisement_listener(None)
+                for name in registered_proxy_tools:
                     try:
-                        resource.close()
+                        server.remove_tool(name)
                     except Exception:
-                        logger.warning("Failed to close %s", name, exc_info=True)
-            if parent_watcher_task is not None and parent_watcher is not None:
-                # A teardown is under way, so there is nothing left for the
-                # watcher to notice — and if it started this one, it is already
-                # cancelled and this join just collects it.
-                parent_watcher.stop()
-                parent_watcher_task.cancel()
+                        logger.debug("Failed to remove proxy tool '%s'", name, exc_info=True)
+                if proxy_manager is not None:
+                    try:
+                        await await_or_warn(
+                            proxy_manager.stop(),
+                            timeout=_PROXY_STOP_BUDGET_SECONDS,
+                            what="Proxy manager stop",
+                        )
+                    except Exception:
+                        logger.warning("Failed to stop proxy manager", exc_info=True)
+                if surfacing_engine is not None:
+                    try:
+                        await await_or_warn(
+                            surfacing_engine.stop(),
+                            timeout=_ENGINE_STOP_BUDGET_SECONDS,
+                            what="Surfacing engine stop",
+                        )
+                    except Exception:
+                        logger.warning("Failed to stop surfacing engine", exc_info=True)
+                if feedback_tracker is not None:
+                    try:
+                        # Queued on the feedback-I/O worker rather than called
+                        # here: closing from the loop takes the store's writer
+                        # lock, which an in-flight write holds for as long as its
+                        # statement runs (#996).
+                        await close_store_on_worker(feedback_tracker.close)
+                    except Exception:
+                        logger.warning("Failed to close feedback_tracker", exc_info=True)
+                # Cache counts buffered since the last recorded call go out before
+                # the store closes (#1329). The manager has stopped, so no call is
+                # still adding to them. One synchronous write; failure is logged.
                 try:
-                    await await_or_warn(
-                        parent_watcher_task,
-                        timeout=_PARENT_LIVENESS_JOIN_BUDGET_SECONDS,
-                        what="Parent-liveness watcher join",
-                    )
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if warmup_task is not None:
-                # Cancelling mid-start abandons the op (#664) — it finishes in
-                # the adapter's owner task, and ``stop()``'s bounded join below
-                # closes or cancels it in-task.
-                warmup_task.cancel()
-                try:
-                    await await_or_warn(
-                        warmup_task,
-                        timeout=_WARMUP_JOIN_BUDGET_SECONDS,
-                        what="Warm-up task join",
-                    )
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if mcp_adapter is not None:
-                try:
-                    await mcp_adapter.stop()
+                    tracker.flush_cache_counts()
                 except Exception:
-                    logger.warning("Failed to stop MCP adapter", exc_info=True)
-            if langfuse_client is not None:
-                try:
-                    from memtomem_stm.observability.tracing import shutdown_langfuse
+                    logger.warning("Failed to flush cache counts", exc_info=True)
+                for resource, name in [
+                    (proxy_cache, "proxy_cache"),
+                    (metrics_store, "metrics_store"),
+                    (compression_feedback_tracker, "compression_feedback_tracker"),
+                    (progressive_reads_tracker, "progressive_reads_tracker"),
+                    (selection_log, "selection_log"),
+                ]:
+                    if resource is not None:
+                        try:
+                            resource.close()
+                        except Exception:
+                            logger.warning("Failed to close %s", name, exc_info=True)
+                if parent_watcher_task is not None and parent_watcher is not None:
+                    # A teardown is under way, so there is nothing left for the
+                    # watcher to notice — and if it started this one, it is already
+                    # cancelled and this join just collects it.
+                    parent_watcher.stop()
+                    parent_watcher_task.cancel()
+                    try:
+                        await await_or_warn(
+                            parent_watcher_task,
+                            timeout=_PARENT_LIVENESS_JOIN_BUDGET_SECONDS,
+                            what="Parent-liveness watcher join",
+                        )
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if warmup_task is not None:
+                    # Cancelling mid-start abandons the op (#664) — it finishes in
+                    # the adapter's owner task, and ``stop()``'s bounded join below
+                    # closes or cancels it in-task.
+                    warmup_task.cancel()
+                    try:
+                        await await_or_warn(
+                            warmup_task,
+                            timeout=_WARMUP_JOIN_BUDGET_SECONDS,
+                            what="Warm-up task join",
+                        )
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if mcp_adapter is not None:
+                    try:
+                        await mcp_adapter.stop()
+                    except Exception:
+                        logger.warning("Failed to stop MCP adapter", exc_info=True)
+                if langfuse_client is not None:
+                    try:
+                        from memtomem_stm.observability.tracing import shutdown_langfuse
 
-                    shutdown_langfuse(langfuse_client)
-                except Exception:
-                    pass
-            if otlp_emitter is not None:
-                # Last: every span-producing component above has stopped, so the
-                # drain has a finite set to wait on. Bounded by its own config —
-                # a hung collector delays shutdown by at most that budget.
-                try:
-                    from memtomem_stm.observability.otlp import shutdown_otlp
+                        shutdown_langfuse(langfuse_client)
+                    except Exception:
+                        pass
+                if otlp_emitter is not None:
+                    # Last: every span-producing component above has stopped, so the
+                    # drain has a finite set to wait on. Bounded by its own config —
+                    # a hung collector delays shutdown by at most that budget.
+                    try:
+                        from memtomem_stm.observability.otlp import shutdown_otlp
 
-                    shutdown_otlp(otlp_emitter, timeout_seconds=config.otlp.flush_timeout_seconds)
-                except Exception:
-                    logger.warning("Failed to shut down OTLP export", exc_info=True)
-            teardown_ran_to_end = True
+                        shutdown_otlp(
+                            otlp_emitter, timeout_seconds=config.otlp.flush_timeout_seconds
+                        )
+                    except Exception:
+                        logger.warning("Failed to shut down OTLP export", exc_info=True)
+                teardown_ran_to_end = True
         finally:
             try:
                 child_reaper.sweep_leaked_children(baseline=children_at_startup)

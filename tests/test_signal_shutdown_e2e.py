@@ -103,10 +103,11 @@ def _initialize(proc: subprocess.Popen[bytes]) -> None:
 def _settle(proc: subprocess.Popen[bytes]) -> None:
     """Finish one request round trip after the handshake.
 
-    A signal that lands in the first milliseconds after the handshake can cut
-    the teardown short — measured locally when SIGINT followed the handshake
-    immediately — and that shutdown exits 1. A test about the ordinary shutdown
-    must not race that window, so it waits for an answered request first."""
+    A signal in the first milliseconds after the handshake meets a different
+    teardown: the SDK's task group scope can be cancelled while it runs, which
+    the lifespan's shield absorbs (#1468). The test about the ordinary shutdown
+    stays out of that window so it tests one thing; the window has its own
+    test below."""
     assert proc.stdin is not None
     proc.stdin.write(b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n')
     proc.stdin.flush()
@@ -258,6 +259,40 @@ def test_a_twice_signalled_server_exits_with_the_signal_status(tmp_path: Path) -
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             if stream is not None:
                 stream.close()
+
+
+def test_a_signal_right_after_the_handshake_runs_the_close_sequence(tmp_path: Path) -> None:
+    """A SIGINT sent as soon as the client has written ``initialized`` (not
+    waiting for the server to process it) used to cut the teardown short in
+    about half of local macOS runs: the SDK's task group scope, cancelled
+    during teardown, delivered the cancellation into ``ProxyManager.stop()``,
+    and the leaked-child sweep had to terminate the upstream (#1468).
+
+    A smoke test against the real SDK, with several runs because the window is
+    a matter of timing. The deterministic check is the lifespan unit test with
+    a cancelled host scope."""
+    for attempt in range(5):
+        run_dir = tmp_path / f"run-{attempt}"
+        run_dir.mkdir()
+        stderr_path = run_dir / "stderr.log"
+        with stderr_path.open("wb") as stderr_file:
+            proc = _start_server(run_dir, log_level="INFO", stderr=stderr_file)
+        try:
+            _initialize(proc)
+            proc.send_signal(signal.SIGINT)
+            returncode = proc.wait(timeout=_EXIT_BUDGET_SECONDS)
+            log = stderr_path.read_bytes()
+            tail = log.decode(errors="replace")[-2000:]
+            assert returncode == 0, f"attempt {attempt}\n{tail}"
+            assert b"did not run to the end" not in log, f"attempt {attempt}\n{tail}"
+            assert b"Terminating leaked child" not in log, f"attempt {attempt}\n{tail}"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10.0)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
 
 
 # Replaces ``ProxyManager.stop`` with a step that is cut short, the way a
