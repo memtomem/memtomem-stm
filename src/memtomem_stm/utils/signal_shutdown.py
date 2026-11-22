@@ -148,7 +148,7 @@ class ShutdownSignals:
     def __init__(
         self,
         *,
-        arm_watchdog: Callable[[], None],
+        arm_watchdog: Callable[[], object],
         hard_exit_cleanup: Callable[[], None] | None = None,
     ) -> None:
         self._arm_watchdog = arm_watchdog

@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import pytest
 
 from memtomem_stm.proxy.config import ConfigLoadResult, ProxyConfig, UpstreamServerConfig
@@ -2410,6 +2411,12 @@ class TestTuningRecommendations:
 # ── app_lifespan ──────────────────────────────────────────────────────────
 
 
+class _HostScope:
+    """The cancel scope of the task group hosting a lifespan under test."""
+
+    scope: anyio.CancelScope | None = None
+
+
 class TestLifespan:
     async def test_proxy_disabled(self):
         """When proxy is disabled, ProxyManager.start() should not be called."""
@@ -2554,7 +2561,14 @@ class TestLifespan:
                 assert captured_engine_kwargs.get("feedback_tracker") is None
 
     async def _run_minimal_lifespan(
-        self, *, pm_stop=None, parent_liveness_poll=0.0, parent_liveness_grace=900.0, settle=False
+        self,
+        *,
+        pm_stop=None,
+        parent_liveness_poll=0.0,
+        parent_liveness_grace=900.0,
+        settle=False,
+        host_scope=None,
+        watchdog_seconds=None,
     ):
         """Drive app_lifespan with everything optional off — enough config for
         startup, so a teardown-only assertion is all the test carries.
@@ -2562,7 +2576,26 @@ class TestLifespan:
 
         *parent_liveness_poll* is spelled out rather than left to the MagicMock
         because ``MagicMock() > 0`` is truthy, which would silently turn the
-        #914 backstop on in every one of these."""
+        #914 backstop on in every one of these.
+
+        *host_scope* (a ``_HostScope``) runs the lifespan inside an AnyIO task
+        group, the way the MCP SDK's ``stdio_server`` hosts it, and publishes
+        that group's cancel scope for *pm_stop* to cancel. The group absorbs its
+        own scope's cancellation on exit, so nothing escapes the helper.
+        *watchdog_seconds* gives the config a real number, for a test that puts
+        the real ``TeardownWatchdog`` back."""
+        if host_scope is not None:
+            async with anyio.create_task_group() as tg:
+                host_scope.scope = tg.cancel_scope
+                await self._run_minimal_lifespan(
+                    pm_stop=pm_stop,
+                    parent_liveness_poll=parent_liveness_poll,
+                    parent_liveness_grace=parent_liveness_grace,
+                    settle=settle,
+                    watchdog_seconds=watchdog_seconds,
+                )
+            return
+
         from memtomem_stm.server import app_lifespan, mcp
 
         mock_pm_instance = MagicMock()
@@ -2586,6 +2619,8 @@ class TestLifespan:
             mock_cfg.otlp.enabled = False
             mock_cfg.parent_liveness_poll_seconds = parent_liveness_poll
             mock_cfg.parent_liveness_grace_seconds = parent_liveness_grace
+            if watchdog_seconds is not None:
+                mock_cfg.teardown_watchdog_seconds = watchdog_seconds
 
             async with app_lifespan(mcp) as _ctx:
                 if settle:
@@ -2815,6 +2850,131 @@ class TestLifespan:
         completed = self._record_completion(monkeypatch)
         await self._run_minimal_lifespan(pm_stop=pm_stop)
         assert completed == [1]
+
+    @staticmethod
+    def _deliberate_shutdown(monkeypatch, *, signalled):
+        """Set whether a deliberate shutdown started this teardown, and keep
+        its exit from ending pytest: conftest's inert ShutdownSignals leaves
+        ``exit_after_signal_shutdown`` real, and that calls ``os._exit``."""
+        exits = []
+        monkeypatch.setattr("memtomem_stm.server.shutdown_was_signalled", lambda: signalled)
+        monkeypatch.setattr(
+            "memtomem_stm.server.exit_after_signal_shutdown", lambda: exits.append(1)
+        )
+        return exits
+
+    @pytest.mark.parametrize(
+        ("armed", "signalled", "shielded"),
+        [(True, True, True), (True, False, False), (False, True, False)],
+        ids=["signalled-and-armed", "not-signalled", "watchdog-not-armed"],
+    )
+    async def test_a_deliberate_shutdown_with_an_armed_watchdog_is_shielded_from_the_host(
+        self, monkeypatch, armed, signalled, shielded
+    ):
+        """The MCP SDK hosts the lifespan in ``stdio_server``'s task group. When
+        that group's scope is cancelled during teardown, AnyIO delivers the
+        cancellation at the next await and cuts the close sequence short —
+        measured after a SIGINT right after the handshake (#1468). A signalled
+        shutdown with the watchdog armed is shielded from it. Not when no such
+        shutdown started the teardown: cancelling an embedded lifespan is its
+        host's call. Not when the watchdog is not armed: then nothing outside
+        the loop guarantees the exit."""
+        completed = self._record_completion(monkeypatch)
+        self._deliberate_shutdown(monkeypatch, signalled=signalled)
+
+        class _Watchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                pass
+
+            def arm(self):
+                return armed
+
+            def disarm(self):
+                pass
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _Watchdog)
+        host = _HostScope()
+        markers = []
+
+        async def _stop_while_the_host_is_cancelled():
+            host.scope.cancel()
+            await asyncio.sleep(0.01)
+            markers.append("stop-returned")
+
+        await self._run_minimal_lifespan(pm_stop=_stop_while_the_host_is_cancelled, host_scope=host)
+
+        assert host.scope is not None and host.scope.cancel_called
+        if shielded:
+            assert markers == ["stop-returned"]
+            assert completed == [1]
+        else:
+            assert markers == []
+            assert completed == []
+
+    async def test_the_watchdog_deadline_still_runs_under_the_shield(self, monkeypatch):
+        """The shield blocks cancellation from enclosing AnyIO scopes, so for a
+        shielded teardown that wedges, the hard deadline is the watchdog, which
+        counts down on its own thread: it reaches its exit while the teardown is
+        still parked in the shielded step. Separately, a direct
+        ``Task.cancel()`` still reaches that step."""
+        from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
+
+        self._deliberate_shutdown(monkeypatch, signalled=True)
+        loop = asyncio.get_running_loop()
+        fired = asyncio.Event()
+        built = []
+
+        class _NoExitWatchdog(TeardownWatchdog):
+            # A subclass, not a patched method: a countdown thread that reaches
+            # its exit after the test has ended must still find no os._exit.
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                built.append(self)
+
+            def _fire(self):
+                loop.call_soon_threadsafe(fired.set)
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _NoExitWatchdog)
+        # Above the watchdog ceiling, so the watchdog is what ends the wait.
+        monkeypatch.setattr("memtomem_stm.server._PROXY_STOP_BUDGET_SECONDS", 30.0)
+        host = _HostScope()
+        markers = []
+        release = asyncio.Event()
+
+        async def _wedged_stop():
+            host.scope.cancel()
+            markers.append("stop-entered")
+            try:
+                await release.wait()
+            finally:
+                markers.append("stop-left")
+
+        task = asyncio.create_task(
+            self._run_minimal_lifespan(pm_stop=_wedged_stop, host_scope=host, watchdog_seconds=0.3)
+        )
+        try:
+            try:
+                await asyncio.wait_for(fired.wait(), timeout=5.0)
+                assert markers == ["stop-entered"]
+                assert not task.done()
+
+                # ``asyncio.wait``, not ``wait_for``: a shield that held back
+                # this cancellation must fail the test, not hang it.
+                task.cancel()
+                done, _ = await asyncio.wait({task}, timeout=5.0)
+                assert done == {task}
+                assert task.cancelled()
+                assert markers == ["stop-entered", "stop-left"]
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                    await asyncio.wait({task}, timeout=5.0)
+        finally:
+            for watchdog in built:
+                watchdog.disarm()
+                if watchdog._thread is not None:
+                    watchdog._thread.join(timeout=5.0)
 
     async def test_a_wedged_stop_does_not_park_the_rest_of_teardown(self, monkeypatch, caplog):
         """Teardown is on the critical path of process exit, so one stop() that

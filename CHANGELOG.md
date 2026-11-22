@@ -97,6 +97,24 @@ changes inline only. See the deprecation policy in
   **Behavior change**: such a shutdown now exits 1 and logs the warning. A
   shutdown whose close sequence and leaked-child sweep both finish still
   exits 0, including one where a step failed inside its own error handling.
+- A shutdown started by SIGTERM, SIGINT or the parent-liveness backstop, with
+  the teardown watchdog armed, now runs its close sequence shielded from
+  cancellation of the AnyIO scopes around the lifespan (issue #1468). The MCP
+  SDK runs the lifespan inside the stdio transport's task group, and when that
+  group's scope was cancelled during teardown, AnyIO delivered the
+  cancellation into `ProxyManager.stop()`: the closes after it were skipped,
+  the leaked-child sweep terminated the upstream, and the process exited 1.
+  This happened when SIGINT came right after the handshake: in local macOS
+  runs with SIGINT sent as soon as the client wrote
+  `notifications/initialized`, 11 of 20 shutdowns were cut short before and
+  0 of 20 after. The shield does not block a direct task cancellation, so the
+  per-step time limits still cancel their waits; a second signal still takes
+  the immediate-exit path, and the watchdog remains the hard deadline. Not
+  shielded: a teardown with the watchdog disabled
+  (`teardown_watchdog_seconds = 0`), or one no deliberate shutdown started,
+  such as a host unmounting an embedded lifespan. A deliberate shutdown whose close sequence is still cut short
+  some other way, and whose teardown then reaches its normal exit, exits 1 as
+  before; a second signal still exits with 128 + the signal number.
 - `mms doctor`'s `hook registration` row now says what it can miss. It
   recognizes an STM hook from the command text (in exec form, the command and
   its `args`) by a heuristic, the matching described with the row under

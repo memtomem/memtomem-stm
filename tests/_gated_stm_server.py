@@ -19,8 +19,10 @@ The hold ends when ``gate-release`` appears or after ``_HOLD_SECONDS``. That
 bound sits nominally below the 10 s ``await_or_warn`` budget around ``stop()``
 and the 10 s teardown watchdog the test configures. The headroom is nominal:
 the watchdog starts at the first signal, not at gate entry, and the real
-``stop()`` then runs outside the shield, with whatever cancellation is pending
-and only what is left of its budget.
+``stop()`` then runs outside the gate's own shield, with only what is left of
+its budget. Whether it is shielded then is the lifespan's doing: a signalled
+shutdown with the watchdog armed shields the whole close sequence (#1468). The
+gate keeps its own shield so the hold does not depend on that.
 
 Usage: ``python _gated_stm_server.py <gate-dir>``
 """
@@ -51,9 +53,10 @@ def _install_gate(gate_dir: Path) -> None:
             # Shielded: when the first signal lands just after the handshake,
             # the SDK's cancelled cancel scope re-delivers the cancellation at
             # every await of the teardown, which would end this hold at once
-            # (measured). When the shield exits, any enclosing cancellation
-            # still pending becomes deliverable again, so the real stop()
-            # below is not protected by the gate.
+            # (measured). When this shield exits, any enclosing cancellation
+            # still pending becomes deliverable again unless an outer shield
+            # holds it: the real stop() below is not protected by the gate,
+            # only by the lifespan's own shield when that applies (#1468).
             with anyio.CancelScope(shield=True):
                 while time.monotonic() < deadline:
                     if (gate_dir / "gate-release").exists():
