@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import sys
 import tomllib
 from dataclasses import replace
@@ -28,7 +29,7 @@ from click.testing import CliRunner
 from helpers import set_home
 
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, known_hosts
-from memtomem_stm.cli.hook_cmd import _DEFAULT_SURFACE_TOOLS
+from memtomem_stm.cli.hook_cmd import _DEFAULT_SURFACE_TOOLS, _hook_install_command_argv
 from memtomem_stm.cli.hook_hosts import (
     HOOK_HOSTS,
     HookInstallError,
@@ -40,7 +41,8 @@ from memtomem_stm.cli.hook_hosts import (
     plan_install,
     plan_uninstall,
 )
-from memtomem_stm.cli.proxy import cli
+from memtomem_stm.cli.host_runtime import HostRuntimePolicy
+from memtomem_stm.cli.proxy import _launcher_for, _StmProject, cli
 
 _CMD = "memtomem-stm hook --host {host}"
 
@@ -122,6 +124,132 @@ def test_is_stm_hook_command_recognizes_our_invocations(command: str) -> None:
 )
 def test_is_stm_hook_command_ignores_foreign_commands(command: str) -> None:
     assert _is_stm_hook_command(command) is False
+
+
+# Lines that name STM's hook but would not run its bridge (#1460): a management
+# subcommand, help, a usage error, an assignment or a directory where the
+# executable goes, and ``uv`` printing its own help or failing on an empty
+# directory. Each was rewritten by install and deleted by uninstall.
+_NOT_THE_BRIDGE = [
+    "mms hook uninstall",
+    "mms hook install --host claude --apply",
+    "mms hook --help",
+    "mms hook -h",
+    "mms hook --typo",
+    "uv run --help mms hook",
+    "uv run --directory '' memtomem-stm hook --host claude",
+    "OTHER=/mms hook",
+    "mms/ hook",
+    # The same word check on the ``env`` launcher: an assignment (which makes
+    # the line a bare assignment prefix) and a directory.
+    "OTHER=/env MEMTOMEM_STM_X=1 mms hook",
+    "/tmp/env/ MEMTOMEM_STM_X=1 mms hook",
+]
+
+
+@pytest.mark.parametrize("command", _NOT_THE_BRIDGE)
+def test_is_stm_hook_command_requires_a_line_that_runs_the_bridge(command: str) -> None:
+    assert _is_stm_hook_command(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # These may well run the hook, but not through the one ``uv`` launcher
+        # install writes (``uv run --directory <dir> <entry point>``), so they
+        # are left alone rather than rewritten.
+        "uv run memtomem-stm hook --host claude",
+        "uv run --directory /repo --frozen memtomem-stm hook --host claude",
+        "uv run --directory /repo /repo/.venv/bin/memtomem-stm hook --host claude",
+        "uv run --directory -x memtomem-stm hook --host claude",  # an option, not a directory
+    ],
+)
+def test_is_stm_hook_command_requires_the_uv_launcher_install_writes(command: str) -> None:
+    assert _is_stm_hook_command(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # #1453 is not taken over here: a bare assignment prefix stays unrecognized.
+        "MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook --host claude",
+        "FOO=1 mms hook",
+    ],
+)
+def test_is_stm_hook_command_still_ignores_a_bare_assignment_prefix(command: str) -> None:
+    assert _is_stm_hook_command(command) is False
+
+
+def test_is_stm_hook_command_keeps_a_quoted_legacy_env_value() -> None:
+    """The legacy ``env`` form keeps its recognition whatever the value: the
+    runtime-policy reader recovers ``12`` from it on install."""
+    assert _is_stm_hook_command("env MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=' 12 ' mms hook")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows path rules")
+def test_is_stm_hook_command_keeps_a_drive_relative_executable() -> None:
+    """``Path("C:mms").name`` is ``mms`` on Windows; the executable-word check
+    must not take the drive prefix for a directory."""
+    assert _is_stm_hook_command("C:mms hook --host claude") is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Matching is by ``shlex`` words, which keep a shell comment: the
+        # comment reaches the ``hook`` arguments and fails the parse there, so
+        # these working lines are left alone (a documented limit).
+        "mms hook --host claude # managed",
+        "env MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=12 mms hook --host claude #pinned",
+    ],
+)
+def test_is_stm_hook_command_leaves_a_line_with_a_trailing_comment(command: str) -> None:
+    assert _is_stm_hook_command(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mms hook --host '#x' uninstall",  # a quoted ``#`` is a word; ``uninstall`` is left over
+        "mms hook \r#x | cat",  # the shell keeps ``\r#x`` as a word and runs a pipeline
+        "mms/. hook",  # a directory, as written
+    ],
+)
+def test_is_stm_hook_command_leaves_a_pipeline_a_leftover_word_and_a_directory(
+    command: str,
+) -> None:
+    assert _is_stm_hook_command(command) is False
+
+
+@pytest.mark.parametrize("host", sorted(HOOK_HOSTS))
+@pytest.mark.parametrize(
+    "root", [None, Path("/repo"), Path("/Users/x/My Repo"), Path("C:\\Users\\x\\repo")]
+)
+@pytest.mark.parametrize(
+    "policy",
+    [
+        None,
+        HostRuntimePolicy(
+            use_daemon=True,
+            surfacing_timeout_seconds=3.0,
+            daemon_timeout_seconds=5.0,
+            persist_query_text=False,
+        ),
+        HostRuntimePolicy(
+            use_daemon=False,
+            surfacing_timeout_seconds=9.5,
+            daemon_timeout_seconds=0.25,
+            persist_query_text=True,
+        ),
+    ],
+)
+def test_install_recognizes_every_command_it_writes(
+    host: str, root: Path | None, policy: HostRuntimePolicy | None
+) -> None:
+    """Install's own output, built the way ``mms hook install`` builds it."""
+    project = None if root is None else _StmProject(root=root, source_checkout=True)
+    argv = _hook_install_command_argv(host, policy=policy, launcher=_launcher_for(project))
+    assert _is_stm_hook_command(shlex.join(argv)) is True
 
 
 # ── matcher_for + cross-module consistency ───────────────────────────────────
@@ -682,6 +810,24 @@ def test_cli_install_migrates_legacy_inline_env_and_preserves_timeout(redirect) 
     assert "--daemon-timeout-seconds 13" in command
     handler = json.loads(path.read_text())["hooks"]["PostToolUse"][0]["hooks"][0]
     assert handler["timeout"] == 30
+
+
+def test_cli_install_leaves_a_commented_line_and_reads_no_setting_from_it(redirect) -> None:
+    """A commented line is not taken over (#1460), so nothing written in its
+    comment reaches the installed command's runtime settings."""
+    path = redirect("claude")
+    commented = "mms hook --host claude # --persist-query-text --surfacing-timeout-seconds 99"
+    _seed(path, _claude_groups([_h(commented)]))
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+
+    assert result.exit_code == 0, result.output
+    assert "(in the written file: hooks.PostToolUse[0].hooks[0])" in result.output
+    commands = _claude_commands(path)
+    assert commands[0] == commented and len(commands) == 2
+    written = shlex.split(commands[1])
+    assert "--persist-query-text" not in written
+    assert written[written.index("--surfacing-timeout-seconds") + 1] != "99"
 
 
 def test_cli_install_can_inherit_runtime_environment(redirect) -> None:
@@ -1427,6 +1573,74 @@ def test_uninstall_of_only_empty_entries_does_not_claim_a_removal(redirect) -> N
     assert "hook install manages" not in preview.output + applied.output
     groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
     assert [h["command"] for g in groups for h in g["hooks"]] == [_BARE]
+
+
+def _claude_commands(path: Path) -> list[str]:
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    return [h["command"] for g in groups for h in g["hooks"]]
+
+
+@pytest.mark.parametrize(
+    "command", ["mms hook uninstall", "uv run --help mms hook", "OTHER=/mms hook"]
+)
+def test_cli_leaves_a_line_that_does_not_run_the_bridge(command: str, redirect) -> None:
+    """#1460's end-to-end reproduction: install used to replace these lines
+    and uninstall to delete them, both calling them STM's hook."""
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(command)]))
+    runner = CliRunner()
+    where = "hooks.PostToolUse[0].hooks[0]"
+
+    assert plan_uninstall("claude").status == "not_installed"
+    removed = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+    assert removed.exit_code == 0, removed.output
+    assert "not installed (no memtomem-stm hook that uninstall manages)." in removed.output
+    assert "Removed" not in removed.output
+    assert f"(in the current file: {where})" in removed.output
+    assert _claude_commands(path) == [command]
+
+    installed = runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    assert installed.exit_code == 0, installed.output
+    assert "Installed memtomem-stm's PostToolUse hook." in installed.output
+    assert f"(in the written file: {where})" in installed.output
+    commands = _claude_commands(path)
+    assert commands[0] == command
+    assert len(commands) == 2 and _is_stm_hook_command(commands[1])
+
+    assert plan_uninstall("claude").status == "remove"
+    again = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+    assert again.exit_code == 0, again.output
+    assert "Removed the memtomem-stm hook install manages." in again.output
+    assert f"(in the written file: {where})" in again.output
+    assert _claude_commands(path) == [command]
+
+
+@pytest.mark.parametrize(
+    "command", ["mms hook uninstall", "uv run --help mms hook", "OTHER=/mms hook"]
+)
+def test_uninstall_beside_a_line_that_does_not_run_the_bridge_only_prunes(
+    command: str, redirect
+) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups([], [_h(command)]))
+
+    change = plan_uninstall("claude")
+
+    assert change.status == "prune"
+    assert json.loads(change.new_text) == _claude_groups([_h(command)])
+
+
+def test_cursor_install_leaves_a_management_subcommand(redirect) -> None:
+    """Only Claude was run end to end in #1460; Cursor matches on ``command`` too."""
+    path = redirect("cursor")
+    _seed(path, {"version": 1, "hooks": {"postToolUse": [{"command": "mms hook uninstall"}]}})
+
+    installed = plan_install("cursor", _CMD.format(host="cursor"))
+
+    entries = json.loads(installed.new_text)["hooks"]["postToolUse"]
+    assert [e["command"] for e in entries] == ["mms hook uninstall", _CMD.format(host="cursor")]
+    assert installed.unmanaged == ("hooks.postToolUse[0]",)
+    assert plan_uninstall("cursor").status == "not_installed"
 
 
 @pytest.mark.parametrize(

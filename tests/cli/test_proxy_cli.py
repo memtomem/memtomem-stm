@@ -5842,9 +5842,10 @@ class TestInitMcpRegistration:
 
 
 class TestDetectInstallType:
-    """``_detect_install_type`` returns ``(server_cmd, server_args)`` for the
-    current install location. Covers the three relevant shapes: STM source
-    checkout, user project that ``uv add``'d memtomem-stm, and global install."""
+    """``_detect_install_type`` returns ``(server_cmd, server_args)``, the
+    launcher ``mms hook install`` writes into a host's user-scope hook. Covers
+    the three relevant shapes: STM source checkout, user project that ``uv
+    add``'d memtomem-stm, and global install."""
 
     def test_detects_stm_source_checkout(self, tmp_path, monkeypatch):
         (tmp_path / "pyproject.toml").write_text(
@@ -5856,12 +5857,7 @@ class TestDetectInstallType:
 
         cmd, args = _detect_install_type()
         assert cmd == "uv"
-        assert args[:2] == ["run", "--directory"]
-        # The entrypoint must be the ``memtomem-stm`` console script, not the
-        # ``mms`` click group — ``mms`` with no subcommand prints help and
-        # exits 0, which closes the MCP stdio pipe and the client reports
-        # "Failed to reconnect".
-        assert args[-1] == "memtomem-stm"
+        assert args == ["run", "--directory", str(tmp_path), "memtomem-stm"]
 
     def test_detects_user_project_with_stm_dep(self, tmp_path, monkeypatch):
         (tmp_path / "pyproject.toml").write_text(
@@ -5995,18 +5991,12 @@ class TestDetectInstallType:
         assert cmd == "memtomem-stm"
         assert args == []
 
-    def test_never_emits_click_group_as_mcp_entrypoint(self, tmp_path, monkeypatch):
-        """Regression guard: neither branch may return ``mms`` as the command
-        the MCP client will spawn.
-
-        ``mms`` is the click CLI group (entrypoint
-        ``memtomem_stm.cli.proxy:cli``) — calling it with no subcommand
-        prints help and exits 0, the stdio pipe closes before ``initialize``,
-        and the client reports "Failed to reconnect". The actual server is
-        ``memtomem-stm`` (entrypoint ``memtomem_stm.server:main``). Pinning
-        the non-inclusion here because the three branch-specific tests above
-        could all flip together in a refactor and silently reintroduce the
-        regression."""
+    def test_launcher_names_the_memtomem_stm_entry_point(self, tmp_path, monkeypatch):
+        """The checkout launcher runs the ``memtomem-stm`` entry point, the
+        name the hook-registration readers (``hook_hosts``, ``mms doctor``)
+        recognize next to ``uv run --directory``. All three console scripts
+        share one Click group (``pyproject.toml`` ``[project.scripts]``), so
+        this pins the spelling, not a dispatch difference."""
         from memtomem_stm.cli.proxy import _detect_install_type
 
         # Dev-checkout branch.
@@ -6016,10 +6006,132 @@ class TestDetectInstallType:
         )
         monkeypatch.chdir(tmp_path)
         cmd, args = _detect_install_type()
-        assert "mms" not in [cmd, *args], (
-            "regression: _detect_install_type emits the click group — "
-            "MCP stdio will close on initialize"
+        assert [cmd, *args][-1] == "memtomem-stm"
+        assert "mms" not in [cmd, *args]
+
+
+class TestHookProjectBinding:
+    """``_hook_project_binding`` names the project a user-scope hook launcher
+    would be tied to (#1379): ``mms hook install`` run inside a project that
+    depends on memtomem-stm writes ``uv run --directory <project>``, so every
+    hook call, in every project, runs from that project's environment. The
+    install output says so. STM's own source checkout is the intended
+    developer binding and gets no notice."""
+
+    @staticmethod
+    def _source_checkout(root: Path) -> Path:
+        (root / "src" / "memtomem_stm").mkdir(parents=True)
+        (root / "src" / "memtomem_stm" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "pyproject.toml").write_text(
+            '[project]\nname = "memtomem-stm"\nversion = "0.0.0"\n', encoding="utf-8"
         )
+        return root
+
+    @staticmethod
+    def _dependent(root: Path, deps: str = 'dependencies = ["memtomem-stm>=0.1"]') -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "pyproject.toml").write_text(
+            f'[project]\nname = "my-app"\n{deps}\n', encoding="utf-8"
+        )
+        return root
+
+    def test_dependent_project_is_named(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _detect_install_type, _hook_project_binding
+
+        project = self._dependent(tmp_path / "app")
+        monkeypatch.chdir(project)
+        assert _detect_install_type() == (
+            "uv",
+            ["run", "--directory", str(project), "memtomem-stm"],
+        )
+        assert _hook_project_binding() == project
+
+    def test_optional_dependency_project_is_named(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _hook_project_binding
+
+        project = self._dependent(
+            tmp_path / "app",
+            'dependencies = []\n[project.optional-dependencies]\nstm = ["memtomem-stm"]',
+        )
+        monkeypatch.chdir(project)
+        assert _hook_project_binding() == project
+
+    def test_dependent_project_two_levels_up_is_named(self, tmp_path, monkeypatch):
+        """The issue's measured shape: install run from a subdirectory."""
+        from memtomem_stm.cli.proxy import _hook_project_binding
+
+        project = self._dependent(tmp_path / "app")
+        nested = project / "pkg" / "sub"
+        nested.mkdir(parents=True)
+        monkeypatch.chdir(nested)
+        assert _hook_project_binding() == project
+
+    def test_source_checkout_and_its_subdirectory_are_not_named(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _detect_install_type, _hook_project_binding
+
+        root = self._source_checkout(tmp_path / "memtomem-stm")
+        for cwd in (root, root / "src" / "memtomem_stm"):
+            monkeypatch.chdir(cwd)
+            assert _detect_install_type() == (
+                "uv",
+                ["run", "--directory", str(root), "memtomem-stm"],
+            )
+            assert _hook_project_binding() is None
+
+    def test_name_only_project_without_the_package_is_named(self, tmp_path, monkeypatch):
+        """A pyproject that only declares the name is not shaped like STM's
+        checkout, so the binding is reported rather than assumed intended."""
+        from memtomem_stm.cli.proxy import _hook_project_binding
+
+        root = tmp_path / "lookalike"
+        root.mkdir()
+        (root / "pyproject.toml").write_text('[project]\nname = "memtomem-stm"\n', encoding="utf-8")
+        monkeypatch.chdir(root)
+        assert _hook_project_binding() == root
+
+    def test_unreadable_source_marker_counts_as_unconfirmed(self, tmp_path, monkeypatch):
+        """Before Python 3.14 ``Path.is_file`` raises ``PermissionError`` for
+        an unreadable ``src/``. That must not abort install: the checkout is
+        unconfirmed, so the binding is reported."""
+        from memtomem_stm.cli.proxy import _hook_project_binding
+
+        root = self._source_checkout(tmp_path / "memtomem-stm")
+        real_is_file = Path.is_file
+
+        def is_file(self):
+            if self.name == "__init__.py":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", is_file)
+        monkeypatch.chdir(root)
+        assert _hook_project_binding() == root
+
+    def test_plain_directory_is_not_named(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _detect_install_type, _hook_project_binding
+
+        monkeypatch.chdir(tmp_path)
+        assert _detect_install_type() == ("memtomem-stm", [])
+        assert _hook_project_binding() is None
+
+    @pytest.mark.parametrize(
+        "inner",
+        ['[project]\nname = "unrelated"\ndependencies = ["requests"]\n', "not [[ toml\n"],
+        ids=["unrelated", "malformed"],
+    )
+    def test_nearest_pyproject_wins_inside_a_source_checkout(self, tmp_path, monkeypatch, inner):
+        """The walk stops at the first pyproject.toml: an unrelated or broken
+        one nested inside STM's checkout yields the bare launcher, not the
+        checkout above it."""
+        from memtomem_stm.cli.proxy import _detect_install_type, _hook_project_binding
+
+        root = self._source_checkout(tmp_path / "memtomem-stm")
+        inner_dir = root / "examples" / "demo"
+        inner_dir.mkdir(parents=True)
+        (inner_dir / "pyproject.toml").write_text(inner, encoding="utf-8")
+        monkeypatch.chdir(inner_dir)
+        assert _detect_install_type() == ("memtomem-stm", [])
+        assert _hook_project_binding() is None
 
 
 class TestClaudeDesktopConfigHint:

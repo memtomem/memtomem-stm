@@ -31,7 +31,12 @@ _PREFIX = "STM hook commands: "
 _LACKING = "without --host claude, so hook compression, if enabled, never replaces their output: "
 _SHELL_SYNTAX = "not checked because of shell syntax (quotes, $, ~, # or operators): "
 _OTHER = "not checked (an unknown launcher or an unsupported handler field): "
-_SCOPE = "project, local and managed Claude Code settings are not read"
+# What the row can miss, at the end of each detail that reports on commands (#1457).
+_SCOPE = (
+    "STM hooks are recognized from the command text by a heuristic, so one behind a wrapper "
+    "script or spelled with shell syntax can be missed; project, local and managed Claude "
+    "Code settings are not read"
+)
 _NEXT_RUN = "fix the arguments of the commands that do not run the hook"
 _NEXT_HOST = (
     "add --host claude where Claude Code routing is intended (or make the last "
@@ -317,6 +322,52 @@ def test_known_misses_outside_the_quote_tier(command: str) -> None:
     assert not hr.is_candidate({"type": "command", "command": command})
 
 
+# The three misses #1457 lists. The first two are also pinned above.
+_ISSUE_MISSES = [
+    {"type": "command", "command": 'm"m"s hook --host claude # comment'},
+    {"type": "command", "command": "m\\\nms hook --host claude"},
+    # ``,`` is outside the quote tier's characters, and quoting splits the name
+    # for the raw search.
+    {"type": "command", "command": "'/opt/tools,v2/bin/'m\"m\"s hook --host claude"},
+]
+_MORE_KNOWN_MISSES = [
+    # Quote removal leaves the inner script as one word, which names nothing.
+    {"type": "command", "command": "sh -c 'm\"m\"s hook --host claude'"},
+    {"type": "command", "command": "sh", "args": ["-c", 'm"m"s hook --host claude']},
+    # ``-m`` attached to the module name hides the name's left boundary.
+    {"type": "command", "command": "python -mmemtomem_stm hook --host claude"},
+    {"type": "command", "command": "python", "args": ["-mmemtomem_stm", "hook"]},
+    # A wrapper script names nothing at all.
+    {"type": "command", "command": "/usr/local/bin/stm-hook-wrapper.sh"},
+]
+
+
+@pytest.mark.parametrize("handler", _ISSUE_MISSES + _MORE_KNOWN_MISSES)
+def test_known_misses_recognition_cannot_close(handler: dict[str, Any]) -> None:
+    """#1457: each of these runs (or can run) the hook bridge and is not
+    recognized. Recognition is by the command text, so the class is open-ended;
+    the row states that limit instead of chasing each spelling."""
+    assert not hr.is_candidate(handler)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mms version hook",  # the ``version`` subcommand, which rejects the extra word
+        "mms status --config hook",  # the ``status`` subcommand
+        "echo /opt/bin/mms/README hook",  # runs ``echo``
+    ],
+)
+def test_known_over_matches_are_not_checked(command: str) -> None:
+    """#1457: kept on purpose. Each exclusion tried for these could hide a real
+    hook (``python …/memtomem_stm/__main__.py hook`` names STM only in a path
+    component), and an over-match costs one "not checked" entry."""
+    assert _read(command).not_checked == hr.LAUNCHER
+    assert _read("python /venv/site-packages/memtomem_stm/__main__.py hook").not_checked == (
+        hr.LAUNCHER
+    )
+
+
 def test_quote_tier_over_matches_a_printed_name() -> None:
     """Known, harmless over-match: ``echo`` only prints ``mms hook``, but the
     quote tier does not know what ``echo`` does. The handler is counted and
@@ -410,9 +461,42 @@ def test_registration_with_host_claude_passes(tmp_path: Path, claude_dir: Path) 
         "id": "hook_registration",
         "label": "hook registration",
         "status": "PASS",
-        "detail": f"{_PREFIX}1 pass --host claude to mms hook — in {path}; {_SCOPE}",
+        "detail": (
+            f"{_PREFIX}1 recognized, all passing --host claude to mms hook — in {path}; {_SCOPE}"
+        ),
         "next_action": None,
     }
+
+
+@pytest.mark.parametrize("missed", _ISSUE_MISSES + _MORE_KNOWN_MISSES)
+def test_pass_says_it_covers_recognized_commands_only(
+    tmp_path: Path, claude_dir: Path, missed: dict[str, Any]
+) -> None:
+    """#1457: a hook the row cannot recognize still leaves it at PASS, so the
+    PASS has to say what it counted and what it cannot see."""
+    path = _write(claude_dir, _cmd("mms hook --host claude"), missed)
+
+    row = _row(tmp_path)
+
+    assert row["status"] == "PASS"
+    assert row["detail"] == (
+        f"{_PREFIX}1 recognized, all passing --host claude to mms hook — in {path}; {_SCOPE}"
+    )
+    assert "can be missed" in row["detail"]
+
+
+def test_text_output_states_the_recognition_limit(tmp_path: Path, claude_dir: Path) -> None:
+    """The text renderer shows the whole detail that ``--json`` carries, once."""
+    path = _write(claude_dir, _cmd("mms hook --host claude"))
+
+    result = CliRunner().invoke(cli, ["doctor", "--config", str(tmp_path / "absent.json")])
+
+    lines = [line for line in result.output.splitlines() if "hook registration" in line]
+    assert len(lines) == 1
+    line = lines[0]
+    detail = f"{_PREFIX}1 recognized, all passing --host claude to mms hook — in {path}; {_SCOPE}"
+    assert line.endswith(detail)
+    assert line.count("can be missed") == 1
 
 
 @pytest.mark.parametrize("env", [None, "1", "0"])

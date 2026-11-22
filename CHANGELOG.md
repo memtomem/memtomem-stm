@@ -11,6 +11,118 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms stats` reports response-cache savings (#1466, issue #1329). The proxy used to
+  keep cache hits, misses and unstorable misses in memory only, with no server
+  or tool, so `mms stats` could not see them. Each proxy process now also
+  counts them per UTC day, server and tool, together with the characters
+  served from cache, and writes them into a new never-pruned
+  `proxy_cache_daily` table in the metrics DB, best-effort, with its next
+  metrics row, every 30 seconds while counts are waiting, and during an
+  orderly MCP server stop; the cache hit path itself does no database write. A new `Proxy / Cache` block (`cache` in `--json`) shows hits, misses,
+  unstorable misses, the hit rate over storable lookups (the `stm_admin`
+  `proxy_stats` formula; `n/a`/`null` when there are none) and the
+  characters served, with the date coverage starts; `--tool` filters it and
+  `--source hook` omits it. A killed process loses the counts buffered since
+  its last successful write, older STM versions sharing the DB write none,
+  and a miss and its
+  unstorable outcome can land on adjacent UTC days. **Behavior change**:
+  `mms stats` gains the block and the `cache` key; the metrics DB gains one
+  table, so this version's first open rebuilds the schema stamp (and does
+  again after an older version sharing the DB re-stamps it).
+
+### Changed
+
+- `mms hook install` says when the user-scope hook it writes is bound to a
+  project (#1464, issue #1379). When the nearest `pyproject.toml` (the current
+  directory or one of its four parents) lists `memtomem-stm` as a dependency,
+  install writes `uv run --directory <project> memtomem-stm hook …` into a
+  config every project shares, so every hook call runs from that project's
+  environment. The output now names the project and how to get the bare
+  launcher instead, in the preview, after `--apply`, and when the hook is
+  already installed. STM's own source checkout (a `memtomem-stm` project with
+  `src/memtomem_stm/__init__.py`) and directories where no such file is found
+  get no notice; a project that is only named `memtomem-stm` does. **Behavior
+  change**: one more line of install output in those cases; the written
+  command is unchanged.
+
+### Fixed
+
+- `mms hook install` and `mms hook uninstall` no longer take over commands that
+  name STM's hook but do not run it (issue #1460). They used to treat a
+  command as STM's own hook whenever an STM entry point followed by `hook` had
+  nothing before it, an `env` with only `MEMTOMEM_STM_*` settings, or `uv run
+  …` without a `--`, so install replaced, and uninstall deleted, lines such as
+  `mms hook uninstall`, `uv run --help mms hook` and `OTHER=/mms hook`, both
+  calling them memtomem-stm's hook. Three token checks are added: the words
+  after `hook` must read as a hook run with `mms hook`'s own options (not a
+  subcommand, `--help` or a usage error); the executable word must have no `=`
+  or control character and not end in `/` or `/.`, and so must an `env`
+  word in front of it; and a `uv` launcher must be
+  exactly `uv run --directory <dir> <entry point>` with a non-empty `<dir>`
+  that does not start with `-` and a bare entry-point name, the form install
+  writes. The words are still split with `shlex`, so the checks approximate
+  the shell rather than prove what it runs. Lines that fail them are left in
+  place; those that look like STM's hook by the #1456 heuristic are named by
+  location. **Behavior change**: such lines are no longer updated or removed,
+  and when install finds no handler it manages it adds its own beside them.
+  That includes lines that do run the hook in a form the checks reject: a
+  hand-written `uv run` in another form (`uv run memtomem-stm hook`, extra
+  `uv` options, a path after `--directory <dir>`), an executable path with
+  `=` in it, and usually a line with a trailing `# comment`, whose words are
+  read as more arguments.
+- An unstorable cache miss is now counted only for a call that counted the
+  miss itself (#1474, issue #1473). Whether a call had counted a miss was
+  decided again when it completed, from the tool's cache eligibility at that
+  moment. Eligibility can change while a call is in flight, because tool
+  annotations are refreshed by a reconnect or a `tools/list_changed`
+  notification. A call that skipped the lookup could then still count an
+  unstorable miss, which raised the hit rate over storable lookups in
+  `stm_admin` `proxy_stats` and `mms stats` above the true rate. The reverse
+  flip also dropped the unstorable outcome of a call that had counted its
+  miss, when the store was refused before eligibility is checked (a mixed,
+  non-text, empty or block-metadata response, for example). Both now follow
+  the lookup.
+- A server shutdown started by SIGTERM, SIGINT or the parent-liveness backstop
+  no longer exits 0 when its teardown was cut short. The exit status was
+  meant to say whether the close sequence ran to the end, but the completion
+  was recorded in a `finally`, so it was recorded on every path. A
+  `CancelledError` that escaped a step, skipping every close after it, still
+  exited 0 without the "teardown did not run to the end" warning. Completion
+  is now recorded only when the sequence reaches its end, and a new lifespan
+  in the same process starts with it cleared (#1465, issue #1459). In local
+  macOS runs, SIGINT sent immediately after the MCP handshake cut the
+  teardown short this way.
+  **Behavior change**: such a shutdown now exits 1 and logs the warning. A
+  shutdown whose close sequence and leaked-child sweep both finish still
+  exits 0, including one where a step failed inside its own error handling.
+- `mms doctor`'s `hook registration` row now says what it can miss. It
+  recognizes an STM hook from the command text (in exec form, the command and
+  its `args`) by a heuristic, the matching described with the row under
+  0.7.10. So some hooks are not counted: a wrapper script whose command names
+  neither an STM executable nor `hook`, and spellings such as
+  `m"m"s hook # note`, `sh -c 'm"m"s hook'` and `python -mmemtomem_stm hook`.
+  (Others are counted, for example `m"m"s hook` and `sh -c "mms hook"`.) A
+  hook that is not counted does not by itself keep the row from PASS; the
+  other handlers decide. The PASS now reads `N recognized, all passing --host
+  claude to mms hook`, and the PASS and WARN details that report on commands
+  end by saying such hooks can be missed (the WARN for a settings file that
+  cannot be used does not). Recognition itself is unchanged: those hooks are
+  still missed, and a command that only mentions both words, such as `mms
+  version hook`, is still counted and reported as not checked (#1462, issue
+  #1457).
+  **Behavior change**: the row's detail text changes, in the text output and
+  in `checks[].detail` of `mms doctor --json`. Its statuses, the conditions
+  for showing it, and doctor's exit code do not.
+- The 0.7.10 notes for `mms doctor`'s `hook registration` row now state the
+  conditions of its quote-removal match: never for a handler whose `args` is
+  a list (exec form), a line of plain-word characters (ASCII letters and
+  digits, and `_./:=+-`), spaces, tabs and quotes, and balanced quotes. They
+  said only "a line made only of plain words and quotes, up to 4,096
+  characters" (#1469).
+  **Behavior change**: none external (documentation only).
+
 ## [0.7.10] — 2026-11-21
 
 ### Upgrade notes
@@ -111,15 +223,17 @@ changes inline only. See the deprecation policy in
   a hand edit rather than `mms hook install --apply`: install merges every STM
   handler it recognizes into one, drops most inline `env` settings, and does
   not recognize a `NAME=value mms hook` line. Project, local and managed Claude
-  Code settings are not read. A line made only of plain words and quotes, up
-  to 4,096 characters, is also matched on the words left after quote removal,
-  so `m"m"s hook` next to `mms hook --host claude` is counted, marked not
-  checked, and the row WARNs. A quoted hook in a longer line, or in a line
-  with other shell syntax (a comment, an operator, a line continuation), is
-  found only by a search of the raw text, which can miss it and let the row
-  PASS. A plain command whose `hook` is only part of a word, such as
-  `mms status --config /tmp/hook.json`, is not counted as an STM hook (#1455,
-  issue #1450).
+  Code settings are not read. Unless the handler's `args` is a list (exec
+  form), a line made only of plain-word characters (ASCII letters and digits,
+  and `_./:=+-`), spaces, tabs and quotes, up to 4,096 characters and with
+  balanced quotes, is also matched on the words left after quote removal, so
+  `m"m"s hook` next to `mms hook --host claude` is counted, marked not
+  checked, and the row WARNs. A quoted hook in a longer line, in a line whose
+  quotes do not balance, or in a line with any other character (a comment, an
+  operator, a line continuation, a non-ASCII letter), is found only by a
+  search of the raw text, which can miss it and let the row PASS. A plain
+  command whose `hook` is only part of a word, such as `mms status --config
+  /tmp/hook.json`, is not counted as an STM hook (#1455, issue #1450).
   **Behavior change**: when the settings hold an STM-looking handler or
   cannot be read, `mms doctor` prints the new row and `--json` gains a
   `hook_registration` check, so a setup doctor passed before can now report

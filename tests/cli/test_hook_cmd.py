@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2452,3 +2453,162 @@ def test_hook_process_delivers_compressed_output_through_a_cp1252_pipe(tmp_path:
     assert proc.stdout.isascii()
     replaced = json.loads(proc.stdout)["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
     assert replaced.startswith(f"{_COMPRESS_SENTINEL}\n한국어 로그 0\n")
+
+
+# ── #1379: say when the user-scope hook is bound to a project ──────────────
+
+
+class TestInstallProjectBindingNotice:
+    """``mms hook install`` run inside a project that depends on memtomem-stm
+    writes ``uv run --directory <project> memtomem-stm hook …`` into a
+    user-scope config, so every hook call, in every project, runs from that
+    project's environment (#1379). The written command is unchanged; the
+    install output names the binding in every outcome — preview, ``--apply``
+    and an already-identical reinstall. No real PATH lookup is involved."""
+
+    MARK = "STM through `uv run --directory`"
+
+    @staticmethod
+    def _project(tmp_path: Path) -> Path:
+        project = tmp_path / "app"
+        project.mkdir()
+        (project / "pyproject.toml").write_text(
+            '[project]\nname = "my-app"\ndependencies = ["memtomem-stm>=0.1"]\n',
+            encoding="utf-8",
+        )
+        return project
+
+    @staticmethod
+    def _install(*extra: str):
+        return CliRunner().invoke(cli, ["hook", "install", "--host", "claude", *extra])
+
+    def test_dependent_project_names_the_binding_in_every_outcome(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_dir = tmp_path / "claude"
+        config_dir.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+        project = self._project(tmp_path)
+        monkeypatch.chdir(project)
+
+        outcomes = {
+            "preview": self._install(),
+            "apply": self._install("--apply"),
+            "already": self._install("--apply"),
+            # A dry run over the installed hook: unchanged, so present tense
+            # even without --apply (the tense follows the change, not the flag).
+            "already_preview": self._install(),
+        }
+
+        assert "already installed" in outcomes["already"].output
+        assert "already installed" in outcomes["already_preview"].output
+        for name, result in outcomes.items():
+            assert result.exit_code == 0, (name, result.output)
+            notice = [line for line in result.output.splitlines() if self.MARK in line]
+            assert len(notice) == 1, (name, result.output)
+            assert str(project) in notice[0], (name, notice)
+            # A dry run that changes the config describes the hook it would
+            # write; every other outcome describes the hook that is installed.
+            tense = "hook would run STM" if name == "preview" else "hook runs STM"
+            assert tense in notice[0], (name, notice)
+        # The written command is the project-bound one, unchanged by #1379.
+        settings = json.loads((config_dir / "settings.json").read_text(encoding="utf-8"))
+        commands = [
+            h["command"] for entry in settings["hooks"]["PostToolUse"] for h in entry["hooks"]
+        ]
+        assert len(commands) == 1
+        assert shlex.split(commands[0])[:5] == [
+            "uv",
+            "run",
+            "--directory",
+            str(project),
+            "memtomem-stm",
+        ]
+
+    @pytest.mark.parametrize("project_name", ["my-app", "memtomem-stm"])
+    def test_command_and_notice_come_from_one_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, project_name: str
+    ) -> None:
+        """A second lookup or a second read could see a ``pyproject.toml``
+        saved in between and disagree with the command it describes; install
+        reads the selected file exactly once, for both decisions."""
+        from memtomem_stm.cli import proxy
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        project = self._project(tmp_path)
+        if project_name == "memtomem-stm":  # source-shaped checkout: no notice
+            (project / "pyproject.toml").write_text(
+                '[project]\nname = "memtomem-stm"\n', encoding="utf-8"
+            )
+            (project / "src" / "memtomem_stm").mkdir(parents=True)
+            (project / "src" / "memtomem_stm" / "__init__.py").write_text("", encoding="utf-8")
+        monkeypatch.chdir(project)
+        real = proxy._load_pyproject
+        reads: list[Path] = []
+
+        def counting(pyp: Path) -> Any:
+            reads.append(pyp)
+            return real(pyp)
+
+        monkeypatch.setattr(proxy, "_load_pyproject", counting)
+
+        result = self._install()
+
+        assert result.exit_code == 0, result.output
+        assert reads == [project / "pyproject.toml"]
+        notice = [line for line in result.output.splitlines() if self.MARK in line]
+        if project_name == "memtomem-stm":
+            assert notice == []
+        else:
+            assert len(notice) == 1 and str(project) in notice[0]
+
+    def test_plain_directory_and_source_checkout_get_no_notice(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        checkout = tmp_path / "memtomem-stm"
+        (checkout / "src" / "memtomem_stm").mkdir(parents=True)
+        (checkout / "src" / "memtomem_stm" / "__init__.py").write_text("", encoding="utf-8")
+        (checkout / "pyproject.toml").write_text(
+            '[project]\nname = "memtomem-stm"\n', encoding="utf-8"
+        )
+        for cwd in (plain, checkout):
+            monkeypatch.chdir(cwd)
+            result = self._install()
+            assert result.exit_code == 0, result.output
+            assert self.MARK not in result.output, (cwd, result.output)
+
+    @pytest.mark.parametrize("changed", [True, False], ids=["changed", "already"])
+    def test_binding_path_is_escaped(self, capsys, changed: bool) -> None:
+        """The project path is filesystem-derived, so it is escaped at render
+        time like every other path ``_emit_hook_change`` prints (#760)."""
+        from memtomem_stm.cli import hook_cmd
+        from memtomem_stm.cli.hook_hosts import HookChange
+
+        change = HookChange(
+            host_tag="claude",
+            label="Claude Code",
+            path=Path("/tmp/settings.json"),
+            fmt="json",
+            action="install",
+            status="create" if changed else "already",
+            changed=changed,
+            current_text=None,
+            new_text="{}",
+            rendered_block="{}",
+            notes=(),
+        )
+
+        hook_cmd._emit_hook_change(
+            change,
+            apply_=False,
+            backup=None,
+            project_binding=Path("/tmp/ev\x1b[31m\nil"),
+        )
+
+        out = capsys.readouterr().out
+        assert self.MARK in out
+        assert "\x1b" not in out
+        assert "\\u001B" in out and "\\u000A" in out

@@ -750,12 +750,28 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         # not no shutdown. Idempotent, so a signal that already armed it (see
         # ``ShutdownSignals``) simply keeps its countdown.
         watchdog.arm()
+        # Set as the body's last statement, so it is true only when the close
+        # sequence reached its end. A ``BaseException`` that escapes a step — a
+        # ``CancelledError`` passes every ``except Exception`` guard below —
+        # skips the steps after it and leaves this false. Completion is then
+        # recorded only if the sweep also returns, and the exit status after a
+        # signal reports it (#1459). A step that fails inside its own guard
+        # does not cut the sequence short.
+        teardown_ran_to_end = False
         try:
             # Not a ``remove()``: handing the signals back would put the
             # default disposition in charge for the whole of teardown, which is
             # the window this exists to survive. From here a signal means
             # "stop waiting" and takes the immediate-exit path.
             shutdown_signals.entering_teardown()
+            # Cache counts buffered so far go out before the first await of
+            # teardown, which a cancelled scope can cut short (#1458). The
+            # short lock budget of the periodic flush keeps a locked shared DB
+            # from delaying the stop; the final flush below retries in full.
+            try:
+                tracker.flush_cache_counts(periodic=True)
+            except Exception:
+                logger.warning("Failed to flush cache counts", exc_info=True)
             # Remove exactly what registration took ownership of (#891). Re-deriving
             # the set with ``get_proxy_tools()`` here would remove whatever the
             # session advertises *now*. Re-advertisement (#917) keeps the owned
@@ -808,6 +824,13 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                     await close_store_on_worker(feedback_tracker.close)
                 except Exception:
                     logger.warning("Failed to close feedback_tracker", exc_info=True)
+            # Cache counts buffered since the last recorded call go out before
+            # the store closes (#1329). The manager has stopped, so no call is
+            # still adding to them. One synchronous write; failure is logged.
+            try:
+                tracker.flush_cache_counts()
+            except Exception:
+                logger.warning("Failed to flush cache counts", exc_info=True)
             for resource, name in [
                 (proxy_cache, "proxy_cache"),
                 (metrics_store, "metrics_store"),
@@ -869,19 +892,22 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                     shutdown_otlp(otlp_emitter, timeout_seconds=config.otlp.flush_timeout_seconds)
                 except Exception:
                     logger.warning("Failed to shut down OTLP export", exc_info=True)
+            teardown_ran_to_end = True
         finally:
             try:
                 child_reaper.sweep_leaked_children(baseline=children_at_startup)
+                if teardown_ran_to_end:
+                    teardown_completed()
             finally:
-                teardown_completed()
                 watchdog.disarm()
                 if shutdown_was_signalled():
                     # Here, not in ``main``: cancelling the lifespan does not
                     # make ``mcp.run()`` return — the SDK's ``anyio.run`` is
                     # still waiting on the stdin reader, blocked on a pipe the
                     # client (alive; it only signalled us) still holds open. So
-                    # this is the last line of ours that runs, and everything
-                    # that had to happen has happened. Does not return.
+                    # this is the last line of ours that runs, whether or not
+                    # the teardown completed. Status 0 needs the close sequence
+                    # to reach its end and the sweep to return. Does not return.
                     exit_after_signal_shutdown()
 
 

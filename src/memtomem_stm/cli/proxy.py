@@ -27,7 +27,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import wraps
-from typing import TYPE_CHECKING, Any, NoReturn, TextIO, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, TextIO, TypeGuard
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import click
@@ -877,15 +877,19 @@ def _dep_name(spec: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _pyproject_references_stm(pyp: Path) -> bool:
-    """True if ``pyp`` is STM's own pyproject.toml, or lists memtomem-stm as
-    a dep. Parses the TOML via ``tomllib`` so comments, descriptions, and
-    adjacent-name packages (``memtomem-stm-extension``) can't false-positive.
-    """
+def _load_pyproject(pyp: Path) -> dict[str, Any] | None:
+    """``pyp`` parsed, or ``None`` when it cannot be read or parsed."""
     try:
-        data = tomllib.loads(pyp.read_text(encoding="utf-8"))
+        return tomllib.loads(pyp.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-        return False
+        return None
+
+
+def _project_table_references_stm(data: dict[str, Any]) -> bool:
+    """True if parsed pyproject ``data`` is STM's own (``[project].name``), or
+    lists memtomem-stm as a dependency or optional dependency. ``tomllib``
+    parsing means comments, descriptions and adjacent-name packages
+    (``memtomem-stm-extension``) can't false-positive."""
     project = data.get("project")
     if not isinstance(project, dict):
         return False
@@ -905,43 +909,109 @@ def _pyproject_references_stm(pyp: Path) -> bool:
     return False
 
 
-def _detect_install_type() -> tuple[str, list[str]]:
-    """Return ``(server_cmd, server_args)`` to register with an MCP client.
+class _StmProject(NamedTuple):
+    """The project a user-scope hook launcher binds to.
 
-    Branches:
+    ``source_checkout`` is True when the directory is shaped like STM's own
+    source checkout: ``[project].name = "memtomem-stm"`` and the package at
+    ``src/memtomem_stm/__init__.py`` (the name alone could be any project's).
+    Both fields come from one read of the same ``pyproject.toml``, so the
+    written command and the binding notice cannot describe different
+    versions of the file (#1379)."""
 
-    * Inside a ``pyproject.toml`` that is STM's own source checkout OR a
-      user project that lists ``memtomem-stm`` in ``[project].dependencies``
-      / ``[project].optional-dependencies`` → ``uv run --directory <root>
-      memtomem-stm``.
-    * Default (global install via ``uv tool install`` / ``pipx``, or a cwd
-      with no relevant pyproject) → bare ``memtomem-stm`` console script.
+    root: Path
+    source_checkout: bool
 
-    Both branches spawn the ``memtomem-stm`` console script, not ``mms``:
-    ``mms`` is the click CLI group and exits 0 on no-subcommand, which closes
-    the stdio pipe immediately and the MCP client reports "Failed to
-    reconnect". ``memtomem-stm`` is the actual server entrypoint
-    (``memtomem_stm.server:main``).
 
-    Parent ``mm init`` keeps source/project as separate branches because
-    the parent is a monorepo (``packages/`` subdir is the discriminator).
-    STM has a flat layout so the two collapse into one.
-
-    PEP 735 ``dependency-groups`` and tool-specific dev-dep tables (``[tool.uv
-    .dev-dependencies]``, ``[tool.poetry.group.*.dependencies]``) are
-    intentionally **not** matched — a dev-only dep usually means the user
-    wants `uv run --group <name>` which the registration command can't pick.
-    Bare ``memtomem-stm`` is the safer default; users can override manually.
-    """
+def _stm_project() -> _StmProject | None:
+    """The nearest ``pyproject.toml`` (cwd and up to four parents) that
+    references STM, read once; ``None`` when the nearest one does not (the
+    walk stops at the first ``pyproject.toml``, so an unrelated project
+    nested inside an STM checkout yields ``None``) or there is none."""
     check = Path.cwd()
     for _ in range(5):
         pyp = check / "pyproject.toml"
         if pyp.exists():
-            if _pyproject_references_stm(pyp):
-                return ("uv", ["run", "--directory", str(check), "memtomem-stm"])
-            break
+            data = _load_pyproject(pyp)
+            if data is None or not _project_table_references_stm(data):
+                return None
+            return _StmProject(check, _is_stm_source_checkout(check, data))
         check = check.parent
+    return None
+
+
+def _is_stm_source_checkout(root: Path, data: dict[str, Any]) -> bool:
+    """Whether ``root`` (whose parsed pyproject is ``data``) is shaped like
+    STM's own source checkout. An unreadable package marker counts as not
+    confirmed, so install goes on and reports the binding: ``Path.is_file``
+    raises ``PermissionError`` before Python 3.14 for an unreadable ``src/``."""
+    project = data.get("project")
+    if not isinstance(project, dict) or project.get("name") != "memtomem-stm":
+        return False
+    try:
+        return (root / "src" / "memtomem_stm" / "__init__.py").is_file()
+    except OSError:
+        return False
+
+
+def _detect_install_type() -> tuple[str, list[str]]:
+    """Return ``(cmd, args)``, the launcher ``mms hook install`` writes into a
+    host's **user-scope** hook (its only caller: MCP registration uses
+    ``sys.executable -P -m memtomem_stm``, :func:`_registration_command`).
+
+    Branches, decided by the nearest ``pyproject.toml`` in the cwd or one of
+    its four parents (:func:`_stm_project`):
+
+    * It declares ``[project].name = "memtomem-stm"`` (STM's own checkout, or
+      any project with that name) or lists ``memtomem-stm`` in
+      ``[project].dependencies`` / ``[project].optional-dependencies`` →
+      ``uv run --directory <its directory> memtomem-stm``. Unless the
+      directory is shaped like STM's source checkout, the hook is then bound
+      to that project's environment for every project, which
+      :func:`_hook_project_binding` names so install can say so (#1379).
+    * Otherwise (global install via ``uv tool install`` / ``pipx``, or no
+      such pyproject) → bare ``memtomem-stm`` console script.
+
+    Both branches name the ``memtomem-stm`` entry point, the spelling the
+    hook-registration readers recognize after ``uv run --directory``.
+
+    PEP 735 ``dependency-groups`` and tool-specific dev-dep tables (``[tool.uv
+    .dev-dependencies]``, ``[tool.poetry.group.*.dependencies]``) are
+    intentionally **not** matched — a dev-only dep usually means the user
+    wants `uv run --group <name>` which the written command can't pick.
+    Bare ``memtomem-stm`` is the safer default; users can override manually.
+    """
+    return _launcher_for(_stm_project())
+
+
+def _launcher_for(project: _StmProject | None) -> tuple[str, list[str]]:
+    """The launcher for a :func:`_stm_project` result. Split out so ``mms hook
+    install`` derives the written command and its binding notice from one
+    lookup."""
+    if project is not None:
+        return ("uv", ["run", "--directory", str(project.root), "memtomem-stm"])
     return ("memtomem-stm", [])
+
+
+def _hook_project_binding() -> Path | None:
+    """The project a user-scope hook launcher from :func:`_detect_install_type`
+    is tied to, or ``None`` when it is not tied to one.
+
+    ``None`` for the bare console script and for STM's own source checkout
+    (the developer binding, intended). A dependent project's directory
+    otherwise: every hook call, in every project, would run from that
+    project's environment, which install reports instead of changing (#1379).
+    The written command is left alone because the install shell's PATH is not
+    the host app's, so switching to a bare command could break a working hook.
+    """
+    return _binding_for(_stm_project())
+
+
+def _binding_for(project: _StmProject | None) -> Path | None:
+    """:func:`_hook_project_binding` for an already looked-up project."""
+    if project is None or project.source_checkout:
+        return None
+    return project.root
 
 
 def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, str]]:
@@ -2874,6 +2944,45 @@ def _render_compression_block(
             )
 
 
+def _render_cache_block(summary: dict[str, Any], *, collecting: bool) -> None:
+    """Response-cache counts from :func:`read_cache_summary` (#1329)."""
+    click.echo(_hdr("Proxy / Cache"))
+    click.echo("=" * 30)
+    if summary.get("error"):
+        click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
+        return
+    if not collecting:
+        click.echo(
+            "  Not collecting (proxy.enabled, proxy.cache.enabled or proxy.metrics.enabled "
+            "is false)."
+        )
+    if not summary.get("available"):
+        click.echo("  No cache lookups recorded yet.")
+        return
+    hits, misses = int(summary.get("hits") or 0), int(summary.get("misses") or 0)
+    unstorable = int(summary.get("unstorable") or 0)
+    if hits or misses or unstorable:
+        click.echo(f"  lookups: {hits:,} hits, {misses:,} misses ({unstorable:,} unstorable)")
+        rate = summary.get("storable_hit_rate")
+        rate_text = f"{float(rate) * 100:.1f}%" if rate is not None else "n/a (no storable lookups)"
+        click.echo(f"  hit rate: {rate_text} of storable lookups")
+        click.echo(f"  served from cache: {int(summary.get('hit_chars') or 0):,} chars")
+    else:
+        click.echo("  No cache lookups recorded yet.")
+    since = "an unknown start"
+    installed_at = summary.get("installed_at")
+    if installed_at is not None:
+        try:
+            since = datetime.fromtimestamp(float(installed_at), tz=UTC).strftime("%Y-%m-%d UTC")
+        except (OverflowError, OSError, ValueError):
+            pass
+    click.echo(
+        f"  Coverage: since {since}, from STM processes that persist cache counts;\n"
+        "    each tries to write them with its next metrics row, every 30 s while some\n"
+        "    are waiting, and at MCP server stop."
+    )
+
+
 def _render_progressive_block(
     summary: dict[str, Any], *, collecting: bool, retention_days: int
 ) -> None:
@@ -3014,7 +3123,8 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     type=click.Choice(["mcp", "hook"]),
     default=None,
     help="Filter compression rows by provenance: 'mcp' (proxied upstream tools) "
-    "or 'hook' (native built-in tools recorded by 'mms hook').",
+    "or 'hook' (native built-in tools recorded by 'mms hook'). 'hook' also omits the "
+    "cache block, since only proxied tools are cached.",
 )
 @click.option(
     "--all-time",
@@ -3041,15 +3151,18 @@ def stats(
     (``proxy.metrics.max_history`` per source, ``retention_days`` for
     progressive reads and surfacing), not all-time totals. ``--all-time`` switches
     the compression section alone to the never-pruned daily rollup plus retained
-    rows (#1316); progressive and surfacing stay retained-window. The live MCP server
-    keeps additional in-memory counters that a separate CLI process cannot see,
-    so the numbers here reflect only what has been written to disk. An explicit
+    rows (#1316); progressive and surfacing stay retained-window. The cache block
+    reads ``proxy_cache_daily``, which is never pruned and covers everything
+    written since it was created (#1329). The live MCP server keeps additional
+    in-memory counters that a separate CLI process cannot see, so the numbers
+    here reflect only what has been written to disk. An explicit
     ``--config`` also steers the STMConfig-backed feedback-DB location (#839).
     """
     config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.config import STMConfig, stm_config_for_cli
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
     from memtomem_stm.proxy.metrics_store import (
+        read_cache_summary,
         read_compression_all_time,
         read_compression_summary,
     )
@@ -3152,17 +3265,26 @@ def stats(
     hook_status = _hook_status(status_rows)
     total_rows: Any = compression.pop("hook_status", None)
     total_hook_status = hook_status if compression is hook_summary else _hook_status(total_rows)
+    # Only proxied tools are cached, so ``--source hook`` has no cache block.
+    cache = (
+        read_cache_summary(proxy_cfg.metrics.db_path, tool=tool_filter)
+        if source_filter != "hook"
+        else None
+    )
     progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
     # These numbers come only from the on-disk stores; the live MCP server
-    # keeps additional in-memory-only counters (cache hits, latency, reconnects,
-    # …) that a separate CLI process cannot see. Name the source and point at
-    # the live tool so a user comparing the two doesn't read the gap as a bug.
-    # Wording is generic (not the default filenames) because metrics.db_path and
-    # surfacing.feedback_db_path are both configurable.
+    # keeps additional in-memory-only counters (latency, reconnects, cache counts
+    # not yet written, …) that a separate CLI process cannot see. Name the
+    # source and point at the live tool so a user comparing the two doesn't
+    # read the gap as a bug. Wording is generic (not the default filenames)
+    # because metrics.db_path and surfacing.feedback_db_path are both
+    # configurable.
     data_source = (
-        "on-disk stores only (metrics DB + surfacing-feedback DB); "
+        "on-disk stores only (metrics DB + surfacing-feedback DB; each proxy tries to "
+        "write its pending cache counts with its next metrics write, every 30 s, and "
+        "during an orderly MCP server stop); "
         "live in-memory counters via the stm_admin MCP tool (action proxy_stats)"
     )
 
@@ -3182,6 +3304,7 @@ def stats(
                     "compression_by_source": compression_by_source,
                     "hook_by_host": hook_by_host,
                     "hook_status": hook_status,
+                    "cache": cache,
                     "progressive": progressive,
                     "surfacing": surfacing,
                 },
@@ -3208,6 +3331,12 @@ def stats(
         hook_status=hook_status,
         total_hook_status=total_hook_status,
     )
+    if cache is not None:
+        click.echo("")
+        _render_cache_block(
+            cache,
+            collecting=proxy_cfg.enabled and proxy_cfg.cache.enabled and proxy_cfg.metrics.enabled,
+        )
     click.echo("")
     _render_progressive_block(
         progressive,
@@ -11037,7 +11166,15 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
     return checks
 
 
-_HOOK_REGISTRATION_SCOPE = "project, local and managed Claude Code settings are not read"
+# What the row can miss, stated at the end of each detail that reports on
+# commands (the settings-read failure has none to report). Recognition is a
+# search of the command text (``hook_registration.is_candidate``), and what it
+# misses cannot be listed from that text, so the limit is said instead (#1457).
+_HOOK_REGISTRATION_SCOPE = (
+    "STM hooks are recognized from the command text by a heuristic, so one behind a wrapper "
+    "script or spelled with shell syntax can be missed; project, local and managed Claude "
+    "Code settings are not read"
+)
 
 
 def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
@@ -11054,7 +11191,11 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
     Not gated on compression being enabled: the hook process's environment
     cannot be established from here, and ``--host claude`` is the right
     registration for Claude Code either way. WARN only, like the other hook
-    checks; no row when the file holds no STM hook command.
+    checks; no row when the file holds no command recognized as STM's hook.
+
+    A PASS covers the recognized commands only. Recognition is a heuristic, and
+    a hook it does not find (a wrapper script, some shell spellings) is not counted,
+    so a detail that reports on commands ends with that limit (#1457).
     """
     from memtomem_stm.cli import hook_hosts
     from memtomem_stm.cli.hook_cmd import host_authorizes_replacement
@@ -11112,7 +11253,8 @@ def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
             "hook_registration",
             label,
             "PASS",
-            f"STM hook commands: {len(passing)} pass --host claude to mms hook — {where}",
+            f"STM hook commands: {len(passing)} recognized, all passing --host claude to "
+            f"mms hook — {where}",
         )
         return
     problems = []
