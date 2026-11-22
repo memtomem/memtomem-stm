@@ -157,6 +157,7 @@ def test_is_stm_hook_command_requires_a_line_that_runs_the_bridge(command: str) 
         "uv run memtomem-stm hook --host claude",
         "uv run --directory /repo --frozen memtomem-stm hook --host claude",
         "uv run --directory /repo /repo/.venv/bin/memtomem-stm hook --host claude",
+        "uv run --directory -x memtomem-stm hook --host claude",  # an option, not a directory
     ],
 )
 def test_is_stm_hook_command_requires_the_uv_launcher_install_writes(command: str) -> None:

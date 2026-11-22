@@ -156,7 +156,7 @@ def _is_stm_hook_command(command: str) -> bool:
     checks are this function's own. All of them read ``shlex`` words, an
     approximation of the shell, not its exact reading: a ``# comment``'s words
     usually fail the parse, so a commented line usually does not match, but
-    in ``--host # x`` the ``#`` is read as the host value."""
+    ``--host # --no-daemon`` matches, reading ``#`` as the host value."""
     # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
     from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE, runs_hook_bridge
 

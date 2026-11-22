@@ -1088,7 +1088,8 @@ executable word has no `=` or control character and does not end in `/` or
 <dir>` with a non-empty `<dir>` not starting with `-` and a bare entry-point
 name after it, may appear (`uv run --help mms hook` does not count). A shell
 comment stays in the words: a trailing `# comment` usually makes a command not
-count, but `--host # …` reads `#` as the host value. Claude Code and Codex also fold any further
+count, but `--host # --no-daemon` counts, reading `#` as the host value.
+Claude Code and Codex also fold any further
 recognized STM handlers into it; Cursor and Kimi update the first one and leave
 the rest as they are. `uninstall` removes every recognized STM handler, prunes
 the emptied containers, and leaves other hooks untouched. A handler that only
