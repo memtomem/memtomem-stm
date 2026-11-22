@@ -657,11 +657,13 @@ class TokenTracker:
         Without this, a tool whose responses are never storable (mixed/non-text
         content, transient retrieval keys, …) re-misses forever: ``cache_misses``
         grows unbounded while its hit-rate contribution stays 0%, and the
-        diagnostics point at a tool the cache can never help (#558). Callers only
-        invoke this when the lookup path actually recorded a miss, so
-        ``cache_misses - cache_unstorable`` is the demand the cache can convert
-        to hits. Best-effort: store-side failures after an accepted response
-        (sqlite errors, the privacy write gate) are not counted.
+        diagnostics point at a tool the cache can never help (#558). The proxy
+        calls this only for a call whose own lookup recorded a miss — the manager
+        carries that fact from the lookup rather than re-checking eligibility at
+        completion (#1473) — so ``cache_misses - cache_unstorable`` is the miss
+        count the storable hit rate uses. Best-effort: store-side failures
+        after an accepted response (sqlite errors, the privacy write gate) are
+        not counted.
         """
         self._cache_unstorable += 1
         self._buffer_cache(server, tool, unstorable=1)

@@ -6161,7 +6161,9 @@ class ProxyManager:
             # exit, so account the miss here. The ineligible and no-cache paths
             # above deliberately record NOTHING — no lookup was attempted, and
             # counting a forced-forward writer (or a ``cache: false`` tool) as a
-            # miss would skew the hit-rate diagnostics.
+            # miss would skew the hit-rate diagnostics. Whether this call
+            # counted a miss is passed on, not decided again at completion,
+            # where eligibility can read differently (#1473).
             self.tracker.record_cache_miss(server=server, tool=tool)
             return await self._call_tool_inner(
                 server,
@@ -6170,6 +6172,7 @@ class ProxyManager:
                 trace_id=trace_id,
                 cfg_snap=cfg_snap,
                 config_fp=config_fp,
+                cache_miss_recorded=True,
             ), False
 
     def _server_cfg(self, conn: UpstreamConnection, cfg_snap: ProxyConfig) -> UpstreamServerConfig:
@@ -7797,27 +7800,23 @@ class ProxyManager:
                     exc_info=True,
                 )
 
-    def _record_unstorable_response(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> None:
-        """Count a recorded cache miss whose response shape refuses the store.
+    def _record_unstorable_response(
+        self, server: str, tool: str, *, cache_miss_recorded: bool
+    ) -> None:
+        """Count a cache miss whose response the store refuses, against the
+        miss this call recorded.
 
-        The gate mirrors the lookup path in ``_call_tool_guarded`` exactly
-        (cache wired, resolved TTL positive/None, tool cache-eligible): a miss
-        is recorded only behind that gate, so the counter must only move behind
-        the same gate — otherwise force-forwarded (ineligible / ttl<=0 / no-
-        cache) calls would report "unstorable" misses that were never counted
-        as misses in the first place. Direct ``_call_tool_inner`` callers
-        (tests) bypass the lookup AND this accounting stays consistent only
-        through production's guarded path; see the miss-accounting comment in
-        ``_call_tool_inner``.
+        ``cache_miss_recorded`` is ``True`` only when ``_call_tool_guarded``
+        counted a miss for this call at lookup. Force-forwarded calls (no
+        cache, ttl<=0, cache-ineligible) and direct ``_call_tool_inner``
+        callers count no miss, so they count no unstorable outcome either.
+        The lookup gate is not evaluated again here: tool annotations (and,
+        when the snapshot lacks the server, its config) can change while the
+        call is in flight, and a gate read at completion would then count an
+        unstorable outcome with no miss, or drop the outcome of one (#1473).
         """
-        if self._cache is None:
-            return
-        cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
-        if cache_ttl is not None and cache_ttl <= 0:
-            return
-        if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
-            return
-        self.tracker.record_cache_unstorable(server=server, tool=tool)
+        if cache_miss_recorded:
+            self.tracker.record_cache_unstorable(server=server, tool=tool)
 
     def _store_cache(
         self,
@@ -7835,6 +7834,7 @@ class ProxyManager:
         connection_identity_matches: bool,
         source_response_chars: int,
         text_block_metadata: dict[str, Any] | None,
+        cache_miss_recorded: bool,
         postprocess_retry_required: bool = False,
     ) -> Callable[[], None] | None:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
@@ -7845,7 +7845,13 @@ class ProxyManager:
         it with the miss; the cache write or invalidation it decided on is
         returned, for the caller to run after that metrics write, so the entry's
         TTL still starts when the response is complete. ``None`` when there is
-        nothing to write.
+        nothing to write. Once a branch below refuses the store, it counts an
+        unstorable outcome only when ``cache_miss_recorded`` says this call
+        counted a miss at lookup (#1473). The completion-time ttl and
+        eligibility checks are not used for that count, but they still come
+        before the four branches that follow them (credential refused,
+        progressive passthrough, selective store error, transient key): a
+        response they skip reaches none of those and counts nothing.
 
         Successful text responses may include JSON-safe result-level
         ``structuredContent``/``_meta``; cache v6 stores and reconstructs that
@@ -7898,20 +7904,20 @@ class ProxyManager:
         if not connection_identity_matches:
             # A failed hot edit can deliberately serve the previous connection.
             # That response must not become a cache hit for the requested one.
-            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             return lambda: self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
         if postprocess_retry_required:
             # Cache hits bypass INDEX/EXTRACT. Keep failed sync work and
             # not-yet-resolved background work retryable on the next call.
-            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             return None
         if non_text_content:
             # A non-text / mixed response is never stored because the cache row
             # contract cannot reproduce arbitrary content blocks and ordering.
             # Text-only result envelopes are handled below.
-            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             return lambda: self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
@@ -7935,7 +7941,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.credential_store_refused:
-            self.tracker.record_cache_unstorable(server=server, tool=tool)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             logger.debug(
                 "Skipping cache store for %s/%s: a persistent pending store "
                 "refused this credential-bearing response",
@@ -7943,7 +7949,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.progressive_passthrough_on_error:
-            self.tracker.record_cache_unstorable(server=server, tool=tool)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             logger.debug(
                 "Skipping cache store for %s/%s: progressive passthrough "
                 "degradation (transient store failure)",
@@ -7951,7 +7957,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.selective_store_error:
-            self.tracker.record_cache_unstorable(server=server, tool=tool)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             logger.debug(
                 "Skipping cache store for %s/%s: selective/hybrid truncate "
                 "degradation (transient store failure)",
@@ -7963,7 +7969,7 @@ class ProxyManager:
             or comp.progressive_key_issued
             or response_carries_transient_key(comp.compressed)
         ):
-            self.tracker.record_cache_unstorable(server=server, tool=tool)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             logger.debug(
                 "Skipping cache store for %s/%s: response carries a transient "
                 "retrieval key (progressive/selective TOC)",
@@ -8007,6 +8013,7 @@ class ProxyManager:
         trace_id: str | None = None,
         cfg_snap: ProxyConfig,
         config_fp: str | None = None,
+        cache_miss_recorded: bool = False,
     ) -> str | list | CallToolResult:
         # Public entry point ``call_tool`` generates the trace_id and passes
         # it in so it can match the enclosing Langfuse span. Direct callers
@@ -8047,7 +8054,10 @@ class ProxyManager:
         # record nothing. By the time we reach here the call is already past that
         # gate, so we just proceed with the upstream fetch. Direct callers (tests)
         # that invoke ``_call_tool_inner`` bypass the lookup and therefore the
-        # miss counter too, matching the no-lookup semantics.
+        # miss counter too, matching the no-lookup semantics. An unstorable
+        # outcome is counted only against that miss: ``cache_miss_recorded``
+        # carries it from the lookup (``True`` only at the guarded eligible-miss
+        # exit), so no count here re-reads the lookup gate (#1473).
 
         # Pin the identity paired with the lookup key before any await. The
         # connection may be replaced (or cleared by stop()) before storage.
@@ -8314,7 +8324,7 @@ class ProxyManager:
             # surfaced or read further — so stats count it as classified.
             # The unstorable count goes first, so this call's metrics write
             # carries it together with the miss (#1329).
-            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             self.tracker.record(
                 CallMetrics(
                     server=server,
@@ -8357,7 +8367,7 @@ class ProxyManager:
             # write carries both (#1329) — and mirror the mixed-branch
             # invalidation in ``_store_cache`` so a stale prior text row for
             # this key is dropped while caching is disabled (#541).
-            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
+            self._record_unstorable_response(server, tool, cache_miss_recorded=cache_miss_recorded)
             self.tracker.record(
                 CallMetrics(
                     server=server,
@@ -8593,6 +8603,7 @@ class ProxyManager:
                     and extract_ok is None
                 )
             ),
+            cache_miss_recorded=cache_miss_recorded,
         )
 
         # Record metrics (using pre-surfacing compressed size)
