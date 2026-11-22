@@ -13,7 +13,7 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
-- `mms stats` reports response-cache savings (issue #1329). The proxy used to
+- `mms stats` reports response-cache savings (#1466, issue #1329). The proxy used to
   keep cache hits, misses and unstorable misses in memory only, with no server
   or tool, so `mms stats` could not see them. Each proxy process now also
   counts them per UTC day, server and tool, together with the characters
