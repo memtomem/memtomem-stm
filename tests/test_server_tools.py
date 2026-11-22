@@ -3000,6 +3000,62 @@ class TestLifespan:
         assert any("Proxy manager stop did not finish" in m for m in messages)
         assert killed == [{4242}]  # the abandoned step's child still swept
 
+    async def test_a_wedged_stop_under_the_shield_still_hits_its_ceiling(self, monkeypatch, caplog):
+        """The shield of a deliberate shutdown (#1468) blocks the host scope's
+        cancellation, not the per-step ceiling: ``await_or_warn`` cancels its
+        wait directly. So a stop() that never returns is still abandoned, the
+        rest of the teardown runs to its end, and the sweep collects what the
+        step left."""
+        completed = self._record_completion(monkeypatch)
+        self._deliberate_shutdown(monkeypatch, signalled=True)
+
+        class _Watchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                pass
+
+            def arm(self):
+                return True
+
+            def disarm(self):
+                pass
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _Watchdog)
+        killed = []
+        probes = iter([set(), {4242}])
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+        monkeypatch.setattr("memtomem_stm.server._PROXY_STOP_BUDGET_SECONDS", 0.05)
+        host = _HostScope()
+
+        async def _never_returns_while_the_host_is_cancelled():
+            host.scope.cancel()
+            await asyncio.sleep(30)
+
+        task = asyncio.create_task(
+            self._run_minimal_lifespan(
+                pm_stop=_never_returns_while_the_host_is_cancelled, host_scope=host
+            )
+        )
+        try:
+            with caplog.at_level("WARNING"):
+                # ``asyncio.wait``: a ceiling that no longer fired must fail
+                # this test, not hang it.
+                done, _ = await asyncio.wait({task}, timeout=10.0)
+            assert done == {task}
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.wait({task}, timeout=5.0)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Proxy manager stop did not finish" in m for m in messages)
+        assert killed == [{4242}]
+        assert completed == [1]
+
     async def test_the_watchdog_would_reap_the_children_a_wedged_teardown_left(self, monkeypatch):
         """The watchdog exits with os._exit, which runs no finally blocks — so
         whatever the wedged teardown abandoned is gone for good unless the
