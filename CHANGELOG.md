@@ -60,10 +60,11 @@ changes inline only. See the deprecation policy in
   in `checks[].detail` of `mms doctor --json`. Its statuses, the conditions
   for showing it, and doctor's exit code do not.
 - The 0.7.10 notes for `mms doctor`'s `hook registration` row now state the
-  conditions of its quote-removal match: shell form only, a line of
-  plain-word characters (ASCII letters and digits, and `_./:=+-`), spaces,
-  tabs and quotes, and balanced quotes. They said only "a line made only of plain
-  words and quotes, up to 4,096 characters" (#1469).
+  conditions of its quote-removal match: never for a handler whose `args` is
+  a list (exec form), a line of plain-word characters (ASCII letters and
+  digits, and `_./:=+-`), spaces, tabs and quotes, and balanced quotes. They
+  said only "a line made only of plain words and quotes, up to 4,096
+  characters" (#1469).
   **Behavior change**: none external (documentation only).
 
 ## [0.7.10] — 2026-11-21
@@ -166,17 +167,17 @@ changes inline only. See the deprecation policy in
   a hand edit rather than `mms hook install --apply`: install merges every STM
   handler it recognizes into one, drops most inline `env` settings, and does
   not recognize a `NAME=value mms hook` line. Project, local and managed Claude
-  Code settings are not read. In shell form, a line made only of plain-word
-  characters (ASCII letters and digits, and `_./:=+-`), spaces, tabs and
-  quotes, up to 4,096 characters and with balanced quotes, is also matched on the words
-  left after quote removal, so `m"m"s hook` next to `mms hook --host claude`
-  is counted, marked not checked, and the row WARNs. A quoted hook in a longer
-  line, in a line whose quotes do not balance, or in a line with any other
-  character (a comment, an operator, a line continuation, a non-ASCII
-  letter), is found only by a search of the raw text, which can miss it and
-  let the row PASS. A plain command whose `hook` is only part of a word, such as
-  `mms status --config /tmp/hook.json`, is not counted as an STM hook (#1455,
-  issue #1450).
+  Code settings are not read. Unless the handler's `args` is a list (exec
+  form), a line made only of plain-word characters (ASCII letters and digits,
+  and `_./:=+-`), spaces, tabs and quotes, up to 4,096 characters and with
+  balanced quotes, is also matched on the words left after quote removal, so
+  `m"m"s hook` next to `mms hook --host claude` is counted, marked not
+  checked, and the row WARNs. A quoted hook in a longer line, in a line whose
+  quotes do not balance, or in a line with any other character (a comment, an
+  operator, a line continuation, a non-ASCII letter), is found only by a
+  search of the raw text, which can miss it and let the row PASS. A plain
+  command whose `hook` is only part of a word, such as `mms status --config
+  /tmp/hook.json`, is not counted as an STM hook (#1455, issue #1450).
   **Behavior change**: when the settings hold an STM-looking handler or
   cannot be read, `mms doctor` prints the new row and `--json` gains a
   `hook_registration` check, so a setup doctor passed before can now report
