@@ -49,6 +49,28 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook install` and `mms hook uninstall` no longer take over commands that
+  name STM's hook but do not run it (issue #1460). They used to treat a
+  command as STM's own hook whenever an STM entry point followed by `hook` had
+  nothing before it, an `env` with only `MEMTOMEM_STM_*` settings, or `uv run
+  …` without a `--`, so install replaced, and uninstall deleted, lines such as
+  `mms hook uninstall`, `uv run --help mms hook` and `OTHER=/mms hook`, both
+  calling them memtomem-stm's hook. Three token checks are added: the words
+  after `hook` must read as a hook run with `mms hook`'s own options (not a
+  subcommand, `--help` or a usage error); the executable word must have no `=`
+  or control character and not end in `/` or `/.`; and a `uv` launcher must be
+  exactly `uv run --directory <dir> <entry point>` with a non-empty `<dir>`
+  that does not start with `-` and a bare entry-point name, the form install
+  writes. The words are still split with `shlex`, so the checks approximate
+  the shell rather than prove what it runs. Lines that fail them are left in
+  place; those that look like STM's hook by the #1456 heuristic are named by
+  location. **Behavior change**: such lines are no longer updated or removed,
+  and when install finds no handler it manages it adds its own beside them.
+  That includes lines that do run the hook in a form the checks reject: a
+  hand-written `uv run` in another form (`uv run memtomem-stm hook`, extra
+  `uv` options, a path after `--directory <dir>`), an executable path with
+  `=` in it, and usually a line with a trailing `# comment`, whose words are
+  read as more arguments.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that

@@ -14,7 +14,8 @@ compression is enabled for the hook process, are not claimed.
 
 Kept out of :mod:`memtomem_stm.cli.hook_cmd` so the runtime bridge's import
 path does not grow. Its callers are ``mms doctor``, and ``mms hook install``
-and ``mms hook uninstall``, which import :func:`is_candidate` lazily (through
+and ``mms hook uninstall``, which import lazily: :func:`runs_hook_bridge` to
+decide which handlers are STM's own, and :func:`is_candidate` (through
 ``hook_hosts.unmanaged_stm_like``) to name look-alike handlers they leave alone.
 """
 
@@ -208,6 +209,14 @@ def _hook_args(words: list[str], *, exec_form: bool, windows: bool) -> list[str]
     if _executable_name(words[i], windows=windows) not in _STM_EXECUTABLES:
         return None
     return words[i + 2 :]
+
+
+def runs_hook_bridge(args: list[str]) -> bool:
+    """Whether ``mms hook`` given ``args`` (the words after ``hook``) would run
+    the runtime bridge rather than help, a usage error or a subcommand such as
+    ``install``. ``mms hook install`` and ``uninstall`` use it to decide which
+    handlers are STM's own (#1460)."""
+    return _read_hook_args(args).runs_bridge
 
 
 def _read_hook_args(args: list[str]) -> HookRegistration:
