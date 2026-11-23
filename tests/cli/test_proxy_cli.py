@@ -17240,10 +17240,11 @@ class TestDoctor:
         assert env_check["status"] == "PASS"
 
     def test_ltm_row_probes_the_hook_daemon_with_the_hook_view(self, monkeypatch, tmp_path):
-        """Doctor's LTM row asks the hook daemon (``prefer_hook_daemon``), so
-        without an explicit ``--config`` it must build the config the hook and
-        daemon build — degraded under a proxy-only break, not a bootstrap
-        error. An explicit ``--config`` keeps the strict construction."""
+        """Doctor's LTM row asks the hook daemon (``prefer_hook_daemon``), so it
+        builds the config the hook and daemon build — degraded under a
+        proxy-only break, not a bootstrap error — with or without an explicit
+        path. ``mms health``'s route (no ``prefer_hook_daemon``) stays strict
+        against the path it is given."""
         from memtomem_stm.cli import proxy as proxy_mod
         from memtomem_stm.proxy.config import ProxyConfig
 
@@ -17267,8 +17268,16 @@ class TestDoctor:
         assert probed[0].proxy == ProxyConfig()
 
         probed.clear()
-        strict = proxy_mod._surfacing_bootstrap_status(
+        with_path = proxy_mod._surfacing_bootstrap_status(
             1.0, prefer_hook_daemon=True, config_path=str(tmp_path / "absent.json")
+        )
+        assert "error" not in with_path, with_path
+        assert len(probed) == 1
+        assert probed[0].proxy == ProxyConfig()
+
+        probed.clear()
+        strict = proxy_mod._surfacing_bootstrap_status(
+            1.0, prefer_hook_daemon=False, config_path=str(tmp_path / "absent.json")
         )
         assert strict.get("error"), strict
         assert probed == []
@@ -17311,6 +17320,54 @@ class TestDoctor:
         assert direct == [], result.output
         assert len(probed) == 1, result.output
         hook_config = hook_cmd._load_hook_config("comparing").config
+        assert config_fingerprint(probed[0], create_key=True) == config_fingerprint(
+            hook_config, create_key=True
+        )
+
+    def test_doctor_with_config_still_probes_the_daemon_the_hook_would_use(
+        self, runner, config, monkeypatch, tmp_path
+    ):
+        """The hook never sees doctor's ``--config``. Here the flag's file
+        declares the overridden upstream and the default file does not, so a
+        build against the flag succeeds and keeps the env's consumer model,
+        while the hook's build degrades and drops it — two fingerprints. The
+        daemon probe must use the hook's."""
+        from memtomem_stm.cli import hook_cmd
+        from memtomem_stm.cli import proxy as proxy_mod
+        from memtomem_stm.daemon.discovery import config_fingerprint
+
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        data = json.loads(config.read_text(encoding="utf-8"))
+        data["upstream_servers"]["ghost"] = {"prefix": "gh", "transport": "stdio", "command": "y"}
+        config.write_text(json.dumps(data), encoding="utf-8")
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GHOST__TIMEOUT", "5")
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONSUMER_MODEL", "some-model")
+        probed: list = []
+        direct: list = []
+
+        def fake_daemon_status(cfg, timeout, **kwargs):
+            probed.append(cfg)
+            return {"connected": False}
+
+        def fake_mcp_status(surfacing, timeout):
+            direct.append(surfacing)
+            return {"connected": False}
+
+        monkeypatch.setattr(proxy_mod, "_ltm_daemon_status", fake_daemon_status)
+        monkeypatch.setattr(proxy_mod, "_ltm_mcp_status", fake_mcp_status)
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        assert direct == [], result.output
+        assert len(probed) == 1, result.output
+        hook_config = hook_cmd._load_hook_config("comparing").config
+        # Precondition: the two builds really differ in what the fingerprint sees.
+        from memtomem_stm.config import stm_config_for_cli
+
+        flag_config = stm_config_for_cli(config)
+        assert flag_config.surfacing.consumer_model != hook_config.surfacing.consumer_model
         assert config_fingerprint(probed[0], create_key=True) == config_fingerprint(
             hook_config, create_key=True
         )

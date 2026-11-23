@@ -35,7 +35,7 @@ changes inline only. See the deprecation policy in
 ### Changed
 
 - `mms hook` and the surfacing daemon keep running when only a
-  `MEMTOMEM_STM_PROXY*` variable is invalid (issue #847). Compression,
+  `MEMTOMEM_STM_PROXY*` variable is invalid (#1482, issue #847). Compression,
   surfacing and the daemon need only the `surfacing`, `hook` and `daemon`
   settings (the hook reads `proxy` just for its metrics database), yet one
   invalid proxy variable (an override naming an upstream server the config
@@ -51,9 +51,9 @@ changes inline only. See the deprecation policy in
   `MEMTOMEM_STM_LOG_LEVEL` is `ERROR` or higher. An invalid variable outside
   `proxy` fails as before. `mms doctor`'s `env_overrides` row says which case
   applies, and its LTM row, which probes the hook's daemon, builds the same
-  configuration when no `--config` is given. **Behavior change**: under such
-  an environment the hook compresses and surfaces again and the daemon
-  starts. These paths ignore every `MEMTOMEM_STM_PROXY*` variable, valid ones
+  configuration, from the environment alone even when `--config` is given.
+  **Behavior change**: under such an environment the hook compresses and
+  surfaces again and the daemon starts. These paths ignore every `MEMTOMEM_STM_PROXY*` variable, valid ones
   included, so `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` no longer reaches
   surfacing, and the hook records no metrics rows, because the metrics
   database path is a proxy setting. Fixing the variable can change the

@@ -234,6 +234,11 @@ def test_env_supplied_invalid_value_stays_out_of_every_section(
             }
         ),
     )
+    if command == "doctor":
+        # Doctor's surfacing row probes the hook daemon, which recovers from a
+        # proxy-only break (#847); a second, non-proxy fault keeps it on the
+        # failure path this test is about.
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS", "nope")
     args = [command, "--config", str(path)]
     if json_output:
         args.append("--json")
