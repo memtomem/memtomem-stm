@@ -1038,8 +1038,9 @@ see [the hook CLI reference](reference/cli-hooks.md#mms-hook) for the list.
 ### `install` / `uninstall` — per-host registration
 
 `mms hook install --host <name>` writes STM's `PostToolUse` hook block into the
-host's own config so the host fires `mms hook --host <name>` after each built-in
-tool call. `uninstall` removes it.
+host's own config so the host fires `memtomem-stm hook --host <name>` (behind
+`uv run --directory <dir>` in a project that uses STM) after each built-in tool
+call. `uninstall` removes it.
 
 | host     | config file               | format |
 | -------- | ------------------------- | ------ |

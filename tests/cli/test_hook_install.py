@@ -2041,7 +2041,7 @@ def on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _WINDOWS_LOOK_ALIKES = [
-    # #1483: PowerShell reads a quoted executable as a string, not a command.
+    # #1483: a quoted executable name, which install never writes.
     '"mms" hook --host claude --persist-query-text',
     '"memtomem-stm" hook --host claude',
     "'mms' hook --host claude",
@@ -2113,6 +2113,9 @@ def test_cli_leaves_a_quoted_executable_and_reads_no_setting_from_it(on_windows,
         # Quote removal joins the executable name, which the raw search misses.
         "m\"m\"s hook --host 'C*'",
         "m\"m\"s hook --host '~x'",
+        # A quoted first word (#1483).
+        '"mms" hook --host claude',
+        "'mms' hook --host claude",
     ],
 )
 def test_windows_names_a_line_it_does_not_own(command: str, on_windows, redirect) -> None:
@@ -2196,6 +2199,31 @@ def test_the_notice_scan_splits_a_line_once(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == [line]
 
 
+def test_the_notice_names_a_long_quoted_name_from_one_split_and_one_scan(
+    on_windows, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A balanced line past ``is_candidate``'s ``shlex`` limit, with a name
+    its raw search misses, is named from one split and one adjacency scan."""
+    from memtomem_stm.cli import hook_hosts
+
+    calls = _count_splits(monkeypatch)
+    scans: list[int] = []
+    real_scan = hook_hosts._exe_before_hook
+
+    def counting_scan(tokens: list[str]) -> Iterator[int]:
+        scans.append(len(tokens))
+        return real_scan(tokens)
+
+    monkeypatch.setattr(hook_hosts, "_exe_before_hook", counting_scan)
+    command = 'm"m"s hook --host \'' + "x" * 5000 + "'"
+
+    assert hook_hosts.unmanaged_stm_like("claude", _claude_groups([_h(command)])) == (
+        "hooks.PostToolUse[0].hooks[0]",
+    )
+    assert calls == [command]
+    assert scans == [4]
+
+
 # ── a quoted first word on every host (#1483) ────────────────────────────────
 
 
@@ -2267,14 +2295,20 @@ def test_a_quoted_first_word_is_named_on_every_host(
 
 
 def test_cli_windows_install_refreshes_the_owned_handler_after_a_quoted_one(
-    on_windows, redirect
+    on_windows, redirect, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A quoted line ahead of an owned one: install keeps the first as
-    written and carries the second's own settings over, not the quoted
-    line's ``--persist-query-text``."""
+    written and rewrites the second, carrying its own settings over, not the
+    quoted line's ``--persist-query-text``."""
+    # An unrelated project stops ``_stm_project``'s walk, so install writes
+    # the bare launcher wherever the suite runs; the seed uses the other one.
+    project = tmp_path / "elsewhere"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nname = "other"\n', encoding="utf-8")
+    monkeypatch.chdir(project)
     owned = _written(
         "claude",
-        None,
+        PurePosixPath("/repo"),
         HostRuntimePolicy(
             use_daemon=False,
             surfacing_timeout_seconds=7.5,
@@ -2295,6 +2329,7 @@ def test_cli_windows_install_refreshes_the_owned_handler_after_a_quoted_one(
     assert [h["command"] for h in groups[0]["hooks"]] == [quoted]
     (refreshed,) = groups[1]["hooks"]
     written = shlex.split(refreshed["command"])
+    assert written[:2] == ["memtomem-stm", "hook"]  # rewritten, not left as seeded
     assert "--no-daemon" in written
     assert written[written.index("--surfacing-timeout-seconds") + 1] == "7.5"
     assert "--no-persist-query-text" in written

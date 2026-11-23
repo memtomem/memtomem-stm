@@ -131,7 +131,8 @@ changes inline only. See the deprecation policy in
   `OTHER=/mms hook`), lines a shell reads differently (a `#` comment, `$VAR`,
   a glob, a here-string: for `mms hook --host # --persist-query-text` install
   wrote `--persist-query-text` into the replacement, a flag the shell never
-  passed), a quoted executable that PowerShell would not run (`"mms" hook`),
+  passed), a quoted executable whose PowerShell reading was never measured
+  (`"mms" hook`),
   and a Kimi entry registered on another event, which install moved to
   `PostToolUse` and uninstall deleted. It also read a setting the hook does
   not: `env MEMTOMEM_STM_SURFACING__USE_DAEMON=false mms hook` turned the

@@ -11,7 +11,7 @@ Two stages, two hook fields. *Surfacing* appends ``additionalContext`` (the
 side-effect-free play). *Compression* (P1a) *replaces* a built-in tool's output
 via ``updatedToolOutput`` and is **Bash-only and opt-in**
 (``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``) and runs only when the hook is
-registered as ``mms hook --host claude`` (an ``auto`` registration cannot tell
+registered with an explicit ``--host claude`` (an ``auto`` registration cannot tell
 Claude from Codex, so it never replaces output; on a call compression would
 have attempted it reports the refusal through ``systemMessage`` instead, #1437):
 for the built-in Bash tool the
@@ -1543,7 +1543,9 @@ def hook_install_command(
     Read-modify-writes the host's hook-config file (``~/.claude/settings.json``,
     ``~/.cursor/hooks.json``, ``$KIMI_CODE_HOME/config.toml`` or
     ``~/.kimi-code/config.toml``, or ``~/.codex/config.toml``)
-    so the host fires ``mms hook --host <name>`` after each built-in tool call.
+    so the host fires ``memtomem-stm hook --host <name>`` (behind
+    ``uv run --directory <dir>`` in a project that uses STM) after each
+    built-in tool call.
     Re-running updates the handler install wrote in place rather than
     duplicating it. Only a handler in the form install writes is install's
     own; one that only looks like STM's hook is left alone and named by

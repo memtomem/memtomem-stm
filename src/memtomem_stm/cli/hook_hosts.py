@@ -4,7 +4,8 @@
 (:mod:`memtomem_stm.cli.hook_cmd`); B4 made the live invocation host-explicit
 (``mms hook --host <name>``). This module is the *registration UX* on top of
 that: it read-modify-writes each host's hook-config file so the host actually
-fires ``mms hook --host <name>`` on PostToolUse.
+fires ``memtomem-stm hook --host <name>`` (behind ``uv run --directory <dir>``
+in a project that uses STM) on PostToolUse.
 
 It parallels :mod:`memtomem_stm.mms.import_hosts` (which knows each host's *MCP*
 config locations) but for the *hook* configs, which live elsewhere and differ in

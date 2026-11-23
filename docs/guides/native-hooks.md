@@ -93,9 +93,9 @@ before diagnosing an apparently missing STM registration.
 
 ## Runtime host selection
 
-The installed command includes `mms hook --host <name>`. On the runtime bridge,
-`--host` accepts text rather than a strict Choice because a non-zero usage exit
-could block a host action. An unrecognized or bare value warns and falls back
+The installed command includes `memtomem-stm hook --host <name>`. On the runtime
+bridge, `--host` accepts text rather than a strict Choice because a non-zero
+usage exit could block a host action. An unrecognized or bare value warns and falls back
 to auto-detection. `install` and `uninstall` remain strict operator commands.
 
 Auto-detection recognizes Codex when the payload carries a non-empty `turn_id`.
