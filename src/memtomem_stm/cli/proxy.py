@@ -10278,28 +10278,17 @@ def _surfacing_bootstrap_status(
     probe so the documented per-server bound covers it too. *config_path* is
     the command's explicit ``--config``, threaded so the ``STMConfig`` here
     reads the same file as the command's own proxy checks (#839).
-
-    With *prefer_hook_daemon* the probe asks the hook's daemon, so the config
-    is the one the hook and the daemon build, from the environment alone: a
-    proxy-only env break degrades it to proxy defaults rather than failing
-    (#847), and *config_path* is not used, because the hook never sees it. The
-    daemon's identity is fingerprinted from that config, so a build against
-    the flag's file could keep a consumer model the hook dropped and look for
-    the daemon under the wrong key.
     """
     try:
         from memtomem_stm.cli.rrf_diagnostics import rrf_boundary_doctor_checks
-        from memtomem_stm.config import load_env_stm_config, stm_config_for_cli
+        from memtomem_stm.config import stm_config_for_cli
         from memtomem_stm.surfacing.feedback_store import (
             inspect_feedback_db,
             read_surfacing_summary,
         )
         from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
 
-        if prefer_hook_daemon:
-            config = load_env_stm_config().config
-        else:
-            config = stm_config_for_cli(config_path)
+        config = stm_config_for_cli(config_path)
         surfacing = config.surfacing
         db_status = inspect_feedback_db(surfacing.feedback_db_path)
         ltm_status = _ltm_status(

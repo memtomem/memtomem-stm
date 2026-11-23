@@ -50,11 +50,11 @@ changes inline only. See the deprecation policy in
   decoded at all, and a detached daemon writes it to its log file unless
   `MEMTOMEM_STM_LOG_LEVEL` is `ERROR` or higher. An invalid variable outside
   `proxy` fails as before. `mms doctor`'s `env_overrides` row says which case
-  applies, and its LTM row, which probes the hook's daemon, builds the same
-  configuration, from the environment alone even when `--config` is given.
-  **Behavior change**: under such an environment the hook compresses and
-  surfaces again and the daemon starts. These paths ignore every `MEMTOMEM_STM_PROXY*` variable, valid ones
-  included, so `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` no longer reaches
+  applies; its LTM row still builds the configuration strictly, so under such
+  an environment it reports the configuration error. **Behavior change**:
+  under such an environment the hook compresses and surfaces again and the
+  daemon starts. These paths ignore every `MEMTOMEM_STM_PROXY*` variable,
+  valid ones included, so `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` no longer reaches
   surfacing, and the hook records no metrics rows, because the metrics
   database path is a proxy setting. Fixing the variable can change the
   daemon's identity (when it restores a consumer model), so a daemon started
