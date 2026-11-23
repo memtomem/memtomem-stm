@@ -1079,7 +1079,7 @@ The merge is idempotent: an existing STM block (recognized by command shape,
 so a global or `uv run --directory <dir> <entry point>` registration with any
 `--host` is matched) is updated in place instead of adding another. Matching is by
 words split with Python's `shlex`, and only on a line where those are the words
-the shell passes on: plain characters, single-quoted text, and double-quoted
+a POSIX shell (`sh`, Bash) passes on: plain characters, single-quoted text, and double-quoted
 text without `$`, backquote or `\` (the form install itself writes), with `~/`
 allowed at the very start (the shell expands it, which keeps the executable's
 name). A line with anything else outside quotes, such as a `#` comment, `$VAR`,
@@ -1089,7 +1089,10 @@ operator, even quoted (`mms hook --host '|'`). On Windows, where the `mms`
 entry point itself expands globs, `$VAR`, `%VAR%` and a leading `~` in its
 arguments before reading them, a command whose words after the executable hold
 a glob character (`*`, `?`, `[`), any `$` or `%` (even a literal `100%`), or a
-leading `~` does not count either, quoted or not (`mms hook --host 'C*'`). A
+leading `~` does not count either, quoted or not (`mms hook --host 'C*'`).
+That check covers the entry point's own expansion only: how PowerShell, which
+Claude Code uses on Windows when Git Bash is missing, reads the line is not
+checked, so a quoted executable (`"mms" hook`) still counts there (#1483). A
 command counts only when its words then pass three checks:
 the words after `hook` read as a hook run with `mms hook`'s own options, so
 `mms hook uninstall`, `mms hook --help` and a usage error do not count; the

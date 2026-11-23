@@ -73,7 +73,7 @@ changes inline only. See the deprecation policy in
   `=` in it, and usually a line with a trailing `# comment`, whose words are
   read as more arguments.
 - `mms hook install` and `mms hook uninstall` no longer act on a hook command
-  whose `shlex` words differ from what the shell runs (issue #1476). A line
+  whose `shlex` words differ from what a POSIX shell runs (issue #1476). A line
   with a `#` comment, `$VAR` (also inside double quotes), a glob, a here-string
   (`<<<`), a line break, NUL or an unbalanced quote could be recognized as
   STM's hook, so install rewrote it and uninstall deleted it; for
@@ -100,7 +100,9 @@ changes inline only. See the deprecation policy in
   `mms` entry point may expand such a word itself before reading its
   arguments (`mms hook --host 'C*'` can reach it as several words), so install
   refuses every word holding one, including ones that would stay as written
-  (`100%`).
+  (`100%`). PowerShell, which Claude Code uses on Windows without Git Bash,
+  is not modelled: a quoted executable (`"mms" hook`) is still recognized there
+  (#1483).
   **Behavior change**: for a handler with both `--persist-query-text` and
   `--no-persist-query-text` (or both daemon flags), install keeps the last one,
   where it used to keep the enabling one.
