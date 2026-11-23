@@ -23,7 +23,7 @@ import sys
 import tomllib
 from collections.abc import Iterator
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
 import pytest
 from click.testing import CliRunner
@@ -149,21 +149,24 @@ def test_a_line_a_released_install_wrote_is_owned(host: str, command: str) -> No
     assert _owned(command, host) is True
 
 
-_ROOTS = [
+# Pure paths: each root is spelled the same on every test platform. The native
+# ``Path("/repo")`` is ``\\repo`` on Windows, which is drive-relative and so,
+# rightly, not a directory install's own line can hold.
+_ROOTS: list[PurePath | None] = [
     None,
-    Path("/repo"),
-    Path("/Users/x/My Repo"),
-    Path("C:\\Users\\x\\repo"),
-    Path("C:\\Users\\x\\it's $HOME %TEMP% (*) ~"),
-    Path("\\\\server\\share\\repo"),
+    PurePosixPath("/repo"),
+    PurePosixPath("/Users/x/My Repo"),
+    PureWindowsPath("C:\\Users\\x\\repo"),
+    PureWindowsPath("C:\\Users\\x\\it's $HOME %TEMP% (*) ~"),
+    PureWindowsPath("\\\\server\\share\\repo"),
     # Every character a shell gives a meaning to, in install's own output
     # (``shlex.join`` single-quotes them).
-    Path("/Users/x/it's $HOME #1 (*) ~ {a} <b> `c` !"),
-    Path("/tmp/line\nbreak"),
-    Path("/Users/사용자/repo"),
+    PurePosixPath("/Users/x/it's $HOME #1 (*) ~ {a} <b> `c` !"),
+    PurePosixPath("/tmp/line\nbreak"),
+    PurePosixPath("/Users/사용자/repo"),
     # The directory holds the words the reader searches for.
-    Path("/r/x memtomem-stm hook --host claude"),
-    Path("/r/''\"'\"'"),
+    PurePosixPath("/r/x memtomem-stm hook --host claude"),
+    PurePosixPath("/r/''\"'\"'"),
 ]
 
 _POLICIES = [
@@ -188,8 +191,9 @@ _POLICIES = [
 ]
 
 
-def _written(host: str, root: Path | None, policy: HostRuntimePolicy | None) -> str:
+def _written(host: str, root: PurePath | None, policy: HostRuntimePolicy | None) -> str:
     """Install's own output, built the way ``mms hook install`` builds it."""
+    # ``_launcher_for`` only spells the root out, so a pure path stands in.
     project = None if root is None else _StmProject(root=root, source_checkout=True)
     return shlex.join(
         _hook_install_command_argv(host, policy=policy, launcher=_launcher_for(project))
@@ -200,7 +204,7 @@ def _written(host: str, root: Path | None, policy: HostRuntimePolicy | None) -> 
 @pytest.mark.parametrize("root", _ROOTS)
 @pytest.mark.parametrize("policy", _POLICIES)
 def test_install_owns_every_command_it_writes(
-    host: str, root: Path | None, policy: HostRuntimePolicy | None
+    host: str, root: PurePath | None, policy: HostRuntimePolicy | None
 ) -> None:
     """Writer ⊆ owned, and the settings read back are the ones written."""
     owned = owned_hook_command(_written(host, root, policy), host)
@@ -2053,10 +2057,15 @@ def test_a_look_alike_is_not_owned_on_either_platform(
 
 @pytest.mark.parametrize("host", sorted(HOOK_HOSTS))
 @pytest.mark.parametrize(
-    "root", [None, Path("C:\\Users\\x\\repo"), Path("C:\\Users\\x\\it's $HOME %TEMP% (*) ~")]
+    "root",
+    [
+        None,
+        PureWindowsPath("C:\\Users\\x\\repo"),
+        PureWindowsPath("C:\\Users\\x\\it's $HOME %TEMP% (*) ~"),
+    ],
 )
 def test_windows_owns_every_command_install_writes(
-    host: str, root: Path | None, on_windows
+    host: str, root: PurePath | None, on_windows
 ) -> None:
     assert _owned(_written(host, root, _POLICIES[2]), host) is True
 
@@ -2127,35 +2136,36 @@ def _count_splits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("filler", "named", "splits"),
+    ("command", "named"),
     [
-        # Within the bound: the word test splits the line, once, and sees the
-        # executable name the raw search misses.
-        ("x" * 3000, True, 1),
-        # Past it: no split at all, so this spelling goes unnamed.
-        ("x" * 5000, False, 0),
+        # Spelled so that ``is_candidate``'s raw search misses the name, which
+        # leaves the decision to the word test; the ``#`` keeps that test's
+        # own quoted split away. A long argument or comment after the hook's
+        # words does not hide them.
+        (f"m\"m\"s hook --host '{'x' * 5000}' # pinned", True),
+        ('m"m"s hook --host claude' + " " * 5000 + "# pinned", True),
+        # The hook's words start past the part of the line that is read.
+        (f"echo '{'x' * 5000}' # then\nm\"m\"s hook --host claude", False),
     ],
 )
-def test_the_notice_splits_only_a_line_within_the_bound(
-    filler: str, named: bool, splits: int, monkeypatch: pytest.MonkeyPatch
+def test_the_notice_reads_the_words_of_the_head_of_a_long_line(
+    command: str, named: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
+    from memtomem_stm.cli.hook_registration import _QUOTED_MAX_CHARS
 
     calls = _count_splits(monkeypatch)
-    # Spelled so that ``is_candidate``'s raw search misses it, which leaves the
-    # decision to the word test; the ``#`` keeps its own quoted split away.
-    command = f"m\"m\"s hook --host '{filler}' # pinned"
 
     expected = ("hooks.PostToolUse[0].hooks[0]",) if named else ()
     assert unmanaged_stm_like("claude", _claude_groups([_h(command)])) == expected
-    assert calls.count(command) == splits
+    assert calls == [command[:_QUOTED_MAX_CHARS]]
 
 
-def test_planning_an_install_never_splits_a_long_unrelated_line(
+def test_planning_an_install_splits_only_the_head_of_a_long_unrelated_line(
     redirect, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The planner scans the file before and after the merge. On ``main`` each
-    scan split a long line once: 352 ms for one 160,000-character word."""
+    """The planner scans the file before and after the merge. Each scan used
+    to split the whole line: 352 ms for one 160,000-character word."""
     path = redirect("claude")
     line = "echo '" + "x" * 160_000 + "'"
     _seed(path, _claude_groups([_h(line)]))
@@ -2164,7 +2174,7 @@ def test_planning_an_install_never_splits_a_long_unrelated_line(
     change = plan_install("claude", _MANAGED)
 
     assert change.unmanaged == () and change.unmanaged_after == ()
-    assert calls == []
+    assert calls == [line[:4096]] * 2
 
 
 def test_a_refused_line_the_candidate_test_names_is_not_split(
@@ -2175,8 +2185,9 @@ def test_a_refused_line_the_candidate_test_names_is_not_split(
     from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
 
     calls = _count_splits(monkeypatch)
-    # Past ``is_candidate``'s ``shlex`` limit, so its raw search names it.
-    line = "mms hook --host '" + "x" * 5000 + "' # pinned"
+    # The raw search names it; the word test, which could split a line this
+    # short, must not run after that.
+    line = "mms hook --host claude # pinned"
 
     assert unmanaged_stm_like("claude", _claude_groups([_h(line)])) == (
         "hooks.PostToolUse[0].hooks[0]",
@@ -2315,6 +2326,30 @@ def test_kimi_manages_only_the_post_tool_use_entry_of_two(redirect) -> None:
     assert installed.unmanaged == ("hooks[0]",)
     assert removed.status == "remove"
     assert tomllib.loads(removed.new_text)["hooks"] == [pre]
+
+
+# ── a Claude Code handler on another event is not install's ─────────────────
+
+
+def test_claude_install_and_uninstall_leave_an_owned_looking_handler_on_another_event(
+    redirect,
+) -> None:
+    """Place is part of ownership on every host: install writes under
+    ``PostToolUse`` and reads nothing else, so the same text under
+    ``PreToolUse`` is neither replaced nor removed."""
+    path = redirect("claude")
+    pre = {"matcher": "Bash", "hooks": [_h(_MANAGED)]}
+    _seed(path, {"hooks": {"PreToolUse": [pre]}})
+
+    installed = plan_install("claude", _MANAGED_UV)
+    apply_change(installed)
+    removed = plan_uninstall("claude")
+
+    written = json.loads(installed.new_text)["hooks"]
+    assert written["PreToolUse"] == [pre]
+    assert [h["command"] for g in written["PostToolUse"] for h in g["hooks"]] == [_MANAGED_UV]
+    assert removed.status == "remove"
+    assert json.loads(removed.new_text) == {"hooks": {"PreToolUse": [pre]}}
 
 
 # ── a handler in exec form is not install's ──────────────────────────────────

@@ -199,14 +199,15 @@ def _words_name_the_hook(command: str) -> bool:
     does not see, such as ``m"m"s hook --host claude # pinned``, and a
     handler that test skips for its ``type``.
 
-    ``shlex`` is quadratic in a word's length, so a line longer than the
-    bound that candidate test uses for its own split is not split here."""
+    ``shlex`` is quadratic in a word's length, so only the head of the line
+    is split, up to the bound that candidate test uses for its own split. A
+    long comment or argument after the hook's words does not hide them; a
+    hook spelled this way that starts past the bound is not seen."""
     # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
     from memtomem_stm.cli.hook_registration import _QUOTED_MAX_CHARS
 
-    if len(command) > _QUOTED_MAX_CHARS:
-        return False
-    return next(_exe_before_hook(_lenient_shell_tokens(command)), None) is not None
+    head = _lenient_shell_tokens(command[:_QUOTED_MAX_CHARS])
+    return next(_exe_before_hook(head), None) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +647,8 @@ def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
     ``mms hook --host claude`` would otherwise stay registered beside the
     installed hook with nothing said. "Look like" is ``mms doctor``'s
     candidate test, which errs toward matching, or an STM executable word
-    right before ``hook``; only locations are returned, never command text,
+    right before ``hook`` within the first 4,096 characters of the line
+    (:func:`_words_name_the_hook`); only locations are returned, never command text,
     which can hold secret values. The containers are the ones install
     examines, and for Kimi every entry whatever its ``event``.
     """

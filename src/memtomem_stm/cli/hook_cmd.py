@@ -45,14 +45,17 @@ refusal found before a failure that the per-call barrier catches, a timeout
 included (#1437); the tool result still passes through. A ``BaseException``
 that reaches the outermost barrier still emits ``{}``.
 
-Register in Claude Code ``settings.json``::
+Register by hand in Claude Code ``settings.json``::
 
     {"hooks": {"PostToolUse": [
       {"matcher": "Read|Grep|Glob|Bash",
        "hooks": [{"type": "command", "command": "mms hook --host claude"}]}]}}
 
-``mms hook install --host claude --apply`` writes this block (without
-``--apply`` it previews it).
+``mms hook install --host claude --apply`` writes the registration for you
+(without ``--apply`` it previews it): the same block under the
+``memtomem-stm`` name, with its runtime flags. Install manages only the block
+it writes, so one registered by hand, like the example above, stays in place
+beside it.
 
 Performance — daemon by default: surfacing routes through the local daemon
 (``HookConfig.use_daemon`` defaults ``True``), a warm LTM connection that turns

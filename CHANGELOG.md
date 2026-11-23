@@ -98,9 +98,11 @@ changes inline only. See the deprecation policy in
   `uv run --directory <absolute dir>`, followed by nothing or by install's six
   runtime-setting words, spelled as install spells it. Every command a release
   of install has written has that form, including one written with a
-  non-finite deadline (#1492). The command is compared with what install
-  would write for the same directory and settings; no shell is modelled, so
-  the rule is the same on every platform. Install now reads the host file
+  non-finite deadline (#1492). The command must have install's
+  words, in install's order and in `shlex.join`'s spelling; only the
+  directory and the two deadlines are read from it, as text (`9.0` passes
+  where install writes `9`). No shell is modelled, so the rule is the same
+  on every platform. Install now reads the host file
   once, so the settings it carries over and the handler it replaces come from
   the same version of the file. Those settings are read from the handler's
   setting words as the hook applies them.
@@ -114,8 +116,14 @@ changes inline only. See the deprecation policy in
   event. Install adds its own handler beside such a line and reads no setting
   from it; uninstall leaves it. Both name its location, and install's preview
   now does so above the block it would write. Remove the old line by hand if
-  it should not stay registered, and pin its settings again with
-  `--surfacing-timeout` and `--daemon` / `--no-daemon`.
+  it should not stay registered. `--surfacing-timeout` and `--daemon` /
+  `--no-daemon` set the surfacing deadline and the daemon mode again; a
+  custom daemon deadline or `--persist-query-text` has no install option and
+  is edited into the written command by hand, which install then keeps. A
+  look-alike is found by `mms doctor`'s candidate test, or by the words of
+  the first 4,096 characters of the line when the name is spelled so that
+  test misses it (`m"m"s hook`); in that spelling, a hook that starts past
+  that point is not named.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that

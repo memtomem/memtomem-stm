@@ -41,6 +41,10 @@ write only with `--apply`, create a non-clobbering backup, and refuse malformed
 host configuration. Install serializes shared-daemon, deadline, and query-text
 privacy settings into portable runtime flags. `--inherit-runtime-env` omits
 those flags and cannot be combined with the explicit daemon/deadline options.
+Both commands manage only the handler install writes
+(`memtomem-stm hook --host <host>`, bare or after `uv run --directory <dir>`).
+A registration made by hand, such as `mms hook --host claude`, is left in
+place and named by location; see [`mms hook install`](../cli.md).
 
 Current host paths are:
 

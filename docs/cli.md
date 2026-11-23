@@ -1119,7 +1119,10 @@ the location above the block it would write, so the second registration is
 not silent; remove the old handler by hand if it should not stay registered.
 Both commands look where install itself writes in that host's config file
 (`PostToolUse` for Claude Code and Codex, `postToolUse` for Cursor) and at
-every entry for Kimi. An uninstall that only prunes empty hook containers (an
+every entry for Kimi. "Looks like" is the test `mms doctor` uses for its
+`hook registration` row, plus the words of the first 4,096 characters of the
+line for a name spelled so that test misses it (`m"m"s hook`); a hook that
+starts past that point in such a spelling is not named. An uninstall that only prunes empty hook containers (an
 empty matcher group, event list or `hooks` section) says so instead of
 reporting a removal.
 Both **default to a dry-run preview**; pass `--apply` to write,
