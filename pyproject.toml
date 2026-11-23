@@ -41,6 +41,11 @@ dependencies = [
     # Direct SDK wire-serialization imports in proxy/_fastmcp_compat.py.
     "mcp-types>=2.2.0,<3",
     "pydantic>=2.10",
+    # Imported directly (``proxy/config.py`` imports ``ErrorDetails`` for its
+    # annotations; ``pydantic`` does not re-export it), so declared rather than
+    # borrowed from ``pydantic``. No version bound: ``pydantic`` already pins
+    # ``pydantic-core`` exactly.
+    "pydantic-core",
     "pydantic-settings>=2.7",
     "httpx>=0.28",
     # The 2.0 SDK moved its own HTTP client to ``httpx2``. We import it
