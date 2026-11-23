@@ -1494,6 +1494,9 @@ def test_flat_host_uninstall_shifts_the_look_alike(
         _h(_MANAGED),  # recognized: install manages it
         _h("echo hi"),
         _h("ruff check hooks.py"),
+        # Unbalanced: ``shlex`` reads ``hook --label mms`` before the error and
+        # ``str.split()`` starts with ``hook``; no pair forms across the two.
+        _h('hook --label m"m"s #\''),
     ],
 )
 def test_managed_and_unrelated_handlers_are_not_named(handler: dict, redirect) -> None:
@@ -1801,6 +1804,8 @@ def test_notice_agrees_with_the_number_of_handlers(redirect) -> None:
         'm"m"s hook --host # --persist-query-text',
         'mms h"o"ok --host "$H"',
         'm"m"s hook --host claude # pinned',
+        # Unbalanced: the words read before the parse error still name it.
+        'm"m"s hook --host \'claude',
     ],
 )
 def test_a_refused_hook_line_is_kept_and_named(command: str, redirect) -> None:

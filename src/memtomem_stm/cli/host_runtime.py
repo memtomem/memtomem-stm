@@ -68,17 +68,24 @@ def _shell_tokens_accepts(command: str) -> bool:
 
 
 def _lenient_shell_tokens(command: str) -> list[str]:
-    """``shlex`` words of any line, falling back to ``str.split()`` on a parse
-    error. An approximation of the shell, used only to decide whether a line
-    that :func:`_shell_tokens` refuses still looks like STM's hook, never to
-    act on it or read settings from it."""
+    """``shlex`` words of any line; on a parse error (an unbalanced quote, a
+    trailing ``\\``), the words read before it, an empty word, then the
+    ``str.split()`` words of the whole line, so neither reading is lost. An
+    approximation of the shell, used only to decide whether a line that
+    :func:`_shell_tokens` refuses still looks like STM's hook, never to act on
+    it or read settings from it."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    words: list[str] = []
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        return list(lexer)
+        for word in lexer:
+            words.append(word)
     except ValueError:
-        return command.split()
+        # The empty word keeps a pair from forming across the two readings:
+        # it is neither an executable name nor ``hook``.
+        return [*words, "", *command.split()]
+    return words
 
 
 def _parse_bool(raw: str | None) -> bool | None:
