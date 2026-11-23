@@ -104,6 +104,11 @@ _STM_EXECUTABLES: frozenset[str] = frozenset({"mms", "memtomem-stm", "memtomem-s
 # ``%VAR%`` (``os.path.expandvars``) and a leading ``~`` (``expanduser``).
 _CLICK_WINDOWS_EXPANDS = re.compile(r"[*?\[$%]|^~")
 
+# The first word of a line, as written. On a line the split accepts, a quote
+# that is part of that word opens before the blank that would end it, so the
+# first run of non-blank characters holds a quote exactly when the word does.
+_FIRST_WORD_HOLDS_A_QUOTE = re.compile(r"[ \t]*[^ \t'\"]*['\"]")
+
 
 class HookInstallError(Exception):
     """A host config exists but cannot be safely modified (e.g. unparseable).
@@ -165,7 +170,14 @@ def _is_stm_hook_command(command: str) -> bool:
     so such a line never matches. On Windows, where the entry point expands
     its own arguments (globs, ``$VAR``, ``%VAR%``, a leading ``~``) before
     Click parses them, a line whose words after the executable hold any of
-    those does not match either. Three more checks keep out lines that would
+    those does not match either. Nor does one whose first word holds a quote
+    (``"mms" hook``, #1483): by Claude Code's hooks reference, a shell-form
+    hook with no ``shell`` field runs under PowerShell when Git Bash is not
+    installed, and PowerShell prints a command made only of quoted strings
+    instead of running it. This match reads the command text alone, not the
+    handler's ``shell`` field, and PowerShell's reading of a quoted word
+    followed by other words is not modelled, so this is a refusal to own the
+    line, not a claim about what runs. Three more checks keep out lines that would
     not run the hook bridge (#1460): the executable word has no ``=`` or
     control character and its last component as written is not empty or ``.``
     (so ``OTHER=/mms hook`` and ``mms/ hook`` do not match); a ``uv`` launcher
@@ -189,7 +201,7 @@ def _stm_hook_words(command: str) -> _StmHookWords | None:
     of :func:`_is_stm_hook_command` except the parse of the words after
     ``hook``), else ``None``."""
     tokens = _shell_tokens(command)
-    return None if tokens is None else _stm_hook_shape(tokens)[0]
+    return None if tokens is None else _stm_hook_shape(tokens, command)[0]
 
 
 @dataclass(frozen=True)
@@ -233,7 +245,7 @@ def _read_hook_line(command: str) -> _HookLine:
     strict = _shell_tokens(command)
     if strict is None:
         return _HookLine(command=command, strict=None, recognized=False, strict_names=None)
-    words, starts = _stm_hook_shape(strict)
+    words, starts = _stm_hook_shape(strict, command)
     return _HookLine(
         command=command,
         strict=tuple(strict),
@@ -251,10 +263,12 @@ def _exe_before_hook(tokens: list[str]) -> Iterator[int]:
             yield i - 1
 
 
-def _stm_hook_shape(tokens: list[str]) -> tuple[_StmHookWords | None, list[int] | None]:
-    """:func:`_stm_hook_words` on the words of an accepted line, with the
-    first two :func:`_exe_before_hook` indexes it read (``None`` when the
-    operator guard refused the line before that scan)."""
+def _stm_hook_shape(
+    tokens: list[str], command: str
+) -> tuple[_StmHookWords | None, list[int] | None]:
+    """:func:`_stm_hook_words` on the words of an accepted line ``command``,
+    with the first two :func:`_exe_before_hook` indexes it read (``None`` when
+    the operator guard refused the line before that scan)."""
     # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
     from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE, running_on_windows
 
@@ -266,6 +280,9 @@ def _stm_hook_shape(tokens: list[str]) -> tuple[_StmHookWords | None, list[int] 
     # candidate rather than mistaking the --directory value for an executable.
     starts = list(itertools.islice(_exe_before_hook(tokens), 2))
     if len(starts) != 1:
+        return None, starts
+    # The quotes are gone from ``tokens``, so this reads the line as written.
+    if running_on_windows() and _FIRST_WORD_HOLDS_A_QUOTE.match(command):
         return None, starts
     i = starts[0]
     executable = tokens[i]
