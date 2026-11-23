@@ -21,6 +21,7 @@ import logging
 import shlex
 import sys
 import tomllib
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 
@@ -2044,3 +2045,84 @@ def test_a_refused_line_the_candidate_test_names_is_not_split(
         "hooks.PostToolUse[0].hooks[0]",
     )
     assert calls == []
+
+
+def test_the_notice_scan_reads_a_long_unrelated_line_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """For an accepted line that is not STM's, recognition and the look-alike
+    test share one adjacency scan, which reads a word as a path only before a
+    ``hook`` word (an ``echo`` with many arguments builds no path at all)."""
+    from memtomem_stm.cli import hook_hosts
+
+    scans: list[int] = []
+    real_scan = hook_hosts._exe_before_hook
+
+    def counting_scan(tokens: list[str]) -> Iterator[int]:
+        scans.append(len(tokens))
+        return real_scan(tokens)
+
+    paths: list[str] = []
+    real_path = hook_hosts.Path
+
+    def counting_path(*args: str) -> Path:
+        paths.extend(args)
+        return real_path(*args)
+
+    monkeypatch.setattr(hook_hosts, "_exe_before_hook", counting_scan)
+    monkeypatch.setattr(hook_hosts, "Path", counting_path)
+    line = "echo " + " ".join(["a"] * 1000)
+
+    assert hook_hosts.unmanaged_stm_like("claude", _claude_groups([_h(line)])) == ()
+    assert scans == [1001]
+    assert paths == []
+
+
+@pytest.mark.parametrize(
+    ("tokens", "indexes"),
+    [
+        (["mms", "hook", "x", "memtomem-stm", "hook"], [0, 3]),  # two pairs, in order
+        (["mms", "hook", "hook"], [0]),  # ``hook`` after ``hook`` is not a pair
+        (["echo", "hook", "/bin/mms"], []),  # an executable last, with no ``hook``
+        (["hook", "mms"], []),
+        (["/usr/local/bin/memtomem-stm-proxy", "hook"], [0]),
+    ],
+)
+def test_exe_before_hook_finds_each_pair(tokens: list[str], indexes: list[int]) -> None:
+    from memtomem_stm.cli.hook_hosts import _exe_before_hook
+
+    assert list(_exe_before_hook(tokens)) == indexes
+
+
+@pytest.mark.parametrize(
+    ("line", "most"),
+    [
+        # Refused by the split: the look-alike test stops at the first pair.
+        # Quoted names, so ``is_candidate``'s raw search does not decide first.
+        ('m"m"s hook # ' + 'm"m"s hook ' * 2000, 1),
+        # Accepted: recognition needs to know only whether there is one pair.
+        ('m"m"s hook ' * 2000, 2),
+        # Refused by the operator guard, which runs before the pair scan.
+        ('mms hook --host "|" ' + 'm"m"s hook ' * 2000, 0),
+        # The same guard, with a quoted name the candidate test misses: the
+        # fallback scans the kept words and stops at the first pair.
+        ('m"m"s hook --host "|"', 1),
+    ],
+)
+def test_the_notice_scan_stops_early(line: str, most: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    from memtomem_stm.cli import hook_hosts
+
+    yielded: list[int] = []
+    real_scan = hook_hosts._exe_before_hook
+
+    def counting_scan(tokens: list[str]) -> Iterator[int]:
+        for index in real_scan(tokens):
+            yielded.append(index)
+            yield index
+
+    monkeypatch.setattr(hook_hosts, "_exe_before_hook", counting_scan)
+
+    assert hook_hosts.unmanaged_stm_like("claude", _claude_groups([_h(line)])) == (
+        "hooks.PostToolUse[0].hooks[0]",
+    )
+    assert len(yielded) <= most

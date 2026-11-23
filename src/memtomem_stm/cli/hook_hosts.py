@@ -71,12 +71,13 @@ Design choices (all surfaced to the operator before any write):
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import os
 import re
 import stat
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -188,7 +189,7 @@ def _stm_hook_words(command: str) -> _StmHookWords | None:
     of :func:`_is_stm_hook_command` except the parse of the words after
     ``hook``), else ``None``."""
     tokens = _shell_tokens(command)
-    return None if tokens is None else _stm_hook_shape(tokens)
+    return None if tokens is None else _stm_hook_shape(tokens)[0]
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,9 @@ class _HookLine:
     """The words of an accepted line, ``None`` when the split refuses it."""
     recognized: bool
     """What :func:`_is_stm_hook_command` returns for the command."""
+    strict_names: bool | None
+    """:meth:`names_the_hook` when recognition already scanned the words for
+    an executable before ``hook``, else ``None``."""
 
     def names_the_hook(self) -> bool:
         """Whether the command's words put an STM executable right before
@@ -208,49 +212,61 @@ class _HookLine:
         of ``mms doctor``'s candidate test does not see, such as
         ``m"m"s hook --host claude # pinned`` (#1476). A refused line is split
         here, so call this only when that test has not already decided."""
-        tokens = (
-            list(self.strict) if self.strict is not None else _lenient_shell_tokens(self.command)
-        )
-        return any(
-            Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
-            for i, tok in enumerate(tokens)
-        )
+        if self.strict_names is not None:
+            return self.strict_names
+        tokens = list(self.strict) if self.strict is not None else None
+        if tokens is None:
+            tokens = _lenient_shell_tokens(self.command)
+        return next(_exe_before_hook(tokens), None) is not None
 
 
 def _read_hook_line(command: str) -> _HookLine:
-    """Recognition of ``command`` with the words it read kept for
-    :meth:`_HookLine.names_the_hook`, so a line is split once
-    (``shlex`` is quadratic in a word's length)."""
+    """Recognition of ``command`` with what it read kept for
+    :meth:`_HookLine.names_the_hook`, so recognition and that fallback split
+    a line, and scan its words for an executable before ``hook``, at most once
+    between them (``shlex`` is quadratic in a word's length). ``mms doctor``'s
+    candidate test, which runs between the two, reads the line on its own and
+    may split a short quoted line again."""
     # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
     from memtomem_stm.cli.hook_registration import runs_hook_bridge
 
     strict = _shell_tokens(command)
-    words = _stm_hook_shape(strict) if strict is not None else None
+    if strict is None:
+        return _HookLine(command=command, strict=None, recognized=False, strict_names=None)
+    words, starts = _stm_hook_shape(strict)
     return _HookLine(
         command=command,
-        strict=tuple(strict) if strict is not None else None,
+        strict=tuple(strict),
         recognized=words is not None and runs_hook_bridge(list(words.args)),
+        strict_names=None if starts is None else bool(starts),
     )
 
 
-def _stm_hook_shape(tokens: list[str]) -> _StmHookWords | None:
-    """:func:`_stm_hook_words` on the words of an accepted line."""
+def _exe_before_hook(tokens: list[str]) -> Iterator[int]:
+    """Indexes of the words that name an STM executable and are followed by a
+    ``hook`` word, in order. Only a word before ``hook`` is read as a path,
+    and a caller stops reading once it has what it needs."""
+    for i, tok in enumerate(tokens):
+        if tok == "hook" and i > 0 and Path(tokens[i - 1]).name in _STM_EXECUTABLES:
+            yield i - 1
+
+
+def _stm_hook_shape(tokens: list[str]) -> tuple[_StmHookWords | None, list[int] | None]:
+    """:func:`_stm_hook_words` on the words of an accepted line, with the
+    first two :func:`_exe_before_hook` indexes it read (``None`` when the
+    operator guard refused the line before that scan)."""
     # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
     from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE, running_on_windows
 
     if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
-        return None
+        return None, None
     # A source checkout directory can itself be named ``memtomem-stm``. Count
     # only executable-shaped tokens immediately followed by the subcommand, so
     # ``uv run --directory /repo/memtomem-stm memtomem-stm hook`` has one owner
     # candidate rather than mistaking the --directory value for an executable.
-    starts = [
-        i
-        for i, tok in enumerate(tokens)
-        if Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
-    ]
+    starts = list(itertools.islice(_exe_before_hook(tokens), 2))
     if len(starts) != 1:
-        return None
+        return None, starts
     i = starts[0]
     executable = tokens[i]
 
@@ -263,14 +279,14 @@ def _stm_hook_shape(tokens: list[str]) -> _StmHookWords | None:
         return not _NOT_EXECUTABLE.search(word) and re.split(r"[\\/]", word)[-1] not in {"", "."}
 
     if not names_a_file(executable):
-        return None
+        return None, starts
     # On Windows the entry point expands its own arguments before Click parses
     # them, so a word the shell passed as written may reach ``mms hook`` as
     # other words, or several, depending on the hook's environment and working
     # directory. Words before the executable (``env``, ``uv run``) are not
     # its arguments.
     if running_on_windows() and any(_CLICK_WINDOWS_EXPANDS.search(w) for w in tokens[i + 1 :]):
-        return None
+        return None, starts
     prefix = tokens[:i]
     assignments: tuple[str, ...] = ()
     # Pre-runtime-flag installs commonly used POSIX ``env`` to pin timeout
@@ -283,7 +299,7 @@ def _stm_hook_shape(tokens: list[str]) -> _StmHookWords | None:
         # as assignments as well, so the line is a bare assignment prefix
         # (#1453), not an ``env`` launcher.
         if not names_a_file(prefix[0]):
-            return None
+            return None, starts
         j = 1
         while j < len(prefix):
             key, sep, _value = prefix[j].partition("=")
@@ -291,7 +307,7 @@ def _stm_hook_shape(tokens: list[str]) -> _StmHookWords | None:
                 break
             j += 1
         if j == 1:
-            return None
+            return None, starts
         assignments = tuple(prefix[1:j])
         prefix = prefix[j:]
     # ``uv run`` resolves a bare entry-point name; with another option, an empty
@@ -304,8 +320,8 @@ def _stm_hook_shape(tokens: list[str]) -> _StmHookWords | None:
         and not prefix[3].startswith("-")
         and executable in _STM_EXECUTABLES
     ):
-        return None
-    return _StmHookWords(assignments, tuple(tokens[i + 2 :]))
+        return None, starts
+    return _StmHookWords(assignments, tuple(tokens[i + 2 :])), starts
 
 
 def _is_stm_command_handler(handler: Any) -> bool:
