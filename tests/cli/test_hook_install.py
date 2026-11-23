@@ -196,9 +196,9 @@ def test_is_stm_hook_command_keeps_a_drive_relative_executable() -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        # Matching is by ``shlex`` words, which keep a shell comment: the
-        # comment reaches the ``hook`` arguments and fails the parse there, so
-        # these working lines are left alone (a documented limit).
+        # The split refuses a line with ``#`` outside quotes, so these working
+        # lines are left alone (and named) rather than read without their
+        # comment (#1476).
         "mms hook --host claude # managed",
         "env MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=12 mms hook --host claude #pinned",
     ],
@@ -221,9 +221,78 @@ def test_is_stm_hook_command_leaves_a_pipeline_a_leftover_word_and_a_directory(
     assert _is_stm_hook_command(command) is False
 
 
+# ── shell syntax the command split does not model (#1476) ────────────────────
+#
+# Each line below reads as a bridge run in ``shlex`` words, while the shell
+# reads it differently (a second command, a comment, an expansion, a syntax
+# error, a redirection). Recognizing it would let install rewrite and
+# uninstall delete a handler on a reading the shell does not share.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mms\nhook --host claude",  # two commands: ``mms``, then ``hook …``
+        "mms hook --host # --persist-query-text",  # a comment: runs ``mms hook --host``
+        "mms hook --host 'claude",  # unbalanced quote: a syntax error, nothing runs
+        "mms hook --host $HOOK_HOST",  # expanded and word-split first
+        'mms hook --host "$H"',  # still expanded inside double quotes
+        'mms hook --host "\\$H"',  # the shell passes ``$H``, ``shlex`` ``\\$H``
+        "mms hook --host cl*",  # a glob: may become several words
+        "mms hook --host [c]laude",
+        "mms hook --host <<< --persist-query-text",  # here-string: the flag goes to stdin
+        "mms hook --host clau\x00de",  # NUL cannot reach the shell intact
+        "mms hook --host claude\r",  # ``\r`` is part of the word to the shell
+        "env MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=~ mms hook --host claude",
+        "uv run --directory ~ memtomem-stm hook --host claude",
+        "mms hook --host {claude}",
+        # ``~user/`` and ``~+/`` name another directory than ``$HOME``.
+        "~root/mms hook --host claude",
+        "~+/mms hook --host claude",
+    ],
+)
+def test_is_stm_hook_command_refuses_shell_syntax_the_split_does_not_model(
+    command: str,
+) -> None:
+    assert _is_stm_hook_command(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Tilde expansion keeps the executable's basename.
+        "~/.local/bin/mms hook --host claude",
+        'mms hook --host "claude"',
+        # Single quotes keep every character literal, to the shell and to shlex.
+        "mms hook --host 'cl$a#u*de'",
+        "uv run --directory '/tmp/line\nbreak' memtomem-stm hook --host claude",
+        "/home/사용자/.local/bin/mms hook --host claude",
+    ],
+)
+def test_is_stm_hook_command_keeps_quoted_and_plain_lines(command: str) -> None:
+    assert _is_stm_hook_command(command) is True
+
+
+def test_is_stm_hook_command_still_refuses_a_quoted_operator_word() -> None:
+    """The word-level operator guard predates the split's whitelist and still
+    refuses a quoted operator, though the shell passes it as a plain word."""
+    assert _is_stm_hook_command("mms hook --host '|'") is False
+
+
 @pytest.mark.parametrize("host", sorted(HOOK_HOSTS))
 @pytest.mark.parametrize(
-    "root", [None, Path("/repo"), Path("/Users/x/My Repo"), Path("C:\\Users\\x\\repo")]
+    "root",
+    [
+        None,
+        Path("/repo"),
+        Path("/Users/x/My Repo"),
+        Path("C:\\Users\\x\\repo"),
+        # Every character the split refuses outside quotes, in install's own
+        # output (``shlex.join`` single-quotes them).
+        Path("/Users/x/it's $HOME #1 (*) ~ {a} <b> `c` !"),
+        Path("/tmp/line\nbreak"),
+        Path("/Users/사용자/repo"),
+    ],
 )
 @pytest.mark.parametrize(
     "policy",
@@ -1712,3 +1781,92 @@ def test_notice_agrees_with_the_number_of_handlers(redirect) -> None:
         "so they stay in the config (in the written file: hooks.PostToolUse[0].hooks[0], "
         "hooks.PostToolUse[0].hooks[1]). Check them by hand"
     ) in result.output
+
+
+# ── a line the split refuses is left alone and named (#1476) ─────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mms hook --host # --persist-query-text",
+        # Quote removal joins these into STM's executable or ``hook``, which
+        # ``mms doctor``'s candidate test does not see in the raw text.
+        'm"m"s hook --host # --persist-query-text',
+        'mms h"o"ok --host "$H"',
+        'm"m"s hook --host claude # pinned',
+    ],
+)
+def test_a_refused_hook_line_is_kept_and_named(command: str, redirect) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(command)]))
+    location = "hooks.PostToolUse[0].hooks[0]"
+
+    installed = plan_install("claude", _MANAGED)
+    removed = plan_uninstall("claude")
+
+    groups = json.loads(installed.new_text)["hooks"]["PostToolUse"]
+    assert [h["command"] for g in groups for h in g["hooks"]] == [command, _MANAGED]
+    assert installed.unmanaged == (location,)
+    assert removed.status == "not_installed"
+    assert removed.unmanaged == (location,)
+
+
+def test_a_refused_hook_line_without_a_type_is_named(redirect) -> None:
+    """Install's own match reads ``command`` alone, so a handler with no
+    ``type`` that loses recognition is named too."""
+    path = redirect("claude")
+    _seed(path, _claude_groups([{"command": 'm"m"s hook --host # --persist-query-text'}]))
+
+    assert plan_install("claude", _MANAGED).unmanaged == ("hooks.PostToolUse[0].hooks[0]",)
+
+
+def test_the_notice_scan_splits_a_line_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lenient naming test does not split again a line the recognizer
+    has already split (``shlex`` is quadratic in a word's length)."""
+    import shlex as shlex_module
+
+    from memtomem_stm.cli import host_runtime
+    from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
+
+    calls: list[str] = []
+    real = shlex_module.shlex
+
+    def counting(command: str, *args: object, **kwargs: object) -> shlex_module.shlex:
+        calls.append(command)
+        return real(command, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(host_runtime.shlex, "shlex", counting)
+    # Past ``is_candidate``'s own ``shlex`` limit (4,096 characters), as in
+    # the 320 KB line the review measured.
+    line = "echo '" + "x" * 5000 + "'"
+
+    assert unmanaged_stm_like("claude", _claude_groups([_h(line)])) == ()
+    assert calls == [line]
+
+
+def test_cli_install_does_not_take_over_a_commented_line(redirect) -> None:
+    """The issue's commented line, end to end: install used to rewrite it with
+    ``--persist-query-text``, a flag the shell never passed to the hook."""
+    commented = "mms hook --host # --persist-query-text"
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(commented)]))
+    location = "hooks.PostToolUse[0].hooks[0]"
+    runner = CliRunner()
+
+    applied = runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    assert f"in the written file: {location}" in applied.output
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    commands = [h["command"] for g in groups for h in g["hooks"]]
+    assert commands[0] == commented
+    assert len(commands) == 2
+    written = shlex.split(commands[1])
+    assert "--no-persist-query-text" in written
+    assert "--persist-query-text" not in written
+
+    removed = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+    assert removed.exit_code == 0, removed.output
+    assert f"in the written file: {location}" in removed.output
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    assert [h["command"] for g in groups for h in g["hooks"]] == [commented]

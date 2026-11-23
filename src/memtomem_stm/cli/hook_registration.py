@@ -217,11 +217,25 @@ def runs_hook_bridge(args: list[str]) -> bool:
     the runtime bridge rather than help, a usage error or a subcommand such as
     ``install``. ``mms hook install`` and ``uninstall`` use it to decide which
     handlers are STM's own (#1460)."""
-    return _read_hook_args(args).runs_bridge
+    return _parse_hook_args(args)[0].runs_bridge
+
+
+def hook_bridge_params(args: list[str]) -> dict[str, Any] | None:
+    """The option values ``mms hook`` would run the bridge with, given ``args``
+    (the words after ``hook``), or ``None`` when it would not run the bridge
+    (see :func:`runs_hook_bridge`). ``mms hook install`` reads an existing
+    handler's runtime settings from these, so a repeated flag and an
+    assignment-shaped ``--host`` value read as the hook reads them (#1476)."""
+    return _parse_hook_args(args)[1]
 
 
 def _read_hook_args(args: list[str]) -> HookRegistration:
     """Parse ``args`` with ``mms hook``'s own Click options, never running it."""
+    return _parse_hook_args(args)[0]
+
+
+def _parse_hook_args(args: list[str]) -> tuple[HookRegistration, dict[str, Any] | None]:
+    """The reading of ``args`` and, for a bridge run, Click's parsed values."""
     from memtomem_stm.cli.hook_cmd import hook_command
     from memtomem_stm.cli.proxy import CONTEXT_SETTINGS
 
@@ -245,12 +259,13 @@ def _read_hook_args(args: list[str]) -> HookRegistration:
         resilient = reader.make_context(
             "hook", list(args), resilient_parsing=True, help_option_names=help_names
         )
-        return _registration(resilient, runs_bridge=False)
+        return _registration(resilient, runs_bridge=False), None
     except Exception:
         # A usage error stops Click at the offending token, so options after
         # it were never read: the host is unknown (``--typo --host claude``).
-        return HookRegistration(None, runs_bridge=False, host=None)
-    return _registration(strict, runs_bridge=True)
+        return HookRegistration(None, runs_bridge=False, host=None), None
+    registration = _registration(strict, runs_bridge=True)
+    return registration, dict(strict.params) if registration.runs_bridge else None
 
 
 def _registration(ctx: click.Context, *, runs_bridge: bool) -> HookRegistration:

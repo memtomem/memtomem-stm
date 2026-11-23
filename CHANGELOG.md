@@ -72,6 +72,33 @@ changes inline only. See the deprecation policy in
   `uv` options, a path after `--directory <dir>`), an executable path with
   `=` in it, and usually a line with a trailing `# comment`, whose words are
   read as more arguments.
+- `mms hook install` and `mms hook uninstall` no longer act on a hook command
+  whose `shlex` words differ from what the shell runs (issue #1476). A line
+  with a `#` comment, `$VAR` (also inside double quotes), a glob, a here-string
+  (`<<<`), a line break, NUL or an unbalanced quote could be recognized as
+  STM's hook, so install rewrote it and uninstall deleted it; for
+  `mms hook --host # --persist-query-text` install also wrote
+  `--persist-query-text` into the replacement, a flag the shell never passed.
+  The split now reads only plain characters, single-quoted text, and
+  double-quoted text without `$`, backquote or `\` (the form install writes),
+  with `~/` at the start, and refuses any other line. Install also reads the
+  updated handler's settings with `mms hook`'s own options instead of its own
+  token scan, takes `MEMTOMEM_STM_*` assignments only from a leading `env`, and
+  lays the flags over those assignments the way the hook does: a repeated flag
+  resolves as the hook resolves it (the last one wins), an invalid flag value
+  leaves the inline setting in place, a `--surfacing-timeout-seconds` flag also
+  sets the daemon deadline over an inline one, and an assignment-shaped
+  `--host` value is no longer read as a setting. A refused line that looks like
+  STM's hook, including one whose executable or `hook` is spelled with quotes
+  (`m"m"s hook --host claude # pinned`), is named by location. **Behavior
+  change**: such lines are no longer updated or removed, and when install finds
+  no handler it manages it adds its own beside them. This includes lines that
+  run the hook correctly in a spelling the split refuses, such as
+  `$HOME/.local/bin/mms hook --host claude`; spell the path out to have install
+  manage it.
+  **Behavior change**: for a handler with both `--persist-query-text` and
+  `--no-persist-query-text` (or both daemon flags), install keeps the last one,
+  where it used to keep the enabling one.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that

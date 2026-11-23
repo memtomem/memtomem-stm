@@ -85,7 +85,11 @@ import tomli_w
 
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, get_adapter
-from memtomem_stm.cli.host_runtime import _shell_tokens
+from memtomem_stm.cli.host_runtime import (
+    _lenient_shell_tokens,
+    _shell_tokens,
+    _shell_tokens_accepts,
+)
 from memtomem_stm.mms.host_homes import (
     HOST_HOME_UNKNOWN_REASONS,
     HostHomeUnknown,
@@ -128,6 +132,16 @@ class HookConfigLocationUnknown(HookInstallError):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _StmHookWords:
+    """The parts of a recognized STM hook command line."""
+
+    assignments: tuple[str, ...]
+    """The ``MEMTOMEM_STM_*=value`` words of a leading ``env`` launcher."""
+    args: tuple[str, ...]
+    """The words after ``hook``."""
+
+
 def _is_stm_hook_command(command: str) -> bool:
     """Whether ``command`` is an STM ``mms hook`` invocation (any entry point).
 
@@ -143,26 +157,40 @@ def _is_stm_hook_command(command: str) -> bool:
     ``echo hook && memtomem-stm status`` from matching: ``status`` is not ``hook``,
     so install/uninstall leave it alone.
 
-    Three more token checks keep out lines that would not run the hook
-    bridge (#1460): the executable word has no ``=`` or control character
-    and its last component as written is not empty or ``.`` (so
-    ``OTHER=/mms hook`` and ``mms/ hook`` do not match); a ``uv`` launcher is
-    exactly ``uv run --directory <dir> <entry point>`` with a non-empty
+    The words come from :func:`~memtomem_stm.cli.host_runtime._shell_tokens`,
+    which refuses a line with shell syntax it does not model (a ``#``, ``$``,
+    a glob, an operator or a line break outside quotes, among others; #1476),
+    so such a line never matches. Three more checks keep out lines that would
+    not run the hook bridge (#1460): the executable word has no ``=`` or
+    control character and its last component as written is not empty or ``.``
+    (so ``OTHER=/mms hook`` and ``mms/ hook`` do not match); a ``uv`` launcher
+    is exactly ``uv run --directory <dir> <entry point>`` with a non-empty
     ``<dir>`` that does not start with ``-``; and the words after ``hook``
-    parse with ``mms hook``'s own options into a bridge run, not help, a
-    usage error or a subcommand (``mms hook uninstall``). That parse is the
-    one ``mms doctor`` uses
-    (:func:`memtomem_stm.cli.hook_registration.runs_hook_bridge`); the other
-    checks are this function's own. All of them read ``shlex`` words, an
-    approximation of the shell, not its exact reading: a ``# comment``'s words
-    usually fail the parse, so a commented line usually does not match, but
-    ``--host # --no-daemon`` matches, reading ``#`` as the host value."""
+    parse with ``mms hook``'s own options into a bridge run, not help, a usage
+    error or a subcommand (``mms hook uninstall``). That parse is the one
+    ``mms doctor`` uses
+    (:func:`memtomem_stm.cli.hook_registration.runs_hook_bridge`), and the one
+    install reads runtime settings from. A quoted operator word
+    (``mms hook --host '|'``) is refused as well, as before."""
     # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
-    from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE, runs_hook_bridge
+    from memtomem_stm.cli.hook_registration import runs_hook_bridge
+
+    words = _stm_hook_words(command)
+    return words is not None and runs_hook_bridge(list(words.args))
+
+
+def _stm_hook_words(command: str) -> _StmHookWords | None:
+    """The parts of ``command`` when it has the shape of STM's hook (every check
+    of :func:`_is_stm_hook_command` except the parse of the words after
+    ``hook``), else ``None``."""
+    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
+    from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE
 
     tokens = _shell_tokens(command)
+    if tokens is None:
+        return None
     if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
-        return False
+        return None
     # A source checkout directory can itself be named ``memtomem-stm``. Count
     # only executable-shaped tokens immediately followed by the subcommand, so
     # ``uv run --directory /repo/memtomem-stm memtomem-stm hook`` has one owner
@@ -173,7 +201,7 @@ def _is_stm_hook_command(command: str) -> bool:
         if Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
     ]
     if len(starts) != 1:
-        return False
+        return None
     i = starts[0]
     executable = tokens[i]
 
@@ -186,8 +214,9 @@ def _is_stm_hook_command(command: str) -> bool:
         return not _NOT_EXECUTABLE.search(word) and re.split(r"[\\/]", word)[-1] not in {"", "."}
 
     if not names_a_file(executable):
-        return False
+        return None
     prefix = tokens[:i]
+    assignments: tuple[str, ...] = ()
     # Pre-runtime-flag installs commonly used POSIX ``env`` to pin timeout
     # values in the host command.  Recognize only a leading env executable
     # followed exclusively by MEMTOMEM_STM_* assignments; an arbitrary env
@@ -198,7 +227,7 @@ def _is_stm_hook_command(command: str) -> bool:
         # as assignments as well, so the line is a bare assignment prefix
         # (#1453), not an ``env`` launcher.
         if not names_a_file(prefix[0]):
-            return False
+            return None
         j = 1
         while j < len(prefix):
             key, sep, _value = prefix[j].partition("=")
@@ -206,7 +235,8 @@ def _is_stm_hook_command(command: str) -> bool:
                 break
             j += 1
         if j == 1:
-            return False
+            return None
+        assignments = tuple(prefix[1:j])
         prefix = prefix[j:]
     # ``uv run`` resolves a bare entry-point name; with another option, an empty
     # or option-like directory, or a path target it is not the launcher install
@@ -218,8 +248,25 @@ def _is_stm_hook_command(command: str) -> bool:
         and not prefix[3].startswith("-")
         and executable in _STM_EXECUTABLES
     ):
+        return None
+    return _StmHookWords(assignments, tuple(tokens[i + 2 :]))
+
+
+def _lenient_names(command: str) -> bool:
+    """Whether the lenient words of ``command`` hold an STM executable word
+    immediately followed by ``hook``. :func:`unmanaged_stm_like` uses it to
+    name a line :func:`_is_stm_hook_command` refuses, such as
+    ``m"m"s hook --host claude # pinned``, whose split executable name the raw
+    search of ``mms doctor``'s candidate test does not see (#1476). A line the
+    strict split accepts is not split again: its words are the ones the
+    recognizer read, and recognition there is what it was before #1476."""
+    if _shell_tokens_accepts(command):
         return False
-    return runs_hook_bridge(tokens[i + 2 :])
+    tokens = _lenient_shell_tokens(command)
+    return any(
+        Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
+        for i, tok in enumerate(tokens)
+    )
 
 
 def _is_stm_command_handler(handler: Any) -> bool:
@@ -705,7 +752,9 @@ def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
         # else they hold (their merges match on ``command`` alone), so the type
         # is set last, over any ``type`` field of their own.
         probe = handler if typed else {**handler, "type": "command"}
-        if is_candidate(probe):
+        # The lenient test reads ``command`` alone, as install's own match does,
+        # so a handler that loses recognition is named whatever its ``type``.
+        if is_candidate(probe) or _lenient_names(command):
             found.append(location)
 
     if host_tag in {"claude", "codex"}:
