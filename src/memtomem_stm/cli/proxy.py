@@ -54,7 +54,7 @@ from memtomem_stm.cli._display import _disp, _disp_escapes
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import has_lone_surrogate, unencodable_field
 from memtomem_stm.cli._write_lock import ConfigWriteError, with_config_write_lock
-from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
+from memtomem_stm.cli.host_runtime import hook_launcher, resolve_host_runtime_policy
 from memtomem_stm.mms.claude_config import (
     CLAUDE_CONFIG_UNKNOWN_REASONS,
     ClaudeConfigUnknown,
@@ -988,9 +988,10 @@ def _launcher_for(project: _StmProject | None) -> tuple[str, list[str]]:
     """The launcher for a :func:`_stm_project` result. Split out so ``mms hook
     install`` derives the written command and its binding notice from one
     lookup."""
-    if project is not None:
-        return ("uv", ["run", "--directory", str(project.root), "memtomem-stm"])
-    return ("memtomem-stm", [])
+    # The words come from ``host_runtime.hook_launcher``, which the reader
+    # of installed hook commands (``owned_hook_command``) shares.
+    words = hook_launcher(str(project.root) if project is not None else None)
+    return (words[0], words[1:])
 
 
 def _hook_project_binding() -> Path | None:

@@ -77,77 +77,45 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- `mms hook install` and `mms hook uninstall` no longer take over commands that
-  name STM's hook but do not run it (issue #1460). They used to treat a
-  command as STM's own hook whenever an STM entry point followed by `hook` had
-  nothing before it, an `env` with only `MEMTOMEM_STM_*` settings, or `uv run
-  …` without a `--`, so install replaced, and uninstall deleted, lines such as
-  `mms hook uninstall`, `uv run --help mms hook` and `OTHER=/mms hook`, both
-  calling them memtomem-stm's hook. Three token checks are added: the words
-  after `hook` must read as a hook run with `mms hook`'s own options (not a
-  subcommand, `--help` or a usage error); the executable word must have no `=`
-  or control character and not end in `/` or `/.`, and so must an `env`
-  word in front of it; and a `uv` launcher must be
-  exactly `uv run --directory <dir> <entry point>` with a non-empty `<dir>`
-  that does not start with `-` and a bare entry-point name, the form install
-  writes. The words are still split with `shlex`, so the checks approximate
-  the shell rather than prove what it runs. Lines that fail them are left in
-  place; those that look like STM's hook by the #1456 heuristic are named by
-  location. **Behavior change**: such lines are no longer updated or removed,
-  and when install finds no handler it manages it adds its own beside them.
-  That includes lines that do run the hook in a form the checks reject: a
-  hand-written `uv run` in another form (`uv run memtomem-stm hook`, extra
-  `uv` options, a path after `--directory <dir>`), an executable path with
-  `=` in it, and usually a line with a trailing `# comment`, whose words are
-  read as more arguments.
-- `mms hook install` and `mms hook uninstall` no longer act on a hook command
-  whose `shlex` words differ from what a POSIX shell runs (issue #1476). A line
-  with a `#` comment, `$VAR` (also inside double quotes), a glob, a here-string
-  (`<<<`), a line break, NUL or an unbalanced quote could be recognized as
-  STM's hook, so install rewrote it and uninstall deleted it; for
-  `mms hook --host # --persist-query-text` install also wrote
-  `--persist-query-text` into the replacement, a flag the shell never passed.
-  The split now reads only plain characters, single-quoted text, and
-  double-quoted text without `$`, backquote or `\` (the form install writes),
-  with `~/` at the start, and refuses any other line. Install also reads the
-  updated handler's settings with `mms hook`'s own options instead of its own
-  token scan, takes `MEMTOMEM_STM_*` assignments only from a leading `env`, and
-  lays the flags over those assignments the way the hook does: a repeated flag
-  resolves as the hook resolves it (the last one wins), an invalid flag value
-  leaves the inline setting in place, a `--surfacing-timeout-seconds` flag also
-  sets the daemon deadline over an inline one, and an assignment-shaped
-  `--host` value is no longer read as a setting. A refused line that looks like
-  STM's hook, including one whose executable or `hook` is spelled with quotes
-  (`m"m"s hook --host claude # pinned`), is named by location. **Behavior
-  change**: such lines are no longer updated or removed, and when install finds
-  no handler it manages it adds its own beside them. This includes lines that
-  run the hook correctly in a spelling the split refuses, such as
-  `$HOME/.local/bin/mms hook --host claude`; spell the path out to have install
-  manage it. On Windows a line whose words after the executable hold a glob
-  character, `$`, `%` or a leading `~` is refused as well, even quoted: the
-  `mms` entry point may expand such a word itself before reading its
-  arguments (`mms hook --host 'C*'` can reach it as several words), so install
-  refuses every word holding one, including ones that would stay as written
-  (`100%`). PowerShell, which Claude Code uses on Windows without Git Bash,
-  is not modelled: a quoted executable (`"mms" hook`) is still recognized there
-  (#1483).
-  **Behavior change**: for a handler with both `--persist-query-text` and
-  `--no-persist-query-text` (or both daemon flags), install keeps the last one,
-  where it used to keep the enabling one.
-- `mms hook install` no longer reads an existing handler's daemon mode from an
-  inline `MEMTOMEM_STM_SURFACING__USE_DAEMON` (issue #1484). The hook reads only
-  `MEMTOMEM_STM_HOOK__USE_DAEMON`, so
-  `env MEMTOMEM_STM_SURFACING__USE_DAEMON=false mms hook --host claude` ran
-  with the daemon (unless the host's own environment set
-  `MEMTOMEM_STM_HOOK__USE_DAEMON`), but install wrote `--no-daemon` into the replacement and
-  turned it off. Install now recovers the mode only from `--use-daemon` /
-  `--no-daemon` and `MEMTOMEM_STM_HOOK__USE_DAEMON`. **Behavior change**: on a
-  line whose only daemon setting is `MEMTOMEM_STM_SURFACING__USE_DAEMON` (or
-  whose `MEMTOMEM_STM_HOOK__USE_DAEMON` is empty), install takes the mode from
-  the effective `hook.use_daemon` (on by default), as for a line with no
-  daemon setting; pass `--no-daemon` to turn it off. No released install
-  wrote `MEMTOMEM_STM_SURFACING__USE_DAEMON` into a hook command, only into MCP
-  registrations.
+- `mms hook install` and `mms hook uninstall` now manage only the handlers
+  install writes (issues #1453, #1460, #1461, #1476, #1483, #1484). They used
+  to decide whether a handler was STM's hook by reading its command the way
+  a shell might: any entry-point name followed by `hook`, alone or behind
+  `env MEMTOMEM_STM_*=…` or `uv run`. That reading took over lines that do
+  not run the hook (`mms hook uninstall`, `uv run --help mms hook`,
+  `OTHER=/mms hook`), lines a shell reads differently (a `#` comment, `$VAR`,
+  a glob, a here-string: for `mms hook --host # --persist-query-text` install
+  wrote `--persist-query-text` into the replacement, a flag the shell never
+  passed), a quoted executable that PowerShell would not run (`"mms" hook`),
+  and a Kimi entry registered on another event, which install moved to
+  `PostToolUse` and uninstall deleted. It also read a setting the hook does
+  not: `env MEMTOMEM_STM_SURFACING__USE_DAEMON=false mms hook` turned the
+  daemon off in the replacement. A handler is now install's own only in the
+  form install writes: in the container install writes to (for Kimi, an entry
+  whose `event` is `PostToolUse`), with `"type": "command"` and no `args`
+  (Claude Code, Codex), and with the command
+  `memtomem-stm hook --host <that host>`, bare or after
+  `uv run --directory <absolute dir>`, followed by nothing or by install's six
+  runtime-setting words, spelled as install spells it. Every command a release
+  of install has written has that form, including one written with a
+  non-finite deadline (#1492). The command is compared with what install
+  would write for the same directory and settings; no shell is modelled, so
+  the rule is the same on every platform. Install now reads the host file
+  once, so the settings it carries over and the handler it replaces come from
+  the same version of the file. Those settings are read from the handler's
+  setting words as the hook applies them.
+  **Behavior change**: these commands leave in place handlers they used to
+  update or remove: `mms hook …` and `memtomem-stm-proxy hook …` (including
+  the manual registration `mms hook --host claude`), a path to the executable,
+  an `env MEMTOMEM_STM_…` prefix (its settings are no longer turned into
+  flags), a quoted name, flags added, left out or in another order, another
+  host's `--host`, a relative `uv run --directory`, other spacing, a handler
+  with `args` or without `"type": "command"`, and a Kimi entry on another
+  event. Install adds its own handler beside such a line and reads no setting
+  from it; uninstall leaves it. Both name its location, and install's preview
+  now does so above the block it would write. Remove the old line by hand if
+  it should not stay registered, and pin its settings again with
+  `--surfacing-timeout` and `--daemon` / `--no-daemon`.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that
