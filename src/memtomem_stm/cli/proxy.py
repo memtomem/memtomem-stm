@@ -10135,12 +10135,13 @@ def _ltm_status(
     timeout: float,
     *,
     measure_ltm: bool = False,
-    prefer_hook_daemon: bool = False,
+    hook_route: bool = False,
 ) -> dict[str, Any]:
     # Standalone proxy surfacing and native hooks have independent routing
-    # knobs. Health keeps describing the standalone route; doctor opts into
-    # the hook daemon because its timeout advice governs hook→daemon traffic.
-    if config.surfacing.use_daemon or (prefer_hook_daemon and config.hook.use_daemon):
+    # knobs. *hook_route* is the caller's decision that the row describes the
+    # hook's daemon (see ``_surfacing_bootstrap_status``), and *config* is then
+    # the hook's own build; otherwise this is the standalone route.
+    if hook_route or config.surfacing.use_daemon:
         return _ltm_daemon_status(config, timeout, measure_ltm=measure_ltm)
     return _ltm_mcp_status(config.surfacing, timeout)
 
@@ -10275,27 +10276,53 @@ def _surfacing_bootstrap_status(
     """Return surfacing bootstrap readiness without starting the proxy.
 
     *timeout* is the ``mms health --timeout`` value, forwarded into the LTM
-    probe so the documented per-server bound covers it too. *config_path* is
-    the command's explicit ``--config``, threaded so the ``STMConfig`` here
-    reads the same file as the command's own proxy checks (#839).
+    probe so the documented per-server bound covers it too.
+
+    The route is chosen first, then the configuration to look its daemon up
+    with, because a daemon is found by the fingerprint of the build that
+    started it (#1485):
+
+    - *prefer_hook_daemon* (doctor) and the hook's own daemon gate on: the
+      section describes the hook. The hook decides with
+      ``hook_cmd._daemon_enabled`` (a raw read of
+      ``MEMTOMEM_STM_HOOK__USE_DAEMON``, not the parsed ``hook.use_daemon``)
+      and builds with ``load_env_stm_config``: environment only, never
+      doctor's ``--config``, and tolerant of a proxy-only break. A daemon it
+      spawns reloads the same way, so that build is the daemon's identity.
+      Doctor's proxy checks still report a broken proxy variable.
+    - Otherwise (health, or the hook off): the standalone route, in the
+      command's own view: built from *config_path*, the command's explicit
+      ``--config``, so the ``STMConfig`` here reads the same file as the
+      command's own proxy checks (#839). That view gives a registered
+      server's fingerprint when the server's own build also succeeds and its
+      environment matches this one in the fingerprinted settings; doctor
+      cannot see the server's environment. A standalone server snapshots its
+      daemon identity before it applies the file's proxy settings; the file
+      reaches that build only through upstream completion, which decides
+      whether the build succeeds, not what it fingerprints.
     """
     try:
         from memtomem_stm.cli.rrf_diagnostics import rrf_boundary_doctor_checks
-        from memtomem_stm.config import stm_config_for_cli
+        from memtomem_stm.config import load_env_stm_config, stm_config_for_cli
         from memtomem_stm.surfacing.feedback_store import (
             inspect_feedback_db,
             read_surfacing_summary,
         )
         from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
 
-        config = stm_config_for_cli(config_path)
+        hook_route = False
+        if prefer_hook_daemon:
+            from memtomem_stm.cli.hook_cmd import _daemon_enabled
+
+            hook_route = _daemon_enabled()
+        config = load_env_stm_config().config if hook_route else stm_config_for_cli(config_path)
         surfacing = config.surfacing
         db_status = inspect_feedback_db(surfacing.feedback_db_path)
         ltm_status = _ltm_status(
             config,
             timeout,
             measure_ltm=measure_ltm,
-            prefer_hook_daemon=prefer_hook_daemon,
+            hook_route=hook_route,
         )
         # Judge Core's profile as it was sent, then render only its projection
         # (#1082): the checks below read the raw snapshot, so a value the
@@ -11380,7 +11407,9 @@ def doctor(
     ``--measure-ltm`` explicitly authorizes read-only synthetic searches against
     an already running daemon; it still never edits configuration or LTM data.
     An explicit ``--config`` also steers the STMConfig-backed checks (LTM /
-    surfacing), not just the proxy-file checks (#839).
+    surfacing), not just the proxy-file checks (#839), unless the hook would
+    use the daemon: those checks then use the configuration the hook builds
+    from the environment, which ``--config`` does not reach (#1485).
     """
     resolved_cfg = resolve_cli_config_path(config_path)
     config_path = resolved_cfg.path
@@ -12064,17 +12093,50 @@ def doctor(
             # optional measurement above is the only path that executes a
             # synthetic search.  These are WARN-only operational checks: an
             # undersized budget degrades surfacing but never breaks proxying.
-            if measure_ltm and (
-                not isinstance(ltm, dict)
-                or ltm.get("route") != "daemon"
-                or ltm.get("daemon_reachable") is False
-            ):
+            if measure_ltm and not isinstance(ltm, dict):
+                # The bootstrap raised (while loading the configuration or
+                # later, even after measuring); the ``ltm`` row above already
+                # renders its sanitized error, and no result survives.
                 check(
                     "ltm_measurement",
                     "ltm measurement",
                     "WARN",
-                    "--measure-ltm requires surfacing.use_daemon=true and a running daemon",
-                    "export MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                    "--measure-ltm result unavailable: the surfacing status could not be "
+                    "read (see the ltm server row)",
+                    "see the ltm server row",
+                )
+            elif (
+                measure_ltm and isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled"
+            ):
+                # Either route: the probe never pinged, so whether a daemon runs
+                # is unknown.
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm did not run: surfacing is disabled",
+                    "enable surfacing (surfacing.enabled, default true), then rerun",
+                )
+            elif measure_ltm and isinstance(ltm, dict) and ltm.get("route") != "daemon":
+                # The daemon route is the hook's when its daemon gate is on
+                # (#1485), else the standalone ``surfacing.use_daemon`` one.
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm needs a daemon route (the hook's, with "
+                    "MEMTOMEM_STM_HOOK__USE_DAEMON unset or true, or surfacing.use_daemon=true) "
+                    "and a running daemon",
+                    "unset MEMTOMEM_STM_HOOK__USE_DAEMON or export "
+                    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                )
+            elif measure_ltm and isinstance(ltm, dict) and ltm.get("daemon_reachable") is False:
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm requires a running daemon for the probed configuration",
+                    "mms daemon start",
                 )
             elif isinstance(ltm, dict) and ltm.get("route") == "daemon":
                 measurement = ltm.get("measurement")
