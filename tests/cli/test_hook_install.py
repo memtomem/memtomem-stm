@@ -1988,9 +1988,11 @@ def test_windows_reads_no_setting_from_an_expanded_line(on_windows) -> None:
     [
         "mms hook --host 'C*'",
         # Quote removal joins the executable name, which the raw search misses.
-        "m\"m\"s hook --host 'C*'",
+        # Behind ``uv``, so the line's first word is unquoted and only the
+        # expansion rule refuses it (#1483).
+        "uv run --directory /repo m\"m\"s hook --host 'C*'",
         # ``~`` counts at the start of a word, not of the line.
-        "m\"m\"s hook --host '~x'",
+        "uv run --directory /repo m\"m\"s hook --host '~x'",
     ],
 )
 def test_windows_names_a_line_it_refuses(command: str, on_windows, redirect) -> None:
@@ -2036,12 +2038,199 @@ def test_windows_notice_scan_splits_a_line_once(
 
     monkeypatch.setattr(host_runtime.shlex, "shlex", counting)
     # Spelled so that ``is_candidate``'s raw search misses it, which leaves the
-    # decision to the word test.
-    command = f'm"m"s hook --host {line}'
+    # decision to the word test. Behind ``uv``, so the line's first word is
+    # unquoted and the quoted-first-word rule (#1483) does not decide instead.
+    command = f'uv run --directory /repo m"m"s hook --host {line}'
 
     expected = ("hooks.PostToolUse[0].hooks[0]",) if named else ()
     assert unmanaged_stm_like("claude", _claude_groups([_h(command)])) == expected
     assert calls.count(command) == 1
+
+
+# ── Windows: a quoted first word (#1483) ─────────────────────────────────────
+#
+# Claude Code runs a shell-form hook under PowerShell when Git Bash is not
+# installed, and PowerShell prints a command made only of quoted strings
+# instead of running it. Install cannot tell which shell will run a line, so
+# under the Windows rules it does not own one whose first word holds a quote.
+
+_WINDOWS_QUOTED_FIRST_WORD = [
+    '"mms" hook --host claude',
+    "'mms' hook --host claude",
+    'm"m"s hook --host claude',
+    '""mms hook --host claude',
+    '"uv" run --directory /repo memtomem-stm hook --host claude',
+    '~/bin/"mms" hook --host claude',
+    # Leading blanks, and a blank inside the quoted word.
+    '  "C:/Program Files/stm/mms" hook --host claude',
+]
+
+_QUOTED_PERSISTS = '"mms" hook --host claude --persist-query-text'
+
+
+@pytest.mark.parametrize("command", _WINDOWS_QUOTED_FIRST_WORD)
+def test_windows_refuses_a_quoted_first_word(command: str, on_windows) -> None:
+    assert _is_stm_hook_command(command) is False
+
+
+@pytest.mark.parametrize("command", _WINDOWS_QUOTED_FIRST_WORD)
+def test_a_quoted_first_word_is_recognized_elsewhere(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control: a POSIX shell removes the quotes and runs the word."""
+    from memtomem_stm.cli import hook_registration
+
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: False)
+    assert _is_stm_hook_command(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Install's own source-checkout output: only the directory is quoted.
+        "uv run --directory 'C:\\Users\\x\\repo' memtomem-stm hook --host claude",
+        'uv run --directory /repo "memtomem-stm" hook --host claude',
+        'mms hook --host "claude"',
+        "mms hook '--host' claude",
+        '  mms hook --host "claude"',
+    ],
+)
+def test_windows_does_not_examine_quotes_after_the_first_word(command: str, on_windows) -> None:
+    assert _is_stm_hook_command(command) is True
+
+
+def test_windows_reads_no_setting_from_a_quoted_first_word(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from memtomem_stm.cli import hook_registration
+    from memtomem_stm.cli.host_runtime import (
+        PartialHostRuntimePolicy,
+        parse_managed_hook_runtime,
+    )
+
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: False)
+    assert parse_managed_hook_runtime(_QUOTED_PERSISTS).persist_query_text is True
+
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: True)
+    assert parse_managed_hook_runtime(_QUOTED_PERSISTS) == PartialHostRuntimePolicy()
+
+
+def test_windows_does_not_list_a_quoted_first_word_as_installed(on_windows, redirect) -> None:
+    """``installed_stm_hook_commands`` feeds the runtime policy install
+    resolves, first command first: a quoted line must not be in it, even ahead
+    of a managed one."""
+    managed = "mms hook --host claude --no-daemon"
+    path = redirect("claude")
+
+    _seed(path, _claude_groups([_h(_QUOTED_PERSISTS)]))
+    assert installed_stm_hook_commands("claude") == ()
+
+    _seed(path, _claude_groups([_h(_QUOTED_PERSISTS)], [_h(managed)]))
+    assert installed_stm_hook_commands("claude") == (managed,)
+
+
+@pytest.mark.parametrize("command", _WINDOWS_QUOTED_FIRST_WORD[:2])
+def test_windows_names_a_quoted_first_word(command: str, on_windows, redirect) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(command)]))
+    location = "hooks.PostToolUse[0].hooks[0]"
+
+    installed = plan_install("claude", _MANAGED)
+    removed = plan_uninstall("claude")
+
+    groups = json.loads(installed.new_text)["hooks"]["PostToolUse"]
+    assert [h["command"] for g in groups for h in g["hooks"]] == [command, _MANAGED]
+    assert installed.unmanaged == (location,)
+    assert removed.status == "not_installed"
+    assert removed.unmanaged == (location,)
+
+
+def test_windows_names_a_long_quoted_first_word_from_the_one_scan(
+    on_windows, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused line past ``is_candidate``'s ``shlex`` limit, with a name its
+    raw search misses, is named from the split and the adjacency scan
+    recognition already made."""
+    import shlex as shlex_module
+
+    from memtomem_stm.cli import hook_hosts, host_runtime
+
+    calls: list[str] = []
+    real = shlex_module.shlex
+
+    def counting(command: str, *args: object, **kwargs: object) -> shlex_module.shlex:
+        calls.append(command)
+        return real(command, *args, **kwargs)  # type: ignore[arg-type]
+
+    scans: list[int] = []
+    real_scan = hook_hosts._exe_before_hook
+
+    def counting_scan(tokens: list[str]) -> Iterator[int]:
+        scans.append(len(tokens))
+        return real_scan(tokens)
+
+    monkeypatch.setattr(host_runtime.shlex, "shlex", counting)
+    monkeypatch.setattr(hook_hosts, "_exe_before_hook", counting_scan)
+    command = 'm"m"s hook --host \'' + "x" * 5000 + "'"
+
+    assert hook_hosts.unmanaged_stm_like("claude", _claude_groups([_h(command)])) == (
+        "hooks.PostToolUse[0].hooks[0]",
+    )
+    assert calls == [command]
+    assert scans == [4]
+
+
+def test_cli_windows_install_does_not_take_over_a_quoted_first_word(on_windows, redirect) -> None:
+    """The issue's line, end to end: install used to rewrite it with
+    ``--persist-query-text``, a flag PowerShell may never have passed on."""
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(_QUOTED_PERSISTS)]))
+    location = "hooks.PostToolUse[0].hooks[0]"
+    runner = CliRunner()
+
+    applied = runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    assert f"in the written file: {location}" in applied.output
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    commands = [h["command"] for g in groups for h in g["hooks"]]
+    assert commands[0] == _QUOTED_PERSISTS
+    assert len(commands) == 2
+    written = shlex.split(commands[1])
+    assert "--no-persist-query-text" in written
+    assert "--persist-query-text" not in written
+
+    removed = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+    assert removed.exit_code == 0, removed.output
+    assert f"in the written file: {location}" in removed.output
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    assert [h["command"] for g in groups for h in g["hooks"]] == [_QUOTED_PERSISTS]
+
+
+def test_cli_windows_install_refreshes_the_managed_handler_after_a_quoted_one(
+    on_windows, redirect
+) -> None:
+    """A quoted line ahead of a managed one: install keeps the first as
+    written and refreshes the second from the second's own settings."""
+    managed = (
+        "mms hook --host claude --no-daemon --surfacing-timeout-seconds 7.5 --no-persist-query-text"
+    )
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(_QUOTED_PERSISTS)], [_h(managed)]))
+    runner = CliRunner()
+
+    applied = runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    assert "in the written file: hooks.PostToolUse[0].hooks[0]" in applied.output
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    assert len(groups) == 2
+    assert [h["command"] for h in groups[0]["hooks"]] == [_QUOTED_PERSISTS]
+    (refreshed,) = groups[1]["hooks"]
+    assert refreshed["command"] != managed
+    written = shlex.split(refreshed["command"])
+    assert "--no-daemon" in written
+    assert written[written.index("--surfacing-timeout-seconds") + 1] == "7.5"
+    assert "--no-persist-query-text" in written
+    assert "--persist-query-text" not in written
 
 
 def test_a_refused_line_the_candidate_test_names_is_not_split(

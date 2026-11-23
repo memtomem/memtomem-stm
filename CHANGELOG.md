@@ -129,8 +129,8 @@ changes inline only. See the deprecation policy in
   arguments (`mms hook --host 'C*'` can reach it as several words), so install
   refuses every word holding one, including ones that would stay as written
   (`100%`). PowerShell, which Claude Code uses on Windows without Git Bash,
-  is not modelled: a quoted executable (`"mms" hook`) is still recognized there
-  (#1483).
+  is not modelled; a line whose first word is quoted is refused by a separate
+  rule (issue #1483, below).
   **Behavior change**: for a handler with both `--persist-query-text` and
   `--no-persist-query-text` (or both daemon flags), install keeps the last one,
   where it used to keep the enabling one.
@@ -148,6 +148,25 @@ changes inline only. See the deprecation policy in
   daemon setting; pass `--no-daemon` to turn it off. No released install
   wrote `MEMTOMEM_STM_SURFACING__USE_DAEMON` into a hook command, only into MCP
   registrations.
+- On Windows, `mms hook install` and `mms hook uninstall` no longer act on a
+  hook command whose first word holds a quote (issue #1483). Claude Code runs
+  a hook line under Git Bash on Windows and under PowerShell when Git Bash is
+  not installed, and PowerShell prints a command made only of quoted strings
+  instead of running it. `"mms" hook --host claude --persist-query-text` was
+  recognized as STM's hook all the same, so install wrote
+  `--persist-query-text` into the replacement and uninstall deleted the line.
+  Install cannot tell which shell will run a line, so under the Windows rules
+  it now refuses every line whose first word holds a quote character
+  (`"mms" hook`, `'mms' hook`, `m"m"s hook`, `"uv" run …`), on every host.
+  This is a refusal to manage the line, not a model of PowerShell: how
+  PowerShell reads a quoted word followed by other words, or the arguments
+  after an unquoted first word, was not measured, and quotes after the first
+  word are not examined. The command install writes starts with `memtomem-stm`
+  or `uv`, unquoted, and is still recognized. **Behavior change**: on Windows
+  such a line is no longer updated or removed and no setting is read from it;
+  it is named by location. When install finds no other handler it manages, it
+  adds its own beside it, also where Git Bash runs the quoted line as before;
+  remove the quotes from the first word to have install manage the line.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that
