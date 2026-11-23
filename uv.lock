@@ -1725,6 +1725,7 @@ name = "memtomem-stm"
 version = "0.7.10"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "click" },
     { name = "cryptography" },
     { name = "httpx" },
@@ -1782,6 +1783,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.9" },
     { name = "click", specifier = ">=8.1" },
     { name = "cryptography", specifier = ">=48.0.1" },
     { name = "httpx", specifier = ">=0.28" },
