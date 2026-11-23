@@ -150,7 +150,7 @@ changes inline only. See the deprecation policy in
   wrote `MEMTOMEM_STM_SURFACING__USE_DAEMON` into a hook command, only into MCP
   registrations.
 - On Windows, `mms hook install` and `mms hook uninstall` no longer act on a
-  hook command whose first word holds a quote (issue #1483).
+  hook command whose first word holds a quote (#1500, issue #1483).
   `"mms" hook --host claude --persist-query-text` was recognized as STM's
   hook, so install wrote `--persist-query-text` into the replacement and
   uninstall deleted the line. Claude Code's hooks reference says that a
