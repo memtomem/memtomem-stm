@@ -51,8 +51,9 @@ dependencies = [
     "httpx2>=2.5.0",
     # Imported directly (``server.py``: ``CancelScope``;
     # ``utils/mcp_transport.py``: stream exceptions), so declared rather than
-    # borrowed from ``mcp``. The floor matches the one ``mcp`` 2.2 and 2.3 set
-    # for Python < 3.14, so declaring it does not narrow resolution.
+    # borrowed transitively (``mcp``, ``httpx`` and ``starlette`` all pull it
+    # in today). The floor matches the one ``mcp`` 2.2 and 2.3 set for
+    # Python < 3.14, so declaring it does not narrow resolution.
     "anyio>=4.9",
     "click>=8.1",
     "questionary>=2.0",
