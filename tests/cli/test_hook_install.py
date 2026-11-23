@@ -2044,6 +2044,13 @@ _WINDOWS_LOOK_ALIKES = [
     # #1483: PowerShell reads a quoted executable as a string, not a command.
     '"mms" hook --host claude --persist-query-text',
     '"memtomem-stm" hook --host claude',
+    "'mms' hook --host claude",
+    'm"m"s hook --host claude',
+    '""mms hook --host claude',
+    '"uv" run --directory /repo memtomem-stm hook --host claude',
+    "'env' MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=12 mms hook --host claude",
+    '~/bin/"mms" hook --host claude',
+    '  "C:/Program Files/stm/mms" hook --host claude',
     "mms hook --host 'C*'",
     "mms hook --host %HOOK_HOST%",
     "mms hook --host '$HOOK_HOST'",
@@ -2095,6 +2102,7 @@ def test_cli_leaves_a_quoted_executable_and_reads_no_setting_from_it(on_windows,
 
     removed = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
     assert removed.exit_code == 0, removed.output
+    assert f"in the written file: {location}" in removed.output
     assert _claude_commands(path) == [quoted]
 
 
@@ -2186,6 +2194,111 @@ def test_the_notice_scan_splits_a_line_once(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert unmanaged_stm_like("claude", _claude_groups([_h(line)])) == ()
     assert calls == [line]
+
+
+# ── a quoted first word on every host (#1483) ────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("host", "data", "location"),
+    [
+        (
+            "claude",
+            _claude_groups([_h('"memtomem-stm" hook --host claude')]),
+            "hooks.PostToolUse[0].hooks[0]",
+        ),
+        (
+            "codex",
+            _claude_groups([_h('"memtomem-stm" hook --host codex')]),
+            "hooks.PostToolUse[0].hooks[0]",
+        ),
+        (
+            "cursor",
+            {
+                "version": 1,
+                "hooks": {"postToolUse": [{"command": '"memtomem-stm" hook --host cursor'}]},
+            },
+            "hooks.postToolUse[0]",
+        ),
+        (
+            "kimi",
+            {
+                "hooks": [
+                    {
+                        "event": "PostToolUse",
+                        "matcher": "Bash",
+                        "command": '"memtomem-stm" hook --host kimi',
+                    }
+                ]
+            },
+            "hooks[0]",
+        ),
+    ],
+)
+@pytest.mark.parametrize("windows", [True, False])
+def test_a_quoted_first_word_is_named_on_every_host(
+    host: str,
+    data: dict,
+    location: str,
+    windows: bool,
+    redirect,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Install's own line with quotes ``shlex.join`` would not add is left in
+    place and named, in every host's container, on either platform."""
+    from memtomem_stm.cli import hook_registration
+
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: windows)
+    path = redirect(host)
+
+    # Positive control: the same entry, unquoted, is install's own.
+    unquoted = json.loads(json.dumps(data).replace('\\"memtomem-stm\\"', "memtomem-stm"))
+    _seed(path, unquoted, HOOK_HOSTS[host].fmt)
+    assert plan_install(host, _CMD.format(host=host)).unmanaged == ()
+    assert plan_uninstall(host).status != "not_installed"
+
+    _seed(path, data, HOOK_HOSTS[host].fmt)
+    installed = plan_install(host, _CMD.format(host=host))
+    removed = plan_uninstall(host)
+    assert installed.unmanaged == (location,)
+    assert installed.unmanaged_after == (location,)  # appended after it, so it stays put
+    assert removed.status == "not_installed"
+    assert removed.unmanaged == (location,)
+
+
+def test_cli_windows_install_refreshes_the_owned_handler_after_a_quoted_one(
+    on_windows, redirect
+) -> None:
+    """A quoted line ahead of an owned one: install keeps the first as
+    written and carries the second's own settings over, not the quoted
+    line's ``--persist-query-text``."""
+    owned = _written(
+        "claude",
+        None,
+        HostRuntimePolicy(
+            use_daemon=False,
+            surfacing_timeout_seconds=7.5,
+            daemon_timeout_seconds=4.0,
+            persist_query_text=False,
+        ),
+    )
+    quoted = '"mms" hook --host claude --persist-query-text'
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(quoted)], [_h(owned)]))
+    runner = CliRunner()
+
+    applied = runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    assert "in the written file: hooks.PostToolUse[0].hooks[0]" in applied.output
+    groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    assert len(groups) == 2
+    assert [h["command"] for h in groups[0]["hooks"]] == [quoted]
+    (refreshed,) = groups[1]["hooks"]
+    written = shlex.split(refreshed["command"])
+    assert "--no-daemon" in written
+    assert written[written.index("--surfacing-timeout-seconds") + 1] == "7.5"
+    assert "--no-persist-query-text" in written
+    assert "--persist-query-text" not in written
 
 
 def test_a_refused_line_the_candidate_test_names_is_not_split(

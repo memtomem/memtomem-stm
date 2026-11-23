@@ -50,11 +50,13 @@ changes inline only. See the deprecation policy in
   decoded at all, and a detached daemon writes it to its log file unless
   `MEMTOMEM_STM_LOG_LEVEL` is `ERROR` or higher. An invalid variable outside
   `proxy` fails as before. `mms doctor`'s `env_overrides` row says which case
-  applies; its LTM row still builds the configuration strictly, so under such
-  an environment it reports the configuration error. **Behavior change**:
-  under such an environment the hook compresses and surfaces again and the
-  daemon starts. These paths ignore every `MEMTOMEM_STM_PROXY*` variable,
-  valid ones included, so `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` no longer reaches
+  applies. Doctor's LTM row keeps strict validation when the hook's daemon is
+  off; with it on, the row uses the hook's build, so a proxy-only failure the
+  hook recovers from no longer shows there (see the `mms doctor` entry under
+  Fixed, #1485). **Behavior change**: when only a `MEMTOMEM_STM_PROXY*`
+  variable is invalid, the hook compresses and surfaces again and the daemon
+  starts. These paths ignore every `MEMTOMEM_STM_PROXY*` variable, valid ones
+  included, so `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` no longer reaches
   surfacing, and the hook records no metrics rows, because the metrics
   database path is a proxy setting. Fixing the variable can change the
   daemon's identity (when it restores a consumer model), so a daemon started
@@ -77,9 +79,52 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The `otlp` extra declares `requests` and `opentelemetry-api`, which STM's OTLP
+  exporter imports directly, and config validation now also checks that
+  `requests` can be found (#1493, issue #1486). Both were previously installed
+  only as transitive dependencies; the lock resolves the same versions as
+  before. Validation used to check only the SDK and the HTTP exporter, so an
+  install without `requests` passed it and then failed when the exporter
+  started.
+  **Behavior change**: with `otlp.enabled=true` and `requests` missing, STM
+  now refuses the configuration at validation, naming `requests` and the
+  install command, instead of raising an import error at startup. The message
+  now reads "required OTLP modules could not be found" in place of "the
+  OpenTelemetry packages are not installed".
+- `mms doctor`'s `ltm` row looks the hook's daemon up under the
+  configuration a bare `mms hook` builds in doctor's environment, rather than
+  under one built from doctor's `--config` (#1491, issue #1485). A daemon is
+  looked up by a fingerprint of the configuration it started with, and the hook
+  builds from the environment alone and, since #1482, without an invalid
+  `MEMTOMEM_STM_PROXY*` variable. Under such a variable, a
+  `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` (which the hook then drops) made doctor
+  report a running daemon as unreachable, and without a `--config` file that
+  builds, the row reported the configuration error without probing. When the
+  hook would use the daemon (`MEMTOMEM_STM_HOOK__USE_DAEMON` unset or true,
+  read as the hook reads it), doctor's surfacing checks now use the
+  configuration the hook builds in doctor's environment. That covers the `ltm`
+  row, the measurement, the feedback database and the RRF, profile and timeout
+  checks. **Behavior change**: on that route `--config` no longer steers those
+  checks, and a broken proxy variable the hook recovers from (nothing outside
+  `proxy` is invalid) shows only in doctor's proxy checks (`env_overrides`),
+  not in the `ltm` row. A `MEMTOMEM_STM_HOOK` JSON value
+  that sets `use_daemon` to false no longer moves the row to the direct
+  route, since the hook ignores it. `mms health`, and doctor with the hook's
+  daemon off, keep the standalone view built from `--config`. Known limit:
+  doctor sees its own environment, not the host's, and does not read the
+  options registered on the hook command, which also change the daemon's
+  fingerprint. `mms hook install` writes `--no-persist-query-text` unless the
+  existing command says otherwise, while the settings default to persisting
+  query text, so with an installed hook doctor still reports its daemon as
+  unreachable unless `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=false` is set
+  in doctor's environment too. `--no-daemon` and the timeout options are not
+  read either. So next to a hook installed with `--no-daemon`, with a
+  standalone `surfacing.use_daemon` daemon and `MEMTOMEM_STM_HOOK__USE_DAEMON`
+  unset or true in doctor's environment, doctor now looks under the bare
+  hook's fingerprint, not the `--config` one (#1494).
 - `mms hook install` and `mms hook uninstall` now manage only the handlers
-  install writes (issues #1453, #1460, #1461, #1476, #1483, #1484). They used
-  to decide whether a handler was STM's hook by reading its command the way
+  install writes (#1499, issues #1453, #1460, #1461, #1476, #1483, #1484).
+  They used to decide whether a handler was STM's hook by reading its command the way
   a shell might: any entry-point name followed by `hook`, alone or behind
   `env MEMTOMEM_STM_*=…` or `uv run`. That reading took over lines that do
   not run the hook (`mms hook uninstall`, `uv run --help mms hook`,
