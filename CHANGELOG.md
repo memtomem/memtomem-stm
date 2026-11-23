@@ -79,10 +79,11 @@ changes inline only. See the deprecation policy in
 
 - The `otlp` extra declares `requests` and `opentelemetry-api`, which STM's OTLP
   exporter imports directly, and config validation now also checks that
-  `requests` can be found (issue #1486). Both were previously installed only
-  as transitive dependencies; the lock resolves the same versions as before.
-  Validation used to check only the SDK and the HTTP exporter, so an install
-  without `requests` passed it and then failed when the exporter started.
+  `requests` can be found (#1493, issue #1486). Both were previously installed
+  only as transitive dependencies; the lock resolves the same versions as
+  before. Validation used to check only the SDK and the HTTP exporter, so an
+  install without `requests` passed it and then failed when the exporter
+  started.
   **Behavior change**: with `otlp.enabled=true` and `requests` missing, STM
   now refuses the configuration at validation, naming `requests` and the
   install command, instead of raising an import error at startup. The message
