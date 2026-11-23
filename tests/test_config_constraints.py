@@ -9,6 +9,7 @@ from memtomem_stm.config import (
     DaemonConfig,
     HookConfig,
     LangfuseConfig,
+    OtlpExportConfig,
     STMConfig,
     _is_loopback_host,
 )
@@ -511,6 +512,47 @@ class TestLangfusePackageValidator:
         cfg = LangfuseConfig(enabled=False)
         assert cfg.enabled is False
         assert "langfuse" not in calls
+
+
+class TestOtlpPackageValidator:
+    """``OtlpExportConfig.enabled=true`` must refuse an install that ``init_otlp`` would crash on.
+
+    Lives here rather than in ``tests/test_observability_otlp.py`` because that
+    module imports the OpenTelemetry SDK at collection time; these stubs make
+    the result independent of which extras the test environment has.
+    """
+
+    _OTEL_MODULES = ("opentelemetry.sdk", "opentelemetry.exporter.otlp.proto.http")
+
+    def _stub(self, monkeypatch: pytest.MonkeyPatch, absent: set[str]) -> None:
+        # The header-env validator runs on the same model; clear its inputs so
+        # it cannot raise first and stand in for the error under test.
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_HEADERS", raising=False)
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", raising=False)
+        import importlib.util as importlib_util
+
+        real_find_spec = importlib_util.find_spec
+
+        def _fake_find_spec(name: str, package: str | None = None) -> object | None:
+            if name in absent:
+                return None
+            if name in self._OTEL_MODULES or name == "requests":
+                return object()
+            return real_find_spec(name, package)
+
+        monkeypatch.setattr("importlib.util.find_spec", _fake_find_spec)
+
+    def test_enabled_without_requests_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # ``_export_session`` imports requests; a validator that probed only
+        # the SDK and the exporter passed this install and setup then crashed.
+        self._stub(monkeypatch, absent={"requests"})
+        with pytest.raises(ValidationError, match=r"missing: requests\)"):
+            OtlpExportConfig(enabled=True, endpoint="http://localhost:4318")
+
+    def test_enabled_with_every_module_found_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._stub(monkeypatch, absent=set())
+        cfg = OtlpExportConfig(enabled=True, endpoint="http://localhost:4318")
+        assert cfg.enabled is True
 
 
 class TestProxyConfigUniquePrefixes:
