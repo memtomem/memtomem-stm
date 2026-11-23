@@ -85,11 +85,7 @@ import tomli_w
 
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, get_adapter
-from memtomem_stm.cli.host_runtime import (
-    _lenient_shell_tokens,
-    _shell_tokens,
-    _shell_tokens_accepts,
-)
+from memtomem_stm.cli.host_runtime import _lenient_shell_tokens, _shell_tokens
 from memtomem_stm.mms.host_homes import (
     HOST_HOME_UNKNOWN_REASONS,
     HostHomeUnknown,
@@ -101,6 +97,11 @@ from memtomem_stm.utils.fileio import atomic_write_text
 # ``mms ≡ memtomem-stm ≡ memtomem-stm-proxy`` (the three ``[project.scripts]``
 # entry points, #260) so a block registered under any of them is recognized.
 _STM_EXECUTABLES: frozenset[str] = frozenset({"mms", "memtomem-stm", "memtomem-stm-proxy"})
+
+# What Click's Windows entry point expands in each argument before parsing
+# (``click.utils._expand_args``): glob characters, ``$VAR`` / ``${VAR}`` /
+# ``%VAR%`` (``os.path.expandvars``) and a leading ``~`` (``expanduser``).
+_CLICK_WINDOWS_EXPANDS = re.compile(r"[*?\[$%]|^~")
 
 
 class HookInstallError(Exception):
@@ -160,7 +161,10 @@ def _is_stm_hook_command(command: str) -> bool:
     The words come from :func:`~memtomem_stm.cli.host_runtime._shell_tokens`,
     which refuses a line with shell syntax it does not model (a ``#``, ``$``,
     a glob, an operator or a line break outside quotes, among others; #1476),
-    so such a line never matches. Three more checks keep out lines that would
+    so such a line never matches. On Windows, where the entry point expands
+    its own arguments (globs, ``$VAR``, ``%VAR%``, a leading ``~``) before
+    Click parses them, a line whose words after the executable hold any of
+    those does not match either. Three more checks keep out lines that would
     not run the hook bridge (#1460): the executable word has no ``=`` or
     control character and its last component as written is not empty or ``.``
     (so ``OTHER=/mms hook`` and ``mms/ hook`` do not match); a ``uv`` launcher
@@ -183,12 +187,57 @@ def _stm_hook_words(command: str) -> _StmHookWords | None:
     """The parts of ``command`` when it has the shape of STM's hook (every check
     of :func:`_is_stm_hook_command` except the parse of the words after
     ``hook``), else ``None``."""
-    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
-    from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE
-
     tokens = _shell_tokens(command)
-    if tokens is None:
-        return None
+    return None if tokens is None else _stm_hook_shape(tokens)
+
+
+@dataclass(frozen=True)
+class _HookLine:
+    """One handler command, split at most once (see :func:`_read_hook_line`)."""
+
+    command: str
+    strict: tuple[str, ...] | None
+    """The words of an accepted line, ``None`` when the split refuses it."""
+    recognized: bool
+    """What :func:`_is_stm_hook_command` returns for the command."""
+
+    def names_the_hook(self) -> bool:
+        """Whether the command's words put an STM executable right before
+        ``hook``: the strict words of an accepted line, else the lenient ones.
+        These catch a refused line whose quoted executable name the raw search
+        of ``mms doctor``'s candidate test does not see, such as
+        ``m"m"s hook --host claude # pinned`` (#1476). A refused line is split
+        here, so call this only when that test has not already decided."""
+        tokens = (
+            list(self.strict) if self.strict is not None else _lenient_shell_tokens(self.command)
+        )
+        return any(
+            Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
+            for i, tok in enumerate(tokens)
+        )
+
+
+def _read_hook_line(command: str) -> _HookLine:
+    """Recognition of ``command`` with the words it read kept for
+    :meth:`_HookLine.names_the_hook`, so a line is split once
+    (``shlex`` is quadratic in a word's length)."""
+    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
+    from memtomem_stm.cli.hook_registration import runs_hook_bridge
+
+    strict = _shell_tokens(command)
+    words = _stm_hook_shape(strict) if strict is not None else None
+    return _HookLine(
+        command=command,
+        strict=tuple(strict) if strict is not None else None,
+        recognized=words is not None and runs_hook_bridge(list(words.args)),
+    )
+
+
+def _stm_hook_shape(tokens: list[str]) -> _StmHookWords | None:
+    """:func:`_stm_hook_words` on the words of an accepted line."""
+    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
+    from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE, running_on_windows
+
     if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
         return None
     # A source checkout directory can itself be named ``memtomem-stm``. Count
@@ -214,6 +263,13 @@ def _stm_hook_words(command: str) -> _StmHookWords | None:
         return not _NOT_EXECUTABLE.search(word) and re.split(r"[\\/]", word)[-1] not in {"", "."}
 
     if not names_a_file(executable):
+        return None
+    # On Windows the entry point expands its own arguments before Click parses
+    # them, so a word the shell passed as written may reach ``mms hook`` as
+    # other words, or several, depending on the hook's environment and working
+    # directory. Words before the executable (``env``, ``uv run``) are not
+    # its arguments.
+    if running_on_windows() and any(_CLICK_WINDOWS_EXPANDS.search(w) for w in tokens[i + 1 :]):
         return None
     prefix = tokens[:i]
     assignments: tuple[str, ...] = ()
@@ -250,23 +306,6 @@ def _stm_hook_words(command: str) -> _StmHookWords | None:
     ):
         return None
     return _StmHookWords(assignments, tuple(tokens[i + 2 :]))
-
-
-def _lenient_names(command: str) -> bool:
-    """Whether the lenient words of ``command`` hold an STM executable word
-    immediately followed by ``hook``. :func:`unmanaged_stm_like` uses it to
-    name a line :func:`_is_stm_hook_command` refuses, such as
-    ``m"m"s hook --host claude # pinned``, whose split executable name the raw
-    search of ``mms doctor``'s candidate test does not see (#1476). A line the
-    strict split accepts is not split again: its words are the ones the
-    recognizer read, and recognition there is what it was before #1476."""
-    if _shell_tokens_accepts(command):
-        return False
-    tokens = _lenient_shell_tokens(command)
-    return any(
-        Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
-        for i, tok in enumerate(tokens)
-    )
 
 
 def _is_stm_command_handler(handler: Any) -> bool:
@@ -745,16 +784,19 @@ def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
         if not isinstance(handler, dict):
             return
         command = handler.get("command")
-        if not isinstance(command, str) or _is_stm_hook_command(command):
+        if not isinstance(command, str):
+            return
+        line = _read_hook_line(command)
+        if line.recognized:
             return
         # Claude and Codex handlers name their ``type``, and only a ``command``
         # handler runs anything. Cursor and Kimi entries are commands whatever
         # else they hold (their merges match on ``command`` alone), so the type
         # is set last, over any ``type`` field of their own.
         probe = handler if typed else {**handler, "type": "command"}
-        # The lenient test reads ``command`` alone, as install's own match does,
+        # The word test reads ``command`` alone, as install's own match does,
         # so a handler that loses recognition is named whatever its ``type``.
-        if is_candidate(probe) or _lenient_names(command):
+        if is_candidate(probe) or line.names_the_hook():
             found.append(location)
 
     if host_tag in {"claude", "codex"}:

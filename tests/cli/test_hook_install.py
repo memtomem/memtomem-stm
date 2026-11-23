@@ -269,7 +269,13 @@ def test_is_stm_hook_command_refuses_shell_syntax_the_split_does_not_model(
         "/home/사용자/.local/bin/mms hook --host claude",
     ],
 )
-def test_is_stm_hook_command_keeps_quoted_and_plain_lines(command: str) -> None:
+def test_is_stm_hook_command_keeps_quoted_and_plain_lines(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The shell's reading; on Windows Click expands ``$`` and ``*`` itself.
+    from memtomem_stm.cli import hook_registration
+
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: False)
     assert _is_stm_hook_command(command) is True
 
 
@@ -1822,8 +1828,8 @@ def test_a_refused_hook_line_without_a_type_is_named(redirect) -> None:
 
 
 def test_the_notice_scan_splits_a_line_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The lenient naming test does not split again a line the recognizer
-    has already split (``shlex`` is quadratic in a word's length)."""
+    """Recognition and the look-alike test share one split of a line
+    (``shlex`` is quadratic in a word's length)."""
     import shlex as shlex_module
 
     from memtomem_stm.cli import host_runtime
@@ -1870,3 +1876,166 @@ def test_cli_install_does_not_take_over_a_commented_line(redirect) -> None:
     assert f"in the written file: {location}" in removed.output
     groups = json.loads(path.read_text())["hooks"]["PostToolUse"]
     assert [h["command"] for g in groups for h in g["hooks"]] == [commented]
+
+
+# ── Windows: Click expands the hook's own arguments (#1476) ──────────────────
+#
+# On Windows the ``mms`` entry point runs Click's ``_expand_args`` on every
+# argument before parsing: ``~`` at the start, ``$VAR`` / ``%VAR%`` and globs.
+# A word the shell passes as written can still reach ``mms hook`` as other
+# words, or as several, depending on the hook's environment and directory.
+
+
+@pytest.fixture
+def on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from memtomem_stm.cli import hook_registration
+
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: True)
+
+
+_WINDOWS_EXPANDED = [
+    "mms hook --host 'C*'",
+    "mms hook --host cl'?'ude",
+    "mms hook --host '[c]laude'",
+    "mms hook --host %HOOK_HOST%",
+    "mms hook --host '$HOOK_HOST'",
+    "mms hook --host '~x'",
+    "uv run --directory /repo memtomem-stm hook --host 'C*'",
+]
+
+
+@pytest.mark.parametrize("command", _WINDOWS_EXPANDED)
+def test_windows_refuses_arguments_click_would_expand(command: str, on_windows) -> None:
+    assert _is_stm_hook_command(command) is False
+
+
+@pytest.mark.parametrize("command", _WINDOWS_EXPANDED[:2] + _WINDOWS_EXPANDED[4:6])
+def test_the_same_quoted_words_are_recognized_elsewhere(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control: without Click's Windows expansion these quoted words
+    reach the hook as written."""
+    from memtomem_stm.cli import hook_registration
+
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: False)
+    assert _is_stm_hook_command(command) is True
+
+
+@pytest.mark.parametrize("host", sorted(HOOK_HOSTS))
+@pytest.mark.parametrize(
+    "root", [None, Path("C:\\Users\\x\\repo"), Path("C:\\Users\\x\\it's $HOME %TEMP% (*) ~")]
+)
+def test_windows_recognizes_every_command_install_writes(
+    host: str, root: Path | None, on_windows
+) -> None:
+    """The launcher's directory comes before the executable, so Click never
+    sees it; the words after the executable are install's fixed flags."""
+    project = None if root is None else _StmProject(root=root, source_checkout=True)
+    policy = HostRuntimePolicy(
+        use_daemon=False,
+        surfacing_timeout_seconds=9.5,
+        daemon_timeout_seconds=0.25,
+        persist_query_text=True,
+    )
+    argv = _hook_install_command_argv(host, policy=policy, launcher=_launcher_for(project))
+    assert _is_stm_hook_command(shlex.join(argv)) is True
+
+
+def test_windows_reads_no_setting_from_an_expanded_line(on_windows) -> None:
+    from memtomem_stm.cli.host_runtime import (
+        PartialHostRuntimePolicy,
+        parse_managed_hook_runtime,
+    )
+
+    assert (
+        parse_managed_hook_runtime("mms hook --host 'C*' --persist-query-text")
+        == PartialHostRuntimePolicy()
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mms hook --host 'C*'",
+        # Quote removal joins the executable name, which the raw search misses.
+        "m\"m\"s hook --host 'C*'",
+        # ``~`` counts at the start of a word, not of the line.
+        "m\"m\"s hook --host '~x'",
+    ],
+)
+def test_windows_names_a_line_it_refuses(command: str, on_windows, redirect) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(command)]))
+    location = "hooks.PostToolUse[0].hooks[0]"
+
+    installed = plan_install("claude", _MANAGED)
+    removed = plan_uninstall("claude")
+
+    groups = json.loads(installed.new_text)["hooks"]["PostToolUse"]
+    assert [h["command"] for g in groups for h in g["hooks"]] == [command, _MANAGED]
+    assert installed.unmanaged == (location,)
+    assert removed.status == "not_installed"
+    assert removed.unmanaged == (location,)
+
+
+@pytest.mark.parametrize(
+    ("line", "named"),
+    [
+        ("'" + "x" * 5000 + "'", False),  # recognized: install manages it
+        ("'" + "x" * 4999 + "*'", True),  # refused by the Windows rule
+        ("'" + "x" * 4999 + "%'", True),
+        ("'" + "x" * 5000 + "' # refused by the split", True),
+    ],
+)
+def test_windows_notice_scan_splits_a_line_once(
+    line: str, named: bool, on_windows, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recognition and the look-alike test share one split of each line, also
+    where the Windows rule refuses it."""
+    import shlex as shlex_module
+
+    from memtomem_stm.cli import host_runtime
+    from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
+
+    calls: list[str] = []
+    real = shlex_module.shlex
+
+    def counting(command: str, *args: object, **kwargs: object) -> shlex_module.shlex:
+        calls.append(command)
+        return real(command, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(host_runtime.shlex, "shlex", counting)
+    # Spelled so that ``is_candidate``'s raw search misses it, which leaves the
+    # decision to the word test.
+    command = f'm"m"s hook --host {line}'
+
+    expected = ("hooks.PostToolUse[0].hooks[0]",) if named else ()
+    assert unmanaged_stm_like("claude", _claude_groups([_h(command)])) == expected
+    assert calls.count(command) == 1
+
+
+def test_a_refused_line_the_candidate_test_names_is_not_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A line the split refuses is split for the look-alike test only when
+    ``mms doctor``'s candidate test has not already named it."""
+    import shlex as shlex_module
+
+    from memtomem_stm.cli import host_runtime
+    from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
+
+    calls: list[str] = []
+    real = shlex_module.shlex
+
+    def counting(command: str, *args: object, **kwargs: object) -> shlex_module.shlex:
+        calls.append(command)
+        return real(command, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(host_runtime.shlex, "shlex", counting)
+    # Past ``is_candidate``'s ``shlex`` limit, so its raw search names it.
+    line = "mms hook --host '" + "x" * 5000 + "' # pinned"
+
+    assert unmanaged_stm_like("claude", _claude_groups([_h(line)])) == (
+        "hooks.PostToolUse[0].hooks[0]",
+    )
+    assert calls == []

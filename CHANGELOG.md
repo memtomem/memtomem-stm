@@ -95,7 +95,12 @@ changes inline only. See the deprecation policy in
   no handler it manages it adds its own beside them. This includes lines that
   run the hook correctly in a spelling the split refuses, such as
   `$HOME/.local/bin/mms hook --host claude`; spell the path out to have install
-  manage it.
+  manage it. On Windows a line whose words after the executable hold a glob
+  character, `$`, `%` or a leading `~` is refused as well, even quoted: the
+  `mms` entry point may expand such a word itself before reading its
+  arguments (`mms hook --host 'C*'` can reach it as several words), so install
+  refuses every word holding one, including ones that would stay as written
+  (`100%`).
   **Behavior change**: for a handler with both `--persist-query-text` and
   `--no-persist-query-text` (or both daemon flags), install keeps the last one,
   where it used to keep the enabling one.

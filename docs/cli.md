@@ -1085,8 +1085,12 @@ allowed at the very start (the shell expands it, which keeps the executable's
 name). A line with anything else outside quotes, such as a `#` comment, `$VAR`,
 a glob, an operator or redirection (`<<<`), a line break, another `~` form, or
 an unbalanced quote, does not count, and neither does a word that is only an
-operator, even quoted (`mms hook --host '|'`). A command counts only when its
-words then pass three checks:
+operator, even quoted (`mms hook --host '|'`). On Windows, where the `mms`
+entry point itself expands globs, `$VAR`, `%VAR%` and a leading `~` in its
+arguments before reading them, a command whose words after the executable hold
+a glob character (`*`, `?`, `[`), any `$` or `%` (even a literal `100%`), or a
+leading `~` does not count either, quoted or not (`mms hook --host 'C*'`). A
+command counts only when its words then pass three checks:
 the words after `hook` read as a hook run with `mms hook`'s own options, so
 `mms hook uninstall`, `mms hook --help` and a usage error do not count; the
 executable word has no `=` or control character and does not end in `/` or
