@@ -48,7 +48,13 @@ from typing import Any
 
 from memtomem_stm.cli.hook_adapter import CanonicalHookCall
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
-from memtomem_stm.config import STMConfig, _is_loopback_host, log_stm_config_failure
+from memtomem_stm.config import (
+    STMConfig,
+    _is_loopback_host,
+    load_env_stm_config,
+    log_proxy_env_ignored,
+    log_stm_config_failure,
+)
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
 from memtomem_stm.surfacing.config import holdout_startup_warnings
@@ -1114,14 +1120,22 @@ def run(config: STMConfig | None = None) -> int:
     An unusable discovery key is the one failure reported without a traceback:
     it is an operator-fixable file, named in a single log line, exit code 1.
     """
-    try:
-        cfg = config if config is not None else STMConfig()
-    except Exception as exc:
-        # The construction used to sit outside the barrier below, so a broken
-        # MEMTOMEM_STM_* env killed the daemon with no trace in the file log
-        # this docstring promises (#847). Log with the env-var hint, re-raise.
-        log_stm_config_failure(exc, logger=logger, context="starting the daemon server")
-        raise
+    if config is not None:
+        cfg = config
+    else:
+        try:
+            load = load_env_stm_config()
+        except Exception as exc:
+            # Inside run(), not before it, so a broken MEMTOMEM_STM_* env
+            # reaches the file log this docstring promises (#847). Log with
+            # the env-var hint, re-raise.
+            log_stm_config_failure(exc, logger=logger, context="starting the daemon server")
+            raise
+        if load.proxy_error is not None:
+            log_proxy_env_ignored(
+                load.proxy_error, logger=logger, context="starting the daemon server"
+            )
+        cfg = load.config
     try:
         return asyncio.run(DaemonServer(cfg).serve())
     except LocalKeyError as exc:

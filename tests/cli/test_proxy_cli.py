@@ -17173,7 +17173,61 @@ class TestDoctor:
         assert env_check is not None, result.output
         assert env_check["status"] == "WARN"
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND" in env_check["detail"]
+        # Proxy-only (#847): the hook and the daemon run with proxy defaults,
+        # so the row says that rather than "cannot start".
+        assert "proxy settings at defaults" in env_check["detail"]
+        assert "hook metrics are not recorded" in env_check["detail"]
+        assert "cannot start" not in env_check["detail"]
         assert result.exit_code == 0, result.output  # WARN-only never exits 1
+
+    def test_env_overrides_check_keeps_the_failure_text_for_a_non_proxy_break(
+        self, runner, config, monkeypatch
+    ):
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS", "nope")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        env_check = self._check_by_id(result, "env_overrides")
+        assert env_check is not None, result.output
+        assert env_check["status"] == "WARN"
+        assert "the daemon cannot start" in env_check["detail"]
+        assert "proxy settings at defaults" not in env_check["detail"]
+
+    @pytest.mark.parametrize(
+        ("var", "recovered"),
+        [
+            pytest.param("MEMTOMEM_STM_PROXY", True, id="proxy_payload"),
+            pytest.param("MEMTOMEM_STM_HOOK", False, id="non_proxy_payload"),
+        ],
+    )
+    def test_env_overrides_blank_hint_still_names_a_target(
+        self, runner, config, monkeypatch, var, recovered
+    ):
+        """An undecodable payload is a ``SettingsError``, whose hint is blank
+        by design, so "the variable(s) named above" would point at nothing.
+        The recovered branch names the proxy variables; the other one stays
+        generic, since a blank hint also comes from a non-proxy payload."""
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        monkeypatch.setenv(var, "{")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        env_check = self._check_by_id(result, "env_overrides")
+        assert env_check is not None, result.output
+        assert env_check["status"] == "WARN"
+        action = env_check["next_action"]
+        assert "named above" not in action
+        assert "{" not in env_check["detail"] + action  # never the value
+        if recovered:
+            assert "MEMTOMEM_STM_PROXY" in action
+            assert "proxy settings at defaults" in env_check["detail"]
+        else:
+            assert "MEMTOMEM_STM_PROXY" not in action
+            assert "MEMTOMEM_STM_*" in action
 
     def test_env_overrides_check_passes_on_a_healthy_env(self, runner, config, monkeypatch):
         self._stub_probe(monkeypatch)

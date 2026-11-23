@@ -1871,32 +1871,185 @@ class TestHookPreviewAndErrorsEscape:
         assert "\\u001B" in res.output and "\\u000D" in res.output
 
 
-def test_cli_broken_proxy_env_passes_through_and_logs_the_hint(
+# ── #847: a broken proxy env no longer takes the hook down ───────────────────
+
+_BROKEN_PROXY_VAR = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND"
+
+
+def _hint_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if "MEMTOMEM_STM_" in r.getMessage()]
+
+
+def test_cli_proxy_only_env_break_still_compresses_and_logs_one_hint(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
-    """#847 observability: a proxy-subtree env break still degrades to `{}`
-    exit 0 (the always-exit-0 contract), but no longer silently — the log
-    names the implicated MEMTOMEM_STM_* var so the degradation is
-    attributable."""
-    import logging
+    """The hook reads ``hook`` and ``surfacing``, never ``proxy``: a broken
+    proxy variable (no file declares server ``gh``) used to fail the whole
+    construction and pass the output through. Now compression still runs, and
+    the hint names the variable once, with no traceback."""
+    monkeypatch.setenv(_BROKEN_PROXY_VAR, "x")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "seq 1 4000"},
+        "tool_response": {"stdout": "".join(f"log line {i}\n" for i in range(4000))},
+    }
 
-    monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+    with caplog.at_level(logging.WARNING):
+        result = CliRunner().invoke(cli, ["hook", "--host", "claude"], input=json.dumps(payload))
+
+    assert result.exit_code == 0
+    assert "updatedToolOutput" in result.output
+    assert (
+        _COMPRESS_SENTINEL
+        in json.loads(result.output)["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+    )
+    hints = _hint_records(caplog)
+    assert len(hints) == 1
+    assert _BROKEN_PROXY_VAR in hints[0].getMessage()
+    assert "proxy settings at defaults" in hints[0].getMessage()
+    assert [r for r in caplog.records if r.exc_info] == []
+
+
+@pytest.mark.parametrize(
+    "route_env",
+    [
+        pytest.param({"MEMTOMEM_STM_HOOK__USE_DAEMON": "0"}, id="daemon_off"),
+        pytest.param(
+            {"MEMTOMEM_STM_HOOK__USE_DAEMON": "1", "MEMTOMEM_STM_HOOK__FALLBACK": "cold"},
+            id="daemon_unavailable_cold_fallback",
+        ),
+    ],
+)
+def test_proxy_only_env_break_reaches_cold_surfacing_with_one_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    route_env: dict[str, str],
+):
+    """Both cold routes surface under a proxy-only break, and the config is
+    loaded once per call: the cold path reuses ``_orchestrate``'s surfacing
+    config instead of rebuilding — which would log the hint a second time."""
+    monkeypatch.setenv(_BROKEN_PROXY_VAR, "x")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__MIN_SCORE", "0.25")
+    for key, value in route_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("memtomem_stm.daemon.client.surface", AsyncMock(return_value=None))
+    built: list[SurfacingConfig] = []
+    engines: list[AsyncMock] = []
+
+    async def inject(_source: str, _tool: str, _input: Any, response_text: str, **kw: Any) -> str:
+        return response_text + "\n\n" + _SURF_BLOCK
+
+    def fake_engine(cfg: SurfacingConfig, *args: Any, **kwargs: Any) -> AsyncMock:
+        built.append(cfg)
+        engine = AsyncMock()
+        engine.injection_mode = "append"
+        engine.surface = AsyncMock(side_effect=inject)
+        engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("memtomem_stm.surfacing.engine.SurfacingEngine", fake_engine)
+    monkeypatch.setattr(
+        "memtomem_stm.surfacing.mcp_client.McpClientSearchAdapter",
+        lambda *args, **kwargs: AsyncMock(),
+    )
+    from memtomem_stm import config as config_mod
+
+    loads: list[int] = []
+    real_load = config_mod.load_env_stm_config
+
+    def counting_load() -> Any:
+        loads.append(1)
+        return real_load()
+
+    monkeypatch.setattr(config_mod, "load_env_stm_config", counting_load)
+
+    with caplog.at_level(logging.WARNING):
+        out = asyncio.run(_orchestrate(_READ_PAYLOAD, ClaudeHookAdapter()))
+
+    assert len(loads) == 1  # counted at the loader, not only by its warnings
+    assert len(built) == 1
+    engines[0].surface.assert_awaited_once()
+    # The surfaced block reaches the hook's own output, not just the engine.
+    assert out["hookSpecificOutput"]["additionalContext"] == _SURF_BLOCK
+    assert built[0].min_score == 0.25  # the env's surfacing value survived
+    assert len(_hint_records(caplog)) == 1
+    assert [r for r in caplog.records if r.exc_info] == []
+
+
+@pytest.mark.parametrize(
+    "proxy_env",
+    [
+        pytest.param({_BROKEN_PROXY_VAR: "x"}, id="validation_error"),
+        pytest.param({"MEMTOMEM_STM_PROXY": "{"}, id="settings_error"),
+    ],
+)
+def test_cli_mixed_env_break_still_passes_through_and_logs_the_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    proxy_env: dict[str, str],
+):
+    """A break outside ``proxy`` keeps #850's behavior: ``{}`` exit 0 (the
+    always-exit-0 contract), one hint line without a traceback and one
+    barrier record that owns the traceback. Includes a proxy break beside it,
+    so a blanket tolerance that ignored every failure would turn this red."""
+    for key, value in proxy_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__MIN_SCORE", "nope")
     with caplog.at_level(logging.WARNING):
         result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
 
     assert result.exit_code == 0
     assert json.loads(result.output) == {}
-    assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text
-    # Logged exactly once each (#847 review round 1): one hint line (no
-    # traceback of its own) and one barrier warning that owns the traceback —
-    # not two traceback blocks per tool call.
     hint_records = [
         r for r in caplog.records if "invalid MEMTOMEM_STM_* configuration" in r.getMessage()
     ]
     assert len(hint_records) == 1
     assert not hint_records[0].exc_info
+    assert "proxy settings at defaults" not in caplog.text
     traceback_records = [r for r in caplog.records if r.exc_info]
     assert len(traceback_records) == 1
+
+
+def test_proxy_only_env_break_records_no_hook_metrics(
+    monkeypatch: pytest.MonkeyPatch, _hermetic_hook_state: tuple[Path, Path]
+):
+    """The metrics DB path and retention are proxy fields. Under a degraded
+    load they are defaults, which may name a different DB than the operator
+    configured, so no store is opened at all — checked on the constructor,
+    not on one DB file, so writing to the wrong DB cannot pass."""
+    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy import metrics_store
+
+    configured_db, _home = _hermetic_hook_state
+    default_db = ProxyConfig().metrics.db_path.expanduser()
+    opened: list[Path] = []
+    real_store = metrics_store.MetricsStore
+
+    def spy(db_path: Path, *args: Any, **kwargs: Any) -> Any:
+        opened.append(Path(db_path))
+        return real_store(db_path, *args, **kwargs)
+
+    monkeypatch.setattr(metrics_store, "MetricsStore", spy)
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+
+    # Positive control: the same call with a healthy env does open the store.
+    asyncio.run(_orchestrate(_READ_PAYLOAD, ClaudeHookAdapter()))
+    assert opened == [configured_db]
+    opened.clear()
+    configured_db.unlink()
+
+    monkeypatch.setenv(_BROKEN_PROXY_VAR, "x")
+    asyncio.run(_orchestrate(_READ_PAYLOAD, ClaudeHookAdapter()))
+
+    assert opened == []
+    assert not configured_db.exists()
+    assert not default_db.exists()
 
 
 # ── #1437: a refused replacement is reported, not silent ─────────────────────
