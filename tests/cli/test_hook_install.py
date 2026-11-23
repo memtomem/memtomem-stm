@@ -888,6 +888,30 @@ def test_cli_install_migrates_legacy_inline_env_and_preserves_timeout(redirect) 
     assert handler["timeout"] == 30
 
 
+@pytest.mark.parametrize(
+    ("assignment", "flag"),
+    [
+        # The hook does not read the proxy's variable and runs with the daemon,
+        # so the replacement must keep it on (#1484).
+        ("MEMTOMEM_STM_SURFACING__USE_DAEMON=false", "--use-daemon"),
+        # Positive control: the hook's own variable still carries over.
+        ("MEMTOMEM_STM_HOOK__USE_DAEMON=false", "--no-daemon"),
+    ],
+)
+def test_cli_install_recovers_daemon_mode_from_the_hook_variable_only(
+    assignment: str, flag: str, redirect
+) -> None:
+    path = redirect("claude")
+    _seed(path, _claude_groups([_h(f"env {assignment} memtomem-stm hook --host claude")]))
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+
+    assert result.exit_code == 0, result.output
+    words = shlex.split(installed_stm_hook_commands("claude")[0])
+    assert flag in words
+    assert {"--use-daemon", "--no-daemon"} & set(words) == {flag}
+
+
 def test_cli_install_leaves_a_commented_line_and_reads_no_setting_from_it(redirect) -> None:
     """A commented line is not taken over (#1460), so nothing written in its
     comment reaches the installed command's runtime settings."""
