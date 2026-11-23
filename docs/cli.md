@@ -1094,7 +1094,8 @@ others. A handler is install's own when all three hold:
 Every command a release of `mms hook install` has written has this form.
 Nothing else does: `mms hook --host claude` (another entry-point name; this is
 the manual registration), a path to the executable, an `env` or `NAME=value`
-prefix, a quoted name (`"memtomem-stm" hook …`), flags added, left out or in
+prefix, a quoted name (`"memtomem-stm" hook …`) or a directory quoted another way
+(`--directory "/a b"`), flags added, left out or in
 another order, another host's `--host`, a relative `--directory`, a trailing
 `# comment`. Whether such a line would run STM's hook is not asked. No shell
 is modelled, so the answer is the same on every platform.
@@ -1120,9 +1121,8 @@ not silent; remove the old handler by hand if it should not stay registered.
 Both commands look where install itself writes in that host's config file
 (`PostToolUse` for Claude Code and Codex, `postToolUse` for Cursor) and at
 every entry for Kimi. "Looks like" is the test `mms doctor` uses for its
-`hook registration` row, plus the words of the first 4,096 characters of the
-line for a name spelled so that test misses it (`m"m"s hook`); a hook that
-starts past that point in such a spelling is not named. An uninstall that only prunes empty hook containers (an
+`hook registration` row, plus the line's own words for a name spelled so that
+test misses it (`m"m"s hook`). An uninstall that only prunes empty hook containers (an
 empty matcher group, event list or `hooks` section) says so instead of
 reporting a removal.
 Both **default to a dry-run preview**; pass `--apply` to write,

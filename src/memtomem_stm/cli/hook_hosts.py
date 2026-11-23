@@ -158,9 +158,11 @@ def owned_handler(host_tag: str, handler: Any) -> OwnedHookCommand | None:
     * Kimi: ``event`` is ``"PostToolUse"``, the only event install registers.
     * Cursor: nothing beyond the text.
 
-    Other fields (a timeout, a status message, a matcher) do not count, and a
-    refresh keeps them. Whether the command would run STM is not asked: a
-    hand-written registration is its author's, however close it comes."""
+    Other fields do not count. A refresh keeps a timeout, a status message
+    and any field it does not know, and sets the matcher to install's own
+    (except in a matcher group shared with another handler). Whether the
+    command would run STM is not asked: a hand-written registration is its
+    author's, however close it comes."""
     if not isinstance(handler, dict):
         return None
     command = handler.get("command")
@@ -197,17 +199,9 @@ def _words_name_the_hook(command: str) -> bool:
     ``hook``. A fallback for the look-alike notice: it catches a line whose
     quoted executable name the raw search of ``mms doctor``'s candidate test
     does not see, such as ``m"m"s hook --host claude # pinned``, and a
-    handler that test skips for its ``type``.
-
-    ``shlex`` is quadratic in a word's length, so only the head of the line
-    is split, up to the bound that candidate test uses for its own split. A
-    long comment or argument after the hook's words does not hide them; a
-    hook spelled this way that starts past the bound is not seen."""
-    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
-    from memtomem_stm.cli.hook_registration import _QUOTED_MAX_CHARS
-
-    head = _lenient_shell_tokens(command[:_QUOTED_MAX_CHARS])
-    return next(_exe_before_hook(head), None) is not None
+    handler that test skips for its ``type``. The whole line is split, so a
+    caller asks this only after that cheaper test has said no."""
+    return next(_exe_before_hook(_lenient_shell_tokens(command)), None) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -647,8 +641,8 @@ def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
     ``mms hook --host claude`` would otherwise stay registered beside the
     installed hook with nothing said. "Look like" is ``mms doctor``'s
     candidate test, which errs toward matching, or an STM executable word
-    right before ``hook`` within the first 4,096 characters of the line
-    (:func:`_words_name_the_hook`); only locations are returned, never command text,
+    right before ``hook`` (:func:`_words_name_the_hook`); only locations are
+    returned, never command text,
     which can hold secret values. The containers are the ones install
     examines, and for Kimi every entry whatever its ``event``.
     """

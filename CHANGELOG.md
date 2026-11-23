@@ -110,7 +110,9 @@ changes inline only. See the deprecation policy in
   update or remove: `mms hook …` and `memtomem-stm-proxy hook …` (including
   the manual registration `mms hook --host claude`), a path to the executable,
   an `env MEMTOMEM_STM_…` prefix (its settings are no longer turned into
-  flags), a quoted name, flags added, left out or in another order, another
+  flags), a quoted name, a
+  `--directory` quoted another way than install quotes it (`"/a b"`), flags
+  added, left out or in another order, another
   host's `--host`, a relative `uv run --directory`, other spacing, a handler
   with `args` or without `"type": "command"`, and a Kimi entry on another
   event. Install adds its own handler beside such a line and reads no setting
@@ -119,11 +121,7 @@ changes inline only. See the deprecation policy in
   it should not stay registered. `--surfacing-timeout` and `--daemon` /
   `--no-daemon` set the surfacing deadline and the daemon mode again; a
   custom daemon deadline or `--persist-query-text` has no install option and
-  is edited into the written command by hand, which install then keeps. A
-  look-alike is found by `mms doctor`'s candidate test, or by the words of
-  the first 4,096 characters of the line when the name is spelled so that
-  test misses it (`m"m"s hook`); in that spelling, a hook that starts past
-  that point is not named.
+  is edited into the written command by hand, which install then keeps.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that

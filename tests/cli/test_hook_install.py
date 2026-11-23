@@ -302,6 +302,12 @@ _NOT_OWNED = [
     "--daemon-timeout-seconds 4 --no-persist-query-text",
     "memtomem-stm hook --host claude --use-daemon --surfacing-timeout-seconds 1_0 "
     "--daemon-timeout-seconds 4 --no-persist-query-text",
+    *(
+        f"memtomem-stm hook --host claude --use-daemon --surfacing-timeout-seconds {malformed} "
+        "--daemon-timeout-seconds 4 --no-persist-query-text"
+        # Not something ``format_seconds`` prints for any deadline.
+        for malformed in ("9e", "1..2", "1.", ".5", "1e+", "e5", "1e5.5", "infinity", "0x10")
+    ),
     "memtomem-stm hook --host claude --use-daemon --surfacing-timeout-seconds $T "
     "--daemon-timeout-seconds 4 --no-persist-query-text",
     # ── anything after the command ──
@@ -338,6 +344,7 @@ def test_the_lines_the_not_owned_corpus_varies_are_owned(command: str) -> None:
         # Not the writer's spelling of a number, but a number: the slot is
         # read as text, since releases wrote ``inf`` and ``nan`` there.
         ("9.0", "10", (9.0, 10.0)),
+        ("1e-07", "1e+16", (1e-07, 1e16)),
         # The hook raises the daemon deadline above a usable surfacing one,
         # so a pair edited by hand is carried over as the hook runs it.
         ("9", "4", (9.0, 10.0)),
@@ -2115,7 +2122,7 @@ def test_windows_names_a_line_it_does_not_own(command: str, on_windows, redirect
     assert removed.unmanaged == (location,)
 
 
-# ── the notice scan is bounded ───────────────────────────────────────────────
+# ── the notice's word test ───────────────────────────────────────────────────
 
 
 def _count_splits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -2135,46 +2142,50 @@ def _count_splits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return calls
 
 
+def _padded(text: str, tail: str) -> str:
+    """``text`` behind enough filler that ``tail`` starts at character 4,096,
+    the length past which ``mms doctor``'s candidate test stops splitting."""
+    return "echo " + "x" * (4096 - len("echo ") - 1 - len(text)) + " " + text + tail
+
+
 @pytest.mark.parametrize(
     ("command", "named"),
     [
         # Spelled so that ``is_candidate``'s raw search misses the name, which
         # leaves the decision to the word test; the ``#`` keeps that test's
-        # own quoted split away. A long argument or comment after the hook's
-        # words does not hide them.
+        # own quoted split away. Length does not hide the hook's words.
         (f"m\"m\"s hook --host '{'x' * 5000}' # pinned", True),
         ('m"m"s hook --host claude' + " " * 5000 + "# pinned", True),
-        # The hook's words start past the part of the line that is read.
-        (f"echo '{'x' * 5000}' # then\nm\"m\"s hook --host claude", False),
+        (f"echo '{'x' * 5000}' # then\nm\"m\"s hook --host claude", True),
+        # Lines a reading of only the first 4,096 characters would name: the
+        # word is ``hookshot``, and in the second the words sit inside one
+        # quoted argument.
+        (_padded('m"m"s hook', "shot # note"), False),
+        ('echo "' + _padded("mms hook", 'shot" # note')[len("echo ") + 1 :], False),
     ],
 )
-def test_the_notice_reads_the_words_of_the_head_of_a_long_line(
+def test_the_notice_reads_the_words_of_the_whole_line(
     command: str, named: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
-    from memtomem_stm.cli.hook_registration import _QUOTED_MAX_CHARS
 
     calls = _count_splits(monkeypatch)
 
     expected = ("hooks.PostToolUse[0].hooks[0]",) if named else ()
     assert unmanaged_stm_like("claude", _claude_groups([_h(command)])) == expected
-    assert calls == [command[:_QUOTED_MAX_CHARS]]
+    assert calls == [command]
 
 
-def test_planning_an_install_splits_only_the_head_of_a_long_unrelated_line(
-    redirect, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The planner scans the file before and after the merge. Each scan used
-    to split the whole line: 352 ms for one 160,000-character word."""
-    path = redirect("claude")
-    line = "echo '" + "x" * 160_000 + "'"
-    _seed(path, _claude_groups([_h(line)]))
+def test_the_notice_scan_splits_a_line_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One split per line per scan (``shlex`` is quadratic in a word's
+    length), also past ``is_candidate``'s own limit of 4,096 characters."""
+    from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
+
     calls = _count_splits(monkeypatch)
+    line = "echo '" + "x" * 5000 + "'"
 
-    change = plan_install("claude", _MANAGED)
-
-    assert change.unmanaged == () and change.unmanaged_after == ()
-    assert calls == [line[:4096]] * 2
+    assert unmanaged_stm_like("claude", _claude_groups([_h(line)])) == ()
+    assert calls == [line]
 
 
 def test_a_refused_line_the_candidate_test_names_is_not_split(
@@ -2315,17 +2326,24 @@ def test_kimi_manages_only_the_post_tool_use_entry_of_two(redirect) -> None:
     pre = {"event": "PreToolUse", "matcher": "Bash", "command": _KIMI}
     post = {"event": "PostToolUse", "matcher": "Bash", "command": _KIMI, "timeout": 5}
     _seed(path, {"hooks": [pre, post]}, "toml")
+    refreshed = f"{_KIMI} {_POLICY}"
 
-    installed = plan_install("kimi", _KIMI + " --use-daemon")
-    removed = plan_uninstall("kimi")
+    installed = plan_install("kimi", refreshed)
+    apply_change(installed)
 
-    assert tomllib.loads(installed.new_text)["hooks"] == [
+    assert _kimi_hooks(path) == [
         pre,
-        {**post, "matcher": matcher_for("kimi"), "command": _KIMI + " --use-daemon"},
+        {**post, "matcher": matcher_for("kimi"), "command": refreshed},
     ]
     assert installed.unmanaged == ("hooks[0]",)
+
+    # Against the refreshed file: the entry install just wrote is the one,
+    # and the only one, uninstall takes.
+    removed = plan_uninstall("kimi")
+    apply_change(removed)
+
     assert removed.status == "remove"
-    assert tomllib.loads(removed.new_text)["hooks"] == [pre]
+    assert _kimi_hooks(path) == [pre]
 
 
 # ── a Claude Code handler on another event is not install's ─────────────────

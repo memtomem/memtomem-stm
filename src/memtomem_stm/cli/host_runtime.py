@@ -81,7 +81,7 @@ def _lenient_shell_tokens(command: str) -> list[str]:
     approximation of the shell, used only to decide whether a handler that
     ``mms hook install`` does not own still looks like STM's hook, never to
     act on it or read settings from it. ``shlex`` is quadratic in a word's
-    length, so callers bound the line they pass."""
+    length."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -192,10 +192,13 @@ class OwnedHookCommand:
     flags; every field ``None`` for a command without them."""
 
 
-# What ``format_seconds`` can write, read as text: a release wrote ``inf``,
-# ``nan`` and ``1.79769313486232e+308`` (which ``float`` reads as infinity)
-# when given such a deadline, so the slot cannot require a finite number.
-_NUMBER = r"(?:[0-9][0-9.e+\-]*|inf|nan)"
+# What ``format_seconds`` can write for a deadline, read as text: digits, an
+# optional fraction and an optional exponent, or ``inf`` / ``nan``. Text and
+# not a parsed number, because releases wrote ``inf``, ``nan`` and
+# ``1.79769313486232e+308`` (which ``float`` reads as infinity) when given
+# such a deadline, so the slot cannot require a finite value. ``9.0`` passes
+# where the writer prints ``9``; ``9e`` and ``1..2`` are not numbers at all.
+_NUMBER = r"(?:[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?|inf|nan)"
 _POLICY_TAIL = re.compile(
     " "
     + " ".join(
@@ -220,7 +223,8 @@ def owned_hook_command(command: str, host: str) -> OwnedHookCommand | None:
     The form is :func:`hook_command_words` joined by ``shlex.join``: a
     :func:`hook_launcher`, ``hook --host <host>``, then either nothing or the
     six setting words. The directory of a ``uv run`` launcher is any absolute
-    path and the two deadlines are any number-shaped words; everything else is
+    path and each deadline is a number as ``format_seconds`` spells one, or
+    ``inf`` / ``nan``; everything else is
     fixed, down to the spacing and the quoting ``shlex.join`` chooses.
 
     The last step decides: the command must equal the join of the words read
