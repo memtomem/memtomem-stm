@@ -4856,15 +4856,47 @@ class TestHandshakeCoercionHelpers:
 
 
 class TestBrokenConfigObservability:
-    """#847: a bare ``STMConfig()`` failure in the daemon paths must leave a
-    legible trace. Outcomes are unchanged — both paths still raise."""
+    """#847: the daemon paths read ``surfacing`` / ``hook`` / ``daemon`` and
+    never ``proxy``. A proxy-only env break degrades to proxy defaults with
+    one hint line; any other break still fails as before, legibly."""
+
+    BROKEN = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND"
 
     @pytest.fixture(autouse=True)
     def _broken_proxy_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path / "data"))
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
-        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+        monkeypatch.setenv(self.BROKEN, "x")
 
-    def test_daemon_server_run_logs_before_raising(self, caplog):
+    @pytest.fixture
+    def non_proxy_break(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__MIN_SCORE", "nope")
+
+    def test_daemon_server_run_serves_on_a_proxy_only_break(self, monkeypatch, caplog):
+        import logging
+
+        from memtomem_stm.daemon import server as daemon_server
+        from memtomem_stm.proxy.config import ProxyConfig
+
+        served: list[STMConfig] = []
+
+        class _FakeServer:
+            def __init__(self, cfg: STMConfig) -> None:
+                served.append(cfg)
+
+            async def serve(self) -> int:
+                return 0
+
+        monkeypatch.setattr(daemon_server, "DaemonServer", _FakeServer)
+        with caplog.at_level(logging.WARNING):
+            assert daemon_server.run(config=None) == 0
+
+        assert len(served) == 1
+        assert served[0].proxy == ProxyConfig()
+        assert self.BROKEN in caplog.text
+        assert "proxy settings at defaults" in caplog.text
+
+    def test_daemon_server_run_logs_before_raising(self, caplog, non_proxy_break):
         import logging
 
         from pydantic import ValidationError
@@ -4877,9 +4909,23 @@ class TestBrokenConfigObservability:
 
         # Previously the construction sat OUTSIDE run()'s exception barrier,
         # so the failure produced no log line at all.
-        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text
+        assert self.BROKEN in caplog.text
+        assert "proxy settings at defaults" not in caplog.text
 
-    def test_load_config_logs_before_exiting(self, caplog):
+    def test_load_config_returns_on_a_proxy_only_break(self, caplog):
+        import logging
+
+        from memtomem_stm.cli.daemon_cmd import _load_config
+        from memtomem_stm.proxy.config import ProxyConfig
+
+        with caplog.at_level(logging.WARNING):
+            config = _load_config()
+
+        assert config.proxy == ProxyConfig()
+        assert self.BROKEN in caplog.text
+        assert "proxy settings at defaults" in caplog.text
+
+    def test_load_config_logs_before_exiting(self, caplog, non_proxy_break):
         import logging
 
         from pydantic import ValidationError
@@ -4894,4 +4940,89 @@ class TestBrokenConfigObservability:
         # bypass the escaping formatter (#1173). The cause stays attached.
         assert exit_.value.code == 1
         assert isinstance(exit_.value.__cause__, ValidationError)
-        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text
+        assert self.BROKEN in caplog.text
+
+    def test_detached_run_writes_the_hint_to_the_daemon_log(
+        self, monkeypatch, tmp_path, _restore_root_logging
+    ):
+        """A detached daemon's stderr is DEVNULL, so the hint has to reach the
+        file ``_configure_logging`` opens — checked in the file itself."""
+        from click.testing import CliRunner
+
+        from memtomem_stm.cli import daemon_cmd
+        from memtomem_stm.cli.daemon_cmd import daemon_group
+        from memtomem_stm.daemon import server as daemon_server
+
+        handed: list[STMConfig] = []
+        logged_with: list[STMConfig] = []
+        real_configure = daemon_cmd._configure_logging
+
+        def configure_spy(cfg: STMConfig, *, detached: bool) -> None:
+            logged_with.append(cfg)
+            real_configure(cfg, detached=detached)
+
+        monkeypatch.setattr(daemon_cmd, "_configure_logging", configure_spy)
+        monkeypatch.setattr(daemon_server, "run", lambda cfg: handed.append(cfg) or 0)
+
+        result = CliRunner().invoke(daemon_group, ["run", "--detached"])
+
+        assert result.exit_code == 0, result.output
+        assert len(handed) == 1
+        # The server serves the very config the log destination came from.
+        assert len(logged_with) == 1 and handed[0] is logged_with[0]
+        log_text = (tmp_path / "data" / "stm-daemon.log").read_text(encoding="utf-8")
+        assert self.BROKEN in log_text
+        assert "proxy settings at defaults" in log_text
+
+    def test_hook_and_detached_daemon_share_one_identity(self, monkeypatch, _restore_root_logging):
+        """Under one broken env that also holds a VALID consumer model, the
+        config the hook hands the daemon client and the one ``mms daemon run``
+        hands the server fingerprint the same, and ``mms daemon status`` looks
+        under that fingerprint. (Removing only the broken var would restore
+        the consumer model and a different fingerprint — not the comparison.)"""
+        from click.testing import CliRunner
+
+        from memtomem_stm.cli import hook_cmd
+        from memtomem_stm.cli.daemon_cmd import daemon_group
+        from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter
+        from memtomem_stm.daemon import client
+        from memtomem_stm.daemon import server as daemon_server
+
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONSUMER_MODEL", "some-model")
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+        monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: None)
+
+        hook_side: list[STMConfig] = []
+
+        async def fake_surface(cfg: STMConfig, *args, **kwargs):
+            hook_side.append(cfg)
+            return {}
+
+        monkeypatch.setattr(client, "surface", fake_surface)
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/src/a.py"},
+            "tool_response": {"content": "JWT authentication handler. " * 50},
+        }
+        asyncio.run(hook_cmd._orchestrate(payload, ClaudeHookAdapter()))
+
+        daemon_side: list[STMConfig] = []
+        monkeypatch.setattr(daemon_server, "run", lambda cfg: daemon_side.append(cfg) or 0)
+        assert CliRunner().invoke(daemon_group, ["run", "--detached"]).exit_code == 0
+
+        assert len(hook_side) == 1 and len(daemon_side) == 1
+        hook_fp = discovery.config_fingerprint(hook_side[0], create_key=True)
+        daemon_fp = discovery.config_fingerprint(daemon_side[0], create_key=True)
+        assert hook_fp == daemon_fp
+
+        looked_up: list[str | None] = []
+
+        async def fake_ping(cfg, *, timeout=2.0, fingerprint=None):
+            looked_up.append(fingerprint)
+            return None
+
+        monkeypatch.setattr(client, "ping", fake_ping)
+        CliRunner().invoke(daemon_group, ["status"])
+        assert looked_up == [hook_fp]

@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from memtomem_stm.config import STMConfig
+    from memtomem_stm.config import EnvSTMConfigLoad, STMConfig
 
 
 def _color_on() -> bool:
@@ -63,11 +63,39 @@ def _warn(s: str) -> str:
     return click.style(s, fg="yellow") if _color_on() else s
 
 
+_LOAD_CONTEXT = "loading the daemon configuration"
+
+
 def _load_config() -> STMConfig:
-    from memtomem_stm.config import STMConfig, log_stm_config_failure
+    """The daemon's env config; a proxy-only break is reported on stderr.
+
+    ``run`` uses :func:`_load_env_config` instead, because a detached daemon's
+    stderr is DEVNULL and the report has to wait for its log file.
+    """
+    load = _load_env_config()
+    if load.proxy_error is not None:
+        configure_stderr_logging(level=logging.WARNING)
+        _log_proxy_env_ignored(load.proxy_error)
+    return load.config
+
+
+def _log_proxy_env_ignored(error: Exception) -> None:
+    from memtomem_stm.config import log_proxy_env_ignored
+
+    log_proxy_env_ignored(error, logger=logging.getLogger(__name__), context=_LOAD_CONTEXT)
+
+
+def _load_env_config() -> EnvSTMConfigLoad:
+    """:func:`~memtomem_stm.config.load_env_stm_config`, or exit 1 with the hint.
+
+    The daemon reads ``surfacing``, ``hook`` and ``daemon``; the hook builds
+    the same degraded config under the same environment, and the fingerprint
+    holds no proxy field, so both sides still agree on the daemon's identity.
+    """
+    from memtomem_stm.config import load_env_stm_config, log_stm_config_failure
 
     try:
-        return STMConfig()
+        return load_env_stm_config()
     except Exception as exc:
         # #847 observability: this runs BEFORE _configure_logging (the config
         # names the destination), so give the line a stderr handler the way
@@ -78,9 +106,7 @@ def _load_config() -> STMConfig:
         # a config that will not build); `mms doctor`'s env_overrides check
         # covers that hole.
         configure_stderr_logging(level=logging.WARNING)
-        log_stm_config_failure(
-            exc, logger=logging.getLogger(__name__), context="loading the daemon configuration"
-        )
+        log_stm_config_failure(exc, logger=logging.getLogger(__name__), context=_LOAD_CONTEXT)
         raise SystemExit(1) from exc
 
 
@@ -419,9 +445,13 @@ def run_cmd(detached: bool, foreground: bool) -> None:
     """Run the daemon server loop — this is the long-lived process."""
     from memtomem_stm.daemon.server import run as run_daemon
 
-    config = _load_config()
-    _configure_logging(config, detached=detached)
-    raise SystemExit(run_daemon(config))
+    load = _load_env_config()
+    _configure_logging(load.config, detached=detached)
+    # After the handler exists: detached, stderr is DEVNULL and the file is
+    # the only place this can land.
+    if load.proxy_error is not None:
+        _log_proxy_env_ignored(load.proxy_error)
+    raise SystemExit(run_daemon(load.config))
 
 
 # Cap on detached children `mms daemon start` may launch in one invocation.
