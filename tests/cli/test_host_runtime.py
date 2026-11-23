@@ -117,6 +117,53 @@ def test_legacy_inline_env_policy_is_recovered() -> None:
     assert parsed.persist_query_text is False
 
 
+@pytest.mark.parametrize(
+    ("assignments", "expected"),
+    [
+        # The proxy's variable alone: the hook does not read it (#1484).
+        ({"MEMTOMEM_STM_SURFACING__USE_DAEMON": "false"}, None),
+        ({"MEMTOMEM_STM_SURFACING__USE_DAEMON": "true"}, None),
+        # An empty hook value no longer falls through to the proxy's variable.
+        (
+            {"MEMTOMEM_STM_HOOK__USE_DAEMON": "", "MEMTOMEM_STM_SURFACING__USE_DAEMON": "false"},
+            None,
+        ),
+        # Positive controls: the hook's own variable is still recovered.
+        (
+            {
+                "MEMTOMEM_STM_HOOK__USE_DAEMON": "true",
+                "MEMTOMEM_STM_SURFACING__USE_DAEMON": "false",
+            },
+            True,
+        ),
+        (
+            {
+                "MEMTOMEM_STM_HOOK__USE_DAEMON": "false",
+                "MEMTOMEM_STM_SURFACING__USE_DAEMON": "true",
+            },
+            False,
+        ),
+    ],
+)
+def test_daemon_mode_is_recovered_only_from_what_the_hook_reads(
+    assignments: dict[str, str], expected: bool | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from memtomem_stm.cli.hook_cmd import _daemon_enabled
+
+    prefix = " ".join(f"{key}={value}" for key, value in assignments.items())
+    parsed = parse_managed_hook_runtime(f"env {prefix} mms hook --host claude")
+    assert parsed.use_daemon is expected
+
+    # The hook's routing predicate under the same environment: a recovered
+    # value must agree with it. An unrecovered one makes install fall back on
+    # its own effective ``hook.use_daemon``. (An empty hook value also fails
+    # the hook's ``STMConfig`` load before routing; this pins only that
+    # install no longer reads the proxy's variable in its place.)
+    for key, value in assignments.items():
+        monkeypatch.setenv(key, value)
+    assert _daemon_enabled() is (True if expected is None else expected)
+
+
 def test_runtime_overlay_ignores_invalid_values_and_normalizes_deadline() -> None:
     overrides = runtime_env_overrides(
         use_daemon="true",

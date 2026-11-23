@@ -134,6 +134,20 @@ changes inline only. See the deprecation policy in
   **Behavior change**: for a handler with both `--persist-query-text` and
   `--no-persist-query-text` (or both daemon flags), install keeps the last one,
   where it used to keep the enabling one.
+- `mms hook install` no longer reads an existing handler's daemon mode from an
+  inline `MEMTOMEM_STM_SURFACING__USE_DAEMON` (issue #1484). The hook reads only
+  `MEMTOMEM_STM_HOOK__USE_DAEMON`, so
+  `env MEMTOMEM_STM_SURFACING__USE_DAEMON=false mms hook --host claude` ran
+  with the daemon (unless the host's own environment set
+  `MEMTOMEM_STM_HOOK__USE_DAEMON`), but install wrote `--no-daemon` into the replacement and
+  turned it off. Install now recovers the mode only from `--use-daemon` /
+  `--no-daemon` and `MEMTOMEM_STM_HOOK__USE_DAEMON`. **Behavior change**: on a
+  line whose only daemon setting is `MEMTOMEM_STM_SURFACING__USE_DAEMON` (or
+  whose `MEMTOMEM_STM_HOOK__USE_DAEMON` is empty), install takes the mode from
+  the effective `hook.use_daemon` (on by default), as for a line with no
+  daemon setting; pass `--no-daemon` to turn it off. No released install
+  wrote `MEMTOMEM_STM_SURFACING__USE_DAEMON` into a hook command, only into MCP
+  registrations.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that
