@@ -351,9 +351,15 @@ def test_doctor_measurement_warning_names_the_missing_piece(
     assert next_action in measurement["next_action"], measurement
 
 
-def test_doctor_measurement_warning_when_surfacing_is_disabled(ghost, monkeypatch, tmp_path):
-    # The probe skips before any ping, so the row must not claim the daemon is down.
+@pytest.mark.parametrize("hook_daemon", [None, "0"], ids=["hook-route", "direct-route"])
+def test_doctor_measurement_warning_when_surfacing_is_disabled(
+    ghost, monkeypatch, tmp_path, hook_daemon
+):
+    # Either probe skips before any ping, so the row must not claim the daemon
+    # is down, nor ask for a daemon route.
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    if hook_daemon is not None:
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", hook_daemon)
     daemons = LiveDaemons(_hook_fp())
     _install(monkeypatch, daemons)
 
@@ -363,4 +369,20 @@ def test_doctor_measurement_warning_when_surfacing_is_disabled(ghost, monkeypatc
     assert measurement["status"] == "WARN", measurement
     assert "surfacing is disabled" in measurement["detail"], measurement
     assert "mms daemon start" not in (measurement["next_action"] or ""), measurement
+    assert daemons.pinged == []
+
+
+def test_doctor_measurement_warning_when_the_bootstrap_fails(ghost, monkeypatch, tmp_path):
+    # A non-proxy break fails the hook's build too, so no route was chosen.
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__MAX_RESULTS", "nope")
+    daemons = LiveDaemons()
+    _install(monkeypatch, daemons)
+
+    checks = _doctor_cli(monkeypatch, tmp_path, "--config", str(ghost), "--measure-ltm")
+
+    assert "invalid configuration" in checks["ltm"]["detail"], checks["ltm"]
+    measurement = checks["ltm_measurement"]
+    assert measurement["status"] == "WARN", measurement
+    assert "result unavailable" in measurement["detail"], measurement
+    assert "daemon route" not in measurement["detail"], measurement
     assert daemons.pinged == []

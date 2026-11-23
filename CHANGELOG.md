@@ -81,8 +81,8 @@ changes inline only. See the deprecation policy in
 
 - `mms doctor`'s `ltm` row looks the hook's daemon up under the
   configuration a bare `mms hook` builds in doctor's environment, rather than
-  under one built from doctor's `--config` (issue #1485). A daemon is looked
-  up by a fingerprint of the configuration it started with, and the hook
+  under one built from doctor's `--config` (#1491, issue #1485). A daemon is
+  looked up by a fingerprint of the configuration it started with, and the hook
   builds from the environment alone and, since #1482, without an invalid
   `MEMTOMEM_STM_PROXY*` variable. Under such a variable, a
   `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` (which the hook then drops) made doctor
@@ -106,7 +106,10 @@ changes inline only. See the deprecation policy in
   query text, so with an installed hook doctor still reports its daemon as
   unreachable unless `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=false` is set
   in doctor's environment too. `--no-daemon` and the timeout options are not
-  read either.
+  read either. So next to a hook installed with `--no-daemon`, with a
+  standalone `surfacing.use_daemon` daemon and `MEMTOMEM_STM_HOOK__USE_DAEMON`
+  unset or true in doctor's environment, doctor now looks under the bare
+  hook's fingerprint, not the `--config` one (#1494).
 - `mms hook install` and `mms hook uninstall` no longer take over commands that
   name STM's hook but do not run it (issue #1460). They used to treat a
   command as STM's own hook whenever an STM entry point followed by `hook` had

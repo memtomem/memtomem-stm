@@ -12093,7 +12093,31 @@ def doctor(
             # optional measurement above is the only path that executes a
             # synthetic search.  These are WARN-only operational checks: an
             # undersized budget degrades surfacing but never breaks proxying.
-            if measure_ltm and (not isinstance(ltm, dict) or ltm.get("route") != "daemon"):
+            if measure_ltm and not isinstance(ltm, dict):
+                # The bootstrap raised (while loading the configuration or
+                # later, even after measuring); the ``ltm`` row above already
+                # renders its sanitized error, and no result survives.
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm result unavailable: the surfacing status could not be "
+                    "read (see the ltm server row)",
+                    "see the ltm server row",
+                )
+            elif (
+                measure_ltm and isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled"
+            ):
+                # Either route: the probe never pinged, so whether a daemon runs
+                # is unknown.
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm did not run: surfacing is disabled",
+                    "enable surfacing (surfacing.enabled, default true), then rerun",
+                )
+            elif measure_ltm and isinstance(ltm, dict) and ltm.get("route") != "daemon":
                 # The daemon route is the hook's when its daemon gate is on
                 # (#1485), else the standalone ``surfacing.use_daemon`` one.
                 check(
@@ -12105,17 +12129,6 @@ def doctor(
                     "and a running daemon",
                     "unset MEMTOMEM_STM_HOOK__USE_DAEMON or export "
                     "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
-                )
-            elif (
-                measure_ltm and isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled"
-            ):
-                # The probe never pinged, so whether a daemon runs is unknown.
-                check(
-                    "ltm_measurement",
-                    "ltm measurement",
-                    "WARN",
-                    "--measure-ltm did not run: surfacing is disabled",
-                    "enable surfacing (surfacing.enabled, default true), then rerun",
                 )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("daemon_reachable") is False:
                 check(
