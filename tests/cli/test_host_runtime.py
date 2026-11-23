@@ -6,6 +6,7 @@ import pytest
 
 from memtomem_stm.cli.host_runtime import (
     HostRuntimePolicy,
+    PartialHostRuntimePolicy,
     _parse_bool,
     _parse_positive_float,
     format_seconds,
@@ -183,3 +184,85 @@ def test_explicit_config_path_reaches_the_policy_construction(
 
     policy = resolve_host_runtime_policy(config_path=config)
     assert policy.use_daemon is True
+
+
+# ── recovery reads what the hook reads (#1476) ───────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The shell drops a comment, so the hook never receives these flags.
+        "mms hook --host # --persist-query-text",
+        "mms hook --host claude #c --persist-query-text",
+        # A here-string: the shell sends the flag to stdin, not to the hook.
+        "mms hook --host <<< --persist-query-text",
+        # Click reads this word as the ``--host`` value, not as a setting.
+        "mms hook --host MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=true",
+    ],
+)
+def test_recovery_reads_no_setting_the_hook_does_not_receive(command: str) -> None:
+    assert parse_managed_hook_runtime(command) == PartialHostRuntimePolicy()
+
+
+def test_recovery_takes_the_last_of_repeated_flags_like_the_hook() -> None:
+    parsed = parse_managed_hook_runtime(
+        "mms hook --persist-query-text --no-persist-query-text --use-daemon --no-daemon "
+        "--surfacing-timeout-seconds 3 --surfacing-timeout-seconds=7 --host claude"
+    )
+    # The surfacing deadline also sets the daemon deadline (7 + 1), as in the hook.
+    assert parsed == PartialHostRuntimePolicy(
+        use_daemon=False,
+        surfacing_timeout_seconds=7.0,
+        daemon_timeout_seconds=8.0,
+        persist_query_text=False,
+    )
+
+
+def test_recovery_prefers_a_flag_over_the_legacy_env_prefix() -> None:
+    parsed = parse_managed_hook_runtime(
+        "env MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=true "
+        "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=9 "
+        "mms hook --host claude --no-persist-query-text"
+    )
+    assert parsed == PartialHostRuntimePolicy(daemon_timeout_seconds=9.0, persist_query_text=False)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # An invalid flag value is dropped by the hook, so the inline setting stays.
+        (
+            "env MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=9 "
+            "mms hook --daemon-timeout-seconds invalid --host claude",
+            PartialHostRuntimePolicy(daemon_timeout_seconds=9.0),
+        ),
+        # A surfacing deadline flag sets the daemon deadline over the inline one.
+        (
+            "env MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=9 "
+            "mms hook --surfacing-timeout-seconds 3 --host claude",
+            PartialHostRuntimePolicy(surfacing_timeout_seconds=3.0, daemon_timeout_seconds=4.0),
+        ),
+    ],
+)
+def test_recovery_lays_flags_over_the_env_prefix_like_the_hook(
+    command: str, expected: PartialHostRuntimePolicy
+) -> None:
+    assert parse_managed_hook_runtime(command) == expected
+
+
+def test_the_split_grammar_keeps_no_backtracking_state_on_a_long_line() -> None:
+    """A long unrelated handler line is checked in memory independent of its
+    length (the per-character form peaked near 117 MiB on a 1M-character line)."""
+    import tracemalloc
+
+    from memtomem_stm.cli.host_runtime import _shell_tokens_accepts
+
+    line = "echo " + "x" * 1_000_000 + "$"
+    tracemalloc.start()
+    try:
+        assert _shell_tokens_accepts(line) is False
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 1 << 20
