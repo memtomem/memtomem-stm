@@ -12106,6 +12106,17 @@ def doctor(
                     "unset MEMTOMEM_STM_HOOK__USE_DAEMON or export "
                     "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
                 )
+            elif (
+                measure_ltm and isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled"
+            ):
+                # The probe never pinged, so whether a daemon runs is unknown.
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm did not run: surfacing is disabled",
+                    "enable surfacing (surfacing.enabled, default true), then rerun",
+                )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("daemon_reachable") is False:
                 check(
                     "ltm_measurement",

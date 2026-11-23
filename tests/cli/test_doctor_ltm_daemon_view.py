@@ -48,7 +48,7 @@ class LiveDaemons:
         fp = config_fingerprint(config, create_key=False)
         self.requested.append(fp)
         if fp not in self.live:
-            return "unavailable", None
+            return "missing", None  # the client's state when no handshake matches
         return "ok", {"ok": True, "outcome": "ok"}
 
 
@@ -349,3 +349,18 @@ def test_doctor_measurement_warning_names_the_missing_piece(
     assert measurement["status"] == "WARN", measurement
     assert expected in measurement["detail"], measurement
     assert next_action in measurement["next_action"], measurement
+
+
+def test_doctor_measurement_warning_when_surfacing_is_disabled(ghost, monkeypatch, tmp_path):
+    # The probe skips before any ping, so the row must not claim the daemon is down.
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    daemons = LiveDaemons(_hook_fp())
+    _install(monkeypatch, daemons)
+
+    checks = _doctor_cli(monkeypatch, tmp_path, "--config", str(ghost), "--measure-ltm")
+
+    measurement = checks["ltm_measurement"]
+    assert measurement["status"] == "WARN", measurement
+    assert "surfacing is disabled" in measurement["detail"], measurement
+    assert "mms daemon start" not in (measurement["next_action"] or ""), measurement
+    assert daemons.pinged == []
