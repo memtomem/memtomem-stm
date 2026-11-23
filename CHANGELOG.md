@@ -140,9 +140,10 @@ changes inline only. See the deprecation policy in
   `mms` entry point may expand such a word itself before reading its
   arguments (`mms hook --host 'C*'` can reach it as several words), so install
   refuses every word holding one, including ones that would stay as written
-  (`100%`). PowerShell, which Claude Code uses on Windows without Git Bash,
-  is not modelled: a quoted executable (`"mms" hook`) is still recognized there
-  (#1483).
+  (`100%`). PowerShell, which Claude Code falls back to on Windows for a
+  hook that names no `shell` when Git Bash is not installed, is not modelled; a
+  line whose first word is quoted is refused by a separate rule (issue #1483,
+  below).
   **Behavior change**: for a handler with both `--persist-query-text` and
   `--no-persist-query-text` (or both daemon flags), install keeps the last one,
   where it used to keep the enabling one.
@@ -160,6 +161,28 @@ changes inline only. See the deprecation policy in
   daemon setting; pass `--no-daemon` to turn it off. No released install
   wrote `MEMTOMEM_STM_SURFACING__USE_DAEMON` into a hook command, only into MCP
   registrations.
+- On Windows, `mms hook install` and `mms hook uninstall` no longer act on a
+  hook command whose first word holds a quote (#1500, issue #1483).
+  `"mms" hook --host claude --persist-query-text` was recognized as STM's
+  hook, so install wrote `--persist-query-text` into the replacement and
+  uninstall deleted the line. Claude Code's hooks reference says that a
+  shell-form hook with no `shell` field runs under PowerShell on Windows when
+  Git Bash is not installed, and that PowerShell prints a command made only of
+  quoted strings instead of running it. How PowerShell reads a quoted word
+  followed by other words (`"mms" hook …`) was not measured, and ownership
+  matching reads the command text without the handler's `shell` field, so
+  under the Windows rules STM now declines every line whose first word holds
+  a quote character (`"mms" hook`, `'mms' hook`, `m"m"s hook`, `"uv" run …`),
+  for every supported hook host. The rule looks at the first word only; the
+  existing checks still apply to quotes after it. The command install writes
+  starts with `memtomem-stm` or `uv`, unquoted, and is still recognized.
+  **Behavior change**: on Windows such a line is no longer updated or removed
+  and no setting is read from it; install and uninstall name it by location
+  as a look-alike. When install finds no other handler it manages, it adds its
+  own beside it, also where Git Bash runs the quoted line as before. To have
+  install manage the hook again, write the command in a form it recognizes,
+  such as `mms hook --host claude` with the entry point on `PATH`, or remove
+  the line and let `mms hook install` write its own.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that
