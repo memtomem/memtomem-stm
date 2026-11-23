@@ -209,15 +209,21 @@ class OtlpExportConfig(BaseModel):
                 except (ModuleNotFoundError, ImportError, ValueError):
                     return True
 
+            # ``requests`` is probed because ``observability/otlp.py`` imports
+            # it to build the export session; it is not an OpenTelemetry module.
             missing = [
                 name
-                for name in ("opentelemetry.sdk", "opentelemetry.exporter.otlp.proto.http")
+                for name in (
+                    "opentelemetry.sdk",
+                    "opentelemetry.exporter.otlp.proto.http",
+                    "requests",
+                )
                 if _absent(name)
             ]
             if missing:
                 raise ValueError(
-                    "OtlpExportConfig.enabled=true but the OpenTelemetry packages are "
-                    f"not installed (missing: {', '.join(missing)}). Install the otlp "
+                    "OtlpExportConfig.enabled=true but required OTLP modules could not "
+                    f"be found (missing: {', '.join(missing)}). Install the otlp "
                     "extra (e.g. `uv tool install --reinstall 'memtomem-stm[otlp]'` "
                     "or `pip install 'memtomem-stm[otlp]'`)."
                 )

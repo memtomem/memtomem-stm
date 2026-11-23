@@ -77,6 +77,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The `otlp` extra declares `requests` and `opentelemetry-api`, which STM's OTLP
+  exporter imports directly, and config validation now also checks that
+  `requests` can be found (issue #1486). Both were previously installed only
+  as transitive dependencies; the lock resolves the same versions as before.
+  Validation used to check only the SDK and the HTTP exporter, so an install
+  without `requests` passed it and then failed when the exporter started. **Behavior change**: with `otlp.enabled=true` and
+  `requests` missing, STM now refuses the configuration at validation, naming
+  `requests` and the install command, instead of raising an import error at
+  startup. The message now reads "required OTLP modules could not be found"
+  in place of "the OpenTelemetry packages are not installed".
 - `mms hook install` and `mms hook uninstall` no longer take over commands that
   name STM's hook but do not run it (issue #1460). They used to treat a
   command as STM's own hook whenever an STM entry point followed by `hook` had
