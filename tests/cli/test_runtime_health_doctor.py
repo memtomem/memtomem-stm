@@ -234,6 +234,11 @@ def test_env_supplied_invalid_value_stays_out_of_every_section(
             }
         ),
     )
+    if command == "doctor":
+        # With the hook's daemon on, doctor's bootstrap reads the hook's build,
+        # which ignores this proxy-only break (#1485); the standalone route is
+        # the one that still builds strictly and takes the error path.
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     args = [command, "--config", str(path)]
     if json_output:
         args.append("--json")
