@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic_settings import (
+    BaseSettings,
+    EnvSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    SettingsError,
+)
 
 from memtomem_stm.proxy.config import ProxyConfig, UpstreamServerCompletionSource
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -697,11 +705,10 @@ def log_stm_config_failure(
     names only, never values (the attached traceback is covered by the root
     ``hide_input_in_errors``).
 
-    Logging only, deliberately not a construct-or-``None`` helper: each caller
-    keeps its existing failure path (re-raise into an outer barrier, degrade
-    to pass-through, exit non-zero) — changing WHICH paths fail is the
-    tolerant-construction half of #847, deferred behind its wait-for-signal
-    gate.
+    Logging only: each caller keeps its own failure path (re-raise into an
+    outer barrier, degrade to pass-through, exit non-zero). This line is for a
+    failure nothing recovered from; one that :func:`load_env_stm_config`
+    recovered from is reported by :func:`log_proxy_env_ignored` instead.
 
     ``exc_info=False`` is for sites that re-raise into a barrier which logs
     the traceback itself (the hook's pass-through guard): the hint line and
@@ -719,6 +726,110 @@ def log_stm_config_failure(
         context,
         # The names are the operator's own variables, and one can carry a
         # newline or a bidi control that would forge or reorder the line (#1166).
+        _disp(env_var_hint_for_validation_error(exc)),
+        exc_info=exc if exc_info else None,
+    )
+
+
+_PROXY_ENV_NAME = "memtomem_stm_proxy"
+"""The ``proxy`` field's variable under ``STMConfig``'s prefix, lower-cased the
+way pydantic-settings stores names when ``case_sensitive`` is off."""
+
+
+def _is_proxy_env_name(name: str) -> bool:
+    lowered = name.lower()
+    return lowered == _PROXY_ENV_NAME or lowered.startswith(_PROXY_ENV_NAME + "__")
+
+
+class _ProxyEnvIgnoredSTMConfig(STMConfig):
+    """``STMConfig`` built as if no ``MEMTOMEM_STM_PROXY*`` variable were set.
+
+    Only :func:`load_env_stm_config` builds it. The filter applies to the env
+    source's own snapshot, and ``UpstreamServerCompletionSource`` reads the env
+    through that same source, so it has nothing to complete and reads no file.
+    """
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Any other source type is left alone: the rebuild then sees the same
+        # proxy variables, fails the same way, and the original error is raised.
+        if isinstance(env_settings, EnvSettingsSource):
+            env_settings.env_vars = {
+                name: value
+                for name, value in env_settings.env_vars.items()
+                if not _is_proxy_env_name(name)
+            }
+        return super().settings_customise_sources(
+            settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+        )
+
+
+@dataclass(frozen=True)
+class EnvSTMConfigLoad:
+    """A bare env ``STMConfig`` and, when it is degraded, the error behind it.
+
+    ``proxy_error`` set means every ``MEMTOMEM_STM_PROXY*`` variable was
+    ignored: ``config.proxy`` is at its defaults, valid proxy variables
+    included, and so is anything derived from it (``model_post_init``'s
+    ``consumer_model`` hand-off to ``surfacing``).
+    """
+
+    config: STMConfig
+    proxy_error: ValidationError | SettingsError | None = None
+
+
+def load_env_stm_config() -> EnvSTMConfigLoad:
+    """Bare ``STMConfig()`` for the readers that never touch ``proxy`` (#847).
+
+    The hook and the daemon read ``surfacing``, ``hook`` and ``daemon``. A
+    broken ``MEMTOMEM_STM_PROXY*`` variable used to fail their whole
+    construction: the hook passed every tool output through and the daemon
+    would not start. When the bare construction fails, this builds once more
+    with every proxy variable removed. If that succeeds, the failure belonged
+    to ``proxy`` alone and the degraded config is returned with the original
+    error. If it fails too, the original error is raised, without the
+    retry's attached. An environment with no proxy variable is not retried:
+    there is nothing to remove, so a retry could only succeed because the
+    environment changed in between.
+
+    Only ``ValidationError`` and ``SettingsError`` are retried; anything else
+    propagates as it is. Commands that serialize or serve the proxy subtree
+    (registration, the MCP server) keep the strict construction.
+    """
+    try:
+        return EnvSTMConfigLoad(STMConfig())
+    except (ValidationError, SettingsError) as exc:
+        if not any(_is_proxy_env_name(name) for name in os.environ):
+            raise
+        try:
+            config = _ProxyEnvIgnoredSTMConfig()
+        except (ValidationError, SettingsError):
+            raise exc from None
+        return EnvSTMConfigLoad(config, exc)
+
+
+def log_proxy_env_ignored(
+    exc: Exception, *, logger: logging.Logger, context: str, exc_info: bool = False
+) -> None:
+    """The line for a load :func:`load_env_stm_config` recovered from.
+
+    Names the implicated variable(s) the way :func:`log_stm_config_failure`
+    does, names only. No traceback by default: nothing failed, and the hook
+    would otherwise print one per tool call.
+    """
+    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+    from memtomem_stm.utils.display import _disp
+
+    logger.warning(
+        "invalid MEMTOMEM_STM_PROXY* configuration ignored while %s; proxy settings at defaults%s",
+        context,
         _disp(env_var_hint_for_validation_error(exc)),
         exc_info=exc if exc_info else None,
     )

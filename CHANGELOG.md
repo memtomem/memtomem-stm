@@ -34,6 +34,34 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- `mms hook` and the surfacing daemon keep running when only a
+  `MEMTOMEM_STM_PROXY*` variable is invalid (issue #847). Compression,
+  surfacing and the daemon need only the `surfacing`, `hook` and `daemon`
+  settings (the hook reads `proxy` just for its metrics database), yet one
+  invalid proxy variable (an override naming an upstream server the config
+  file does not declare, a `MEMTOMEM_STM_PROXY` value settings cannot decode,
+  an out-of-range proxy field) failed their whole configuration: the hook
+  passed every tool output through, and the daemon and the `mms daemon`
+  subcommands exited 1. When the configuration fails, they now build it once
+  more without any `MEMTOMEM_STM_PROXY*` variable. If that succeeds, they run
+  with proxy settings at their defaults and log a warning each time they load
+  the configuration (once per hook call; `mms daemon restart` loads it three
+  times). The warning names the variable unless its value could not be
+  decoded at all, and a detached daemon writes it to its log file unless
+  `MEMTOMEM_STM_LOG_LEVEL` is `ERROR` or higher. An invalid variable outside
+  `proxy` fails as before. `mms doctor`'s `env_overrides` row says which case
+  applies, and its LTM row, which probes the hook's daemon, builds the same
+  configuration when no `--config` is given. **Behavior change**: under such
+  an environment the hook compresses and surfaces again and the daemon
+  starts. These paths ignore every `MEMTOMEM_STM_PROXY*` variable, valid ones
+  included, so `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` no longer reaches
+  surfacing, and the hook records no metrics rows, because the metrics
+  database path is a proxy setting. Fixing the variable can change the
+  daemon's identity (when it restores a consumer model), so a daemon started
+  in the meantime shows as foreign in `mms daemon status`, which says how to
+  stop it on that platform. `mms hook install`, `mms register` and the MCP
+  server keep validating the proxy settings strictly against the config file
+  they resolve.
 - `mms hook install` says when the user-scope hook it writes is bound to a
   project (#1464, issue #1379). When the nearest `pyproject.toml` (the current
   directory or one of its four parents) lists `memtomem-stm` as a dependency,

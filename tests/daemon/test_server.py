@@ -1496,7 +1496,7 @@ async def test_hook_run_hook_autospawn_with_fallback_cold(
 
     cold: list = []
 
-    async def _fake_cold(call):
+    async def _fake_cold(call, **kwargs):
         cold.append(call)
         return {"cold": True}
 

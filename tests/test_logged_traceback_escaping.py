@@ -71,6 +71,18 @@ def hostile_env(tmp_path, monkeypatch) -> ValidationError:
     return caught.value
 
 
+@pytest.fixture
+def unrecovered_hostile_env(hostile_env, monkeypatch) -> ValidationError:
+    """The hostile proxy variable plus an invalid one outside ``proxy``.
+
+    The hook and the daemon recover from a proxy-only break (#847), so the
+    failure paths below need a second, non-proxy fault to stay failures. The
+    hostile name still reaches the hint and the traceback.
+    """
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS", "nope")
+    return hostile_env
+
+
 def _capture(fmt: str, *, withhold: bool = True) -> tuple[logging.Logger, io.StringIO]:
     buf = io.StringIO()
     handler = logging.StreamHandler(buf)
@@ -253,7 +265,7 @@ class TestHookLoggingKeepsTheLastResortContract:
         assert (first.getvalue(), second.getvalue()) == ("one\n", "two\n")
 
     def test_two_cli_invocations_both_capture_the_barrier_warning(
-        self, hostile_env, _restore_root_logging
+        self, unrecovered_hostile_env, _restore_root_logging
     ):
         from memtomem_stm.cli.proxy import cli
 
@@ -367,7 +379,9 @@ def test_server_entry_point_prints_one_escaped_traceback_in_a_fresh_process(tmp_
     assert "ValidationError: [message withheld]" in proc.stderr
 
 
-def test_daemon_subcommand_prints_one_escaped_traceback(hostile_env, _restore_root_logging):
+def test_daemon_subcommand_prints_one_escaped_traceback(
+    unrecovered_hostile_env, _restore_root_logging
+):
     """``mms daemon <cmd>`` loads the config first; same boundary rule."""
     from memtomem_stm.cli.proxy import cli
 
@@ -414,7 +428,38 @@ def test_server_main_takes_over_a_root_the_sdk_already_configured(
     assert ".prefix" not in err
 
 
-def test_hook_barrier_traceback_is_escaped(hostile_env, _restore_root_logging):
+def test_hook_recovered_proxy_hint_is_escaped(hostile_env, monkeypatch, _restore_root_logging):
+    """A proxy-only break no longer fails the hook (#847); the one line it
+    logs instead still names the hostile variable escaped, with no traceback."""
+    from memtomem_stm.cli.proxy import cli
+
+    # The recovered hook goes on to route; with surfacing on and no daemon it
+    # would spawn a real detached one. This test is about the log line only.
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    spawns: list[object] = []
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", spawns.append)
+
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/src/x.py"},
+        "tool_response": {"content": "x" * 2000},
+    }
+
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(payload))
+
+    assert result.exit_code == 0
+    assert "proxy settings at defaults" in result.stderr
+    assert ESCAPED_HINT in result.stderr
+    assert RLO not in result.stderr
+    assert "Traceback (most recent call last)" not in result.stderr
+    assert spawns == []
+
+
+def test_hook_barrier_traceback_is_escaped(unrecovered_hostile_env, _restore_root_logging):
     """The hook's own site drops the traceback; the pass-through barrier logs it."""
     from memtomem_stm.cli.proxy import cli
 

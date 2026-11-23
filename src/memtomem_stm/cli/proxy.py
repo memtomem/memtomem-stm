@@ -10278,17 +10278,26 @@ def _surfacing_bootstrap_status(
     probe so the documented per-server bound covers it too. *config_path* is
     the command's explicit ``--config``, threaded so the ``STMConfig`` here
     reads the same file as the command's own proxy checks (#839).
+
+    With *prefer_hook_daemon* and no explicit path, the probe asks the hook's
+    daemon, so the config is the one the hook and the daemon build: a
+    proxy-only env break degrades it to proxy defaults rather than failing
+    (#847). The daemon's identity is fingerprinted from that config, so a
+    strict build here would look for a daemon under the wrong key, or none.
     """
     try:
         from memtomem_stm.cli.rrf_diagnostics import rrf_boundary_doctor_checks
-        from memtomem_stm.config import stm_config_for_cli
+        from memtomem_stm.config import load_env_stm_config, stm_config_for_cli
         from memtomem_stm.surfacing.feedback_store import (
             inspect_feedback_db,
             read_surfacing_summary,
         )
         from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
 
-        config = stm_config_for_cli(config_path)
+        if prefer_hook_daemon and config_path is None:
+            config = load_env_stm_config().config
+        else:
+            config = stm_config_for_cli(config_path)
         surfacing = config.surfacing
         db_status = inspect_feedback_db(surfacing.feedback_db_path)
         ltm_status = _ltm_status(
@@ -12298,34 +12307,52 @@ def doctor(
 
     # Last check: bare env construction — what `mms hook` and the daemon see.
     # Those paths have no --config flag, so this deliberately ignores the
-    # flag: a broken MEMTOMEM_STM_* env silently degrades hook surfacing/
-    # compression to pass-through and stops the daemon from starting (#847).
-    # WARN, never FAIL: the flag-driven checks above may be fully healthy,
-    # and doctor's exit code must not flip for a degradation the proxy
-    # itself does not share. Runs outside the config_file short-circuit —
-    # it does not read the file.
-    from memtomem_stm.config import STMConfig
+    # flag. A proxy-only break leaves them running with proxy defaults; any
+    # other break degrades hook surfacing/compression to pass-through and
+    # stops the daemon from starting (#847). WARN, never FAIL: the
+    # flag-driven checks above may be fully healthy, and doctor's exit code
+    # must not flip for a degradation the proxy itself does not share. Runs
+    # outside the config_file short-circuit — it does not read the file.
+    from memtomem_stm.config import load_env_stm_config
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
     try:
-        STMConfig()
+        env_load = load_env_stm_config()
     except Exception as exc:
+        hint = env_var_hint_for_validation_error(exc)
         check(
             "env_overrides",
             "env overrides",
             "WARN",
             "bare STMConfig() fails — hook surfacing/compression degrade "
-            "to pass-through (logged per call) and the daemon cannot start"
-            + env_var_hint_for_validation_error(exc),
-            "unset or fix the MEMTOMEM_STM_* variable(s) named above",
+            "to pass-through (logged per call) and the daemon cannot start" + hint,
+            # A SettingsError (an undecodable payload) has no hint by design.
+            "unset or fix the MEMTOMEM_STM_* variable(s) named above"
+            if hint
+            else "check the MEMTOMEM_STM_* variables for a value settings cannot decode",
         )
     else:
-        check(
-            "env_overrides",
-            "env overrides",
-            "PASS",
-            "bare STMConfig() constructs — hook/daemon env path healthy",
-        )
+        if env_load.proxy_error is not None:
+            hint = env_var_hint_for_validation_error(env_load.proxy_error)
+            check(
+                "env_overrides",
+                "env overrides",
+                "WARN",
+                "MEMTOMEM_STM_PROXY* is invalid — mms hook and the daemon ignore it "
+                "and run with proxy settings at defaults; hook metrics are not "
+                "recorded" + hint,
+                "unset or fix the MEMTOMEM_STM_* variable(s) named above"
+                if hint
+                else "check MEMTOMEM_STM_PROXY and its MEMTOMEM_STM_PROXY__* overrides "
+                "for a value settings cannot decode",
+            )
+        else:
+            check(
+                "env_overrides",
+                "env overrides",
+                "PASS",
+                "bare STMConfig() constructs — hook/daemon env path healthy",
+            )
 
     _doctor_hook_registration_check(check)
 

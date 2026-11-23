@@ -17173,7 +17173,61 @@ class TestDoctor:
         assert env_check is not None, result.output
         assert env_check["status"] == "WARN"
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND" in env_check["detail"]
+        # Proxy-only (#847): the hook and the daemon run with proxy defaults,
+        # so the row says that rather than "cannot start".
+        assert "proxy settings at defaults" in env_check["detail"]
+        assert "hook metrics are not recorded" in env_check["detail"]
+        assert "cannot start" not in env_check["detail"]
         assert result.exit_code == 0, result.output  # WARN-only never exits 1
+
+    def test_env_overrides_check_keeps_the_failure_text_for_a_non_proxy_break(
+        self, runner, config, monkeypatch
+    ):
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS", "nope")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        env_check = self._check_by_id(result, "env_overrides")
+        assert env_check is not None, result.output
+        assert env_check["status"] == "WARN"
+        assert "the daemon cannot start" in env_check["detail"]
+        assert "proxy settings at defaults" not in env_check["detail"]
+
+    @pytest.mark.parametrize(
+        ("var", "recovered"),
+        [
+            pytest.param("MEMTOMEM_STM_PROXY", True, id="proxy_payload"),
+            pytest.param("MEMTOMEM_STM_HOOK", False, id="non_proxy_payload"),
+        ],
+    )
+    def test_env_overrides_blank_hint_still_names_a_target(
+        self, runner, config, monkeypatch, var, recovered
+    ):
+        """An undecodable payload is a ``SettingsError``, whose hint is blank
+        by design, so "the variable(s) named above" would point at nothing.
+        The recovered branch names the proxy variables; the other one stays
+        generic, since a blank hint also comes from a non-proxy payload."""
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        monkeypatch.setenv(var, "{")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        env_check = self._check_by_id(result, "env_overrides")
+        assert env_check is not None, result.output
+        assert env_check["status"] == "WARN"
+        action = env_check["next_action"]
+        assert "named above" not in action
+        assert "{" not in env_check["detail"] + action  # never the value
+        if recovered:
+            assert "MEMTOMEM_STM_PROXY" in action
+            assert "proxy settings at defaults" in env_check["detail"]
+        else:
+            assert "MEMTOMEM_STM_PROXY" not in action
+            assert "MEMTOMEM_STM_*" in action
 
     def test_env_overrides_check_passes_on_a_healthy_env(self, runner, config, monkeypatch):
         self._stub_probe(monkeypatch)
@@ -17184,6 +17238,82 @@ class TestDoctor:
         env_check = self._check_by_id(result, "env_overrides")
         assert env_check is not None, result.output
         assert env_check["status"] == "PASS"
+
+    def test_ltm_row_probes_the_hook_daemon_with_the_hook_view(self, monkeypatch, tmp_path):
+        """Doctor's LTM row asks the hook daemon (``prefer_hook_daemon``), so
+        without an explicit ``--config`` it must build the config the hook and
+        daemon build — degraded under a proxy-only break, not a bootstrap
+        error. An explicit ``--config`` keeps the strict construction."""
+        from memtomem_stm.cli import proxy as proxy_mod
+        from memtomem_stm.proxy.config import ProxyConfig
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+        probed: list = []
+
+        def fake_ltm_status(cfg, timeout, **kwargs):
+            probed.append(cfg)
+            return {"connected": False}
+
+        monkeypatch.setattr(proxy_mod, "_ltm_status", fake_ltm_status)
+
+        status = proxy_mod._surfacing_bootstrap_status(
+            1.0, prefer_hook_daemon=True, config_path=None
+        )
+
+        assert "error" not in status, status
+        assert len(probed) == 1
+        assert probed[0].proxy == ProxyConfig()
+
+        probed.clear()
+        strict = proxy_mod._surfacing_bootstrap_status(
+            1.0, prefer_hook_daemon=True, config_path=str(tmp_path / "absent.json")
+        )
+        assert strict.get("error"), strict
+        assert probed == []
+
+    def test_doctor_without_config_probes_the_daemon_the_hook_would_use(
+        self, runner, monkeypatch, tmp_path
+    ):
+        """End to end through ``mms doctor`` with no ``--config``: the LTM row's
+        daemon probe gets a config with the hook's daemon fingerprint, under
+        the same discovery key, while a proxy-only break is in the env."""
+        from memtomem_stm.cli import hook_cmd
+        from memtomem_stm.cli import proxy as proxy_mod
+        from memtomem_stm.daemon.discovery import config_fingerprint
+
+        self._stub_probe(monkeypatch)
+        default_file = tmp_path / "home" / ".memtomem" / "stm_proxy.json"
+        default_file.parent.mkdir(parents=True)
+        self._healthy_config(default_file)
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GHOST__TIMEOUT", "5")
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONSUMER_MODEL", "some-model")
+        probed: list = []
+        direct: list = []
+
+        def fake_daemon_status(cfg, timeout, **kwargs):
+            probed.append(cfg)
+            return {"connected": False}
+
+        def fake_mcp_status(surfacing, timeout):
+            direct.append(surfacing)
+            return {"connected": False}
+
+        # Stubbed below the route choice, so dropping ``prefer_hook_daemon``
+        # (which would send doctor to the direct MCP probe) turns this red.
+        monkeypatch.setattr(proxy_mod, "_ltm_daemon_status", fake_daemon_status)
+        monkeypatch.setattr(proxy_mod, "_ltm_mcp_status", fake_mcp_status)
+
+        result = runner.invoke(cli, ["doctor", "--json"])
+
+        assert direct == [], result.output
+        assert len(probed) == 1, result.output
+        hook_config = hook_cmd._load_hook_config("comparing").config
+        assert config_fingerprint(probed[0], create_key=True) == config_fingerprint(
+            hook_config, create_key=True
+        )
 
     def test_healthy_config_warn_only_exits_zero(self, runner, config, monkeypatch):
         """정상 scenario: all checks PASS except the expected LTM WARN —

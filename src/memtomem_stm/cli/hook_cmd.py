@@ -105,7 +105,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from memtomem_stm.cli.hook_adapter import CanonicalHookCall, HostHookAdapter
-    from memtomem_stm.config import HookCompressionConfig, STMConfig
+    from memtomem_stm.config import EnvSTMConfigLoad, HookCompressionConfig, STMConfig
+    from memtomem_stm.surfacing.config import SurfacingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +500,7 @@ async def run_surfacing_hook(
     *,
     engine: Any | None = None,
     deadline_monotonic: float | None = None,
+    surfacing_config: "SurfacingConfig | None" = None,
 ) -> dict[str, Any]:
     """Core hook logic. Returns the hook-output dict (``{}`` means no-op).
 
@@ -521,10 +523,18 @@ async def run_surfacing_hook(
     this call's LTM attempt for a caller that is itself deadline-bounded (the
     daemon). ``None`` (the cold in-process path, which owns its whole process)
     keeps the configured ``surfacing.timeout_seconds``.
+
+    ``surfacing_config`` is the caller's already-loaded config for the cold
+    path. :func:`_run_hook` passes it so one tool call loads the environment
+    once; under a degraded load a second load would report it a second time.
+    ``None`` loads it here.
     """
     try:
         return await _run_surfacing_hook_inner(
-            call, engine=engine, deadline_monotonic=deadline_monotonic
+            call,
+            engine=engine,
+            deadline_monotonic=deadline_monotonic,
+            surfacing_config=surfacing_config,
         )
     except Exception:
         logger.warning("hook surfacing failed — passing tool output through", exc_info=True)
@@ -532,7 +542,11 @@ async def run_surfacing_hook(
 
 
 async def _run_surfacing_hook_inner(
-    call: "CanonicalHookCall", *, engine: Any | None, deadline_monotonic: float | None = None
+    call: "CanonicalHookCall",
+    *,
+    engine: Any | None,
+    deadline_monotonic: float | None = None,
+    surfacing_config: "SurfacingConfig | None" = None,
 ) -> dict[str, Any]:
     if call.event_type != "PostToolUse":
         return {}
@@ -559,20 +573,15 @@ async def _run_surfacing_hook_inner(
 
     # Lazy imports: keep ``mms hook --help`` and unrelated CLI paths off the
     # surfacing/MCP import cost.
-    from memtomem_stm.config import STMConfig, log_stm_config_failure
     from memtomem_stm.surfacing.engine import SurfacingEngine
     from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
     from memtomem_stm.surfacing.observability import SurfacingObservability
 
-    try:
-        surfacing_cfg = STMConfig().surfacing
-    except Exception as exc:
-        # Observability only (#847): the outer barrier still turns this into
-        # the `{}` pass-through, but no longer silently.
-        log_stm_config_failure(
-            exc, logger=logger, context="running the surfacing hook", exc_info=False
-        )
-        raise
+    surfacing_cfg = (
+        surfacing_config
+        if surfacing_config is not None
+        else _load_hook_config("running the surfacing hook").config.surfacing
+    )
     if not surfacing_cfg.enabled:
         return {}
 
@@ -730,24 +739,17 @@ async def _run_hook(
     return ``{}`` (default ``fallback=skip`` — the daemon exists precisely to
     avoid the ~6s cold start) or take the cold path (``fallback=cold``). The
     whole call runs inside ``_hook_budget_seconds()`` in :func:`hook_command`.
-    ``config`` is reused from :func:`_orchestrate` when given (saving a redundant
-    ``STMConfig()`` load); ``None`` loads on demand.
+    ``config`` is reused from :func:`_orchestrate` when given, on both routes,
+    so one tool call loads the environment once; ``None`` loads on demand.
     """
     if not _hook_eligible(call):
         return {}
     bounded = _bounded_call(call)
     if _daemon_enabled():
-        from memtomem_stm.config import STMConfig, log_stm_config_failure
         from memtomem_stm.daemon import client
 
         if config is None:
-            try:
-                config = STMConfig()
-            except Exception as exc:
-                log_stm_config_failure(
-                    exc, logger=logger, context="routing the hook to the daemon", exc_info=False
-                )
-                raise
+            config = _load_hook_config("routing the hook to the daemon").config
         # Reject ineligible calls (surfacing globally off, non-PostToolUse, or
         # a non-allowlisted tool) before routing to / spawning the daemon — an
         # off-target hook call must not warm a pointless daemon. The cold path
@@ -779,7 +781,37 @@ async def _run_hook(
         if config.hook.fallback != "cold":
             return {}
         # fallback=cold → fall through to the in-process surfacing path.
-    return await run_surfacing_hook(bounded)
+    return await run_surfacing_hook(
+        bounded, surfacing_config=config.surfacing if config is not None else None
+    )
+
+
+def _load_hook_config(context: str) -> "EnvSTMConfigLoad":
+    """The hook's env config, tolerating a proxy-only break (#847).
+
+    The hook never reads ``proxy`` except for the metrics row, which
+    :func:`_record_hook_metrics` skips on a degraded load. A recovered load
+    logs one names-only line; any other failure logs the hint and re-raises
+    into the caller's pass-through barrier, which owns the traceback.
+    """
+    from memtomem_stm.config import (
+        load_env_stm_config,
+        log_proxy_env_ignored,
+        log_stm_config_failure,
+    )
+
+    try:
+        load = load_env_stm_config()
+    except Exception as exc:
+        log_stm_config_failure(exc, logger=logger, context=context, exc_info=False)
+        raise
+    if load.proxy_error is not None:
+        log_proxy_env_ignored(
+            load.proxy_error,
+            logger=logger,
+            context=f"{context} (hook metrics are not recorded)",
+        )
+    return load
 
 
 def _record_hook_metrics(
@@ -789,6 +821,8 @@ def _record_hook_metrics(
     config: "STMConfig",
     host_tag: str,
     status: str,
+    *,
+    proxy_ignored: bool = False,
 ) -> None:
     """Record one native built-in tool call into ``proxy_metrics.db`` (``source='hook'``).
 
@@ -808,9 +842,14 @@ def _record_hook_metrics(
     opened per call — the hook is a one-shot subprocess, so there is no
     long-lived tracker to write through. **Never raises**: any failure degrades
     to no row, so metrics can't disrupt the host.
+
+    ``proxy_ignored`` (a degraded load, see
+    :func:`~memtomem_stm.config.load_env_stm_config`) skips the row: the DB path
+    and retention are proxy fields, so their defaults may name a different DB
+    from the one the operator configured.
     """
     try:
-        if not config.hook.metrics_enabled:
+        if not config.hook.metrics_enabled or proxy_ignored:
             return
         tool_name = call.tool_name
         if not tool_name:
@@ -896,20 +935,13 @@ async def _orchestrate(
     knowledge; compression still runs here in the hook process (it needs the
     original ``tool_response`` object, which is not transmitted).
     """
-    from memtomem_stm.config import STMConfig, log_stm_config_failure
-
     call = adapter.parse(payload)
     if call is None:  # unusable payload → pass the tool output through untouched
         return {}
-    try:
-        config = STMConfig()
-    except Exception as exc:
-        # Raised before the compression/surfacing split, so this one failure
-        # kills both halves — the hint line is the only attributable trace.
-        # exc_info=False: the pass-through barrier logs the traceback once
-        # already — this line carries the hint, not a second traceback.
-        log_stm_config_failure(exc, logger=logger, context="orchestrating the hook", exc_info=False)
-        raise
+    # An unrecovered failure raises before the compression/surfacing split, so
+    # it kills both halves; the pass-through barrier owns its traceback.
+    load = _load_hook_config("orchestrating the hook")
+    config = load.config
     # Each refusal gets its own status, so ``mms stats`` can tell them apart.
     # ``disabled`` comes first: a hook that never enabled compression must not
     # read as one that is missing ``--host claude``. ``allow_output_replacement``
@@ -948,7 +980,13 @@ async def _orchestrate(
             logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
     _record_hook_metrics(
-        call, updated, additional_context, config, adapter.host_tag, compression.status
+        call,
+        updated,
+        additional_context,
+        config,
+        adapter.host_tag,
+        compression.status,
+        proxy_ignored=load.proxy_error is not None,
     )
     rendered = adapter.render(updated_tool_output=updated, additional_context=additional_context)
     if notice:
