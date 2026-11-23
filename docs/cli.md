@@ -1092,11 +1092,12 @@ a glob character (`*`, `?`, `[`), any `$` or `%` (even a literal `100%`), or a
 leading `~` does not count either, quoted or not (`mms hook --host 'C*'`).
 A command whose first word holds a quote (`"mms" hook`, `'mms' hook`,
 `m"m"s hook`) does not count on Windows either (#1483): Claude Code runs a hook
-line under PowerShell when Git Bash is missing, and PowerShell prints a command
-made only of quoted strings instead of running it. Install cannot tell which
-shell will run a line, so it leaves such a line alone and reads no settings
-from it. Quotes after the first word are not examined, and how PowerShell reads
-any other line is not checked. A
+line that names no `shell` under PowerShell when Git Bash is missing, and
+PowerShell prints a command made only of quoted strings instead of running it.
+Install cannot tell which shell will run a line, so it leaves such a line alone
+and reads no settings from it. This rule does not look at quotes after the
+first word (the checks above still apply to them), and how PowerShell reads any
+other line is not checked. A
 command counts only when its words then pass three checks:
 the words after `hook` read as a hook run with `mms hook`'s own options, so
 `mms hook uninstall`, `mms hook --help` and a usage error do not count; the

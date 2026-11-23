@@ -171,12 +171,12 @@ def _is_stm_hook_command(command: str) -> bool:
     its own arguments (globs, ``$VAR``, ``%VAR%``, a leading ``~``) before
     Click parses them, a line whose words after the executable hold any of
     those does not match either. Nor does one whose first word holds a quote
-    (``"mms" hook``, #1483): Claude Code runs the line under PowerShell when
-    Git Bash is not installed, and PowerShell prints a command made only of
-    quoted strings instead of running it. Which shell will run a line is not
-    known here, and PowerShell's reading of other lines is not modelled, so
-    this is a refusal to own the line, not a claim about what runs. Three
-    more checks keep out lines that would
+    (``"mms" hook``, #1483): Claude Code runs a line that names no ``shell``
+    under PowerShell when Git Bash is not installed, and PowerShell prints a
+    command made only of quoted strings instead of running it. Which shell
+    will run a line is not known here, and PowerShell's reading of other
+    lines is not modelled, so this is a refusal to own the line, not a claim
+    about what runs. Three more checks keep out lines that would
     not run the hook bridge (#1460): the executable word has no ``=`` or
     control character and its last component as written is not empty or ``.``
     (so ``OTHER=/mms hook`` and ``mms/ hook`` do not match); a ``uv`` launcher
