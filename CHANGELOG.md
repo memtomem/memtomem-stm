@@ -150,27 +150,27 @@ changes inline only. See the deprecation policy in
   wrote `MEMTOMEM_STM_SURFACING__USE_DAEMON` into a hook command, only into MCP
   registrations.
 - On Windows, `mms hook install` and `mms hook uninstall` no longer act on a
-  hook command whose first word holds a quote (issue #1483). On Windows,
-  Claude Code runs a hook line that names no `shell` under Git Bash, or under
-  PowerShell when Git Bash is not installed, and PowerShell prints a command
-  made only of quoted strings instead of running it.
-  `"mms" hook --host claude --persist-query-text` was
-  recognized as STM's hook all the same, so install wrote
-  `--persist-query-text` into the replacement and uninstall deleted the line.
-  Install cannot tell which shell will run a line, so under the Windows rules
-  it now refuses every line whose first word holds a quote character
-  (`"mms" hook`, `'mms' hook`, `m"m"s hook`, `"uv" run …`), on every host.
-  This is a refusal to manage the line, not a model of PowerShell: how
-  PowerShell reads a quoted word followed by other words, or the arguments
-  after an unquoted first word, was not measured, and this rule does not look
-  at quotes after the first word. The command install writes starts with `memtomem-stm`
-  or `uv`, unquoted, and is still recognized. **Behavior change**: on Windows
-  such a line is no longer updated or removed and no setting is read from it;
-  it is named by location. When install finds no other handler it manages, it
-  adds its own beside it, also where Git Bash runs the quoted line as before.
-  To have install manage the hook again, start the line with an unquoted word
-  (an entry point on `PATH`; a path with a blank cannot simply lose its
-  quotes), or remove the line and let `mms hook install` write its own.
+  hook command whose first word holds a quote (issue #1483).
+  `"mms" hook --host claude --persist-query-text` was recognized as STM's
+  hook, so install wrote `--persist-query-text` into the replacement and
+  uninstall deleted the line. Claude Code's hooks reference says that a
+  shell-form hook with no `shell` field runs under PowerShell on Windows when
+  Git Bash is not installed, and that PowerShell prints a command made only of
+  quoted strings instead of running it. How PowerShell reads a quoted word
+  followed by other words (`"mms" hook …`) was not measured, and ownership
+  matching reads the command text without the handler's `shell` field, so
+  under the Windows rules STM now declines every line whose first word holds
+  a quote character (`"mms" hook`, `'mms' hook`, `m"m"s hook`, `"uv" run …`),
+  for every supported hook host. The rule looks at the first word only; the
+  existing checks still apply to quotes after it. The command install writes
+  starts with `memtomem-stm` or `uv`, unquoted, and is still recognized.
+  **Behavior change**: on Windows such a line is no longer updated or removed
+  and no setting is read from it; install and uninstall name it by location
+  as a look-alike. When install finds no other handler it manages, it adds its
+  own beside it, also where Git Bash runs the quoted line as before. To have
+  install manage the hook again, write the command in a form it recognizes,
+  such as `mms hook --host claude` with the entry point on `PATH`, or remove
+  the line and let `mms hook install` write its own.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that

@@ -2049,10 +2049,11 @@ def test_windows_notice_scan_splits_a_line_once(
 
 # ── Windows: a quoted first word (#1483) ─────────────────────────────────────
 #
-# Claude Code runs a shell-form hook under PowerShell when Git Bash is not
-# installed, and PowerShell prints a command made only of quoted strings
-# instead of running it. Install cannot tell which shell will run a line, so
-# under the Windows rules it does not own one whose first word holds a quote.
+# Claude Code's hooks reference: a shell-form hook with no ``shell`` field
+# runs under PowerShell when Git Bash is not installed, and PowerShell prints
+# a command made only of quoted strings instead of running it. Ownership
+# matching reads the command text alone, so under the Windows rules it
+# declines every line whose first word holds a quote.
 
 _WINDOWS_QUOTED_FIRST_WORD = [
     '"mms" hook --host claude',
@@ -2060,6 +2061,7 @@ _WINDOWS_QUOTED_FIRST_WORD = [
     'm"m"s hook --host claude',
     '""mms hook --host claude',
     '"uv" run --directory /repo memtomem-stm hook --host claude',
+    "'env' MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=12 mms hook --host claude",
     '~/bin/"mms" hook --host claude',
     # Leading blanks, and a blank inside the quoted word.
     '  "C:/Program Files/stm/mms" hook --host claude',
@@ -2077,7 +2079,7 @@ def test_windows_refuses_a_quoted_first_word(command: str, on_windows) -> None:
 def test_a_quoted_first_word_is_recognized_elsewhere(
     command: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Positive control: a POSIX shell removes the quotes and runs the word."""
+    """Positive control: with the POSIX rules the same lines are recognized."""
     from memtomem_stm.cli import hook_registration
 
     monkeypatch.setattr(hook_registration, "running_on_windows", lambda: False)
@@ -2141,6 +2143,57 @@ def test_windows_names_a_quoted_first_word(command: str, on_windows, redirect) -
     groups = json.loads(installed.new_text)["hooks"]["PostToolUse"]
     assert [h["command"] for g in groups for h in g["hooks"]] == [command, _MANAGED]
     assert installed.unmanaged == (location,)
+    assert removed.status == "not_installed"
+    assert removed.unmanaged == (location,)
+
+
+@pytest.mark.parametrize(
+    ("host", "data", "location"),
+    [
+        (
+            "claude",
+            _claude_groups([_h('"mms" hook --host claude')]),
+            "hooks.PostToolUse[0].hooks[0]",
+        ),
+        (
+            "codex",
+            _claude_groups([_h('"mms" hook --host codex')]),
+            "hooks.PostToolUse[0].hooks[0]",
+        ),
+        (
+            "cursor",
+            {"version": 1, "hooks": {"postToolUse": [{"command": '"mms" hook --host cursor'}]}},
+            "hooks.postToolUse[0]",
+        ),
+        (
+            "kimi",
+            {
+                "hooks": [
+                    {"event": "PostToolUse", "matcher": "Bash", "command": '"mms" hook --host kimi'}
+                ]
+            },
+            "hooks[0]",
+        ),
+    ],
+)
+def test_windows_names_a_quoted_first_word_on_every_host(
+    host: str, data: dict, location: str, redirect, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from memtomem_stm.cli import hook_registration
+
+    path = redirect(host)
+    _seed(path, data, HOOK_HOSTS[host].fmt)
+
+    # Positive control: with the POSIX rules the handler is STM's own.
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: False)
+    assert plan_install(host, _CMD.format(host=host)).unmanaged == ()
+    assert plan_uninstall(host).status != "not_installed"
+
+    monkeypatch.setattr(hook_registration, "running_on_windows", lambda: True)
+    installed = plan_install(host, _CMD.format(host=host))
+    removed = plan_uninstall(host)
+    assert installed.unmanaged == (location,)
+    assert installed.unmanaged_after == (location,)  # appended after it, so it stays put
     assert removed.status == "not_installed"
     assert removed.unmanaged == (location,)
 
