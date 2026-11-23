@@ -220,9 +220,10 @@ def parse_managed_hook_runtime(command: str) -> PartialHostRuntimePolicy:
         )
     )
     return PartialHostRuntimePolicy(
-        use_daemon=_parse_bool(
-            env_values.get(_USE_DAEMON_ENV) or env_values.get(_SURFACING_USE_DAEMON_ENV)
-        ),
+        # Only the variable the hook reads (``hook_cmd._daemon_enabled``):
+        # ``MEMTOMEM_STM_SURFACING__USE_DAEMON`` sends the standalone proxy's
+        # LTM calls to the daemon and says nothing about the hook's mode.
+        use_daemon=_parse_bool(env_values.get(_USE_DAEMON_ENV)),
         surfacing_timeout_seconds=_parse_positive_float(env_values.get(_SURFACING_TIMEOUT_ENV)),
         daemon_timeout_seconds=_parse_positive_float(env_values.get(_DAEMON_TIMEOUT_ENV)),
         persist_query_text=_parse_bool(env_values.get(_PERSIST_QUERY_TEXT_ENV)),
