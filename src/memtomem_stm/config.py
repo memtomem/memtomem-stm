@@ -6,6 +6,9 @@ import ipaddress
 import logging
 import os
 import re
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -652,7 +655,14 @@ class STMConfig(BaseSettings):
         ``prefix`` (#835). The completion source hands the file's entry for
         those server names to the merge, below the environment, so env fields
         still win — see ``UpstreamServerCompletionSource`` for its scope.
+
+        A :func:`load_env_stm_config` ``env_overlay`` is applied to the env
+        source's own snapshot here, so the build reads it as it would read the
+        same variables set in ``os.environ``, which stays untouched.
         """
+        overlay = _ENV_OVERLAY.get()
+        if overlay and isinstance(env_settings, EnvSettingsSource):
+            env_settings.env_vars = _overlaid_env_vars(env_settings, overlay)
         return (
             init_settings,
             env_settings,
@@ -794,7 +804,65 @@ class EnvSTMConfigLoad:
     proxy_error: ValidationError | SettingsError | None = None
 
 
-def load_env_stm_config() -> EnvSTMConfigLoad:
+HOOK_FLAG_ENV_NAMES = frozenset(
+    {
+        "MEMTOMEM_STM_HOOK__USE_DAEMON",
+        "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+        "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
+        "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
+    }
+)
+"""The variables ``mms hook`` sets from its command's flags
+(``host_runtime.runtime_env_overrides``), spelled as it sets them: the only
+names a :func:`load_env_stm_config` ``env_overlay`` accepts. Doctor's hook
+route reads them only through that build; the route itself follows the
+command's daemon flag directly when it has one, as the hook does (#1501). The
+hook's own deadline backstop reads one directly, in the hook process."""
+
+_ENV_OVERLAY: ContextVar[Mapping[str, str] | None] = ContextVar("_ENV_OVERLAY", default=None)
+"""Variables :func:`load_env_stm_config` lays over the environment for one build.
+
+A context variable, not ``os.environ``: a build running in another context
+(another thread, unless it was started with a copy of this one) does not see
+it, and the scope resets it on every exit, a raising build included."""
+
+
+def _overlaid_env_vars(
+    env_settings: EnvSettingsSource, overlay: Mapping[str, str]
+) -> dict[str, str | None]:
+    """``env_settings.env_vars`` as if *overlay* had been set in ``os.environ``.
+
+    *overlay* holds only :data:`HOOK_FLAG_ENV_NAMES`, upper case as Windows
+    stores every name, so merging it into a copy of ``os.environ`` is what
+    assignment does there too. Setting a variable that is already there
+    replaces it in place, as
+    ``os.environ[name] = value`` does, before names are folded to lower case.
+    So when another spelling of the same name comes later in the environment
+    (POSIX allows both ``MEMTOMEM_STM_X`` and ``memtomem_stm_x``), that one
+    still wins the fold, for the hook that sets the variable and here alike.
+    Values pass through unparsed: ``STMConfig`` sets neither
+    ``env_ignore_empty`` nor ``env_parse_none_str``.
+    """
+    case_sensitive = env_settings.case_sensitive
+
+    def fold(name: str) -> str:
+        return name if case_sensitive else name.lower()
+
+    merged = {**os.environ, **overlay}
+    folded = {fold(name): value for name, value in merged.items()}
+    return {**env_settings.env_vars, **{fold(name): folded[fold(name)] for name in overlay}}
+
+
+@contextmanager
+def _env_overlay(values: Mapping[str, str] | None) -> Iterator[None]:
+    token = _ENV_OVERLAY.set(values)
+    try:
+        yield
+    finally:
+        _ENV_OVERLAY.reset(token)
+
+
+def load_env_stm_config(env_overlay: Mapping[str, str] | None = None) -> EnvSTMConfigLoad:
     """Bare ``STMConfig()`` for the readers that never touch ``proxy`` (#847).
 
     The hook and the daemon read ``surfacing``, ``hook`` and ``daemon``. A
@@ -811,17 +879,27 @@ def load_env_stm_config() -> EnvSTMConfigLoad:
     Only ``ValidationError`` and ``SettingsError`` are retried; anything else
     propagates as it is. Commands that serialize or serve the proxy subtree
     (registration, the MCP server) keep the strict construction.
+
+    ``env_overlay`` builds as if those variables were also set in the
+    environment, without setting them: ``mms doctor`` builds the hook's config
+    this way from the variables the hook sets from its command's flags
+    (#1494). It accepts only :data:`HOOK_FLAG_ENV_NAMES`, and raises
+    ``ValueError`` for any other name.
     """
-    try:
-        return EnvSTMConfigLoad(STMConfig())
-    except (ValidationError, SettingsError) as exc:
-        if not any(_is_proxy_env_name(name) for name in os.environ):
-            raise
+    unknown = sorted(set(env_overlay or ()) - HOOK_FLAG_ENV_NAMES)
+    if unknown:
+        raise ValueError(f"env_overlay accepts only the hook's flag variables, not {unknown}")
+    with _env_overlay(env_overlay):
         try:
-            config = _ProxyEnvIgnoredSTMConfig()
-        except (ValidationError, SettingsError):
-            raise exc from None
-        return EnvSTMConfigLoad(config, exc)
+            return EnvSTMConfigLoad(STMConfig())
+        except (ValidationError, SettingsError) as exc:
+            if not any(_is_proxy_env_name(name) for name in os.environ):
+                raise
+            try:
+                config = _ProxyEnvIgnoredSTMConfig()
+            except (ValidationError, SettingsError):
+                raise exc from None
+            return EnvSTMConfigLoad(config, exc)
 
 
 def log_proxy_env_ignored(
