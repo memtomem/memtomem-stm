@@ -110,7 +110,8 @@ changes inline only. See the deprecation policy in
   not in the `ltm` row. A `MEMTOMEM_STM_HOOK` JSON value
   that sets `use_daemon` to false no longer moves the row to the direct
   route, since the hook ignores it. `mms health`, and doctor with the hook's
-  daemon off, keep the standalone view built from `--config`. Known limit:
+  daemon off, keep the standalone view built from `--config`. Known limit
+  (narrowed for Claude Code user settings by the next entry, issue #1494):
   doctor sees its own environment, not the host's, and does not read the
   options registered on the hook command, which also change the daemon's
   fingerprint. `mms hook install` writes `--no-persist-query-text` unless the
@@ -122,6 +123,42 @@ changes inline only. See the deprecation policy in
   standalone `surfacing.use_daemon` daemon and `MEMTOMEM_STM_HOOK__USE_DAEMON`
   unset or true in doctor's environment, doctor now looks under the bare
   hook's fingerprint, not the `--config` one (#1494).
+- `mms doctor`'s `ltm` row reads the hook command `mms hook install` wrote
+  into Claude Code's user settings before it looks the hook's daemon up
+  (issue #1494). The hook applies that command's runtime options over its
+  environment, and two of them change the daemon's fingerprint: install
+  writes `--no-persist-query-text`, while the settings default to persisting
+  query text. So doctor reported the daemon of an ordinarily installed hook
+  as unreachable, and next to a hook installed with `--no-daemon` it probed
+  the hook's daemon instead of the standalone route. Doctor now reads the
+  file `mms hook install --host claude` writes. It acts only when that file
+  holds exactly one handler install owns (the rule of #1499) and nothing
+  else that may run STM's hook. Then doctor decides the hook's daemon gate
+  and builds the hook's configuration with that command's settings applied
+  as the hook applies its flags: `--use-daemon`/`--no-daemon`,
+  `--surfacing-timeout-seconds`, `--daemon-timeout-seconds` and
+  `--[no-]persist-query-text`. The standalone route's build does not see
+  them. In any other case doctor keeps the view from its own environment
+  alone: no owned handler, several, a handler install does not own that may
+  still run the hook (a hand-written `mms hook --host claude`, an
+  `env MEMTOMEM_STM_…` prefix, exec-form `args`), a handler with a non-Bash
+  `shell`, an unreadable settings file, or any handler on Windows. The row
+  now ends with the route it chose and why, naming the handler's location
+  (`hooks.PostToolUse[i].hooks[j]`), never its text. Handlers that may run
+  STM's hook are found with the look-alike test `mms hook install` uses,
+  except that one `mms hook` would not run as the bridge (`--help`, a
+  subcommand) is left out. One behind a wrapper script or spelled with shell
+  syntax can be missed. Some handlers that cannot run the hook (a comment,
+  an exec-form `--help` with a quoted argument) are counted anyway, and then
+  doctor falls back to its own environment.
+  **Behavior change**: with an installed hook, the `ltm` row,
+  `--measure-ltm` and the timeout checks describe the daemon the hook's
+  options select. A `--no-daemon` hook sends them to the standalone route or
+  the direct LTM probe. The row's detail gains that note. Not covered:
+  Claude Code project, local and managed settings, other hosts' hook
+  configurations, and the host's own environment. The `--measure-ltm`,
+  timeout and `mms daemon status` advice still names commands that run in
+  doctor's environment.
 - `mms hook install` and `mms hook uninstall` now manage only the handlers
   install writes (#1499, issues #1453, #1460, #1461, #1476, #1483, #1484).
   They used to decide whether a handler was STM's hook by reading its command the way

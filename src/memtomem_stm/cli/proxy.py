@@ -27,7 +27,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import wraps
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, TextIO, TypeGuard
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TextIO, TypeGuard
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import click
@@ -10267,6 +10267,195 @@ def _all_config_secret_values(data: dict[str, Any]) -> list[str]:
     return values
 
 
+@dataclass(frozen=True)
+class _HookCommandView:
+    """What doctor read of the STM hook command in Claude Code's user settings (#1494).
+
+    ``state`` is ``found`` (exactly one handler ``mms hook install`` owns, and
+    nothing else that may run the hook), ``none``, ``several``, ``unreadable``
+    (a handler install does not own that may still run the hook, so what it
+    would build is unknown), ``windows`` (shell form there may run under Git
+    Bash or PowerShell, which this reader does not model; the ``hook
+    registration`` row does not read it either) or ``settings_error``.
+    ``locations`` name the handlers (``hooks.PostToolUse[i].hooks[j]``), never
+    their command text, which can hold credentials. ``env`` is only set for
+    ``found``: the variables the hook sets from that command's flags.
+    """
+
+    state: Literal["found", "none", "several", "unreadable", "windows", "settings_error"]
+    path: Path | None = None
+    locations: tuple[str, ...] = ()
+    env: dict[str, str] = dataclass_field(default_factory=dict)
+    settings_error: str | None = None
+
+    @property
+    def gate_from_command(self) -> bool:
+        """Whether the found command sets the hook's daemon gate."""
+        from memtomem_stm.cli.host_runtime import _USE_DAEMON_ENV
+
+        return _USE_DAEMON_ENV in self.env
+
+
+def _owned_settings_env(settings: Any) -> dict[str, str]:
+    """The variables ``mms hook`` sets from an owned command's flags.
+
+    ``settings`` (``OwnedHookCommand.settings``) was read from those flags
+    through ``runtime_env_overrides``; passing it through that overlay again
+    gives the same variables, since the overlay is idempotent on its own
+    output."""
+    from memtomem_stm.cli.host_runtime import format_seconds, runtime_env_overrides
+
+    def flag(value: bool | None) -> str | None:
+        return None if value is None else ("true" if value else "false")
+
+    def seconds(value: float | None) -> str | None:
+        return None if value is None else format_seconds(value)
+
+    return runtime_env_overrides(
+        use_daemon=flag(settings.use_daemon),
+        surfacing_timeout_seconds=seconds(settings.surfacing_timeout_seconds),
+        daemon_timeout_seconds=seconds(settings.daemon_timeout_seconds),
+        persist_query_text=flag(settings.persist_query_text),
+    )
+
+
+def _hook_command_view() -> _HookCommandView:
+    """Read the STM hook command doctor's hook view should be built with.
+
+    Reads the file ``mms hook install --host claude`` writes, as the ``hook
+    registration`` row does. A handler is recognized when install owns it
+    (``hook_hosts.owned_handler``: install's own words, ``"type": "command"``,
+    no ``args``) and it has no ``shell`` other than Bash. Its settings are
+    then known exactly, from its flags. Any other ``command`` handler that may
+    run STM's hook (install's look-alike test, ``unmanaged_stm_like``) makes
+    the view ``unreadable``: it runs too, and what it would build is unknown.
+    A handler ``mms hook`` would not run as the bridge (``--help``, a
+    subcommand), and one that is not a ``command`` handler, run nothing and
+    are ignored.
+    """
+    from memtomem_stm.cli import hook_hosts
+    from memtomem_stm.cli.hook_registration import (
+        inspect_hook_registration,
+        is_candidate,
+        running_on_windows,
+    )
+
+    try:
+        path, handlers = hook_hosts.claude_post_tool_handlers()
+    except Exception as exc:
+        detail, _action = _hook_settings_read_failure(exc)
+        return _HookCommandView("settings_error", settings_error=detail)
+    windows = running_on_windows()
+
+    def cannot_run_the_bridge(handler: dict[str, Any]) -> bool:
+        # The ``hook registration`` row's reader, which also reads exec form:
+        # ``{"command": "mms", "args": ["hook", "--help"]}`` only prints help.
+        registration = inspect_hook_registration(handler, windows=windows)
+        return registration.not_checked is None and not registration.runs_bridge
+
+    recognized: list[tuple[str, dict[str, str]]] = []
+    unreadable: list[str] = []
+    for location, handler in handlers or []:
+        if not isinstance(handler, dict) or handler.get("type") != "command":
+            continue
+        command = handler.get("command")
+        if not isinstance(command, str):
+            continue
+        owned = hook_hosts.owned_handler("claude", handler)
+        if owned is not None and handler.get("shell", "bash") == "bash":
+            recognized.append((location, _owned_settings_env(owned.settings)))
+        elif owned is not None or is_candidate(handler) or hook_hosts._words_name_the_hook(command):
+            if not cannot_run_the_bridge(handler):
+                unreadable.append(location)
+    every = tuple(loc for loc, _env in recognized) + tuple(unreadable)
+    if every and windows:
+        return _HookCommandView("windows", path, every)
+    if unreadable:
+        return _HookCommandView("unreadable", path, tuple(unreadable))
+    if len(recognized) > 1:
+        return _HookCommandView("several", path, every)
+    if recognized:
+        location, env = recognized[0]
+        return _HookCommandView("found", path, (location,), env)
+    return _HookCommandView("none", path)
+
+
+@contextmanager
+def _applied_env(values: dict[str, str]) -> Iterator[None]:
+    """Set ``values`` in ``os.environ`` for the block, as the hook does with its
+    flags (``hook_cmd._runtime_registration_env``). Every key set, or attempted,
+    is restored on the way out, including when setting a later one fails."""
+    previous: dict[str, str | None] = {}
+    try:
+        for key, value in values.items():
+            previous[key] = os.environ.get(key)
+            os.environ[key] = value
+        yield
+    finally:
+        for key, old in previous.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+
+def _hook_view_summary(view: _HookCommandView, *, hook_route: bool) -> dict[str, Any]:
+    """The JSON form of what doctor read: locations and the path, no values."""
+    return {
+        "state": view.state,
+        "path": None if view.path is None else str(view.path),
+        "locations": list(view.locations),
+        "hook_route": hook_route,
+        "gate_from_command": view.gate_from_command,
+        "settings_error": view.settings_error,
+    }
+
+
+def _hook_view_note(summary: Any, ltm: Any) -> str | None:
+    """The ``ltm server`` row's account of which route it probed and why (#1494)."""
+    if not isinstance(summary, dict):
+        return None
+    path = _disp(str(summary.get("path")))
+    locations = ", ".join(str(loc) for loc in summary.get("locations") or [])
+    state = summary.get("state")
+    # Why the command was not used, for every state but ``found``.
+    if state == "several":
+        unused = f"{len(summary['locations'])} STM hook commands ({locations}) in {path}"
+    elif state == "unreadable":
+        unused = f"a command that may run STM's hook could not be read ({locations}) in {path}"
+    elif state == "windows":
+        unused = f"hook commands are not read on Windows ({locations}) in {path}"
+    elif state == "settings_error":
+        unused = str(summary.get("settings_error"))
+    else:
+        unused = f"no STM hook command in {path}"
+    if summary.get("hook_route"):
+        # The configuration's inputs, not a claim that it built: the build can
+        # still fail validation on them.
+        if state == "found":
+            inputs = f"with the options of the STM hook command at {locations} in {path}"
+        else:
+            inputs = f"with doctor's environment only: {unused}"
+        note = f"route: the hook's daemon, {inputs}"
+    else:
+        # The route chosen, whether or not a probe ran (surfacing disabled, or a
+        # build that failed before the standalone route could be told apart).
+        if not isinstance(ltm, dict):
+            route = "standalone route"
+        elif ltm.get("route") == "daemon":
+            route = "standalone daemon route"
+        else:
+            route = "direct LTM probe"
+        if summary.get("gate_from_command"):
+            source = f"by the STM hook command at {locations}"
+        elif state == "found":
+            source = f"in doctor's environment (the STM hook command at {locations} sets no gate)"
+        else:
+            source = f"in doctor's environment ({unused})"
+        note = f"route: the {route}, hook's daemon off {source}"
+    return f"{note} (Claude Code user settings only)"
+
+
 def _surfacing_bootstrap_status(
     timeout: float,
     *,
@@ -10301,7 +10490,18 @@ def _surfacing_bootstrap_status(
       daemon identity before it applies the file's proxy settings; the file
       reaches that build only through upstream completion, which decides
       whether the build succeeds, not what it fingerprints.
+
+    Doctor also reads the STM hook command in Claude Code's user settings
+    (:func:`_hook_command_view`, #1494). When it finds exactly one that
+    ``mms hook install`` owns, and nothing else that may run the hook, the
+    gate and the hook's build run with the variables the hook sets from that
+    command's flags, so ``--no-daemon`` sends doctor to the
+    standalone route and ``--no-persist-query-text`` reaches the fingerprint.
+    The standalone build runs after the overlay is removed. Otherwise the hook
+    view is built from doctor's environment alone. The result's
+    ``hook_view`` says which.
     """
+    hook_view: dict[str, Any] | None = None
     try:
         from memtomem_stm.cli.rrf_diagnostics import rrf_boundary_doctor_checks
         from memtomem_stm.config import load_env_stm_config, stm_config_for_cli
@@ -10312,19 +10512,31 @@ def _surfacing_bootstrap_status(
         from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
 
         hook_route = False
+        ltm_status: dict[str, Any] | None = None
         if prefer_hook_daemon:
             from memtomem_stm.cli.hook_cmd import _daemon_enabled
 
-            hook_route = _daemon_enabled()
-        config = load_env_stm_config().config if hook_route else stm_config_for_cli(config_path)
+            view = _hook_command_view()
+            hook_view = _hook_view_summary(view, hook_route=False)
+            # Ping and measurement read ``os.environ`` too (the fingerprint
+            # takes ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS`` from it), so the probe
+            # runs inside the overlay.
+            with _applied_env(view.env):
+                hook_route = _daemon_enabled()
+                if hook_route:
+                    hook_view["hook_route"] = True
+                    config = load_env_stm_config().config
+                    # Before the probe, as on the standalone route: a feedback DB
+                    # path that cannot be inspected ends the section unprobed.
+                    db_status = inspect_feedback_db(config.surfacing.feedback_db_path)
+                    ltm_status = _ltm_status(
+                        config, timeout, measure_ltm=measure_ltm, hook_route=True
+                    )
+        if ltm_status is None:
+            config = stm_config_for_cli(config_path)
+            db_status = inspect_feedback_db(config.surfacing.feedback_db_path)
+            ltm_status = _ltm_status(config, timeout, measure_ltm=measure_ltm, hook_route=False)
         surfacing = config.surfacing
-        db_status = inspect_feedback_db(surfacing.feedback_db_path)
-        ltm_status = _ltm_status(
-            config,
-            timeout,
-            measure_ltm=measure_ltm,
-            hook_route=hook_route,
-        )
         # Judge Core's profile as it was sent, then render only its projection
         # (#1082): the checks below read the raw snapshot, so a value the
         # projection cannot represent never changes a verdict.
@@ -10340,7 +10552,7 @@ def _surfacing_bootstrap_status(
         )
         ltm_status["runtime_profile"] = project_runtime_profile(profile)
         fields = ("id", "label", "status", "detail", "next_action")
-        return {
+        status: dict[str, Any] = {
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
@@ -10361,13 +10573,16 @@ def _surfacing_bootstrap_status(
         # which can carry configured values (#1075) or anything the failing
         # code quoted (#1079).
         logger.debug("Surfacing bootstrap status inspection failed: %s", _disp(error))
-        return {
+        status = {
             "enabled": None,
             "feedback_enabled": None,
             "feedback_db": None,
             "ltm_server": None,
             "error": error,
         }
+    if hook_view is not None:
+        status["hook_view"] = hook_view
+    return status
 
 
 def _surfacing_bootstrap_error(exc: Exception) -> str:
@@ -11410,7 +11625,9 @@ def doctor(
     An explicit ``--config`` also steers the STMConfig-backed checks (LTM /
     surfacing), not just the proxy-file checks (#839), unless the hook would
     use the daemon: those checks then use the configuration the hook builds
-    from the environment, which ``--config`` does not reach (#1485).
+    from the environment, which ``--config`` does not reach (#1485), with the
+    options of the STM hook command in Claude Code's user settings applied
+    when they hold exactly one that ``mms hook install`` owns (#1494).
     """
     resolved_cfg = resolve_cli_config_path(config_path)
     config_path = resolved_cfg.path
@@ -11986,11 +12203,13 @@ def doctor(
                 config_path=_explicit_config_path(config_path),
             )
             ltm = surfacing_status.get("ltm_server")
+            view_note = _hook_view_note(surfacing_status.get("hook_view"), ltm)
+            view_suffix = f"; {view_note}" if view_note else ""
             if isinstance(ltm, dict) and ltm.get("connected"):
                 detail = str(ltm.get("display") or ltm.get("command") or "")
                 if ltm.get("version"):
                     detail = f"{detail}, version {ltm['version']}"
-                check("ltm", "ltm server", "PASS", f"connectable ({detail})")
+                check("ltm", "ltm server", "PASS", f"connectable ({detail}){view_suffix}")
                 for runtime_check in surfacing_status.get("runtime_profile_checks", []):
                     check(
                         runtime_check["id"],
@@ -12064,7 +12283,7 @@ def doctor(
                     "ltm server",
                     "WARN",
                     f"{cause} — only LTM-dependent features (memory surfacing) are "
-                    "disabled; the proxy core is unaffected",
+                    f"disabled; the proxy core is unaffected{view_suffix}",
                     (
                         "mms daemon status"
                         if isinstance(ltm, dict) and ltm.get("route") == "daemon"
