@@ -853,3 +853,80 @@ def test_fifo_settings_warn_instead_of_blocking(tmp_path: Path, claude_dir: Path
         "the Claude Code user settings path is not a regular file; "
         "STM hook registrations were not checked"
     )
+
+
+# Reading must not touch the process-wide streams (#1507). Two readings that overlap
+# used to restore each other's StringIO sink and leave stdout/stderr redirected for
+# good. Only one exit order does that, so the probe orders the readings with events:
+# A enters the strict parse first, B enters while A is inside, A finishes while B is
+# still gated, then B is released. It runs in its own interpreter because a red run
+# leaves the process streams swapped, which would corrupt pytest's capture.
+_OVERLAP_PROBE = """
+import json, sys, threading
+
+real = (sys.stdout, sys.stderr)
+out = sys.__stdout__
+orig = type(hook_command).make_context
+a_in, b_in, a_done = threading.Event(), threading.Event(), threading.Event()
+seen = {}
+
+def gated(self, info_name, args, parent=None, **extra):
+    if extra.get("resilient_parsing"):
+        return orig(self, info_name, args, parent=parent, **extra)
+    who = threading.current_thread().name
+    seen[who] = (sys.stdout is real[0], sys.stderr is real[1])
+    try:
+        if who == "A":
+            a_in.set()
+            assert b_in.wait(10), "B never entered"
+        else:
+            b_in.set()
+            assert a_done.wait(10), "A never finished"
+        return orig(self, info_name, args, parent=parent, **extra)
+    finally:
+        if who == "B":
+            a_done.set()
+
+type(hook_command).make_context = gated
+
+results = {}
+
+def run(name, args, wait_for=None):
+    try:
+        if wait_for is not None:
+            assert wait_for.wait(10)
+        r = _read_hook_args(args)
+        results[name] = [r.runs_bridge, r.host]
+    except BaseException as exc:
+        results[name] = repr(exc)
+    finally:
+        if name == "A":
+            a_done.set()
+            b_in.set()
+
+ta = threading.Thread(target=run, name="A", args=("A", ["--help", "--host", "claude"]))
+tb = threading.Thread(target=run, name="B", args=("B", ["--host", "claude"], a_in))
+ta.start(); tb.start(); ta.join(30); tb.join(30)
+print(json.dumps({
+    "results": results,
+    "streams_on_entry": seen,
+    "streams_restored": [sys.stdout is real[0], sys.stderr is real[1]],
+}), file=out)
+"""
+
+
+def test_overlapping_readings_leave_the_process_streams_alone() -> None:
+    probe = json.loads(_run_fresh(_OVERLAP_PROBE))
+    assert probe == {
+        "results": {"A": [False, "claude"], "B": [True, "claude"]},
+        "streams_on_entry": {"A": [True, True], "B": [True, True]},
+        "streams_restored": [True, True],
+    }
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_prints_nothing(flag: str, capsys: pytest.CaptureFixture[str]) -> None:
+    reading = hr._read_hook_args(["--host", "claude", flag])
+    assert reading == hr.HookRegistration(None, runs_bridge=False, host="claude")
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "")
