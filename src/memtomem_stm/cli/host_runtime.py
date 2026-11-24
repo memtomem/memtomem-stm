@@ -5,6 +5,10 @@ Host applications do not consistently inherit the shell environment in which
 that define the shared-daemon contract in the registration itself so an MCP
 server and a native hook discover the same warm daemon generation.
 
+The words of the hook command ``mms hook install`` writes are defined here
+too (:func:`hook_command_words`), next to the reader that decides whether an
+existing command has that form (:func:`owned_hook_command`).
+
 This module is intentionally internal to the CLI.  It does not add another
 public configuration model: the existing ``STMConfig`` fields and environment
 variables remain the source of truth at runtime.
@@ -15,6 +19,7 @@ from __future__ import annotations
 import math
 import re
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,51 +34,54 @@ _PERSIST_QUERY_TEXT_ENV = "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT"
 _TRUE = frozenset({"1", "true", "t", "yes", "y", "on"})
 _FALSE = frozenset({"0", "false", "f", "no", "n", "off"})
 
+HOOK_ENTRY_POINT = "memtomem-stm"
+"""The entry-point name ``mms hook install`` writes, bare or after ``uv run``."""
 
-# The lines whose ``shlex`` words are the words the shell passes on: plain
-# characters and blanks, single-quoted runs (literal to both readers), and
-# double-quoted runs without ``$``, backquote or ``\`` (nothing to expand or
-# escape). On these, quote removal is the only step that changes words, and
-# ``shlex`` performs it. It is the grammar ``shlex.join`` writes, so every
-# command ``mms hook install`` writes matches. ``~/`` may open the line: the
-# shell expands it to ``$HOME/``, which changes the executable's directory but
-# not its basename, the part recognition reads (``~user/`` and ``~+/`` are
-# refused, since they name another directory). Anything else (``#``,
-# ``$``, a glob, an operator, a line break, ``\``, NUL, a ``~`` elsewhere) fails
-# the match. ``\w`` is Unicode, so a non-ASCII path stays readable.
-_SPLIT_GRAMMAR = re.compile(
-    # Possessive (``++``, ``*+``): no backtracking positions are kept, so a
-    # long line costs no memory beyond itself.
-    r"(?:~(?=/))?(?:[\w@%+=:,./\- \t]++|'[^'\x00]*+'|\"[^\"$`\\\x00]*+\")*+"
-)
+_UV_LAUNCHER_HEAD = ("uv", "run", "--directory")
+_DAEMON_FLAGS = {True: "--use-daemon", False: "--no-daemon"}
+_PERSIST_FLAGS = {True: "--persist-query-text", False: "--no-persist-query-text"}
 
 
-def _shell_tokens(command: str) -> list[str] | None:
-    """The words the shell passes on for ``command``, or ``None`` when the line
-    holds shell syntax this split does not model (see ``_SPLIT_GRAMMAR``).
-
-    ``None`` fails closed: ``mms hook install`` and ``uninstall`` do not treat
-    the line as STM's hook, and no runtime setting is read from it. Operator
-    characters inside quotes come out as words of their own, which the
-    recognizer's operator guard still refuses."""
-    if not _shell_tokens_accepts(command):
-        return None
-    return _lenient_shell_tokens(command)
+def hook_launcher(directory: str | None = None) -> list[str]:
+    """The launcher words of an installed hook command: the bare console
+    script, or ``uv run --directory <directory>`` in front of it."""
+    if directory is None:
+        return [HOOK_ENTRY_POINT]
+    return [*_UV_LAUNCHER_HEAD, directory, HOOK_ENTRY_POINT]
 
 
-def _shell_tokens_accepts(command: str) -> bool:
-    """Whether :func:`_shell_tokens` reads ``command`` (a linear check that
-    does not split it)."""
-    return _SPLIT_GRAMMAR.fullmatch(command) is not None
+def hook_command_words(
+    launcher: Sequence[str], host: str, policy_words: Sequence[str]
+) -> list[str]:
+    """The words of an installed hook command. ``mms hook install`` joins them
+    with ``shlex.join``, and :func:`owned_hook_command` reads a command back
+    through this same function, so the two cannot drift apart."""
+    return [*launcher, "hook", "--host", host, *policy_words]
+
+
+def _policy_words(daemon_flag: str, surfacing: str, daemon: str, persist_flag: str) -> list[str]:
+    """The runtime-setting words of an installed hook command, in the order
+    every release since 0.1.40 has written them. A new written form is added
+    beside this one, never by editing it: commands written by older releases
+    must stay recognizable."""
+    return [
+        daemon_flag,
+        "--surfacing-timeout-seconds",
+        surfacing,
+        "--daemon-timeout-seconds",
+        daemon,
+        persist_flag,
+    ]
 
 
 def _lenient_shell_tokens(command: str) -> list[str]:
     """``shlex`` words of any line; on a parse error (an unbalanced quote, a
     trailing ``\\``), the words read before it, an empty word, then the
     ``str.split()`` words of the whole line, so neither reading is lost. An
-    approximation of the shell, used only to decide whether a line that
-    :func:`_shell_tokens` refuses still looks like STM's hook, never to act on
-    it or read settings from it."""
+    approximation of the shell, used only to decide whether a handler that
+    ``mms hook install`` does not own still looks like STM's hook, never to
+    act on it or read settings from it. ``shlex`` is quadratic in a word's
+    length."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -165,80 +173,135 @@ class HostRuntimePolicy:
     def hook_args(self) -> list[str]:
         """Cross-platform flags managed in a native hook command."""
         normalized = self.normalized()
-        return [
-            "--use-daemon" if normalized.use_daemon else "--no-daemon",
-            "--surfacing-timeout-seconds",
+        return _policy_words(
+            _DAEMON_FLAGS[normalized.use_daemon],
             format_seconds(normalized.surfacing_timeout_seconds),
-            "--daemon-timeout-seconds",
             format_seconds(normalized.daemon_timeout_seconds),
-            (
-                "--persist-query-text"
-                if normalized.persist_query_text
-                else "--no-persist-query-text"
-            ),
-        ]
+            _PERSIST_FLAGS[normalized.persist_query_text],
+        )
 
 
-def parse_managed_hook_runtime(command: str) -> PartialHostRuntimePolicy:
-    """Recover managed flags or the pre-flag inline-``env`` representation.
+@dataclass(frozen=True)
+class OwnedHookCommand:
+    """A hook command in the form ``mms hook install`` writes."""
 
-    Invalid values are ignored.  The install command is operator-facing and
-    will fall back to the current effective ``STMConfig`` for any missing
-    field; the runtime bridge independently stays fail-open for hand edits.
-    A command install does not recognize as STM's hook yields nothing.
-    """
-    # Lazy: ``hook_hosts`` imports this module.
-    from memtomem_stm.cli.hook_hosts import _stm_hook_words
-    from memtomem_stm.cli.hook_registration import hook_bridge_params
+    launcher: tuple[str, ...]
+    """:func:`hook_launcher`'s words for the command."""
+    settings: PartialHostRuntimePolicy
+    """The runtime settings the hook runs with when given the command's
+    flags; every field ``None`` for a command without them."""
 
-    # The words recognition reads (#1476): settings come from Click's own
-    # parse of the words after ``hook``, so a repeated flag resolves as the
-    # hook resolves it, and assignments only from a leading ``env`` launcher.
-    words = _stm_hook_words(command)
-    params = hook_bridge_params(list(words.args)) if words is not None else None
-    if words is None or params is None:
-        return PartialHostRuntimePolicy()
-    # The hook applies its flags as an overlay on its environment
-    # (``runtime_env_overrides``): an invalid flag value leaves the inline
-    # setting in effect, and a surfacing deadline flag also sets the daemon
-    # deadline (at least one second above it), over an inline one.
-    env_values: dict[str, str] = {}
-    for assignment in words.assignments:
-        key, _sep, value = assignment.partition("=")
-        env_values[key] = value
 
-    def option(name: str) -> str | None:
-        value = params.get(name)
-        return value if isinstance(value, str) else None
-
-    env_values.update(
-        runtime_env_overrides(
-            use_daemon=option("runtime_use_daemon"),
-            surfacing_timeout_seconds=option("surfacing_timeout_seconds"),
-            daemon_timeout_seconds=option("daemon_timeout_seconds"),
-            persist_query_text=option("runtime_persist_query_text"),
+# What ``format_seconds`` can write for a deadline, read as text: digits, an
+# optional fraction and an optional exponent, or ``inf`` / ``nan``. Text and
+# not a parsed number, because releases wrote ``inf``, ``nan`` and
+# ``1.79769313486232e+308`` (which ``float`` reads as infinity) when given
+# such a deadline, so the slot cannot require a finite value. ``9.0`` passes
+# where the writer prints ``9``; ``9e`` and ``1..2`` are not numbers at all.
+_NUMBER = r"(?:[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?|inf|nan)"
+_POLICY_TAIL = re.compile(
+    " "
+    + " ".join(
+        _policy_words(
+            "(" + "|".join(_DAEMON_FLAGS.values()) + ")",
+            f"({_NUMBER})",
+            f"({_NUMBER})",
+            "(" + "|".join(_PERSIST_FLAGS.values()) + ")",
         )
     )
+)
+# ``/…``, ``C:\…`` or ``C:/…``, ``\\server\…``. The writer takes the directory
+# from ``Path.cwd()``, and a relative word can mean something else to a host
+# shell: ``shlex.join`` leaves ``@project`` bare, which PowerShell splats.
+_ABSOLUTE_DIRECTORY = re.compile(r"/|[A-Za-z]:[\\/]|\\\\")
+
+
+def owned_hook_command(command: str, host: str) -> OwnedHookCommand | None:
+    """``command`` read as a hook command ``mms hook install --host <host>``
+    writes, or ``None`` when it does not have that form.
+
+    The form is :func:`hook_command_words` joined by ``shlex.join``: a
+    :func:`hook_launcher`, ``hook --host <host>``, then either nothing or the
+    six setting words. The directory of a ``uv run`` launcher is any absolute
+    path and each deadline is a number as ``format_seconds`` spells one, or
+    ``inf`` / ``nan``; everything else is
+    fixed, down to the spacing and the quoting ``shlex.join`` chooses.
+
+    The last step decides: the command must equal the join of the words read
+    from it. The steps before only propose those words, so a mistake in them
+    can refuse a command but cannot accept one the writer's join would not
+    produce. Nothing here models a shell, and the cost is linear in the
+    command's length (no ``shlex.split``)."""
+    marker = " " + " ".join(hook_command_words((), host, ()))
+    at = command.rfind(marker)
+    if at < 0:
+        return None
+    head, tail = command[:at], command[at + len(marker) :]
+    policy_words: list[str] = []
+    if tail:
+        match = _POLICY_TAIL.fullmatch(tail)
+        if match is None:
+            return None
+        policy_words = _policy_words(*match.groups())
+    if head == HOOK_ENTRY_POINT:
+        launcher = hook_launcher()
+    else:
+        before, after = " ".join(_UV_LAUNCHER_HEAD) + " ", " " + HOOK_ENTRY_POINT
+        if not (head.startswith(before) and head.endswith(after)):
+            return None
+        directory = _unquoted(head[len(before) : len(head) - len(after)])
+        if "\x00" in directory or not _ABSOLUTE_DIRECTORY.match(directory):
+            return None
+        launcher = hook_launcher(directory)
+    if shlex.join(hook_command_words(launcher, host, policy_words)) != command:
+        return None
+    return OwnedHookCommand(tuple(launcher), _hook_settings(policy_words))
+
+
+def _unquoted(word: str) -> str:
+    """The string ``shlex.quote`` wrote ``word`` for, when it is one of the
+    two shapes ``shlex.quote`` writes; any other text comes back unchanged
+    and fails the comparison in :func:`owned_hook_command`."""
+    if len(word) >= 2 and word[0] == word[-1] == "'":
+        return word[1:-1].replace("'\"'\"'", "'")
+    return word
+
+
+def _hook_settings(policy_words: Sequence[str]) -> PartialHostRuntimePolicy:
+    """The settings the hook runs with when given ``policy_words``.
+
+    Read through :func:`runtime_env_overrides`, the overlay ``mms hook``
+    applies to these flags, so a deadline that is not a positive finite number
+    is dropped and the daemon deadline is at least a second above a usable
+    surfacing one, exactly as at run time."""
+    if not policy_words:
+        return PartialHostRuntimePolicy()
+    daemon_flag, _, surfacing, _, daemon, persist_flag = policy_words
+    overlay = runtime_env_overrides(
+        use_daemon="true" if daemon_flag == _DAEMON_FLAGS[True] else "false",
+        surfacing_timeout_seconds=surfacing,
+        daemon_timeout_seconds=daemon,
+        persist_query_text="true" if persist_flag == _PERSIST_FLAGS[True] else "false",
+    )
     return PartialHostRuntimePolicy(
-        # Only the variable the hook reads (``hook_cmd._daemon_enabled``):
-        # ``MEMTOMEM_STM_SURFACING__USE_DAEMON`` sends the standalone proxy's
-        # LTM calls to the daemon and says nothing about the hook's mode.
-        use_daemon=_parse_bool(env_values.get(_USE_DAEMON_ENV)),
-        surfacing_timeout_seconds=_parse_positive_float(env_values.get(_SURFACING_TIMEOUT_ENV)),
-        daemon_timeout_seconds=_parse_positive_float(env_values.get(_DAEMON_TIMEOUT_ENV)),
-        persist_query_text=_parse_bool(env_values.get(_PERSIST_QUERY_TEXT_ENV)),
+        use_daemon=_parse_bool(overlay.get(_USE_DAEMON_ENV)),
+        surfacing_timeout_seconds=_parse_positive_float(overlay.get(_SURFACING_TIMEOUT_ENV)),
+        daemon_timeout_seconds=_parse_positive_float(overlay.get(_DAEMON_TIMEOUT_ENV)),
+        persist_query_text=_parse_bool(overlay.get(_PERSIST_QUERY_TEXT_ENV)),
     )
 
 
 def resolve_host_runtime_policy(
     *,
-    existing_command: str | None = None,
+    existing: PartialHostRuntimePolicy | None = None,
     use_daemon: bool | None = None,
     surfacing_timeout_seconds: float | None = None,
     config_path: str | Path | None = None,
 ) -> HostRuntimePolicy:
     """Resolve CLI overrides > existing registration > effective config.
 
+    *existing* is the settings of the hook command being replaced
+    (:attr:`OwnedHookCommand.settings`), ``None`` for a fresh registration.
     Query text remains non-persistent for a fresh managed registration.  An
     existing registration that explicitly opted in is retained on refresh;
     ``--inherit-runtime-env`` is the escape hatch for removing all serialized
@@ -256,11 +319,8 @@ def resolve_host_runtime_policy(
     # ClickException with the env-var hint, and a resolver-side
     # ``exc_info`` log printed the raw traceback right before it.
     config = stm_config_for_cli(config_path)
-    existing = (
-        parse_managed_hook_runtime(existing_command)
-        if existing_command is not None
-        else PartialHostRuntimePolicy()
-    )
+    if existing is None:
+        existing = PartialHostRuntimePolicy()
     policy = HostRuntimePolicy(
         use_daemon=(
             use_daemon
@@ -325,10 +385,14 @@ def runtime_env_overrides(
 
 
 __all__ = [
+    "HOOK_ENTRY_POINT",
     "HostRuntimePolicy",
+    "OwnedHookCommand",
     "PartialHostRuntimePolicy",
     "format_seconds",
-    "parse_managed_hook_runtime",
+    "hook_command_words",
+    "hook_launcher",
+    "owned_hook_command",
     "resolve_host_runtime_policy",
     "runtime_env_overrides",
 ]

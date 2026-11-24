@@ -54,9 +54,12 @@ then runs from that project's environment, and install says so in its output.
 To get the bare launcher (for example with `uv tool install memtomem-stm`),
 re-run install from a directory where no such `pyproject.toml` is found.
 
-Reinstalling recognizes and migrates older POSIX commands that began with
-`env MEMTOMEM_STM_...`; the replacement uses cross-platform runtime flags and
-retains the existing managed timeout. The flags are listed in the
+Reinstalling updates the command install wrote earlier in place and keeps its
+daemon, timeout and query-text settings. A command install did not write,
+such as one that names `mms` or begins with `env MEMTOMEM_STM_...`, is left
+as it is, and install adds its own beside it; see
+[`mms hook install`](../cli.md).
+The runtime flags are listed in the
 [hook CLI reference](../reference/cli-hooks.md#mms-hook). Unknown host-specific fields on the hook
 entry are preserved.
 
@@ -90,9 +93,9 @@ before diagnosing an apparently missing STM registration.
 
 ## Runtime host selection
 
-The installed command includes `mms hook --host <name>`. On the runtime bridge,
-`--host` accepts text rather than a strict Choice because a non-zero usage exit
-could block a host action. An unrecognized or bare value warns and falls back
+The installed command includes `memtomem-stm hook --host <name>`. On the runtime
+bridge, `--host` accepts text rather than a strict Choice because a non-zero
+usage exit could block a host action. An unrecognized or bare value warns and falls back
 to auto-detection. `install` and `uninstall` remain strict operator commands.
 
 Auto-detection recognizes Codex when the payload carries a non-empty `turn_id`.
@@ -165,21 +168,21 @@ prints a warning to stderr, and returns it as `systemMessage`, which Claude Code
 and Codex document as a warning shown to the user. Claude Code does not show the stderr of a hook
 that exits 0 outside its debug log.
 
-To fix it, add `--host claude` to the hook command where it is registered.
-`mms hook install --host claude --apply` does that for the user settings file
-(`$CLAUDE_CONFIG_DIR/settings.json`, otherwise `~/.claude/settings.json`), but
-not for Claude Code's project or local settings. It replaces the STM hook
-commands it recognizes in that file (`mms hook …` under any entry-point name,
-`uv run --directory <dir> memtomem-stm hook …`, or either behind an `env` that
-sets only `MEMTOMEM_STM_*` variables, and only when the words after `hook` run
-the hook; see [`mms hook install`](../cli.md)) with one new command. It
-carries settings over from
-the first of them only, and of that command's inline `env` assignments it keeps
-only the daemon, timeout and query-text settings, as flags. A command it does
-not recognize, such as `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook` or
-one behind `env` with another variable, stays in place next to the new one;
-install and uninstall name its location (`hooks.PostToolUse[i].hooks[j]`) when
-it looks like STM's hook, and you edit such a registration by hand.
+To fix it, add `--host claude` to the hook command where it is registered; for
+a command you registered by hand, that is a hand edit.
+`mms hook install --host claude --apply` writes a correct registration into
+the user settings file (`$CLAUDE_CONFIG_DIR/settings.json`, otherwise
+`~/.claude/settings.json`), but not into Claude Code's project or local
+settings. It replaces only a command install wrote earlier
+(`memtomem-stm hook --host claude`, bare or after `uv run --directory <dir>`,
+with install's own setting flags or none; see
+[`mms hook install`](../cli.md)),
+and carries that command's daemon, timeout and query-text settings over. Any
+other STM hook command, such as `mms hook`,
+`MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook` or one behind `env`,
+stays in place next to the new one; install and uninstall name its location
+(`hooks.PostToolUse[i].hooks[j]`) when it looks like STM's hook, and you edit
+or remove such a registration by hand.
 
 See the [hook CLI reference](../reference/cli-hooks.md) and the complete
 [environment-variable reference](../reference/environment-variables.md).

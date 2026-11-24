@@ -2148,12 +2148,8 @@ def test_refused_notice_also_covers_output_the_retention_guard_would_keep(
             _bash_payload({"stdout": _BIG_STDOUT}),
             id="budget_too_small",
         ),
-        pytest.param(
-            {}, _bash_payload({"stdout": _BIG_STDOUT, "exitCode": 1}), id="unsafe_result"
-        ),
-        pytest.param(
-            {}, _bash_payload({"stdout": _BIG_STDOUT}, tool="Read"), id="ineligible_tool"
-        ),
+        pytest.param({}, _bash_payload({"stdout": _BIG_STDOUT, "exitCode": 1}), id="unsafe_result"),
+        pytest.param({}, _bash_payload({"stdout": _BIG_STDOUT}, tool="Read"), id="ineligible_tool"),
         pytest.param({}, _bash_payload(_BIG_STDOUT), id="unsupported_shape"),
         pytest.param(
             {},
@@ -2343,11 +2339,7 @@ def test_bare_hook_process_writes_the_notice_to_stderr(tmp_path: Path):
     import subprocess
     import sys
 
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("MEMTOMEM_STM_")
-    }
+    env = {key: value for key, value in os.environ.items() if not key.startswith("MEMTOMEM_STM_")}
     env.update(
         {
             "HOME": str(tmp_path / "home"),
@@ -2387,63 +2379,83 @@ def test_bare_hook_process_writes_the_notice_to_stderr(tmp_path: Path):
 # ── what `mms hook install --host claude` keeps (docs/guides/native-hooks.md) ──
 
 
-def test_install_keeps_only_daemon_timeout_and_query_text_from_inline_env():
-    """The guide says install turns an inline ``env`` wrapper's daemon,
-    timeout and query-text settings into flags and keeps nothing else, which
-    is why the #1437 notice asks for a hand edit instead of naming install."""
+def test_install_carries_settings_over_only_from_a_command_it_wrote():
+    """The guide says install carries the daemon, timeout and query-text
+    settings over from the command it owns and reads nothing from any other,
+    which is why the #1437 notice asks for a hand edit instead of naming
+    install."""
     import shlex
 
     from memtomem_stm.cli.hook_cmd import _hook_install_command_argv
-    from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
+    from memtomem_stm.cli.host_runtime import owned_hook_command, resolve_host_runtime_policy
 
-    existing = (
+    hand_written = (
         "env MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 MEMTOMEM_STM_HOOK__METRICS_ENABLED=0 "
         "MEMTOMEM_STM_HOOK__USE_DAEMON=0 MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=9 mms hook"
     )
+    assert owned_hook_command(hand_written, "claude") is None
+
+    owned = owned_hook_command(
+        "memtomem-stm hook --host claude --no-daemon --surfacing-timeout-seconds 9 "
+        "--daemon-timeout-seconds 10 --persist-query-text",
+        "claude",
+    )
+    assert owned is not None
     policy = resolve_host_runtime_policy(
-        existing_command=existing, use_daemon=None, surfacing_timeout_seconds=None
+        existing=owned.settings, use_daemon=None, surfacing_timeout_seconds=None
     )
     argv = _hook_install_command_argv("claude", policy=policy)
-    rewritten = shlex.join(argv)
 
     assert argv[argv.index("hook") :][:3] == ["hook", "--host", "claude"]
     assert "--no-daemon" in argv
     assert argv[argv.index("--surfacing-timeout-seconds") + 1] == "9"
-    assert "MEMTOMEM_STM_" not in rewritten
+    assert "--persist-query-text" in argv
+    assert "MEMTOMEM_STM_" not in shlex.join(argv)
 
 
-def test_install_replaces_every_stm_handler_with_one(tmp_path: Path, monkeypatch):
+def test_install_replaces_every_handler_it_owns_with_one_and_leaves_the_rest(
+    tmp_path: Path, monkeypatch
+):
     from memtomem_stm.cli import hook_hosts
 
     config_dir = tmp_path / "claude"
     config_dir.mkdir()
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    look_alikes = [
+        {"type": "command", "command": "mms hook"},
+        {
+            "type": "command",
+            "command": "env MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS=8000 mms hook --host claude",
+        },
+    ]
+    owned = [
+        {"type": "command", "command": "memtomem-stm hook --host claude"},
+        {
+            "type": "command",
+            "command": "uv run --directory /old memtomem-stm hook --host claude",
+        },
+    ]
     (config_dir / "settings.json").write_text(
         json.dumps(
             {
                 "hooks": {
                     "PostToolUse": [
-                        {
-                            "matcher": "Read|Grep|Glob|Bash",
-                            "hooks": [
-                                {"type": "command", "command": "mms hook"},
-                                {
-                                    "type": "command",
-                                    "command": "env MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS"
-                                    "=8000 mms hook --host claude",
-                                },
-                            ],
-                        }
+                        {"matcher": "Read|Grep|Glob|Bash", "hooks": [*look_alikes, *owned]}
                     ]
                 }
             }
         )
     )
+    new = "uv run --directory /new memtomem-stm hook --host claude"
 
-    change = hook_hosts.plan_install("claude", "mms hook --host claude")
+    change = hook_hosts.plan_install("claude", new)
 
     handlers = json.loads(change.new_text)["hooks"]["PostToolUse"][0]["hooks"]
-    assert [h["command"] for h in handlers] == ["mms hook --host claude"]
+    assert handlers == [*look_alikes, {"type": "command", "command": new}]
+    assert change.unmanaged == (
+        "hooks.PostToolUse[0].hooks[0]",
+        "hooks.PostToolUse[0].hooks[1]",
+    )
 
 
 @pytest.mark.parametrize(("stdout", "notice"), [(_BIG_STDOUT, True), ("ok\n", False)])

@@ -11,7 +11,7 @@ Two stages, two hook fields. *Surfacing* appends ``additionalContext`` (the
 side-effect-free play). *Compression* (P1a) *replaces* a built-in tool's output
 via ``updatedToolOutput`` and is **Bash-only and opt-in**
 (``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``) and runs only when the hook is
-registered as ``mms hook --host claude`` (an ``auto`` registration cannot tell
+registered with an explicit ``--host claude`` (an ``auto`` registration cannot tell
 Claude from Codex, so it never replaces output; on a call compression would
 have attempted it reports the refusal through ``systemMessage`` instead, #1437):
 for the built-in Bash tool the
@@ -45,14 +45,17 @@ refusal found before a failure that the per-call barrier catches, a timeout
 included (#1437); the tool result still passes through. A ``BaseException``
 that reaches the outermost barrier still emits ``{}``.
 
-Register in Claude Code ``settings.json``::
+Register by hand in Claude Code ``settings.json``::
 
     {"hooks": {"PostToolUse": [
       {"matcher": "Read|Grep|Glob|Bash",
        "hooks": [{"type": "command", "command": "mms hook --host claude"}]}]}}
 
-``mms hook install --host claude --apply`` writes this block (without
-``--apply`` it previews it).
+``mms hook install --host claude --apply`` writes the registration for you
+(without ``--apply`` it previews it): the same block under the
+``memtomem-stm`` name, with its runtime flags. Install manages only the block
+it writes, so one registered by hand, like the example above, stays in place
+beside it.
 
 Performance — daemon by default: surfacing routes through the local daemon
 (``HookConfig.use_daemon`` defaults ``True``), a warm LTM connection that turns
@@ -97,6 +100,7 @@ from memtomem_stm.cli.hook_adapter import (
 from memtomem_stm.cli.host_runtime import (
     HostRuntimePolicy,
     format_seconds,
+    hook_command_words,
     resolve_host_runtime_policy,
     runtime_env_overrides,
 )
@@ -105,6 +109,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from memtomem_stm.cli.hook_adapter import CanonicalHookCall, HostHookAdapter
+    from memtomem_stm.cli.host_runtime import OwnedHookCommand
     from memtomem_stm.config import EnvSTMConfigLoad, HookCompressionConfig, STMConfig
     from memtomem_stm.surfacing.config import SurfacingConfig
 
@@ -1314,10 +1319,11 @@ def _hook_install_command_argv(
 
         launcher = _detect_install_type()
     server_cmd, server_args = launcher
-    argv = [server_cmd, *server_args, "hook", "--host", host]
-    if policy is not None:
-        argv.extend(policy.hook_args())
-    return argv
+    # One definition of the written words, shared with the reader that decides
+    # which existing handlers are install's own (``owned_hook_command``).
+    return hook_command_words(
+        [server_cmd, *server_args], host, policy.hook_args() if policy is not None else ()
+    )
 
 
 def _emit_unmanaged(
@@ -1328,7 +1334,9 @@ def _emit_unmanaged(
 
     ``written`` says whether ``locations`` index the file just written or the
     current one; a preview names the current file, since that is the one the
-    operator can open now."""
+    operator can open now. For an install the line says the handlers stay
+    beside STM's hook, not that they run: whether one runs depends on its
+    matcher, its event and the host's own approval, none of which is read."""
     if not locations:
         return
     from memtomem_stm.cli.proxy import _warn
@@ -1347,6 +1355,8 @@ def _emit_unmanaged(
         stays = "they will stay" if preview else "they stay"
         them = "them"
     where = "in the written file" if written else "in the current file"
+    if change.action == "install":
+        stays += " beside memtomem-stm's hook"
     click.echo(
         f"  {_warn('!')} {subject} manages, so {stays} in the config ({where}: "
         f"{_disp(', '.join(locations))}). Check {them} by hand, and edit or remove any "
@@ -1414,6 +1424,9 @@ def _emit_hook_change(
                 click.echo(f"  {_ok('Backed up')} {_disp(str(backup))}")
             click.echo(f"  {_ok('Installed')} memtomem-stm's PostToolUse hook.")
         else:
+            # Before the block: applying leaves these handlers registered next
+            # to the one shown, which is the first thing to know about it.
+            _emit_unmanaged(change, unmanaged, written=False, preview=True)
             verb = "create the config and add" if change.status == "create" else "add"
             click.echo(f"  Would {verb} memtomem-stm's PostToolUse hook:")
             click.echo("")
@@ -1456,7 +1469,7 @@ def _emit_hook_change(
 
     if apply_:
         _emit_unmanaged(change, change.unmanaged_after, written=True)
-    else:
+    elif change.action != "install":
         _emit_unmanaged(change, unmanaged, written=False, preview=True)
 
     if not apply_ and change.fmt == "toml":
@@ -1530,10 +1543,13 @@ def hook_install_command(
     Read-modify-writes the host's hook-config file (``~/.claude/settings.json``,
     ``~/.cursor/hooks.json``, ``$KIMI_CODE_HOME/config.toml`` or
     ``~/.kimi-code/config.toml``, or ``~/.codex/config.toml``)
-    so the host fires ``mms hook --host <name>`` after each built-in tool call.
-    Re-running updates the STM block it recognizes in place rather than
-    duplicating it; a handler that only looks like STM's hook is left alone and
-    named by location.
+    so the host fires ``memtomem-stm hook --host <name>`` (behind
+    ``uv run --directory <dir>`` in a project that uses STM) after each
+    built-in tool call.
+    Re-running updates the handler install wrote in place rather than
+    duplicating it. Only a handler in the form install writes is install's
+    own; one that only looks like STM's hook is left alone and named by
+    location, above the block a preview shows.
     Default is a dry-run preview; ``--apply`` writes (backing up any prior file)
     under the hook-host write lock, with plan and apply in one locked span so
     concurrent mms runs cannot interleave (the host app's own concurrent writes
@@ -1555,23 +1571,28 @@ def hook_install_command(
             "--daemon, or --no-daemon"
         )
     with hook_hosts_write_lock(enabled=apply_):
-        try:
-            commands = hook_hosts.installed_stm_hook_commands(host)
+        # One lookup feeds both the written command and its binding
+        # notice, so the two cannot disagree (#1379).
+        project = _stm_project()
+
+        def build_command(owned: tuple[OwnedHookCommand, ...]) -> str:
+            # ``owned`` are install's handlers in the one read of the config
+            # that the merge also works on. The first one's settings carry
+            # over, as the first one is the handler the merge refreshes.
             policy = None
             if not inherit_runtime_env:
                 policy = resolve_host_runtime_policy(
-                    existing_command=commands[0] if commands else None,
+                    existing=owned[0].settings if owned else None,
                     use_daemon=daemon_mode,
                     surfacing_timeout_seconds=surfacing_timeout,
                 )
-            # One lookup feeds both the written command and its binding
-            # notice, so the two cannot disagree (#1379).
-            project = _stm_project()
-            command = shlex.join(
+            return shlex.join(
                 _hook_install_command_argv(host, policy=policy, launcher=_launcher_for(project))
             )
+
+        try:
             project_binding = _binding_for(project)
-            change = hook_hosts.plan_install(host, command)
+            change = hook_hosts.plan_install(host, build_command)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
             # One choke point for every ``HookInstallError`` raise: the
@@ -1629,10 +1650,10 @@ def hook_install_command(
 def hook_uninstall_command(host: str, apply_: bool) -> None:
     """Remove STM's PostToolUse hook from a host's config (symmetric to install).
 
-    Removes the STM blocks it recognizes by command shape (the ones ``install``
-    writes), leaving other hooks untouched; one that only looks like STM's hook
-    is named by location. A no-op when the config is absent or holds no
-    recognized STM block, except that empty hook containers (an empty matcher
+    Removes the handlers in the form ``install`` writes, leaving other hooks
+    untouched; one that only looks like STM's hook is named by location. A
+    no-op when the config is absent or holds no such handler, except that
+    empty hook containers (an empty matcher
     group, event list or ``hooks`` section) are still pruned, and reported as
     such. Default is a dry-run preview; ``--apply`` writes
     (backing up the prior file) under the same locked plan+apply span as

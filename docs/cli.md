@@ -709,7 +709,7 @@ Checks, in order:
 | `ltm score scale` | feedback diagnostics | FAIL while a recent score-scale mismatch episode remains unrecovered |
 | `ltm measurement` / timeout checks | daemon latency telemetry | WARN when measurement cannot run or configured surfacing/hook deadlines are too small |
 | `surfacing outcomes` | daemon `latency.surface` counters | WARN when the surface series records a request that timed out, faulted after issuing a search, or never issued one, with that breakdown; healthy skips (allowlist, gate, cache) and requests refused before admission (`expired`, `busy`) are not in this population, and raw/synthetic `retrieval` traffic is not counted here — see `ltm measurement`. A daemon predating the counters WARNs asking for a restart rather than reading their absence as zero. Independent of whether there is enough data to size a timeout |
-| `hook registration` | the PostToolUse handlers in Claude Code's user settings (`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`), read with `mms hook`'s own options | WARN when an STM hook command lacks `--host claude` (hook compression, if enabled, then never replaces its output), does not run the hook (`--help`, a usage error, a subcommand or another leftover word; a `--host` after a leftover word is never parsed, so its host is not judged), or is not checked. Only plain words are read: in shell form every word must be one (no quotes or expansions such as `$HOME` or `~`); in exec form (`args`) every argument must be, and the executable may be any path whose last component, as written, is an STM entry point (no `=`, control characters or trailing `/`). Before the executable only `MEMTOMEM_STM_*=` assignments (shell form) or `env` with them are allowed, and `uv run --directory <dir> <entry point>` (a bare entry-point name) is the only other launcher; `python -m memtomem_stm hook` is reported as not checked. Anything else, a `shell` field other than `bash` (or any `shell` next to `args`), and the `env` launcher on Windows (Git's MSYS `env.exe`) are reported as not checked rather than guessed. On Windows, shell form is never read, even with `shell: "bash"` (Git Bash may convert path-like arguments, and without it PowerShell runs the line); those commands WARN with advice to check them by hand (install writes that form, so a correct Windows install WARNs too; exec form is still read). Elsewhere, a line with shell syntax becomes checkable when spelled as plain words, where that keeps its behavior, e.g. `/Users/me/.local/bin/mms hook --host claude` instead of `$HOME/.local/bin/mms hook --host claude`. A settings file that cannot be used is a WARN that names the reason (an unusable `CLAUDE_CONFIG_DIR`, a path that is not a regular file, valid JSON that is not an object, or otherwise only the exception type). Names locations (`hooks.PostToolUse[i].hooks[j]`), never command text. Not gated on compression being enabled, since the hook process's environment is not visible here. The `next:` line is a hand edit, not `mms hook install --host claude --apply`: install merges every STM handler it recognizes into one, keeps only the daemon, timeout and query-text settings of an inline `env` wrapper, and does not recognize a `NAME=value mms hook` line. An STM hook is recognized from the command text (in exec form, the command and its `args`) by a heuristic: it looks for an STM name (`mms`, `memtomem-stm`, `memtomem-stm-proxy`, or the module `memtomem_stm`) and a later `hook`: as whole words when the line is plain words, and anywhere in the raw text for any other line. A shell line of only plain words and quotes (up to 4,096 characters, balanced) is also matched as whole words after quote removal. A PASS (`N recognized, all passing --host claude to mms hook`) covers the recognized commands only, and a detail that reports on commands ends by saying a hook can be missed: a wrapper script whose command names neither is not counted, and neither are spellings such as `m"m"s hook # note`, `sh -c 'm"m"s hook'` and `python -mmemtomem_stm hook` (while `m"m"s hook` and `sh -c "mms hook"` are). In the other direction, a command that only mentions both words (`mms version hook`) is counted and reported as not checked. Project, local and managed settings are not read. No row when the file is absent or holds no command recognized as STM's hook |
+| `hook registration` | the PostToolUse handlers in Claude Code's user settings (`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`), read with `mms hook`'s own options | WARN when an STM hook command lacks `--host claude` (hook compression, if enabled, then never replaces its output), does not run the hook (`--help`, a usage error, a subcommand or another leftover word; a `--host` after a leftover word is never parsed, so its host is not judged), or is not checked. Only plain words are read: in shell form every word must be one (no quotes or expansions such as `$HOME` or `~`); in exec form (`args`) every argument must be, and the executable may be any path whose last component, as written, is an STM entry point (no `=`, control characters or trailing `/`). Before the executable only `MEMTOMEM_STM_*=` assignments (shell form) or `env` with them are allowed, and `uv run --directory <dir> <entry point>` (a bare entry-point name) is the only other launcher; `python -m memtomem_stm hook` is reported as not checked. Anything else, a `shell` field other than `bash` (or any `shell` next to `args`), and the `env` launcher on Windows (Git's MSYS `env.exe`) are reported as not checked rather than guessed. On Windows, shell form is never read, even with `shell: "bash"` (Git Bash may convert path-like arguments, and without it PowerShell runs the line); those commands WARN with advice to check them by hand (install writes that form, so a correct Windows install WARNs too; exec form is still read). Elsewhere, a line with shell syntax becomes checkable when spelled as plain words, where that keeps its behavior, e.g. `/Users/me/.local/bin/mms hook --host claude` instead of `$HOME/.local/bin/mms hook --host claude`. A settings file that cannot be used is a WARN that names the reason (an unusable `CLAUDE_CONFIG_DIR`, a path that is not a regular file, valid JSON that is not an object, or otherwise only the exception type). Names locations (`hooks.PostToolUse[i].hooks[j]`), never command text. Not gated on compression being enabled, since the hook process's environment is not visible here. The `next:` line is a hand edit, not `mms hook install --host claude --apply`: install replaces only a handler in the form it writes (`memtomem-stm hook --host claude`, bare or after `uv run --directory <dir>`, with its own setting flags or none) and leaves every other STM hook line, such as `mms hook` or `NAME=value mms hook`, in place beside the handler it adds. An STM hook is recognized from the command text (in exec form, the command and its `args`) by a heuristic: it looks for an STM name (`mms`, `memtomem-stm`, `memtomem-stm-proxy`, or the module `memtomem_stm`) and a later `hook`: as whole words when the line is plain words, and anywhere in the raw text for any other line. A shell line of only plain words and quotes (up to 4,096 characters, balanced) is also matched as whole words after quote removal. A PASS (`N recognized, all passing --host claude to mms hook`) covers the recognized commands only, and a detail that reports on commands ends by saying a hook can be missed: a wrapper script whose command names neither is not counted, and neither are spellings such as `m"m"s hook # note`, `sh -c 'm"m"s hook'` and `python -mmemtomem_stm hook` (while `m"m"s hook` and `sh -c "mms hook"` are). In the other direction, a command that only mentions both words (`mms version hook`) is counted and reported as not checked. Project, local and managed settings are not read. No row when the file is absent or holds no command recognized as STM's hook |
 
 `--json` emits a single document: `{"config_path", "status": "pass"|"warn"|"fail", "checks": [{"id", "label", "status", "detail", "next_action"}, ...]}` plus, once probing ran, the staged `servers` map (same shape as `health --json`) and the `surfacing` bootstrap payload. Active Ollama dependencies add one grouped `ollama_endpoint:<digest>` check per unique base URL (the digest covers the URL without its userinfo, query string or fragment; an endpoint that has any of those appends a digest of its own use sites, so credential-only twins stay distinct and IDs never depend on a secret); duplicate models and use sites share its single inventory request. Short-circuited runs contain only the checks that executed. Probe entries keep the shape documented above: the `description budget` check reports counts and lengths, and no advertised description text enters the document. Configuration values that commonly carry credentials are not printed: `args` values (probe validation errors name locations and error types only, and the LTM server's arguments are hidden as in [`health`](#health)), `env` and `headers` values, and URL userinfo. Probe errors cannot quote them back, since they carry no exception message (see [`health`](#health)). Identifiers you act on are shown deliberately — server names, prefixes (the `prefixes` check names each colliding prefix, since that is the value to change), commands, transports, file paths, model names, and URLs as scheme, host and path: userinfo shows as `***@`, and the query string and fragment are dropped. A URL the parser may have split wrongly — any `@` outside its authority, such as a `?`, `#` or `/` inside the userinfo, or an encoded `@` — is shown as `<unparseable url>`. That includes a legitimate `@` in a path or query (`/users/@me`), since no rule on the URL's shape can tell the two apart.
 
@@ -1038,8 +1038,9 @@ see [the hook CLI reference](reference/cli-hooks.md#mms-hook) for the list.
 ### `install` / `uninstall` — per-host registration
 
 `mms hook install --host <name>` writes STM's `PostToolUse` hook block into the
-host's own config so the host fires `mms hook --host <name>` after each built-in
-tool call. `uninstall` removes it.
+host's own config so the host fires `memtomem-stm hook --host <name>` (behind
+`uv run --directory <dir>` in a project that uses STM) after each built-in tool
+call. `uninstall` removes it.
 
 | host     | config file               | format |
 | -------- | ------------------------- | ------ |
@@ -1075,55 +1076,56 @@ Options:
                                   persistence settings.
 ```
 
-The merge is idempotent: an existing STM block (recognized by command shape,
-so a global or `uv run --directory <dir> <entry point>` registration with any
-`--host` is matched) is updated in place instead of adding another. Matching is by
-words split with Python's `shlex`, and only on a line where those are the words
-a POSIX shell (`sh`, Bash) passes on: plain characters, single-quoted text, and double-quoted
-text without `$`, backquote or `\` (the form install itself writes), with `~/`
-allowed at the very start (the shell expands it, which keeps the executable's
-name). A line with anything else outside quotes, such as a `#` comment, `$VAR`,
-a glob, an operator or redirection (`<<<`), a line break, another `~` form, or
-an unbalanced quote, does not count, and neither does a word that is only an
-operator, even quoted (`mms hook --host '|'`). On Windows, where the `mms`
-entry point itself expands globs, `$VAR`, `%VAR%` and a leading `~` in its
-arguments before reading them, a command whose words after the executable hold
-a glob character (`*`, `?`, `[`), any `$` or `%` (even a literal `100%`), or a
-leading `~` does not count either, quoted or not (`mms hook --host 'C*'`).
-A command whose first word holds a quote (`"mms" hook`, `'mms' hook`,
-`m"m"s hook`) does not count on Windows either (#1483). Claude Code's hooks
-reference says that a shell-form hook with no `shell` field runs under
-PowerShell when Git Bash is missing, and that PowerShell prints a command made
-only of quoted strings instead of running it; how it reads a quoted word
-followed by other words was not measured. Matching reads the command text
-without the handler's `shell` field, so STM declines every such line and reads
-no settings from it. This rule looks at the first word only; the checks above
-still apply to quotes after it. A
-command counts only when its words then pass three checks:
-the words after `hook` read as a hook run with `mms hook`'s own options, so
-`mms hook uninstall`, `mms hook --help` and a usage error do not count; the
-executable word has no `=` or control character and does not end in `/` or
-`/.` (`OTHER=/mms hook` and `mms/ hook` do not count); and before it only an
-`env` word (held to the same word check) with `MEMTOMEM_STM_*` assignments,
-or exactly `uv run --directory
-<dir>` with a non-empty `<dir>` not starting with `-` and a bare entry-point
-name after it, may appear (`uv run --help mms hook` does not count). Install
-keeps the daemon, timeout and query-text settings of the handler it updates,
-read with `mms hook`'s own options (a repeated flag counts as `mms hook` counts
-it: the last one wins) and, for an inline `env` wrapper, from its
-`MEMTOMEM_STM_*` assignments. Claude Code and Codex also fold any further
-recognized STM handlers into it; Cursor and Kimi update the first one and leave
-the rest as they are. `uninstall` removes every recognized STM handler, prunes
-the emptied containers, and leaves other hooks untouched. A handler that only
-looks like STM's hook, such as `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms
-hook` or `mms hook --host claude # pinned`, is not recognized: both commands
-leave it in place and print its
-location (in the written file after an `--apply` that writes, otherwise in the
-current file), never its text, so a duplicate is not silent. They look where
-install itself looks in that host's config file (`PostToolUse` for Claude Code
-and Codex, `postToolUse` for Cursor, every entry for Kimi). An uninstall that
-only prunes empty hook containers (an empty matcher group, event list or
-`hooks` section) says so instead of reporting a removal.
+Install and uninstall manage the handlers `mms hook install` writes, and no
+others. A handler is install's own when all three hold:
+
+- **Place.** It is where install writes for that host:
+  `hooks.PostToolUse[i].hooks[j]` (Claude Code, Codex), `hooks.postToolUse[i]`
+  (Cursor), or a `[[hooks]]` entry whose `event` is `PostToolUse` (Kimi). A
+  Kimi entry on another event is not install's.
+- **Fields.** For Claude Code and Codex, `type` is `command` and there is no
+  `args` key. Other fields, such as a timeout or a status message, do not
+  matter and are kept when the handler is updated.
+- **Text.** The `command` is `memtomem-stm hook --host <that host>`, alone or
+  after `uv run --directory <absolute dir>`, followed by nothing or by the six
+  runtime-setting words in the order install writes them. It is spelled as
+  install spells it: single spaces, and the directory quoted only where and
+  how Python's `shlex.join` quotes it.
+
+Every command a release of `mms hook install` has written has this form.
+Nothing else does: `mms hook --host claude` (another entry-point name; this is
+the manual registration), a path to the executable, an `env` or `NAME=value`
+prefix, a quoted name (`"memtomem-stm" hook …`) or a directory quoted another way
+(`--directory "/a b"`), flags added, left out or in
+another order, another host's `--host`, a relative `--directory`, a trailing
+`# comment`. Whether such a line would run STM's hook is not asked. No shell
+is modelled, so the answer is the same on every platform.
+
+The merge is idempotent: the handler install owns is updated in place instead
+of adding another. Install keeps the daemon, timeout and query-text settings
+of the handler it updates. They are read from its setting words the way
+`mms hook` applies them: a deadline that is not a positive finite number is
+not kept, and the daemon deadline is at least one second above a usable
+surfacing deadline. No setting is read from any other handler, or from an
+environment prefix. Claude Code and Codex also fold any further handlers
+install owns into it; Cursor and Kimi update the first one and leave the rest
+as they are. `uninstall` removes every handler install owns, prunes the
+emptied containers, and leaves other hooks untouched.
+
+A handler that looks like STM's hook but is not install's, such as
+`mms hook --host claude` or `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms
+hook`, is left in place by both commands. They print its location (in the
+written file after an `--apply` that writes, otherwise in the current file),
+never its text. Install adds its own handler beside it, and its preview names
+the location above the block it would write, so the second registration is
+not silent; remove the old handler by hand if it should not stay registered.
+Both commands look where install itself writes in that host's config file
+(`PostToolUse` for Claude Code and Codex, `postToolUse` for Cursor) and at
+every entry for Kimi. "Looks like" is the test `mms doctor` uses for its
+`hook registration` row, plus the line's own words for a name spelled so that
+test misses it (`m"m"s hook`). An uninstall that only prunes empty hook containers (an
+empty matcher group, event list or `hooks` section) says so instead of
+reporting a removal.
 Both **default to a dry-run preview**; pass `--apply` to write,
 which first backs up any existing file to `<path>.bak` (or `<path>.bak.1`, `.bak.2`,
 … if one already exists, so a second apply never clobbers the first backup). A

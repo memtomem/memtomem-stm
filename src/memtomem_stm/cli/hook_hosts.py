@@ -4,7 +4,8 @@
 (:mod:`memtomem_stm.cli.hook_cmd`); B4 made the live invocation host-explicit
 (``mms hook --host <name>``). This module is the *registration UX* on top of
 that: it read-modify-writes each host's hook-config file so the host actually
-fires ``mms hook --host <name>`` on PostToolUse.
+fires ``memtomem-stm hook --host <name>`` (behind ``uv run --directory <dir>``
+in a project that uses STM) on PostToolUse.
 
 It parallels :mod:`memtomem_stm.mms.import_hosts` (which knows each host's *MCP*
 config locations) but for the *hook* configs, which live elsewhere and differ in
@@ -40,21 +41,25 @@ co-locates "how to register host X" with "how to parse/render host X".
 
 Design choices (all surfaced to the operator before any write):
 
-* **Idempotent.** :func:`plan_install` recognizes STM's own block by command
-  shape (:func:`_is_stm_hook_command`: an ``mms`` / ``memtomem-stm`` executable
-  immediately followed by a ``hook`` token whose arguments run the hook bridge),
-  so re-running updates that block in place rather than appending a duplicate,
-  regardless of whether it was registered global (``memtomem-stm hook …``) or
-  source (``uv run --directory … memtomem-stm hook …``). A handler that only
-  *looks* like STM's hook (``NAME=value mms hook``, ``mms hook uninstall``) is
-  not recognized; it is left alone and named by location
-  (:func:`unmanaged_stm_like`), never silently rewritten or deleted (#1453,
-  #1460).
-* **Symmetric uninstall.** :func:`plan_uninstall` removes the blocks
-  :func:`_is_stm_hook_command` recognizes, the shapes :func:`plan_install`
-  writes, and names the look-alikes it leaves. Install is equally
-  careful: a non-STM handler a user co-located in STM's matcher group is
-  preserved across a re-install (see :func:`_nested_install`).
+* **Ownership, not recognition.** Install and uninstall manage the handlers
+  install writes and no others. :func:`owned_handler` is the one test: the
+  handler is in a container install writes to, has the fields install gives
+  it, and its ``command`` is ``memtomem-stm hook --host <host>`` (bare or
+  after ``uv run --directory <dir>``), alone or followed by the six
+  runtime-setting words, spelled as ``shlex.join`` spells it. No shell is
+  modelled: whether some other line would run STM's hook is not asked. A
+  handler that only *looks* like STM's hook (``mms hook --host claude``,
+  ``NAME=value mms hook``, an ``env`` wrapper, a quoted name) is left alone
+  and named by location (:func:`unmanaged_stm_like`), never rewritten or
+  deleted (#1453, #1460, #1483, #1484).
+* **Idempotent.** Re-running :func:`plan_install` updates the owned handler
+  in place rather than appending a duplicate, whether it was registered
+  global (``memtomem-stm hook …``) or source (``uv run --directory …
+  memtomem-stm hook …``).
+* **Symmetric uninstall.** :func:`plan_uninstall` removes the owned handlers
+  and names the look-alikes it leaves. Install is equally careful: a handler
+  a user co-located in STM's matcher group is preserved across a re-install
+  (see :func:`_nested_install`).
 * **Dry-run default + backup.** The CLI previews by default; an ``--apply`` write
   copies the prior file to a non-clobbering backup first (``<path>.bak``, else
   ``.bak.1``, ``.bak.2``, …; :func:`_write_backup`, which claims each slot with
@@ -71,10 +76,8 @@ Design choices (all surfaced to the operator before any write):
 from __future__ import annotations
 
 import copy
-import itertools
 import json
 import os
-import re
 import stat
 import tomllib
 from collections.abc import Callable, Iterator
@@ -86,7 +89,11 @@ import tomli_w
 
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, get_adapter
-from memtomem_stm.cli.host_runtime import _lenient_shell_tokens, _shell_tokens
+from memtomem_stm.cli.host_runtime import (
+    OwnedHookCommand,
+    _lenient_shell_tokens,
+    owned_hook_command,
+)
 from memtomem_stm.mms.host_homes import (
     HOST_HOME_UNKNOWN_REASONS,
     HostHomeUnknown,
@@ -94,20 +101,16 @@ from memtomem_stm.mms.host_homes import (
 )
 from memtomem_stm.utils.fileio import atomic_write_text
 
-# Executable basenames that mark a command as an STM hook invocation. Mirrors
-# ``mms ≡ memtomem-stm ≡ memtomem-stm-proxy`` (the three ``[project.scripts]``
-# entry points, #260) so a block registered under any of them is recognized.
+# Executable basenames that mark a command as naming STM's hook, for the
+# look-alike notice and ``mms doctor``: ``mms ≡ memtomem-stm ≡
+# memtomem-stm-proxy`` (the three ``[project.scripts]`` entry points, #260).
+# Ownership is narrower: install writes ``memtomem-stm`` only.
 _STM_EXECUTABLES: frozenset[str] = frozenset({"mms", "memtomem-stm", "memtomem-stm-proxy"})
 
-# What Click's Windows entry point expands in each argument before parsing
-# (``click.utils._expand_args``): glob characters, ``$VAR`` / ``${VAR}`` /
-# ``%VAR%`` (``os.path.expandvars``) and a leading ``~`` (``expanduser``).
-_CLICK_WINDOWS_EXPANDS = re.compile(r"[*?\[$%]|^~")
-
-# The first word of a line, as written. On a line the split accepts, a quote
-# that is part of that word opens before the blank that would end it, so the
-# first run of non-blank characters holds a quote exactly when the word does.
-_FIRST_WORD_HOLDS_A_QUOTE = re.compile(r"[ \t]*[^ \t'\"]*['\"]")
+# Hosts whose config nests handlers in matcher groups under ``hooks.PostToolUse``.
+_NESTED_HOSTS = frozenset({"claude", "codex"})
+# The ``event`` of the Kimi entry install writes.
+_KIMI_EVENT = "PostToolUse"
 
 
 class HookInstallError(Exception):
@@ -135,122 +138,51 @@ class HookConfigLocationUnknown(HookInstallError):
 
 
 # ---------------------------------------------------------------------------
-# STM-hook command recognition (idempotency + symmetric uninstall)
+# Ownership: which handlers install and uninstall manage
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class _StmHookWords:
-    """The parts of a recognized STM hook command line."""
+def owned_handler(host_tag: str, handler: Any) -> OwnedHookCommand | None:
+    """``handler`` read as one ``mms hook install --host <host_tag>`` writes,
+    or ``None`` when it is not in that form.
 
-    assignments: tuple[str, ...]
-    """The ``MEMTOMEM_STM_*=value`` words of a leading ``env`` launcher."""
-    args: tuple[str, ...]
-    """The words after ``hook``."""
+    The one test of "is this handler install's own": settings are read from
+    it, the merge replaces it, uninstall removes it, and the look-alike notice
+    leaves it out. A handler is owned when it sits in a container install
+    writes to (the caller passes only those), has the fields install gives it,
+    and its ``command`` has the text install writes
+    (:func:`~memtomem_stm.cli.host_runtime.owned_hook_command`):
 
+    * Claude Code and Codex: ``type`` is ``"command"`` and there is no
+      ``args`` key. Install never writes ``args``; in Claude Code it also
+      turns ``command`` into a single executable path.
+    * Kimi: ``event`` is ``"PostToolUse"``, the only event install registers.
+    * Cursor: nothing beyond the text.
 
-def _is_stm_hook_command(command: str) -> bool:
-    """Whether ``command`` is an STM ``mms hook`` invocation (any entry point).
-
-    Token-based, not substring: a command is ours when an STM executable token is
-    *immediately followed by* a ``hook`` token (the ``hook`` subcommand). Catches
-    both the global (``memtomem-stm hook --host X``) and source
-    (``uv run --directory … memtomem-stm hook --host X``) shapes, and any
-    ``--host`` value, so install updates and uninstall removes regardless of how
-    it was first registered.
-
-    Adjacency (exe→``hook``) — not "a ``hook`` token anywhere *and* an STM exe
-    token anywhere" — is what keeps a compound user command like
-    ``echo hook && memtomem-stm status`` from matching: ``status`` is not ``hook``,
-    so install/uninstall leave it alone.
-
-    The words come from :func:`~memtomem_stm.cli.host_runtime._shell_tokens`,
-    which refuses a line with shell syntax it does not model (a ``#``, ``$``,
-    a glob, an operator or a line break outside quotes, among others; #1476),
-    so such a line never matches. On Windows, where the entry point expands
-    its own arguments (globs, ``$VAR``, ``%VAR%``, a leading ``~``) before
-    Click parses them, a line whose words after the executable hold any of
-    those does not match either. Nor does one whose first word holds a quote
-    (``"mms" hook``, #1483): by Claude Code's hooks reference, a shell-form
-    hook with no ``shell`` field runs under PowerShell when Git Bash is not
-    installed, and PowerShell prints a command made only of quoted strings
-    instead of running it. This match reads the command text alone, not the
-    handler's ``shell`` field, and PowerShell's reading of a quoted word
-    followed by other words is not modelled, so this is a refusal to own the
-    line, not a claim about what runs. Three more checks keep out lines that would
-    not run the hook bridge (#1460): the executable word has no ``=`` or
-    control character and its last component as written is not empty or ``.``
-    (so ``OTHER=/mms hook`` and ``mms/ hook`` do not match); a ``uv`` launcher
-    is exactly ``uv run --directory <dir> <entry point>`` with a non-empty
-    ``<dir>`` that does not start with ``-``; and the words after ``hook``
-    parse with ``mms hook``'s own options into a bridge run, not help, a usage
-    error or a subcommand (``mms hook uninstall``). That parse is the one
-    ``mms doctor`` uses
-    (:func:`memtomem_stm.cli.hook_registration.runs_hook_bridge`), and the one
-    install reads runtime settings from. A quoted operator word
-    (``mms hook --host '|'``) is refused as well, as before."""
-    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
-    from memtomem_stm.cli.hook_registration import runs_hook_bridge
-
-    words = _stm_hook_words(command)
-    return words is not None and runs_hook_bridge(list(words.args))
+    Other fields do not count. A refresh keeps a timeout, a status message
+    and any field it does not know, and sets the matcher to install's own
+    (except in a matcher group shared with another handler). Whether the
+    command would run STM is not asked: a hand-written registration is its
+    author's, however close it comes."""
+    if not isinstance(handler, dict):
+        return None
+    command = handler.get("command")
+    if not isinstance(command, str):
+        return None
+    if host_tag in _NESTED_HOSTS:
+        if handler.get("type") != "command" or "args" in handler:
+            return None
+    elif host_tag == "kimi" and handler.get("event") != _KIMI_EVENT:
+        return None
+    return owned_hook_command(command, host_tag)
 
 
-def _stm_hook_words(command: str) -> _StmHookWords | None:
-    """The parts of ``command`` when it has the shape of STM's hook (every check
-    of :func:`_is_stm_hook_command` except the parse of the words after
-    ``hook``), else ``None``."""
-    tokens = _shell_tokens(command)
-    return None if tokens is None else _stm_hook_shape(tokens, command)[0]
-
-
-@dataclass(frozen=True)
-class _HookLine:
-    """One handler command, split at most once (see :func:`_read_hook_line`)."""
-
-    command: str
-    strict: tuple[str, ...] | None
-    """The words of an accepted line, ``None`` when the split refuses it."""
-    recognized: bool
-    """What :func:`_is_stm_hook_command` returns for the command."""
-    strict_names: bool | None
-    """:meth:`names_the_hook` when recognition already scanned the words for
-    an executable before ``hook``, else ``None``."""
-
-    def names_the_hook(self) -> bool:
-        """Whether the command's words put an STM executable right before
-        ``hook``: the strict words of an accepted line, else the lenient ones.
-        These catch a refused line whose quoted executable name the raw search
-        of ``mms doctor``'s candidate test does not see, such as
-        ``m"m"s hook --host claude # pinned`` (#1476). A refused line is split
-        here, so call this only when that test has not already decided."""
-        if self.strict_names is not None:
-            return self.strict_names
-        tokens = list(self.strict) if self.strict is not None else None
-        if tokens is None:
-            tokens = _lenient_shell_tokens(self.command)
-        return next(_exe_before_hook(tokens), None) is not None
-
-
-def _read_hook_line(command: str) -> _HookLine:
-    """Recognition of ``command`` with what it read kept for
-    :meth:`_HookLine.names_the_hook`, so recognition and that fallback split
-    a line, and scan its words for an executable before ``hook``, at most once
-    between them (``shlex`` is quadratic in a word's length). ``mms doctor``'s
-    candidate test, which runs between the two, reads the line on its own and
-    may split a short quoted line again."""
-    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
-    from memtomem_stm.cli.hook_registration import runs_hook_bridge
-
-    strict = _shell_tokens(command)
-    if strict is None:
-        return _HookLine(command=command, strict=None, recognized=False, strict_names=None)
-    words, starts = _stm_hook_shape(strict, command)
-    return _HookLine(
-        command=command,
-        strict=tuple(strict),
-        recognized=words is not None and runs_hook_bridge(list(words.args)),
-        strict_names=None if starts is None else bool(starts),
+def _group_has_owned_handler(host_tag: str, entry: Any) -> bool:
+    """Whether a matcher-group entry (``{matcher, hooks:[…]}``) holds an owned handler."""
+    return (
+        isinstance(entry, dict)
+        and isinstance(inner := entry.get("hooks"), list)
+        and any(owned_handler(host_tag, h) is not None for h in inner)
     )
 
 
@@ -263,107 +195,22 @@ def _exe_before_hook(tokens: list[str]) -> Iterator[int]:
             yield i - 1
 
 
-def _stm_hook_shape(
-    tokens: list[str], command: str
-) -> tuple[_StmHookWords | None, list[int] | None]:
-    """:func:`_stm_hook_words` on the words of an accepted line ``command``,
-    with the first two :func:`_exe_before_hook` indexes it read (``None`` when
-    the operator guard refused the line before that scan)."""
-    # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
-    from memtomem_stm.cli.hook_registration import _NOT_EXECUTABLE, running_on_windows
-
-    if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
-        return None, None
-    # A source checkout directory can itself be named ``memtomem-stm``. Count
-    # only executable-shaped tokens immediately followed by the subcommand, so
-    # ``uv run --directory /repo/memtomem-stm memtomem-stm hook`` has one owner
-    # candidate rather than mistaking the --directory value for an executable.
-    starts = list(itertools.islice(_exe_before_hook(tokens), 2))
-    if len(starts) != 1:
-        return None, starts
-    # The quotes are gone from ``tokens``, so this reads the line as written.
-    if running_on_windows() and _FIRST_WORD_HOLDS_A_QUOTE.match(command):
-        return None, starts
-    i = starts[0]
-    executable = tokens[i]
-
-    def names_a_file(word: str) -> bool:
-        # The last component as written: ``mms/`` and ``mms/.`` name
-        # directories, which ``Path`` would shorten to ``mms``; ``OTHER=/mms``
-        # is an assignment, not a command name. A drive
-        # prefix (Windows ``C:mms``) is part of that component and leaves it a
-        # file name.
-        return not _NOT_EXECUTABLE.search(word) and re.split(r"[\\/]", word)[-1] not in {"", "."}
-
-    if not names_a_file(executable):
-        return None, starts
-    # On Windows the entry point expands its own arguments before Click parses
-    # them, so a word the shell passed as written may reach ``mms hook`` as
-    # other words, or several, depending on the hook's environment and working
-    # directory. Words before the executable (``env``, ``uv run``) are not
-    # its arguments.
-    if running_on_windows() and any(_CLICK_WINDOWS_EXPANDS.search(w) for w in tokens[i + 1 :]):
-        return None, starts
-    prefix = tokens[:i]
-    assignments: tuple[str, ...] = ()
-    # Pre-runtime-flag installs commonly used POSIX ``env`` to pin timeout
-    # values in the host command.  Recognize only a leading env executable
-    # followed exclusively by MEMTOMEM_STM_* assignments; an arbitrary env
-    # wrapper (or flags such as ``env -i``) is not ours to rewrite/remove.
-    if prefix and Path(prefix[0]).name == "env":
-        # The ``env`` word must name a file too: ``/tmp/env/`` is a
-        # directory, and after ``OTHER=/env`` the shell reads the next words
-        # as assignments as well, so the line is a bare assignment prefix
-        # (#1453), not an ``env`` launcher.
-        if not names_a_file(prefix[0]):
-            return None, starts
-        j = 1
-        while j < len(prefix):
-            key, sep, _value = prefix[j].partition("=")
-            if not sep or not key.startswith("MEMTOMEM_STM_"):
-                break
-            j += 1
-        if j == 1:
-            return None, starts
-        assignments = tuple(prefix[1:j])
-        prefix = prefix[j:]
-    # ``uv run`` resolves a bare entry-point name; with another option, an empty
-    # or option-like directory, or a path target it is not the launcher install
-    # writes (``uv run --help mms hook`` prints uv's help).
-    if prefix and not (
-        len(prefix) == 4
-        and prefix[:3] == ["uv", "run", "--directory"]
-        and prefix[3]
-        and not prefix[3].startswith("-")
-        and executable in _STM_EXECUTABLES
-    ):
-        return None, starts
-    return _StmHookWords(assignments, tuple(tokens[i + 2 :])), starts
-
-
-def _is_stm_command_handler(handler: Any) -> bool:
-    """Whether a ``{type:"command", command:"…"}`` handler dict is STM's."""
-    return (
-        isinstance(handler, dict)
-        and isinstance(cmd := handler.get("command"), str)
-        and _is_stm_hook_command(cmd)
-    )
-
-
-def _entry_has_stm_handler(entry: Any) -> bool:
-    """Whether a matcher-group entry (``{matcher, hooks:[…]}``) holds an STM handler."""
-    return (
-        isinstance(entry, dict)
-        and isinstance(inner := entry.get("hooks"), list)
-        and any(_is_stm_command_handler(h) for h in inner)
-    )
+def _words_name_the_hook(command: str) -> bool:
+    """Whether the words of ``command`` put an STM executable right before
+    ``hook``. A fallback for the look-alike notice: it catches a line whose
+    quoted executable name the raw search of ``mms doctor``'s candidate test
+    does not see, such as ``m"m"s hook --host claude # pinned``, and a
+    handler that test skips for its ``type``. The whole line is split, so a
+    caller asks this only after that cheaper test has said no."""
+    return next(_exe_before_hook(_lenient_shell_tokens(command)), None) is not None
 
 
 # ---------------------------------------------------------------------------
 # Per-host merge functions: (data, command, matcher) -> mutated data
 # ---------------------------------------------------------------------------
 #
-# Each takes the parsed config (a dict; ``{}`` when the file is absent) and
+# Each takes the host tag and the parsed config (a dict; ``{}`` when the file is
+# absent) and
 # returns it with STM's PostToolUse block merged in idempotently. ``matcher`` is
 # the host's tool-name filter (``None`` for hosts whose post-tool hook is generic,
 # i.e. Cursor). They mutate-and-return; callers pass a deep copy when they need
@@ -392,7 +239,9 @@ def _ensure_list(parent: dict[str, Any], key: str) -> list[Any]:
     return val
 
 
-def _nested_install(data: dict[str, Any], command: str, matcher: str | None) -> dict[str, Any]:
+def _nested_install(
+    host_tag: str, data: dict[str, Any], command: str, matcher: str | None
+) -> dict[str, Any]:
     """Merge a matcher-group block (Claude / Codex shape).
 
     ``hooks.PostToolUse`` is a list of ``{matcher, hooks:[{type, command}]}``;
@@ -413,13 +262,13 @@ def _nested_install(data: dict[str, Any], command: str, matcher: str | None) -> 
     out: list[Any] = []
     installed = False
     for entry in entries:
-        if not _entry_has_stm_handler(entry):
+        if not _group_has_owned_handler(host_tag, entry):
             out.append(entry)
             continue
-        siblings = [h for h in entry["hooks"] if not _is_stm_command_handler(h)]
+        siblings = [h for h in entry["hooks"] if owned_handler(host_tag, h) is None]
         if not installed:
             installed = True
-            old_handler = next(h for h in entry["hooks"] if _is_stm_command_handler(h))
+            old_handler = next(h for h in entry["hooks"] if owned_handler(host_tag, h) is not None)
             # A host may attach supported fields such as a timeout or status
             # message to the handler.  Refresh only STM-owned identity fields.
             refreshed_handler = {**old_handler, "type": "command", "command": command}
@@ -436,7 +285,7 @@ def _nested_install(data: dict[str, Any], command: str, matcher: str | None) -> 
                 new_inner: list[Any] = []
                 replaced = False
                 for h in entry["hooks"]:
-                    if _is_stm_command_handler(h):
+                    if owned_handler(host_tag, h) is not None:
                         if not replaced:
                             new_inner.append(refreshed_handler)
                             replaced = True
@@ -452,7 +301,7 @@ def _nested_install(data: dict[str, Any], command: str, matcher: str | None) -> 
     return data
 
 
-def _nested_uninstall(data: dict[str, Any]) -> dict[str, Any]:
+def _nested_uninstall(host_tag: str, data: dict[str, Any]) -> dict[str, Any]:
     """Drop STM handlers from a matcher-group block (Claude / Codex shape).
 
     Prunes containers that become empty (the now-empty ``PostToolUse`` list, then
@@ -467,7 +316,7 @@ def _nested_uninstall(data: dict[str, Any]) -> dict[str, Any]:
     kept_entries: list[Any] = []
     for entry in entries:
         if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
-            inner = [h for h in entry["hooks"] if not _is_stm_command_handler(h)]
+            inner = [h for h in entry["hooks"] if owned_handler(host_tag, h) is None]
             if not inner:
                 continue  # entry held only STM handler(s) → drop the whole group
             entry = {**entry, "hooks": inner}
@@ -481,25 +330,27 @@ def _nested_uninstall(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _cursor_install(data: dict[str, Any], command: str, matcher: str | None) -> dict[str, Any]:
+def _cursor_install(
+    host_tag: str, data: dict[str, Any], command: str, matcher: str | None
+) -> dict[str, Any]:
     """Merge Cursor's ``{version:1, hooks:{postToolUse:[{command}]}}`` (no matcher)."""
     if not isinstance(data.get("version"), int):
         data["version"] = 1
     entries = _ensure_list(_ensure_dict(data, "hooks"), "postToolUse")
     block = {"command": command}
     for i, entry in enumerate(entries):
-        if _is_stm_command_handler(entry):
+        if owned_handler(host_tag, entry) is not None:
             entries[i] = {**entry, "command": command}
             return data
     entries.append(block)
     return data
 
 
-def _cursor_uninstall(data: dict[str, Any]) -> dict[str, Any]:
+def _cursor_uninstall(host_tag: str, data: dict[str, Any]) -> dict[str, Any]:
     hooks = data.get("hooks")
     if not isinstance(hooks, dict) or not isinstance(hooks.get("postToolUse"), list):
         return data
-    kept = [e for e in hooks["postToolUse"] if not _is_stm_command_handler(e)]
+    kept = [e for e in hooks["postToolUse"] if owned_handler(host_tag, e) is None]
     if kept:
         hooks["postToolUse"] = kept
     else:
@@ -509,16 +360,18 @@ def _cursor_uninstall(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _kimi_install(data: dict[str, Any], command: str, matcher: str | None) -> dict[str, Any]:
+def _kimi_install(
+    host_tag: str, data: dict[str, Any], command: str, matcher: str | None
+) -> dict[str, Any]:
     """Merge Kimi's top-level ``[[hooks]]`` array of ``{event, matcher, command}``."""
     entries = _ensure_list(data, "hooks")
-    block: dict[str, Any] = {"event": "PostToolUse"}
+    block: dict[str, Any] = {"event": _KIMI_EVENT}
     if matcher is not None:
         block["matcher"] = matcher
     block["command"] = command
     for i, entry in enumerate(entries):
-        if _is_stm_command_handler(entry):
-            refreshed = {**entry, "event": "PostToolUse", "command": command}
+        if owned_handler(host_tag, entry) is not None:
+            refreshed = {**entry, "command": command}
             if matcher is not None:
                 refreshed["matcher"] = matcher
             entries[i] = refreshed
@@ -527,11 +380,11 @@ def _kimi_install(data: dict[str, Any], command: str, matcher: str | None) -> di
     return data
 
 
-def _kimi_uninstall(data: dict[str, Any]) -> dict[str, Any]:
+def _kimi_uninstall(host_tag: str, data: dict[str, Any]) -> dict[str, Any]:
     entries = data.get("hooks")
     if not isinstance(entries, list):
         return data
-    kept = [e for e in entries if not _is_stm_command_handler(e)]
+    kept = [e for e in entries if owned_handler(host_tag, e) is None]
     if kept:
         data["hooks"] = kept
     else:
@@ -543,8 +396,8 @@ def _kimi_uninstall(data: dict[str, Any]) -> dict[str, Any]:
 # Host registry
 # ---------------------------------------------------------------------------
 
-_InstallFn = Callable[[dict[str, Any], str, "str | None"], dict[str, Any]]
-_UninstallFn = Callable[[dict[str, Any]], dict[str, Any]]
+_InstallFn = Callable[[str, dict[str, Any], str, "str | None"], dict[str, Any]]
+_UninstallFn = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -757,56 +610,42 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
     return data, raw
 
 
-def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:
-    """Return STM hook commands currently serialized for ``host_tag``.
-
-    Used by ``mms hook install`` to migrate the legacy inline-``env`` policy
-    into portable runtime flags without losing an operator-pinned timeout.
-    Parsing and malformed-config refusal deliberately share the exact path used
-    by :func:`plan_install`.
-    """
-    spec = HOOK_HOSTS[host_tag]
-    current = _read_current(_config_path(spec), spec.fmt)
-    if current is None:
-        return ()
-    return _stm_hook_commands(host_tag, current[0])
-
-
-def _stm_hook_commands(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
-    """The STM hook commands :func:`_is_stm_hook_command` recognizes in parsed
-    config ``data``, in file order."""
-    commands: list[str] = []
-    if host_tag in {"claude", "codex"}:
+def _owned_hooks(host_tag: str, data: dict[str, Any]) -> tuple[OwnedHookCommand, ...]:
+    """The handlers :func:`owned_handler` accepts in parsed config ``data``,
+    in file order, read from the containers install writes to."""
+    handlers: list[Any] = []
+    if host_tag in _NESTED_HOSTS:
         hooks = data.get("hooks")
         entries = hooks.get("PostToolUse", []) if isinstance(hooks, dict) else []
         if isinstance(entries, list):
             for entry in entries:
-                if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
-                    continue
-                for handler in entry["hooks"]:
-                    if _is_stm_command_handler(handler):
-                        commands.append(handler["command"])
+                if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+                    handlers.extend(entry["hooks"])
     elif host_tag == "cursor":
         hooks = data.get("hooks")
         entries = hooks.get("postToolUse", []) if isinstance(hooks, dict) else []
         if isinstance(entries, list):
-            commands.extend(entry["command"] for entry in entries if _is_stm_command_handler(entry))
+            handlers.extend(entries)
     else:  # kimi
         entries = data.get("hooks", [])
         if isinstance(entries, list):
-            commands.extend(entry["command"] for entry in entries if _is_stm_command_handler(entry))
-    return tuple(commands)
+            handlers.extend(entries)
+    owned = (owned_handler(host_tag, handler) for handler in handlers)
+    return tuple(hook for hook in owned if hook is not None)
 
 
 def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
     """Locations of handlers in ``data`` that look like STM's hook but that
-    :func:`_is_stm_hook_command` does not recognize (#1453).
+    :func:`owned_handler` does not accept (#1453).
 
     Install and uninstall leave these as they are, so a hand-written
-    ``NAME=value mms hook`` would otherwise run beside the installed hook with
-    nothing said. "Look like" is ``mms doctor``'s candidate test, which errs
-    toward matching; only locations are returned, never command text, which
-    can hold secret values. The containers are the ones install examines.
+    ``mms hook --host claude`` would otherwise stay registered beside the
+    installed hook with nothing said. "Look like" is ``mms doctor``'s
+    candidate test, which errs toward matching, or an STM executable word
+    right before ``hook`` (:func:`_words_name_the_hook`); only locations are
+    returned, never command text,
+    which can hold secret values. The containers are the ones install
+    examines, and for Kimi every entry whatever its ``event``.
     """
     # Lazy: ``hook_registration`` imports ``_STM_EXECUTABLES`` from here.
     from memtomem_stm.cli.hook_registration import is_candidate
@@ -819,20 +658,19 @@ def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
         command = handler.get("command")
         if not isinstance(command, str):
             return
-        line = _read_hook_line(command)
-        if line.recognized:
+        if owned_handler(host_tag, handler) is not None:
             return
         # Claude and Codex handlers name their ``type``, and only a ``command``
         # handler runs anything. Cursor and Kimi entries are commands whatever
-        # else they hold (their merges match on ``command`` alone), so the type
-        # is set last, over any ``type`` field of their own.
+        # else they hold, so the type is set last, over any ``type`` field of
+        # their own.
         probe = handler if typed else {**handler, "type": "command"}
-        # The word test reads ``command`` alone, as install's own match does,
-        # so a handler that loses recognition is named whatever its ``type``.
-        if is_candidate(probe) or line.names_the_hook():
+        # The word test reads ``command`` alone, so a handler that is not
+        # owned for its ``type`` is still named.
+        if is_candidate(probe) or _words_name_the_hook(command):
             found.append(location)
 
-    if host_tag in {"claude", "codex"}:
+    if host_tag in _NESTED_HOSTS:
         hooks = data.get("hooks")
         entries = hooks.get("PostToolUse") if isinstance(hooks, dict) else None
         if isinstance(entries, list):
@@ -847,7 +685,7 @@ def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
         if isinstance(entries, list):
             for i, entry in enumerate(entries):
                 consider(f"hooks.postToolUse[{i}]", entry, typed=False)
-    else:  # kimi: every entry, whatever its ``event``, as its install loop reads them
+    else:  # kimi: every entry, whatever its ``event``
         entries = data.get("hooks")
         if isinstance(entries, list):
             for i, entry in enumerate(entries):
@@ -869,9 +707,9 @@ def claude_post_tool_handlers() -> tuple[Path, list[tuple[str, Any]] | None]:
     settings, keyed by that location, read from the file ``mms hook install
     --host claude`` writes. ``None`` in place of the list when the file is absent.
 
-    Unlike :func:`installed_stm_hook_commands`, nothing is filtered: a reader
-    that judges registrations (``mms doctor``, #1443) must also see the ones
-    install does not recognize, such as ``NAME=value mms hook``.
+    Nothing is filtered: a reader that judges registrations (``mms doctor``,
+    #1443) must also see the ones install does not own, such as
+    ``NAME=value mms hook``.
 
     Raises :class:`HookConfigLocationUnknown` when ``CLAUDE_CONFIG_DIR`` names
     no usable directory, :class:`HookConfigNotRegularFile` for a path that is
@@ -931,7 +769,7 @@ def _render_block(host_tag: str, command: str) -> str:
     Built by merging into an *empty* config so the preview shows exactly what
     ``install`` adds, not the whole rewritten file."""
     spec = HOOK_HOSTS[host_tag]
-    only = spec.install_fn({}, command, matcher_for(host_tag))
+    only = spec.install_fn(host_tag, {}, command, matcher_for(host_tag))
     return _serialize(spec.fmt, only).rstrip("\n")
 
 
@@ -944,23 +782,37 @@ def _too_deep_to_rewrite(path: Path) -> HookInstallError:
     )
 
 
-def plan_install(host_tag: str, command: str) -> HookChange:
+CommandSource = str | Callable[[tuple[OwnedHookCommand, ...]], str]
+"""The command :func:`plan_install` registers: the text itself, or a function
+that builds it from the owned handlers already in the config (in file order),
+for a caller that carries their settings over."""
+
+
+def plan_install(host_tag: str, command: CommandSource) -> HookChange:
     """Plan registering ``command`` as ``host_tag``'s PostToolUse hook.
 
     Pure (no writes): parses the current config (if any), computes the merged
     result, and reports whether applying it would create / update / no-op. The
-    merge is idempotent — an existing STM block is replaced in place. Handlers
-    that only look like STM's hook are left as they are and located in
-    ``unmanaged`` (current file) and ``unmanaged_after`` (``new_text``), both
-    from this one parse."""
+    merge is idempotent — an owned handler (:func:`owned_handler`) is replaced
+    in place. Handlers that only look like STM's hook are left as they are and
+    located in ``unmanaged`` (current file) and ``unmanaged_after``
+    (``new_text``).
+
+    The file is read once. A ``command`` function gets the owned handlers of
+    that same read, so the settings it carries over and the handlers the merge
+    replaces cannot come from two versions of the file; ``current_text`` is
+    that read too, which :func:`apply_change` compares with the file before it
+    writes."""
     spec = HOOK_HOSTS[host_tag]
     path = _config_path(spec)
     current = _read_current(path, spec.fmt)
     base: dict[str, Any] = current[0] if current else {}
     current_text = current[1] if current else None
+    if not isinstance(command, str):
+        command = command(_owned_hooks(host_tag, base))
 
     try:
-        new_data = spec.install_fn(copy.deepcopy(base), command, matcher_for(host_tag))
+        new_data = spec.install_fn(host_tag, copy.deepcopy(base), command, matcher_for(host_tag))
         new_text = _serialize(spec.fmt, new_data)
         unchanged = new_data == base
     except RecursionError as exc:
@@ -993,10 +845,10 @@ def plan_install(host_tag: str, command: str) -> HookChange:
 def plan_uninstall(host_tag: str) -> HookChange:
     """Plan removing STM's PostToolUse hook from ``host_tag``'s config.
 
-    Removes the handlers :func:`_is_stm_hook_command` recognizes, the shapes
+    Removes the handlers :func:`owned_handler` accepts, the ones
     :func:`plan_install` writes or refreshes. A handler that only looks like
     STM's hook is left in place and reported in ``unmanaged``. A no-op when the
-    file is absent or holds no recognized STM block, except that emptied
+    file is absent or holds no owned handler, except that emptied
     containers (an empty matcher group, event list or ``hooks`` section) are
     still pruned (status ``prune``)."""
     spec = HOOK_HOSTS[host_tag]
@@ -1018,7 +870,7 @@ def plan_uninstall(host_tag: str) -> HookChange:
         )
     base, current_text = current
     try:
-        new_data = spec.uninstall_fn(copy.deepcopy(base))
+        new_data = spec.uninstall_fn(host_tag, copy.deepcopy(base))
         changed = new_data != base
         new_text = _serialize(spec.fmt, new_data)
     except RecursionError as exc:
@@ -1033,9 +885,7 @@ def plan_uninstall(host_tag: str) -> HookChange:
         # ``hooks`` section with nothing in it), so
         # nothing the hook ran is removed and "Removed" would be false.
         status=(
-            ("remove" if _stm_hook_commands(host_tag, base) else "prune")
-            if changed
-            else "not_installed"
+            ("remove" if _owned_hooks(host_tag, base) else "prune") if changed else "not_installed"
         ),
         changed=changed,
         current_text=current_text,

@@ -222,7 +222,10 @@ mms daemon stop --all
 ```
 
 1. **Hooks** — `mms hook uninstall --host <host> --apply` removes the
-   PostToolUse hook after backing up the host settings file. Every install
+   PostToolUse hook install wrote, after backing up the host settings file.
+   A handler install did not write, such as a manual
+   `mms hook --host claude`, stays; uninstall names its location, so remove
+   it by hand too. Every install
    and uninstall leaves that backup **next to the host's own config**, not
    under STM's directories — `~/.claude/settings.json.bak`,
    `~/.codex/config.toml.bak`, and so on (`.bak.1`, `.bak.2`, … for later
