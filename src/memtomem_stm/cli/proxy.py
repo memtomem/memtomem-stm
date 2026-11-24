@@ -10380,25 +10380,6 @@ def _hook_command_view() -> _HookCommandView:
     return _HookCommandView("none", path)
 
 
-@contextmanager
-def _applied_env(values: dict[str, str]) -> Iterator[None]:
-    """Set ``values`` in ``os.environ`` for the block, as the hook does with its
-    flags (``hook_cmd._runtime_registration_env``). Every key set, or attempted,
-    is restored on the way out, including when setting a later one fails."""
-    previous: dict[str, str | None] = {}
-    try:
-        for key, value in values.items():
-            previous[key] = os.environ.get(key)
-            os.environ[key] = value
-        yield
-    finally:
-        for key, old in previous.items():
-            if old is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = old
-
-
 def _hook_view_summary(view: _HookCommandView, *, hook_route: bool) -> dict[str, Any]:
     """The JSON form of what doctor read: locations and the path, no values."""
     return {
@@ -10496,11 +10477,13 @@ def _surfacing_bootstrap_status(
     Doctor also reads the STM hook command in Claude Code's user settings
     (:func:`_hook_command_view`, #1494). When it finds exactly one that
     ``mms hook install`` owns, and nothing else that may run the hook, the
-    gate and the hook's build run with the variables the hook sets from that
-    command's flags, so ``--no-daemon`` sends doctor to the
-    standalone route and ``--no-persist-query-text`` reaches the fingerprint.
-    The standalone build runs after the overlay is removed. Otherwise the hook
-    view is built from doctor's environment alone. The result's
+    gate and the hook's build read the variables the hook sets from that
+    command's flags over doctor's environment, as the hook does: ``--no-daemon``
+    sends doctor to the standalone route, and the fingerprint takes the
+    query-text persistence and surfacing deadline that build resolves. They
+    are passed to the gate and the build, never set in ``os.environ``: the
+    probe and the standalone build read the environment as it is. Otherwise
+    the hook view is built from doctor's environment alone. The result's
     ``hook_view`` says which.
     """
     hook_view: dict[str, Any] | None = None
@@ -10520,20 +10503,17 @@ def _surfacing_bootstrap_status(
 
             view = _hook_command_view()
             hook_view = _hook_view_summary(view, hook_route=False)
-            # Ping and measurement read ``os.environ`` too (the fingerprint
-            # takes ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS`` from it), so the probe
-            # runs inside the overlay.
-            with _applied_env(view.env):
-                hook_route = _daemon_enabled()
-                if hook_route:
-                    hook_view["hook_route"] = True
-                    config = load_env_stm_config().config
-                    # Before the probe, as on the standalone route: a feedback DB
-                    # path that cannot be inspected ends the section unprobed.
-                    db_status = inspect_feedback_db(config.surfacing.feedback_db_path)
-                    ltm_status = _ltm_status(
-                        config, timeout, measure_ltm=measure_ltm, hook_route=True
-                    )
+            hook_route = _daemon_enabled(view.env)
+            if hook_route:
+                hook_view["hook_route"] = True
+                config = load_env_stm_config(view.env).config
+                # Before the probe, as on the standalone route: a feedback DB
+                # path that cannot be inspected ends the section unprobed.
+                db_status = inspect_feedback_db(config.surfacing.feedback_db_path)
+                # The probe reads the flags' variables only through *config*;
+                # the fingerprint's direct read of the environment is
+                # ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``, which no flag sets.
+                ltm_status = _ltm_status(config, timeout, measure_ltm=measure_ltm, hook_route=True)
         if ltm_status is None:
             config = stm_config_for_cli(config_path)
             db_status = inspect_feedback_db(config.surfacing.feedback_db_path)

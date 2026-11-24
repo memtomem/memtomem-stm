@@ -23,11 +23,12 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from pydantic import ValidationError
 
 from helpers import set_home
 from memtomem_stm.cli.host_runtime import HostRuntimePolicy, hook_command_words, hook_launcher
 from memtomem_stm.cli.proxy import _surfacing_bootstrap_status, cli
-from memtomem_stm.config import STMConfig, load_env_stm_config
+from memtomem_stm.config import HOOK_FLAG_ENV_NAMES, STMConfig, load_env_stm_config
 from memtomem_stm.daemon.discovery import config_fingerprint
 from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
 
@@ -561,59 +562,172 @@ def test_a_feedback_db_inspection_failure_ends_the_section_before_any_probe(
     assert probes == []
 
 
-# --- the overlay leaves nothing behind ----------------------------------------
+# --- the command's options never enter os.environ -------------------------------
 
 
-def test_the_overlay_is_restored_after_a_probe(home, monkeypatch):
+def test_the_probe_reads_the_environment_as_it_is(home, monkeypatch):
+    # The options reach the probe through the config it is handed, never through
+    # ``os.environ``: a second doctor call overlapping this one in the same process
+    # must not see them, nor capture them as its own "original" environment.
+    monkeypatch.setenv(PERSIST, "true")
     _settings(home, _cmd(_installed()))
-    _install(monkeypatch, LiveDaemons(_installed_fp(monkeypatch)))
+    seen: list[tuple[str | None, bool]] = []
+
+    def recording_status(config: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append((os.environ.get(PERSIST), config.surfacing.persist_query_text))
+        return {"connected": True}
+
+    monkeypatch.setattr("memtomem_stm.cli.proxy._ltm_status", recording_status)
     before = dict(os.environ)
+    writes: list[str] = []
+    environ_type = type(os.environ)
+    real_set, real_del = environ_type.__setitem__, environ_type.__delitem__
 
-    status = _doctor()
+    def spy_set(self: Any, key: str, value: str) -> None:
+        writes.append(key)
+        real_set(self, key, value)
 
-    assert status["ltm_server"]["connected"] is True, status
+    def spy_del(self: Any, key: str) -> None:
+        writes.append(key)
+        real_del(self, key)
+
+    # Around the gate and the build too, not just the probe: a design that set
+    # the flags there and restored them before probing would pass the rest.
+    monkeypatch.setattr(environ_type, "__setitem__", spy_set)
+    monkeypatch.setattr(environ_type, "__delitem__", spy_del)
+    try:
+        status = _doctor()
+    finally:
+        monkeypatch.setattr(environ_type, "__setitem__", real_set)
+        monkeypatch.setattr(environ_type, "__delitem__", real_del)
+
+    # The config carries the command's ``--no-persist-query-text``; the
+    # environment keeps doctor's own value, and doctor writes none of the flags.
+    assert seen == [("true", False)], status
+    assert [key for key in writes if key in HOOK_FLAG_ENV_NAMES] == []
     assert dict(os.environ) == before
 
 
-def test_the_overlay_is_restored_when_the_probe_raises(home, monkeypatch):
+def test_the_options_are_gone_when_the_probe_raises(home, monkeypatch):
     _settings(home, _cmd(_installed()))
-    seen: list[str | None] = []
 
     def failing_status(*args: Any, **kwargs: Any) -> Any:
-        seen.append(os.environ.get(PERSIST))
         raise RuntimeError("boom")
 
     monkeypatch.setattr("memtomem_stm.cli.proxy._ltm_status", failing_status)
-    before = dict(os.environ)
+    monkeypatch.delenv(PERSIST, raising=False)
 
     status = _doctor()
 
-    assert seen == ["false"]  # positive control: the overlay was in effect
     assert status["error"] == "RuntimeError", status
-    assert dict(os.environ) == before
+    assert PERSIST not in os.environ
+    assert STMConfig().surfacing.persist_query_text is True
 
 
-def test_applied_env_restores_what_it_set_when_a_later_value_fails(monkeypatch):
-    monkeypatch.delenv("MEMTOMEM_STM_TEST_FIRST", raising=False)
-    monkeypatch.setenv("MEMTOMEM_STM_TEST_SECOND", "kept")
-    from memtomem_stm.cli.proxy import _applied_env
+def test_the_overlay_is_reset_when_the_build_raises(monkeypatch):
+    monkeypatch.delenv(PERSIST, raising=False)
 
-    values: dict[str, str] = {"MEMTOMEM_STM_TEST_FIRST": "set", "MEMTOMEM_STM_TEST_SECOND": "x"}
-    real_setitem = type(os.environ).__setitem__
+    with pytest.raises(ValidationError):
+        load_env_stm_config({PERSIST: "not-a-bool"})
 
-    def setitem(self: Any, key: str, value: str) -> None:
-        if key == "MEMTOMEM_STM_TEST_SECOND" and value == "x":
-            raise UnicodeEncodeError("utf-8", value, 0, 1, "refused")
-        real_setitem(self, key, value)
+    # A bare build, not another ``load_env_stm_config`` call, which would set
+    # the context itself and hide an overlay left behind.
+    assert STMConfig().surfacing.persist_query_text is True
 
-    monkeypatch.setattr(type(os.environ), "__setitem__", setitem)
-    with pytest.raises(UnicodeEncodeError):
-        with _applied_env(values):
-            pass  # pragma: no cover - the apply fails first
-    monkeypatch.setattr(type(os.environ), "__setitem__", real_setitem)
 
-    assert "MEMTOMEM_STM_TEST_FIRST" not in os.environ
-    assert os.environ["MEMTOMEM_STM_TEST_SECOND"] == "kept"
+def test_an_env_overlay_wins_over_the_environment_without_setting_it(monkeypatch):
+    # Over an ambient value that would fail the build, too: the overlay replaces
+    # it, as setting the variable would.
+    monkeypatch.setenv(PERSIST, "not-a-bool")
+    monkeypatch.setenv(SURFACING_TIMEOUT, "7")
+
+    load = load_env_stm_config({PERSIST: "false"})
+
+    assert load.config.surfacing.persist_query_text is False
+    assert load.config.surfacing.timeout_seconds == 7.0  # the rest still from the env
+    assert os.environ[PERSIST] == "not-a-bool"
+    with pytest.raises(ValidationError):
+        load_env_stm_config()  # positive control: without the overlay it fails
+
+
+def test_an_env_overlay_is_not_seen_by_a_build_on_another_thread(monkeypatch):
+    import threading
+
+    from memtomem_stm.config import _env_overlay
+
+    monkeypatch.delenv(PERSIST, raising=False)
+    seen: list[bool] = []
+    go = threading.Event()
+
+    def build() -> None:
+        go.wait(timeout=10)
+        seen.append(STMConfig().surfacing.persist_query_text)
+
+    # Started before the overlay is set, so it cannot have inherited it, and run
+    # while the overlay is in effect here.
+    worker = threading.Thread(target=build)
+    worker.start()
+    with _env_overlay({PERSIST: "false"}):
+        assert STMConfig().surfacing.persist_query_text is False  # positive control
+        go.set()
+        worker.join(timeout=10)
+
+    assert seen == [True]
+    assert STMConfig().surfacing.persist_query_text is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [PERSIST.lower(), "OTEL_EXPORTER_OTLP_HEADERS", CONFIG_PATH],
+    ids=["other-spelling", "non-stm", "proxy"],
+)
+def test_an_env_overlay_accepts_only_the_hooks_flag_variables(monkeypatch, name):
+    # Windows would fold a lower-case spelling onto the upper-case one, and a
+    # name read outside the settings build (the OTLP header check) would see
+    # nothing: the overlay is not the environment for any other name.
+    with pytest.raises(ValueError, match="flag variables"):
+        load_env_stm_config({name: "x"})
+
+
+def test_the_overlay_names_are_the_ones_the_hook_sets():
+    from memtomem_stm.cli import host_runtime
+
+    every = host_runtime.runtime_env_overrides(
+        use_daemon="true",
+        surfacing_timeout_seconds="2",
+        daemon_timeout_seconds="9",
+        persist_query_text="false",
+    )
+    assert set(every) == HOOK_FLAG_ENV_NAMES
+    assert load_env_stm_config(every).config.surfacing.persist_query_text is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows folds environment names itself")
+@pytest.mark.parametrize("later", ["true", "not-a-bool"])
+def test_a_later_spelling_of_the_name_wins_as_it_does_for_the_hook(monkeypatch, later):
+    # POSIX keeps both spellings; pydantic folds names to lower case and the later
+    # one wins. The hook sets the variable in place, so its flag loses to a later
+    # spelling, and doctor must build what the hook builds.
+    lower = PERSIST.lower()
+    monkeypatch.delenv(PERSIST, raising=False)
+    monkeypatch.delenv(lower, raising=False)
+    monkeypatch.setenv(PERSIST, "true")
+    monkeypatch.setenv(lower, later)
+    assert [k for k in os.environ if k.lower() == lower] == [PERSIST, lower]
+
+    def hook_build() -> Any:
+        with monkeypatch.context() as patch:
+            patch.setenv(PERSIST, "false")  # in place, as the hook sets it
+            return STMConfig()
+
+    if later == "true":
+        assert load_env_stm_config({PERSIST: "false"}).config.surfacing.persist_query_text is True
+        assert hook_build().surfacing.persist_query_text is True
+    else:
+        with pytest.raises(ValidationError):
+            load_env_stm_config({PERSIST: "false"})
+        with pytest.raises(ValidationError):
+            hook_build()
 
 
 # --- nothing from the command reaches output ----------------------------------

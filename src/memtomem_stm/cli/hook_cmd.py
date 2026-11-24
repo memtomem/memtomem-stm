@@ -81,6 +81,7 @@ import logging
 import os
 import shlex
 import sys
+from collections.abc import Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from dataclasses import dataclass
@@ -696,7 +697,7 @@ def _read_payload(stream: TextIO) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _daemon_enabled() -> bool:
+def _daemon_enabled(overlay: Mapping[str, str] | None = None) -> bool:
     """Whether the hook should route through the local daemon.
 
     Daemon mode is the default (``HookConfig.use_daemon=True``); unset → on. We
@@ -709,8 +710,13 @@ def _daemon_enabled() -> bool:
     doesn't strip and would reject it); any other value Pydantic rejects (empty,
     garbage) returns enabled here, while a config load like ``mms daemon status``
     would raise.
+
+    A value in *overlay* wins over the environment's, as it would if the
+    overlay were set there (``mms doctor`` passes the variables the hook sets
+    from its command's flags, #1494).
     """
-    val = os.environ.get("MEMTOMEM_STM_HOOK__USE_DAEMON")
+    name = "MEMTOMEM_STM_HOOK__USE_DAEMON"
+    val = overlay[name] if overlay and name in overlay else os.environ.get(name)
     if val is None:
         return True
     return val.strip().lower() not in ("0", "false", "f", "no", "n", "off")

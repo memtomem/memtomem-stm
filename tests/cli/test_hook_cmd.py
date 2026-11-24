@@ -734,6 +734,18 @@ def test_daemon_enabled_default_when_unset(monkeypatch: pytest.MonkeyPatch):
     assert _daemon_enabled() is True
 
 
+@pytest.mark.parametrize(
+    ("ambient", "overlay", "expected"), [("0", "true", True), ("1", "f", False)]
+)
+def test_daemon_enabled_overlay_wins_over_the_environment(
+    monkeypatch: pytest.MonkeyPatch, ambient: str, overlay: str, expected: bool
+):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", ambient)
+    assert _daemon_enabled({"MEMTOMEM_STM_HOOK__USE_DAEMON": overlay}) is expected
+    assert _daemon_enabled({"MEMTOMEM_STM_OTHER": "0"}) is (ambient == "1")
+    assert os.environ["MEMTOMEM_STM_HOOK__USE_DAEMON"] == ambient
+
+
 def test_daemon_explicitly_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     sentinel = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
