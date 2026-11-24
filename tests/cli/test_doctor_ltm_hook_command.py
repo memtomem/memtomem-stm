@@ -254,7 +254,8 @@ def test_cli_row_names_the_command_it_read(home, proxy_file, monkeypatch, tmp_pa
     row = checks["ltm"]
     assert row["status"] == "PASS", row
     expected = (
-        f"route: the hook's daemon, with the options of the STM hook command at {FIRST} in {path}"
+        "route: the hook's daemon, chosen from doctor's environment with the options of the "
+        f"STM hook command at {FIRST} in {path}"
     )
     assert expected in row["detail"], row
     assert row["detail"].endswith("(Claude Code user settings only)"), row
@@ -264,9 +265,10 @@ def test_cli_row_names_the_command_it_read(home, proxy_file, monkeypatch, tmp_pa
 def test_cli_row_names_a_failed_hook_build_not_the_flag(
     home, proxy_file, monkeypatch, tmp_path, use_daemon
 ):
-    # The hook's build fails on a variable outside the flags: the hook then
-    # passes every call through (#1501), so the row must not say the command's
-    # flag turned the hook's daemon off.
+    # Doctor's build of the hook's configuration fails on a variable outside
+    # the flags. The host's environment may not carry it, so the note says only
+    # what doctor chose from, never why the hook behaves as it does; the
+    # failing variable is named by the env_overrides row.
     _settings(home, _cmd(_installed(use_daemon=use_daemon)))
     _install(monkeypatch, LiveDaemons())
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__MAX_RESULTS", "nope")
@@ -275,10 +277,12 @@ def test_cli_row_names_a_failed_hook_build_not_the_flag(
 
     detail = checks["ltm"]["detail"]
     assert (
-        f"the hook's build with the options of the STM hook command at {FIRST} fails on a "
-        "setting, so the hook passes every call through" in detail
+        "route: the standalone route, chosen from doctor's environment with the options of "
+        f"the STM hook command at {FIRST}" in detail
     ), detail
-    assert "hook's daemon off" not in detail
+    for claim in ("passes every call through", "hook's daemon off", "fails on a setting"):
+        assert claim not in detail, detail
+    assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in checks["env_overrides"]["detail"]
 
 
 def test_cli_row_names_the_command_that_turned_the_hook_daemon_off(
@@ -291,8 +295,8 @@ def test_cli_row_names_the_command_that_turned_the_hook_daemon_off(
 
     detail = checks["ltm"]["detail"]
     assert (
-        f"route: the direct LTM probe, hook's daemon off by the STM hook command at {FIRST}"
-        in detail
+        "route: the direct LTM probe, chosen from doctor's environment with the options of "
+        f"the STM hook command at {FIRST}" in detail
     ), detail
 
 
@@ -307,71 +311,69 @@ def test_cli_row_names_doctors_environment_when_it_turned_the_hook_daemon_off(
 
     detail = checks["ltm"]["detail"]
     assert (
-        "route: the standalone daemon route, hook.use_daemon false in doctor's environment "
-        "(no STM hook command in" in detail
+        "route: the standalone daemon route, chosen from doctor's environment only: "
+        "no STM hook command in" in detail
     ), detail
 
 
 _FOUND = {"state": "found", "path": "/s.json", "locations": [FIRST]}
 _UNREAD = {"state": "unreadable", "path": "/s.json", "locations": [FIRST]}
+_WITH = f"doctor's environment with the options of the STM hook command at {FIRST} in /s.json"
+_ONLY = (
+    "doctor's environment only: a command that may run STM's hook could not be read "
+    f"({FIRST}) in /s.json"
+)
+_SKIPPED = {"skipped": "surfacing_disabled"}
 
 
 @pytest.mark.parametrize(
-    ("summary", "ltm", "reason"),
+    ("summary", "ltm", "note"),
     [
         (
-            {**_FOUND, "hook_build_failed": True, "gate_from_command": True},
-            {"route": "direct"},
-            f"the direct LTM probe, the hook's build with the options of the STM hook command "
-            f"at {FIRST} fails on a setting, so the hook passes every call through",
+            {**_FOUND, "hook_route": True},
+            {"route": "daemon"},
+            f"the hook's daemon, chosen from {_WITH}",
+        ),
+        (
+            {**_FOUND, "hook_route": True},
+            {"route": "daemon", **_SKIPPED},
+            f"the hook's daemon (not probed: surfacing is disabled), chosen from {_WITH}",
         ),
         (
             {**_FOUND, "gate_from_command": True},
             {"route": "direct"},
-            f"the direct LTM probe, hook's daemon off by the STM hook command at {FIRST}",
+            f"the direct LTM probe, chosen from {_WITH}",
         ),
-        (
-            {**_FOUND, "gate_from_command": False},
-            {"route": "daemon"},
-            f"the standalone daemon route, hook.use_daemon false in the hook's build "
-            f"(the STM hook command at {FIRST} has no daemon flag)",
-        ),
-        (
-            {**_UNREAD, "hook_build_failed": True},
-            {"route": "direct"},
-            "the direct LTM probe, the build from doctor's environment fails on a setting "
-            f"(a command that may run STM's hook could not be read ({FIRST}) in /s.json)",
-        ),
+        ({**_FOUND}, None, f"the standalone route, chosen from {_WITH}"),
         (
             {**_UNREAD},
             {"route": "direct"},
-            "the direct LTM probe, hook.use_daemon false in doctor's environment "
-            f"(a command that may run STM's hook could not be read ({FIRST}) in /s.json)",
+            f"the direct LTM probe, chosen from {_ONLY}",
         ),
+        ({**_UNREAD}, {"route": "daemon"}, f"the standalone daemon route, chosen from {_ONLY}"),
         (
-            {**_FOUND, "gate_from_command": True},
-            {"route": "direct", "skipped": "surfacing_disabled"},
-            "the standalone route (not probed: surfacing is disabled), hook's daemon off by "
-            f"the STM hook command at {FIRST}",
+            {**_UNREAD},
+            {"route": "direct", **_SKIPPED},
+            f"the direct LTM probe (not probed: surfacing is disabled), chosen from {_ONLY}",
         ),
     ],
     ids=[
-        "found-build-failed",
-        "found-no-daemon",
-        "found-no-flag",
-        "unread-build-failed",
-        "unread-setting-off",
-        "surfacing-disabled",
+        "found-hook-route",
+        "found-hook-route-skipped",
+        "found-direct",
+        "found-no-ltm",
+        "unread-direct",
+        "unread-standalone-daemon",
+        "unread-skipped",
     ],
 )
-def test_the_standalone_note_says_only_what_doctors_build_showed(summary, ltm, reason):
-    # Without the command (every state but ``found``), doctor does not know what
-    # the registered hook does, so the note speaks of doctor's build only.
+def test_the_note_says_only_what_doctor_did(summary, ltm, note):
+    # The route, whether a probe ran, and what doctor chose it from. Doctor
+    # builds from its own environment, not the host's, so the note never says
+    # why the registered hook behaves as it does.
     from memtomem_stm.cli.proxy import _hook_view_note
 
-    note = _hook_view_note({**summary, "hook_route": False}, ltm)
-
-    assert note == f"route: {reason} (Claude Code user settings only)"
+    assert _hook_view_note(summary, ltm) == f"route: {note} (Claude Code user settings only)"
 
 
 def test_a_use_daemon_flag_turns_the_route_on_over_an_ambient_opt_out(home, monkeypatch):

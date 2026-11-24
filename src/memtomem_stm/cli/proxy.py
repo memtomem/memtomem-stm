@@ -10389,14 +10389,20 @@ def _hook_view_summary(view: _HookCommandView, *, hook_route: bool) -> dict[str,
         "path": None if view.path is None else str(view.path),
         "locations": list(view.locations),
         "hook_route": hook_route,
-        "hook_build_failed": False,
         "gate_from_command": view.gate_from_command,
         "settings_error": view.settings_error,
     }
 
 
 def _hook_view_note(summary: Any, ltm: Any) -> str | None:
-    """The ``ltm server`` row's account of which route it probed and why (#1494)."""
+    """The ``ltm server`` row's account of the route it took and what it chose it from (#1494).
+
+    Only what doctor did: the route, whether a probe ran, and the inputs of
+    its build of the hook's configuration. Not why the hook behaves as it
+    does: doctor builds from its own environment, not the host's, so what the
+    registered hook builds is not known here. The ``env_overrides`` row names
+    a variable that fails doctor's environment-only build.
+    """
     if not isinstance(summary, dict):
         return None
     # Raw, like every other ``check()`` detail: the terminal renderer escapes it,
@@ -10404,60 +10410,42 @@ def _hook_view_note(summary: Any, ltm: Any) -> str | None:
     path = str(summary.get("path"))
     locations = ", ".join(str(loc) for loc in summary.get("locations") or [])
     state = summary.get("state")
-    # Why the command was not used, for every state but ``found``.
-    if state == "several":
-        unused = f"{len(summary['locations'])} STM hook commands ({locations}) in {path}"
-    elif state == "unreadable":
-        unused = f"a command that may run STM's hook could not be read ({locations}) in {path}"
-    elif state == "windows":
-        unused = f"hook commands are not read on Windows ({locations}) in {path}"
-    elif state == "settings_error":
-        unused = str(summary.get("settings_error"))
-    else:
-        unused = f"no STM hook command in {path}"
     if summary.get("hook_route"):
-        # The configuration's inputs, not a claim that it built: the build can
-        # still fail validation on them.
-        if state == "found":
-            inputs = f"with the options of the STM hook command at {locations} in {path}"
-        else:
-            inputs = f"with doctor's environment only: {unused}"
-        note = f"route: the hook's daemon, {inputs}"
+        route = "the hook's daemon"
+    elif not isinstance(ltm, dict):
+        # A build that failed before the standalone route could be told apart.
+        route = "the standalone route"
+    elif ltm.get("route") == "daemon":
+        route = "the standalone daemon route"
     else:
-        # The route chosen, whether or not a probe ran (a build that failed
-        # before the standalone route could be told apart has no ``ltm``).
-        if not isinstance(ltm, dict):
-            route = "standalone route"
-        elif ltm.get("skipped") == "surfacing_disabled":
-            route = "standalone route (not probed: surfacing is disabled)"
-        elif ltm.get("route") == "daemon":
-            route = "standalone daemon route"
-        else:
-            route = "direct LTM probe"
-        # Only what doctor's own build of the hook's configuration showed. That
-        # build is the hook's when the command was read (``found``); otherwise
-        # it is doctor's environment alone, and what the registered hook does
-        # is not known, so nothing is said about it.
-        if state == "found" and summary.get("hook_build_failed"):
-            # The hook passes every call through then (#1501), so neither its
-            # flag nor ``hook.use_daemon`` is why its daemon was not probed.
-            reason = (
-                f"the hook's build with the options of the STM hook command at {locations} "
-                "fails on a setting, so the hook passes every call through"
-            )
-        elif state == "found" and summary.get("gate_from_command"):
-            reason = f"hook's daemon off by the STM hook command at {locations}"
-        elif state == "found":
-            reason = (
-                f"hook.use_daemon false in the hook's build (the STM hook command at "
-                f"{locations} has no daemon flag)"
-            )
-        elif summary.get("hook_build_failed"):
-            reason = f"the build from doctor's environment fails on a setting ({unused})"
-        else:
-            reason = f"hook.use_daemon false in doctor's environment ({unused})"
-        note = f"route: the {route}, {reason}"
-    return f"{note} (Claude Code user settings only)"
+        route = "the direct LTM probe"
+    if isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled":
+        route = f"{route} (not probed: surfacing is disabled)"
+    if state == "found":
+        inputs = (
+            f"doctor's environment with the options of the STM hook command at {locations} "
+            f"in {path}"
+        )
+    elif state == "several":
+        inputs = (
+            f"doctor's environment only: {len(summary['locations'])} STM hook commands "
+            f"({locations}) in {path}"
+        )
+    elif state == "unreadable":
+        inputs = (
+            "doctor's environment only: a command that may run STM's hook could not be read "
+            f"({locations}) in {path}"
+        )
+    elif state == "windows":
+        inputs = (
+            f"doctor's environment only: hook commands are not read on Windows ({locations}) "
+            f"in {path}"
+        )
+    elif state == "settings_error":
+        inputs = f"doctor's environment only: {summary.get('settings_error')}"
+    else:
+        inputs = f"doctor's environment only: no STM hook command in {path}"
+    return f"route: {route}, chosen from {inputs} (Claude Code user settings only)"
 
 
 def _surfacing_bootstrap_status(
@@ -10534,7 +10522,6 @@ def _surfacing_bootstrap_status(
                 built: STMConfig | None = load_env_stm_config(view.env).config
             except (ValidationError, SettingsError):
                 built = None
-                hook_view["hook_build_failed"] = True
             # As the hook routes (#1501): its command's daemon flag decides
             # directly, else the build's ``hook.use_daemon``. A build that fails
             # passes every call through, so its route is moot.
@@ -11642,11 +11629,12 @@ def doctor(
     an already running daemon; it still never edits configuration or LTM data.
     An explicit ``--config`` also steers the STMConfig-backed checks (LTM /
     surfacing), not just the proxy-file checks (#839), unless the hook would
-    use the daemon: those checks then use the configuration the hook builds
-    from the environment, which ``--config`` does not reach (#1485), with the
-    options of the STM hook command in Claude Code's user settings applied
-    when they hold exactly one that ``mms hook install`` owns, no other
-    handler that may run the hook, and doctor is not on Windows (#1494).
+    use the daemon: those checks then use doctor's build of the hook's
+    configuration, from doctor's environment (not the host's), which
+    ``--config`` does not reach (#1485), with the options of the STM hook
+    command in Claude Code's user settings applied when they hold exactly one
+    that ``mms hook install`` owns, no other handler that may run the hook,
+    and doctor is not on Windows (#1494).
     """
     resolved_cfg = resolve_cli_config_path(config_path)
     config_path = resolved_cfg.path

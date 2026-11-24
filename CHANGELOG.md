@@ -144,7 +144,8 @@ changes inline only. See the deprecation policy in
   still run the hook (a hand-written `mms hook --host claude`, an
   `env MEMTOMEM_STM_…` prefix, exec-form `args`), a handler with a non-Bash
   `shell`, an unreadable settings file, or any handler on Windows. The row
-  now ends with the route it chose and why, naming the handler's location
+  now ends with the route it chose, whether a probe ran, and what doctor
+  chose it from, naming the handler's location
   (`hooks.PostToolUse[i].hooks[j]`), never its text. Handlers that may run
   STM's hook are found with the look-alike test `mms hook install` uses,
   except that one `mms hook` would not run as the bridge (`--help`, a
@@ -217,10 +218,11 @@ changes inline only. See the deprecation policy in
   route directly: it reaches the settings through one exact variable, which a
   case-equivalent spelling elsewhere in the environment can outrank. Doctor
   follows the same setting, and when the hook's build fails on a variable
-  outside `proxy` (the hook then passes every call through; without the
-  command read, the environment-only build is doctor's estimate of the
-  hook's, issue #1494 entry), doctor reports the error of its own
-  `--config` build instead of the environment-only one.
+  outside `proxy` (the hook then passes every call through; doctor builds
+  from its own environment, with the registered command's flags when it
+  reads them, issue #1494 entry, so its build can differ from the host's),
+  doctor reports the error of its own `--config` build instead of the
+  environment-only one.
   `mms daemon status` says `no (hook.use_daemon is false)` and the
   `--measure-ltm` warning names the setting, instead of naming
   `MEMTOMEM_STM_HOOK__USE_DAEMON=0`. **Behavior change**: a nested or
