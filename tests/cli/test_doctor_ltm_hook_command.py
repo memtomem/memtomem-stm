@@ -973,14 +973,6 @@ def _telemetry(*, predates_counters: bool = False, failures: int = 0) -> dict[st
     return {"ltm": "warm", "pid": 1, "port": 2, "latency": {"surface": surface}}
 
 
-def _daemon_note(command: str) -> str:
-    return (
-        f"{command} (doctor built the hook's daemon configuration with the options of the "
-        f"STM hook command at {FIRST}; `{command}` here builds from this shell's environment "
-        "without them)"
-    )
-
-
 def test_measure_ltm_names_the_commands_no_daemon_flag(home, proxy_file, monkeypatch, tmp_path):
     _settings(home, _cmd(_installed(use_daemon=False)))
     _install(monkeypatch, LiveDaemons())
@@ -1030,34 +1022,37 @@ def test_measure_ltm_keeps_the_setting_advice_when_the_flag_did_not_decide(
     assert row["next_action"] == _OLD_ROUTE_ACTION, row
 
 
-def test_daemon_start_on_the_hook_route_says_it_builds_without_the_options(
-    home, proxy_file, monkeypatch, tmp_path
-):
+_OUTCOME_CASES = pytest.mark.parametrize(
+    ("reply", "subcommand"),
+    [(_telemetry(predates_counters=True), "restart"), (_telemetry(failures=2), "status")],
+    ids=["predates-counters", "failed-requests"],
+)
+
+
+def test_daemon_start_stays_bare_with_a_hook_command(home, proxy_file, monkeypatch, tmp_path):
+    # The command's options change the fingerprint here (a default install
+    # writes --no-persist-query-text), but no runnable daemon command for the
+    # hook's configuration can be stated from doctor's side: the advice keeps
+    # main's bare commands (#1505).
     _settings(home, _cmd(_installed(surfacing=7.25)))
-    _install(monkeypatch, LiveDaemons())
-
-    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
-
-    assert checks["ltm_measurement"]["next_action"] == _daemon_note("mms daemon start")
-    assert checks["ltm"]["next_action"] == _daemon_note("mms daemon status")
-    for row in (checks["ltm_measurement"], checks["ltm"]):
-        assert "7.25" not in row["next_action"], row  # names, never the command's values
-
-
-@pytest.mark.parametrize("case", ["no-hook-command", "same-fingerprint"])
-def test_daemon_start_stays_bare_when_the_shell_builds_the_same_daemon(
-    home, proxy_file, monkeypatch, tmp_path, case
-):
-    if case == "same-fingerprint":
-        # The shell already sets what the command sets that the fingerprint reads.
-        _settings(home, _cmd(_installed()))
-        monkeypatch.setenv(PERSIST, "false")
     _install(monkeypatch, LiveDaemons())
 
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
 
     assert checks["ltm_measurement"]["next_action"] == "mms daemon start"
     assert checks["ltm"]["next_action"] == "mms daemon status"
+
+
+@_OUTCOME_CASES
+def test_outcome_advice_stays_bare_with_a_hook_command(
+    home, proxy_file, monkeypatch, tmp_path, reply, subcommand
+):
+    _settings(home, _cmd(_installed()))
+    _install(monkeypatch, AnswerEveryDaemon(reply))
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert checks["surfacing_outcomes"]["next_action"] == f"mms daemon {subcommand}"
 
 
 def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, tmp_path):
@@ -1115,65 +1110,6 @@ def test_timeout_advice_keeps_the_export_when_the_command_does_not_set_it(
     assert checks["hook_daemon_timeout"]["next_action"] == (
         "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=10"
     ), checks["hook_daemon_timeout"]
-
-
-_OUTCOME_CASES = pytest.mark.parametrize(
-    ("reply", "subcommand"),
-    [(_telemetry(predates_counters=True), "restart"), (_telemetry(failures=2), "status")],
-    ids=["predates-counters", "failed-requests"],
-)
-
-
-@_OUTCOME_CASES
-def test_outcome_advice_says_the_daemon_command_builds_without_the_options(
-    home, proxy_file, monkeypatch, tmp_path, reply, subcommand
-):
-    _settings(home, _cmd(_installed()))
-    _install(monkeypatch, AnswerEveryDaemon(reply))
-
-    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
-
-    row = checks["surfacing_outcomes"]
-    assert row["next_action"] == _daemon_note(f"mms daemon {subcommand}"), row
-
-
-@_OUTCOME_CASES
-def test_outcome_advice_stays_bare_without_a_hook_command(
-    home, proxy_file, monkeypatch, tmp_path, reply, subcommand
-):
-    _install(monkeypatch, AnswerEveryDaemon(reply))
-
-    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
-
-    assert checks["surfacing_outcomes"]["next_action"] == f"mms daemon {subcommand}"
-
-
-def test_no_lookup_note_when_surfacing_is_disabled(home, proxy_file, monkeypatch, tmp_path):
-    # The probe is skipped, so doctor looked nothing up and says nothing about it.
-    _settings(home, _cmd(_installed(surfacing=7.25)))
-    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
-    daemons = LiveDaemons()
-    _install(monkeypatch, daemons)
-
-    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
-
-    assert daemons.pinged == []
-    assert checks["ltm"]["next_action"] == "mms daemon status", checks["ltm"]
-
-
-def test_no_lookup_note_when_the_shell_cannot_build(home, proxy_file, monkeypatch, tmp_path):
-    # The command's flag replaces the ambient invalid deadline for the hook, but
-    # ``mms daemon start`` in this shell fails while loading its configuration.
-    _settings(home, _cmd(_installed(surfacing=7.25)))
-    monkeypatch.setenv(DAEMON_TIMEOUT, "-1")
-    with pytest.raises(ValidationError):
-        load_env_stm_config()  # positive control: the shell's own build fails
-    _install(monkeypatch, LiveDaemons())
-
-    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
-
-    assert checks["ltm_measurement"]["next_action"] == "mms daemon start", checks
-    assert checks["ltm"]["next_action"] == "mms daemon status", checks["ltm"]
 
 
 def test_an_advice_failure_keeps_the_probe_result(home, proxy_file, monkeypatch, tmp_path):

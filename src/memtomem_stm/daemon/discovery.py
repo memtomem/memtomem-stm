@@ -125,31 +125,6 @@ def discovery_key_path(data_dir: Path) -> Path:
     return (data_dir / DISCOVERY_KEY_NAME).expanduser()
 
 
-def fingerprint_material(config: STMConfig) -> dict[str, Any]:
-    """The settings :func:`config_fingerprint` digests, before the key.
-
-    Two configs with equal material under the same ``data_dir`` share a
-    fingerprint; ``mms doctor`` compares them to tell whether the hook
-    command's options select a different daemon than its own shell would.
-    """
-    return {
-        # ``use_daemon`` chooses the standalone client's route; it does not
-        # change the daemon-owned engine or LTM connection and therefore must
-        # not split discovery identity.
-        "surfacing": config.surfacing.model_dump(mode="json", exclude={"use_daemon"}),
-        "record_feedback_events": config.hook.record_feedback_events,
-        "host": config.daemon.host,
-        "idle_timeout_seconds": config.daemon.idle_timeout_seconds,
-        "max_pending_requests": config.daemon.max_pending_requests,
-        # Sibling of the line above and required for the same reason: a caller
-        # that asked for the serialized daemon must not silently reuse a
-        # running four-way one, and vice versa (#874).
-        "max_concurrent_ltm_ops": config.daemon.max_concurrent_ltm_ops,
-        "surface_tools_env": os.environ.get("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", ""),
-        "protocol_version": PROTOCOL_VERSION,
-    }
-
-
 @overload
 def config_fingerprint(config: STMConfig, *, create_key: Literal[True]) -> str: ...
 
@@ -202,7 +177,22 @@ def config_fingerprint(config: STMConfig, *, create_key: bool) -> str | None:
     — see the module docstring and :func:`iter_foreign_handshakes`). This is the structural half of the
     version guard; the explicit per-frame ``v`` check is the belt-and-suspenders.
     """
-    material = fingerprint_material(config)
+    material = {
+        # ``use_daemon`` chooses the standalone client's route; it does not
+        # change the daemon-owned engine or LTM connection and therefore must
+        # not split discovery identity.
+        "surfacing": config.surfacing.model_dump(mode="json", exclude={"use_daemon"}),
+        "record_feedback_events": config.hook.record_feedback_events,
+        "host": config.daemon.host,
+        "idle_timeout_seconds": config.daemon.idle_timeout_seconds,
+        "max_pending_requests": config.daemon.max_pending_requests,
+        # Sibling of the line above and required for the same reason: a caller
+        # that asked for the serialized daemon must not silently reuse a
+        # running four-way one, and vice versa (#874).
+        "max_concurrent_ltm_ops": config.daemon.max_concurrent_ltm_ops,
+        "surface_tools_env": os.environ.get("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", ""),
+        "protocol_version": PROTOCOL_VERSION,
+    }
     # ``json_out.dumps`` rather than ``json.dumps``: ``surface_tools_env`` is an
     # environment variable, and on POSIX one holding a byte that is not valid
     # UTF-8 is decoded with ``surrogateescape``, so a lone surrogate reaches the

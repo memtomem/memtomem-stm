@@ -31,27 +31,28 @@ changes inline only. See the deprecation policy in
   environment without the flags.
 - `mms doctor`'s advice no longer asks to export an environment variable or
   to set a setting that the registered Claude Code hook command's options
-  override, and qualifies the `mms daemon` commands it names when those
-  options change the daemon fingerprint (#1505). **Behavior change**: when
-  doctor reads exactly one STM hook command that `mms hook install` owns,
-  next actions change in these cases, and only these. With `--measure-ltm`,
-  a command whose `--no-daemon` decided the route (doctor's build of the hook's configuration
-  succeeded) and the standalone daemon route off, the `ltm measurement` row
-  says so and asks to replace that flag in the command at its location,
-  instead of "set hook.use_daemon back to true"; with the standalone daemon
-  route on, the rows describe that route as before. On the hook's daemon
-  route, when surfacing is enabled, the shell's own configuration builds, and
-  the command's options change the daemon fingerprint, `mms daemon start`,
-  `status` and `restart` are followed by a note that the command run in this
-  shell builds without those options. The `surfacing timeout` and `hook daemon
-  timeout` rows, on the hook's daemon route, ask to set
-  `--surfacing-timeout-seconds` / `--daemon-timeout-seconds` in the command
-  when the value in effect is the command's, instead of an `export` the
-  command's timeout options override. The advice names the handler's
-  location and flags, never their values; `--json` gains no field. Known
-  limits: with a case-equivalent spelling that outranks a variable (#1503),
-  the rows keep the `export` advice, which that spelling outranks too; the
-  standalone route's `mms daemon start` is #1504.
+  override (#1505). **Behavior change**: when doctor reads exactly one STM
+  hook command that `mms hook install` owns, the text of up to three rows
+  changes in these cases, and only these. With `--measure-ltm`, a command whose
+  `--no-daemon` decided the route (doctor's build of the hook's
+  configuration succeeded) and the standalone daemon route off, both the
+  detail and the next action of the `ltm measurement` row change: the
+  detail says that flag decided the route, and the action asks to replace
+  it in the command at its location, instead of "set hook.use_daemon back to
+  true"; with the standalone daemon route on, the row describes that route as
+  before. The `surfacing timeout` and `hook daemon timeout` rows, on the
+  hook's daemon route and when they WARN that the deadline is too small, ask
+  to set `--surfacing-timeout-seconds` /
+  `--daemon-timeout-seconds` in the command when the value in effect is the
+  command's, instead of an `export` the command's timeout options override.
+  The advice names the handler's location and flags, never their values;
+  `--json` gains no field. Known limits: with a case-equivalent spelling that
+  outranks a variable (#1503), the rows keep the `export` advice, which that
+  spelling outranks too. The `mms daemon start` / `status` / `restart`
+  advice is unchanged: it builds from the shell without the command's
+  options, so on the hook's daemon route it can address another daemon, and
+  doctor cannot state a command that reproduces the hook's configuration
+  (tracked separately; the standalone route's half is #1504).
 
 ## [0.7.11] — 2026-11-24
 

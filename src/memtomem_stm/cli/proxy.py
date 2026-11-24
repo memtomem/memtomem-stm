@@ -10393,19 +10393,20 @@ class _HookAdvice:
     ``hook_route`` is doctor's route decision. ``built`` is whether doctor's
     build of the hook's configuration succeeded. ``use_daemon`` is the
     command's ``--use-daemon``/``--no-daemon`` (``None`` for neither).
-    ``daemon_differs``: on the hook route, after a probe that ran, the
-    command's options change what the daemon fingerprint digests, so a ``mms
-    daemon`` command run in doctor's shell, whose own build succeeds, addresses
-    another daemon. ``command_deadlines``: the deadline variables whose value
-    in doctor's build of the hook's configuration is the command's, so editing
-    the flag changes it and exporting that variable in doctor's shell does not.
+    ``command_deadlines``: the deadline variables whose value in doctor's
+    build of the hook's configuration is the command's, so editing the flag
+    changes it and exporting that variable in doctor's shell does not.
+
+    The bare ``mms daemon start`` / ``status`` / ``restart`` advice for the
+    hook's daemon does not read these: a daemon command for the hook's
+    configuration cannot be stated truthfully from doctor's side, so it keeps
+    its text (#1505).
     """
 
     location: str
     hook_route: bool
     built: bool
     use_daemon: bool | None
-    daemon_differs: bool
     command_deadlines: frozenset[str]
 
 
@@ -10423,34 +10424,12 @@ def _overlay_value_wins(name: str, overlay: Mapping[str, str]) -> bool:
     return winner == name
 
 
-def _hook_advice(
-    view: _HookCommandView, built: Any, *, hook_route: bool, probed: bool
-) -> _HookAdvice | None:
-    """Doctor's advice inputs for a ``found`` view, else ``None``.
-
-    *probed*: the hook route's daemon lookup ran (surfacing is not disabled).
-    When the shell's own build fails, ``mms daemon`` exits there before it
-    looks any daemon up, and the ``env_overrides`` row names the failure, so
-    the advice claims nothing about which daemon it would address.
-    """
+def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _HookAdvice | None:
+    """Doctor's advice inputs for a ``found`` view, else ``None``."""
     if view.state != "found":
         return None
-    from pydantic import ValidationError
-    from pydantic_settings import SettingsError
-
-    from memtomem_stm.config import load_env_stm_config
-    from memtomem_stm.daemon.discovery import fingerprint_material
-
-    daemon_differs = False
     deadlines: set[str] = set()
     if built is not None and hook_route:
-        if probed:
-            try:
-                shell_build = load_env_stm_config().config
-            except (ValidationError, SettingsError):
-                pass
-            else:
-                daemon_differs = fingerprint_material(built) != fingerprint_material(shell_build)
         effective = {
             _SURFACING_TIMEOUT_ENV: float(built.surfacing.timeout_seconds),
             _HOOK_DAEMON_TIMEOUT_ENV: float(built.hook.daemon_timeout_seconds),
@@ -10469,26 +10448,7 @@ def _hook_advice(
         hook_route=hook_route,
         built=built is not None,
         use_daemon=view.use_daemon,
-        daemon_differs=daemon_differs,
         command_deadlines=frozenset(deadlines),
-    )
-
-
-def _hook_daemon_command(advice: Any, subcommand: str) -> str:
-    """``mms daemon <subcommand>``, qualified when it addresses another daemon (#1505).
-
-    On the hook route with options that change the fingerprint, the command
-    run in doctor's shell builds without them. Nothing more is claimed: not
-    that a lookup reached a daemon (a discovery key may be missing or
-    unusable), nor what the host's environment builds.
-    """
-    command = f"mms daemon {subcommand}"
-    if not (isinstance(advice, _HookAdvice) and advice.hook_route and advice.daemon_differs):
-        return command
-    return (
-        f"{command} (doctor built the hook's daemon configuration with the options of the "
-        f"STM hook command at {advice.location}; `{command}` here builds from this shell's "
-        "environment without them)"
     )
 
 
@@ -10650,12 +10610,7 @@ def _surfacing_bootstrap_status(
                 # ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``, which no flag sets.
                 ltm_status = _ltm_status(config, timeout, measure_ltm=measure_ltm, hook_route=True)
             try:
-                hook_advice = _hook_advice(
-                    view,
-                    built,
-                    hook_route=bool(hook_view["hook_route"]),
-                    probed=ltm_status is not None and not ltm_status.get("skipped"),
-                )
+                hook_advice = _hook_advice(view, built, hook_route=bool(hook_view["hook_route"]))
             except Exception as exc:
                 # Advice only: a failure here must not turn a probe that
                 # already ran into the section's error. The type alone: a
@@ -12420,7 +12375,7 @@ def doctor(
                     f"{cause} — only LTM-dependent features (memory surfacing) are "
                     f"disabled; the proxy core is unaffected{view_suffix}",
                     (
-                        _hook_daemon_command(hook_advice, "status")
+                        "mms daemon status"
                         if isinstance(ltm, dict) and ltm.get("route") == "daemon"
                         else "export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=<memtomem-server>"
                         "  # see docs/surfacing.md"
@@ -12513,7 +12468,7 @@ def doctor(
                     "ltm measurement",
                     "WARN",
                     "--measure-ltm requires a running daemon for the probed configuration",
-                    _hook_daemon_command(hook_advice, "start"),
+                    "mms daemon start",
                 )
             elif isinstance(ltm, dict) and ltm.get("route") == "daemon":
                 measurement = ltm.get("measurement")
@@ -12683,7 +12638,7 @@ def doctor(
                             "the running daemon predates the surfacing outcome counters; "
                             "its failures are unreported and its timeout recommendation is "
                             "derived from durations that include failed searches",
-                            _hook_daemon_command(hook_advice, "restart"),
+                            "mms daemon restart",
                         )
                     elif failures:
                         # Neutral about the cause on purpose: this population
@@ -12700,7 +12655,7 @@ def doctor(
                             f"warm LTM search ({breakdown['timeout_samples']} timed out, "
                             f"{breakdown['error_samples']} faulted after issuing one, "
                             f"{breakdown['pre_rpc_faults']} never issued one)",
-                            _hook_daemon_command(hook_advice, "status"),
+                            "mms daemon status",
                         )
                     elif isinstance(surface_summary, dict) and surface_summary.get("samples"):
                         # No count on this side: ``samples`` is windowed, so
