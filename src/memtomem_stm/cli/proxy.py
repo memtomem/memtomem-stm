@@ -10415,7 +10415,9 @@ def _hook_view_note(summary: Any, ltm: Any) -> str | None:
     """The ``ltm server`` row's account of which route it probed and why (#1494)."""
     if not isinstance(summary, dict):
         return None
-    path = _disp(str(summary.get("path")))
+    # Raw, like every other ``check()`` detail: the terminal renderer escapes it,
+    # and ``--json`` consumers decode the value themselves (#755).
+    path = str(summary.get("path"))
     locations = ", ".join(str(loc) for loc in summary.get("locations") or [])
     state = summary.get("state")
     # Why the command was not used, for every state but ``found``.

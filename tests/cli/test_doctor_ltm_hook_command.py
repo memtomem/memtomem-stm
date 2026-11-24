@@ -317,6 +317,29 @@ def test_the_hook_deadline_comes_from_the_command(home, monkeypatch):
     assert status["timeouts"]["hook_daemon_seconds"] == 9.5, status
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows paths cannot hold a line break")
+def test_the_settings_path_is_raw_in_json_and_escaped_on_the_terminal(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    config_dir = tmp_path / "claude\nconfig"
+    config_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    (config_dir / "settings.json").write_text(
+        json.dumps({"hooks": {"PostToolUse": [{"hooks": [_cmd(_installed())]}]}}),
+        encoding="utf-8",
+    )
+    _install(monkeypatch, LiveDaemons())
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+    terminal = CliRunner().invoke(cli, ["doctor", "--config", str(proxy_file)]).output
+
+    assert f"{config_dir / 'settings.json'}" in checks["ltm"]["detail"]  # decoded as it is
+    ltm_line = next(line for line in terminal.splitlines() if "ltm server" in line)
+    assert "claude\\u000aconfig" in ltm_line.lower(), ltm_line
+    # Escaped once, not twice (the detail itself held the raw path).
+    assert "\\\\u000" not in ltm_line, ltm_line
+
+
 # --- what the hook builds from its command ------------------------------------
 
 
