@@ -64,8 +64,15 @@ each call into a sub-second round trip. The daemon is auto-spawned on first use
 and later calls hit the warm process. The legacy in-process path spawns a fresh
 LTM MCP child per call, whose cold start (embedding + reranker model load)
 measured ~6s here — exceeding the default ``surfacing.timeout_seconds`` of 3.0,
-so it usually times out to ``{}``. Opt out with
-``MEMTOMEM_STM_HOOK__USE_DAEMON=0``; when the daemon is unreachable the hook
+so it usually times out to ``{}``. Opt out with ``--no-daemon`` on the hook
+command. A command with neither ``--use-daemon`` nor ``--no-daemon`` follows
+``hook.use_daemon`` in any form the settings read
+(``MEMTOMEM_STM_HOOK__USE_DAEMON=0``,
+``MEMTOMEM_STM_HOOK='{"use_daemon": false}'``); a command with either flag
+ignores it. ``mms hook install`` writes one of the two flags from
+``hook.use_daemon`` in its own environment (``--use-daemon`` by default), so an
+installed hook changes mode by reinstalling with the setting changed, or by
+editing the flag. When the daemon is unreachable the hook
 degrades per ``HookConfig.fallback`` — ``skip`` (default) returns ``{}``,
 ``cold`` runs the in-process path. To exercise the cold path directly, set
 ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``, raise
@@ -99,6 +106,7 @@ from memtomem_stm.cli.hook_adapter import (
 )
 from memtomem_stm.cli.host_runtime import (
     HostRuntimePolicy,
+    _parse_bool,
     format_seconds,
     hook_command_words,
     resolve_host_runtime_policy,
@@ -696,26 +704,6 @@ def _read_payload(stream: TextIO) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _daemon_enabled() -> bool:
-    """Whether the hook should route through the local daemon.
-
-    Daemon mode is the default (``HookConfig.use_daemon=True``); unset → on. We
-    read ``MEMTOMEM_STM_HOOK__USE_DAEMON`` directly here (mirroring the field's
-    env binding) so the explicit opt-out path pays no extra config load —
-    ``_surface_tools()`` reads its env knob the same way. The falsy-token set
-    matches Pydantic's bool parsing so this and ``mms daemon status`` (which
-    reads the parsed field) agree on every value Pydantic accepts. We strip and
-    lower-case first, so a padded token like ``" off "`` still disables (Pydantic
-    doesn't strip and would reject it); any other value Pydantic rejects (empty,
-    garbage) returns enabled here, while a config load like ``mms daemon status``
-    would raise.
-    """
-    val = os.environ.get("MEMTOMEM_STM_HOOK__USE_DAEMON")
-    if val is None:
-        return True
-    return val.strip().lower() not in ("0", "false", "f", "no", "n", "off")
-
-
 def _hook_eligible(call: "CanonicalHookCall") -> bool:
     """Cheap pre-gate mirroring the head of :func:`_run_surfacing_hook_inner` —
     a PostToolUse call for a surface-allowlisted (canonical) tool. ``_run_hook``
@@ -727,7 +715,10 @@ def _hook_eligible(call: "CanonicalHookCall") -> bool:
 
 
 async def _run_hook(
-    call: "CanonicalHookCall", *, config: "STMConfig | None" = None
+    call: "CanonicalHookCall",
+    *,
+    config: "STMConfig | None" = None,
+    use_daemon: bool | None = None,
 ) -> dict[str, Any]:
     """Resolve the *surfacing* hook output, preferring the warm daemon when enabled.
 
@@ -737,24 +728,33 @@ async def _run_hook(
     cold path see the same bounded ``tool_response_text`` (and the wire frame
     stays under the daemon's 4 MiB cap).
 
-    Degradation ladder (every rung still yields a hook-output dict, never
-    raises): daemon disabled → cold in-process path. Daemon enabled → one
-    bounded round trip; on unavailable/stale/slow we (optionally) fire-and-forget
-    spawn the daemon so the *next* call is warm, then for *this* call either
+    Degradation ladder: daemon disabled → cold in-process path. Daemon
+    enabled → one bounded round trip; on unavailable/stale/slow we
+    (optionally) fire-and-forget spawn the daemon so the *next* call is warm,
+    then for *this* call either
     return ``{}`` (default ``fallback=skip`` — the daemon exists precisely to
     avoid the ~6s cold start) or take the cold path (``fallback=cold``). The
     whole call runs inside ``_hook_budget_seconds()`` in :func:`hook_command`.
     ``config`` is reused from :func:`_orchestrate` when given, on both routes,
-    so one tool call loads the environment once; ``None`` loads on demand.
+    so one tool call loads the environment once; ``None`` loads it before
+    either route, and a settings error that load does not recover from
+    raises from here (the caller's barrier owns it).
+
+    The route is ``hook.use_daemon`` as the settings read it, in any form they
+    accept (#1495), unless *use_daemon* carries the hook command's explicit
+    ``--use-daemon``/``--no-daemon``. That flag reaches the settings only
+    through one variable of an environment overlay, which a case-equivalent
+    spelling elsewhere in the environment can outrank, so it decides here
+    directly.
     """
     if not _hook_eligible(call):
         return {}
     bounded = _bounded_call(call)
-    if _daemon_enabled():
+    if config is None:
+        config = _load_hook_config("routing the hook").config
+    if use_daemon if use_daemon is not None else config.hook.use_daemon:
         from memtomem_stm.daemon import client
 
-        if config is None:
-            config = _load_hook_config("routing the hook to the daemon").config
         # Reject ineligible calls (surfacing globally off, non-PostToolUse, or
         # a non-allowlisted tool) before routing to / spawning the daemon — an
         # off-target hook call must not warm a pointless daemon. The cold path
@@ -786,9 +786,7 @@ async def _run_hook(
         if config.hook.fallback != "cold":
             return {}
         # fallback=cold → fall through to the in-process surfacing path.
-    return await run_surfacing_hook(
-        bounded, surfacing_config=config.surfacing if config is not None else None
-    )
+    return await run_surfacing_hook(bounded, surfacing_config=config.surfacing)
 
 
 def _load_hook_config(context: str) -> "EnvSTMConfigLoad":
@@ -908,6 +906,7 @@ async def _orchestrate(
     *,
     allow_output_replacement: bool | None = None,
     notices: list[str] | None = None,
+    use_daemon: bool | None = None,
 ) -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
     LTM *surfacing*, as one host-shaped output.
@@ -939,6 +938,9 @@ async def _orchestrate(
     ``client.surface`` → ``CanonicalHookCall.to_wire``), so it needs no host
     knowledge; compression still runs here in the hook process (it needs the
     original ``tool_response`` object, which is not transmitted).
+
+    *use_daemon* is the hook command's explicit daemon flag (``None`` when the
+    command has none), handed to :func:`_run_hook` to decide the route.
     """
     call = adapter.parse(payload)
     if call is None:  # unusable payload → pass the tool output through untouched
@@ -980,7 +982,7 @@ async def _orchestrate(
     surf_out: dict[str, Any] = {}
     if adapter.can_inject_context:
         try:
-            surf_out = await _run_hook(call, config=config)
+            surf_out = await _run_hook(call, config=config, use_daemon=use_daemon)
         except Exception:
             logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
@@ -1213,6 +1215,7 @@ def hook_command(
                                 # sole destructive capability (native output replace).
                                 allow_output_replacement=host_authorizes_replacement(host),
                                 notices=notices,
+                                use_daemon=_parse_bool(runtime_use_daemon),
                             ),
                             timeout=_hook_budget_seconds(),
                         )

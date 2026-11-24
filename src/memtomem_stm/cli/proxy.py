@@ -10283,14 +10283,19 @@ def _surfacing_bootstrap_status(
     with, because a daemon is found by the fingerprint of the build that
     started it (#1485):
 
-    - *prefer_hook_daemon* (doctor) and the hook's own daemon gate on: the
-      section describes the hook. The hook decides with
-      ``hook_cmd._daemon_enabled`` (a raw read of
-      ``MEMTOMEM_STM_HOOK__USE_DAEMON``, not the parsed ``hook.use_daemon``)
-      and builds with ``load_env_stm_config``: environment only, never
-      doctor's ``--config``, and tolerant of a proxy-only break. A daemon it
+    - *prefer_hook_daemon* (doctor) and the hook's daemon setting on: the
+      section describes the hook. The hook builds with
+      ``load_env_stm_config``: environment only, never doctor's ``--config``,
+      and tolerant of a proxy-only break. It routes on that build's
+      ``hook.use_daemon`` (#1495), unless its command carries
+      ``--use-daemon``/``--no-daemon``, which doctor cannot see. A daemon it
       spawns reloads the same way, so that build is the daemon's identity.
       Doctor's proxy checks still report a broken proxy variable.
+    - When that build fails to decode or validate a setting
+      (``ValidationError``/``SettingsError``), the hook passes every call
+      through and its route is moot: the section is built in the command's
+      own view below, so the error reported is that view's. Any other
+      exception reaches the handler at the end as it is.
     - Otherwise (health, or the hook off): the standalone route, in the
       command's own view: built from *config_path*, the command's explicit
       ``--config``, so the ``STMConfig`` here reads the same file as the
@@ -10303,20 +10308,27 @@ def _surfacing_bootstrap_status(
       whether the build succeeds, not what it fingerprints.
     """
     try:
+        from pydantic import ValidationError
+        from pydantic_settings import SettingsError
+
         from memtomem_stm.cli.rrf_diagnostics import rrf_boundary_doctor_checks
-        from memtomem_stm.config import load_env_stm_config, stm_config_for_cli
+        from memtomem_stm.config import STMConfig, load_env_stm_config, stm_config_for_cli
         from memtomem_stm.surfacing.feedback_store import (
             inspect_feedback_db,
             read_surfacing_summary,
         )
         from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
 
-        hook_route = False
+        hook_config: STMConfig | None = None
         if prefer_hook_daemon:
-            from memtomem_stm.cli.hook_cmd import _daemon_enabled
-
-            hook_route = _daemon_enabled()
-        config = load_env_stm_config().config if hook_route else stm_config_for_cli(config_path)
+            try:
+                built = load_env_stm_config().config
+            except (ValidationError, SettingsError):
+                built = None
+            if built is not None and built.hook.use_daemon:
+                hook_config = built
+        hook_route = hook_config is not None
+        config = hook_config if hook_config is not None else stm_config_for_cli(config_path)
         surfacing = config.surfacing
         db_status = inspect_feedback_db(surfacing.feedback_db_path)
         ltm_status = _ltm_status(
@@ -12119,16 +12131,17 @@ def doctor(
                     "enable surfacing (surfacing.enabled, default true), then rerun",
                 )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("route") != "daemon":
-                # The daemon route is the hook's when its daemon gate is on
-                # (#1485), else the standalone ``surfacing.use_daemon`` one.
+                # The daemon route is the hook's when its ``hook.use_daemon``
+                # is on (#1485, #1495), else the standalone
+                # ``surfacing.use_daemon`` one.
                 check(
                     "ltm_measurement",
                     "ltm measurement",
                     "WARN",
-                    "--measure-ltm needs a daemon route (the hook's, with "
-                    "MEMTOMEM_STM_HOOK__USE_DAEMON unset or true, or surfacing.use_daemon=true) "
-                    "and a running daemon",
-                    "unset MEMTOMEM_STM_HOOK__USE_DAEMON or export "
+                    "--measure-ltm needs a daemon route (the hook's, with hook.use_daemon "
+                    "true, the default, or surfacing.use_daemon=true) and a running daemon",
+                    "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
+                    "use_daemon in MEMTOMEM_STM_HOOK) or export "
                     "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
                 )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("daemon_reachable") is False:

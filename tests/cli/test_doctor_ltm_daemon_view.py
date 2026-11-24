@@ -185,9 +185,9 @@ def test_doctor_probes_the_hook_daemon_under_an_out_of_range_proxy_field(ghost, 
     assert status["ltm_server"]["connected"] is True, status
 
 
-def test_doctor_follows_the_hook_gate_not_the_parsed_flag(ghost, monkeypatch):
-    # The nested form turns the parsed ``hook.use_daemon`` off, but the hook's
-    # own gate reads only ``MEMTOMEM_STM_HOOK__USE_DAEMON`` and stays on.
+def test_doctor_follows_the_nested_form_of_the_hook_opt_out(ghost, monkeypatch):
+    # The hook routes on the parsed ``hook.use_daemon``, which the nested form
+    # turns off (#1495), so doctor leaves the hook's daemon alone too.
     monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": false}')
     assert load_env_stm_config().config.hook.use_daemon is False  # positive control
     hook_fp = _hook_fp()
@@ -196,8 +196,50 @@ def test_doctor_follows_the_hook_gate_not_the_parsed_flag(ghost, monkeypatch):
 
     status = _doctor(ghost)
 
+    assert status["ltm_server"]["route"] != "daemon", status
+    assert daemons.pinged == []
+
+
+def test_doctor_under_the_nested_opt_out_follows_the_standalone_daemon(ghost, monkeypatch):
+    # The hook's route off leaves the standalone view, which still takes its
+    # own daemon route when ``surfacing.use_daemon`` is on.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": false}')
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__USE_DAEMON", "1")
+    _env_b(monkeypatch)
+    hook_fp, server_fp = _hook_fp(), _server_fp(monkeypatch, ghost)
+    assert hook_fp != server_fp  # positive control: the two daemons differ
+    daemons = LiveDaemons(hook_fp, server_fp)
+    _install(monkeypatch, daemons)
+
+    status = _doctor(ghost)
+
     assert status["ltm_server"]["route"] == "daemon", status
-    assert status["ltm_server"]["connected"] is True, status
+    assert daemons.pinged == [server_fp]
+
+
+@pytest.mark.parametrize("gate", ["0", None], ids=["hook-off", "gate-unset"])
+def test_doctor_reports_the_error_of_its_own_view_when_the_hook_build_fails(
+    ghost, monkeypatch, gate
+):
+    # A non-proxy variable breaks every build, so the hook's route cannot be
+    # resolved. The error doctor renders is the command's own view's, built
+    # with ``--config``, which declares ``ghost``: the environment-only build
+    # would also report the ``ghost`` override as incomplete.
+    if gate is not None:
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", gate)
+    monkeypatch.setenv(GHOST_OVERRIDE, "5")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__MAX_RESULTS", "nope")
+    with pytest.raises(ValidationError) as ambient:
+        STMConfig()
+    ambient_locs = [err["loc"] for err in ambient.value.errors()]
+    assert ("proxy", "upstream_servers", "ghost", "prefix") in ambient_locs  # positive control
+
+    status = _doctor(ghost)
+
+    error = status.get("error")
+    assert error is not None, status
+    assert "max_results" in error, error
+    assert "ghost" not in error, error
 
 
 def test_doctor_with_both_routes_on_probes_the_hook_daemon(ghost, monkeypatch):
@@ -328,19 +370,31 @@ def test_without_a_break_the_hook_view_and_the_flag_view_agree(ghost, monkeypatc
 
 
 @pytest.mark.parametrize(
-    ("hook_daemon", "expected", "next_action"),
+    ("env", "expected", "next_action"),
     [
-        ("0", "needs a daemon route", "MEMTOMEM_STM_SURFACING__USE_DAEMON=true"),
-        (None, "requires a running daemon", "mms daemon start"),
+        (
+            {"MEMTOMEM_STM_HOOK__USE_DAEMON": "0"},
+            "needs a daemon route",
+            "MEMTOMEM_STM_SURFACING__USE_DAEMON=true",
+        ),
+        # The nested opt-out leaves the flat variable unset, so the advice
+        # must name the payload too (#1495).
+        (
+            {"MEMTOMEM_STM_HOOK": '{"use_daemon": false}'},
+            "needs a daemon route",
+            "use_daemon in MEMTOMEM_STM_HOOK",
+        ),
+        ({}, "requires a running daemon", "mms daemon start"),
     ],
+    ids=["flat-opt-out", "nested-opt-out", "hook-route"],
 )
 def test_doctor_measurement_warning_names_the_missing_piece(
-    ghost, monkeypatch, tmp_path, hook_daemon, expected, next_action
+    ghost, monkeypatch, tmp_path, env, expected, next_action
 ):
     # Direct route (hook daemon off, no standalone daemon), or the hook's route
     # with no daemon running under its fingerprint.
-    if hook_daemon is not None:
-        monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", hook_daemon)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
     _install(monkeypatch, LiveDaemons())
 
     checks = _doctor_cli(monkeypatch, tmp_path, "--config", str(ghost), "--measure-ltm")
