@@ -10400,8 +10400,9 @@ def _hook_view_note(summary: Any, ltm: Any) -> str | None:
     Only what doctor did: the route, whether a probe ran, and the inputs of
     its build of the hook's configuration. Not why the hook behaves as it
     does: doctor builds from its own environment, not the host's, so what the
-    registered hook builds is not known here. The ``env_overrides`` row names
-    a variable that fails doctor's environment-only build.
+    registered hook builds is not known here. The ``env_overrides`` row
+    reports a failure of doctor's environment-only build, naming the
+    variables when the error identifies them.
     """
     if not isinstance(summary, dict):
         return None
@@ -10418,7 +10419,7 @@ def _hook_view_note(summary: Any, ltm: Any) -> str | None:
     elif ltm.get("route") == "daemon":
         route = "the standalone daemon route"
     else:
-        route = "the direct LTM probe"
+        route = "the direct LTM route"
     if isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled":
         route = f"{route} (not probed: surfacing is disabled)"
     if state == "found":
@@ -10444,7 +10445,7 @@ def _hook_view_note(summary: Any, ltm: Any) -> str | None:
     elif state == "settings_error":
         inputs = f"doctor's environment only: {summary.get('settings_error')}"
     else:
-        inputs = f"doctor's environment only: no STM hook command in {path}"
+        inputs = f"doctor's environment only: no STM hook command recognized in {path}"
     return f"route: {route}, chosen from {inputs} (Claude Code user settings only)"
 
 
@@ -11628,9 +11629,9 @@ def doctor(
     ``--measure-ltm`` explicitly authorizes read-only synthetic searches against
     an already running daemon; it still never edits configuration or LTM data.
     An explicit ``--config`` also steers the STMConfig-backed checks (LTM /
-    surfacing), not just the proxy-file checks (#839), unless the hook would
-    use the daemon: those checks then use doctor's build of the hook's
-    configuration, from doctor's environment (not the host's), which
+    surfacing), not just the proxy-file checks (#839), unless doctor's build
+    of the hook's configuration selects the hook's daemon: those checks then
+    use that build, made from doctor's environment (not the host's), which
     ``--config`` does not reach (#1485), with the options of the STM hook
     command in Claude Code's user settings applied when they hold exactly one
     that ``mms hook install`` owns, no other handler that may run the hook,

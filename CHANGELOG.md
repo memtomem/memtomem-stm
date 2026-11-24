@@ -156,7 +156,7 @@ changes inline only. See the deprecation policy in
   **Behavior change**: with an installed hook, the `ltm` row,
   `--measure-ltm` and the timeout checks describe the daemon the hook's
   options select. A `--no-daemon` hook sends them to the standalone route or
-  the direct LTM probe. The row's detail gains that note. Not covered:
+  the direct LTM route. The row's detail gains that note. Not covered:
   Claude Code project, local and managed settings, other hosts' hook
   configurations, and the host's own environment. The `--measure-ltm`,
   timeout and `mms daemon status` advice still names commands that run in
@@ -217,12 +217,12 @@ changes inline only. See the deprecation policy in
   explicit `--use-daemon` or `--no-daemon` on the hook command decides the
   route directly: it reaches the settings through one exact variable, which a
   case-equivalent spelling elsewhere in the environment can outrank. Doctor
-  follows the same setting, and when the hook's build fails on a variable
-  outside `proxy` (the hook then passes every call through; doctor builds
-  from its own environment, with the registered command's flags when it
-  reads them, issue #1494 entry, so its build can differ from the host's),
-  doctor reports the error of its own `--config` build instead of the
-  environment-only one.
+  follows the same setting, and when its environment-only build of the
+  hook's configuration fails on a variable outside `proxy` (in the hook, such
+  a failure passes every call through; doctor's build uses its own
+  environment, with the registered command's flags when it reads them, issue
+  #1494 entry, so it can differ from the host's), doctor reports the error
+  of its own `--config` build, which carries no hook flags, instead.
   `mms daemon status` says `no (hook.use_daemon is false)` and the
   `--measure-ltm` warning names the setting, instead of naming
   `MEMTOMEM_STM_HOOK__USE_DAEMON=0`. **Behavior change**: a nested or

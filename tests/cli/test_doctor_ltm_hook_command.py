@@ -295,7 +295,7 @@ def test_cli_row_names_the_command_that_turned_the_hook_daemon_off(
 
     detail = checks["ltm"]["detail"]
     assert (
-        "route: the direct LTM probe, chosen from doctor's environment with the options of "
+        "route: the direct LTM route, chosen from doctor's environment with the options of "
         f"the STM hook command at {FIRST}" in detail
     ), detail
 
@@ -312,7 +312,7 @@ def test_cli_row_names_doctors_environment_when_it_turned_the_hook_daemon_off(
     detail = checks["ltm"]["detail"]
     assert (
         "route: the standalone daemon route, chosen from doctor's environment only: "
-        "no STM hook command in" in detail
+        "no STM hook command recognized in" in detail
     ), detail
 
 
@@ -342,19 +342,19 @@ _SKIPPED = {"skipped": "surfacing_disabled"}
         (
             {**_FOUND, "gate_from_command": True},
             {"route": "direct"},
-            f"the direct LTM probe, chosen from {_WITH}",
+            f"the direct LTM route, chosen from {_WITH}",
         ),
         ({**_FOUND}, None, f"the standalone route, chosen from {_WITH}"),
         (
             {**_UNREAD},
             {"route": "direct"},
-            f"the direct LTM probe, chosen from {_ONLY}",
+            f"the direct LTM route, chosen from {_ONLY}",
         ),
         ({**_UNREAD}, {"route": "daemon"}, f"the standalone daemon route, chosen from {_ONLY}"),
         (
             {**_UNREAD},
             {"route": "direct", **_SKIPPED},
-            f"the direct LTM probe (not probed: surfacing is disabled), chosen from {_ONLY}",
+            f"the direct LTM route (not probed: surfacing is disabled), chosen from {_ONLY}",
         ),
     ],
     ids=[
