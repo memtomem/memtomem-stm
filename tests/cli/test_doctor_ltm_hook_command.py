@@ -34,6 +34,7 @@ from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
 
 PERSIST = "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT"
 SURFACING_TIMEOUT = "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS"
+DAEMON_TIMEOUT = "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"
 HOOK_GATE = "MEMTOMEM_STM_HOOK__USE_DAEMON"
 STANDALONE_GATE = "MEMTOMEM_STM_SURFACING__USE_DAEMON"
 CONFIG_PATH = "MEMTOMEM_STM_PROXY__CONFIG_PATH"
@@ -944,3 +945,247 @@ def test_the_hook_deadline_is_the_one_the_hook_builds(
 
     assert status["hook_view"]["hook_route"] is True, status
     assert status["timeouts"]["hook_daemon_seconds"] == expected, status
+
+
+# --- advice names the command, not the variables it overrides (#1505) ---------
+
+
+class AnswerEveryDaemon:
+    """Fake discovery that answers under any fingerprint with *reply*."""
+
+    def __init__(self, reply: dict[str, Any]) -> None:
+        self.reply = reply
+        self.pinged: list[str | None] = []
+
+    async def ping(self, config: STMConfig, *, timeout: float = 2.0, **_: Any) -> Any:
+        self.pinged.append(config_fingerprint(config, create_key=False))
+        return dict(self.reply)
+
+
+def _telemetry(*, predates_counters: bool = False, failures: int = 0) -> dict[str, Any]:
+    """A warm daemon whose hook traffic recommends a 9.5 s surfacing deadline."""
+    surface: dict[str, Any] = {
+        "samples": 5,
+        "recommendation": {"status": "provisional", "seconds": 9.5},
+    }
+    if not predates_counters:
+        surface.update(timeout_samples=failures, error_samples=0, pre_rpc_faults=0)
+    return {"ltm": "warm", "pid": 1, "port": 2, "latency": {"surface": surface}}
+
+
+def _daemon_note(command: str) -> str:
+    return (
+        f"{command} (doctor built the hook's daemon configuration with the options of the "
+        f"STM hook command at {FIRST}; `{command}` here builds from this shell's environment "
+        "without them)"
+    )
+
+
+def test_measure_ltm_names_the_commands_no_daemon_flag(home, proxy_file, monkeypatch, tmp_path):
+    _settings(home, _cmd(_installed(use_daemon=False)))
+    _install(monkeypatch, LiveDaemons())
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
+
+    row = checks["ltm_measurement"]
+    assert row["detail"] == (
+        f"--measure-ltm needs a daemon route: the STM hook command at {FIRST} sets "
+        "--no-daemon, which decides the hook's route, and surfacing.use_daemon is off"
+    ), row
+    assert row["next_action"] == (
+        f"replace --no-daemon with --use-daemon in the STM hook command at {FIRST} "
+        "(Claude Code user settings), or export MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
+        "mms daemon start"
+    ), row
+
+
+_OLD_ROUTE_ACTION = (
+    "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
+    "use_daemon in MEMTOMEM_STM_HOOK) or export "
+    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start"
+)
+
+
+@pytest.mark.parametrize("case", ["build-fails", "no-hook-command", "ambient-opt-out"])
+def test_measure_ltm_keeps_the_setting_advice_when_the_flag_did_not_decide(
+    home, proxy_file, monkeypatch, tmp_path, case
+):
+    if case == "build-fails":
+        # Only the hook's build fails (#1508's extreme deadline), so the
+        # standalone build still runs and the flag decided nothing doctor built.
+        policy = ["--no-daemon", "--surfacing-timeout-seconds", "3"]
+        policy += ["--daemon-timeout-seconds", _EXTREME, "--no-persist-query-text"]
+        _settings(home, _cmd(shlex.join(hook_command_words(hook_launcher(), "claude", policy))))
+    elif case == "ambient-opt-out":
+        # A command without flags: the setting decides, as the advice says.
+        _settings(home, _cmd(shlex.join(hook_command_words(hook_launcher(), "claude", []))))
+        monkeypatch.setenv(HOOK_GATE, "0")
+    else:
+        monkeypatch.setenv(HOOK_GATE, "0")
+    _install(monkeypatch, LiveDaemons())
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
+
+    row = checks["ltm_measurement"]
+    assert row["next_action"] == _OLD_ROUTE_ACTION, row
+
+
+def test_daemon_start_on_the_hook_route_says_it_builds_without_the_options(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    _settings(home, _cmd(_installed(surfacing=7.25)))
+    _install(monkeypatch, LiveDaemons())
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
+
+    assert checks["ltm_measurement"]["next_action"] == _daemon_note("mms daemon start")
+    assert checks["ltm"]["next_action"] == _daemon_note("mms daemon status")
+    for row in (checks["ltm_measurement"], checks["ltm"]):
+        assert "7.25" not in row["next_action"], row  # names, never the command's values
+
+
+@pytest.mark.parametrize("case", ["no-hook-command", "same-fingerprint"])
+def test_daemon_start_stays_bare_when_the_shell_builds_the_same_daemon(
+    home, proxy_file, monkeypatch, tmp_path, case
+):
+    if case == "same-fingerprint":
+        # The shell already sets what the command sets that the fingerprint reads.
+        _settings(home, _cmd(_installed()))
+        monkeypatch.setenv(PERSIST, "false")
+    _install(monkeypatch, LiveDaemons())
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
+
+    assert checks["ltm_measurement"]["next_action"] == "mms daemon start"
+    assert checks["ltm"]["next_action"] == "mms daemon status"
+
+
+def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, tmp_path):
+    _settings(home, _cmd(_installed(surfacing=3.0)))
+    _install(monkeypatch, AnswerEveryDaemon(_telemetry()))
+
+    checks, output = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert checks["surfacing_timeout"]["next_action"] == (
+        f"set --surfacing-timeout-seconds to 9.5 in the STM hook command at {FIRST} "
+        "(Claude Code user settings); its timeout options override an exported "
+        f"{SURFACING_TIMEOUT}"
+    ), checks["surfacing_timeout"]
+    assert checks["hook_daemon_timeout"]["next_action"] == (
+        f"set --daemon-timeout-seconds to 10 in the STM hook command at {FIRST} "
+        "(Claude Code user settings); its timeout options override an exported "
+        f"{DAEMON_TIMEOUT}"
+    ), checks["hook_daemon_timeout"]
+    assert "_hook_advice" not in output
+
+
+_POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows folds environment names itself"
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["no-hook-command", "standalone-fallback", pytest.param("shadowed", marks=_POSIX_ONLY)],
+)
+def test_timeout_advice_keeps_the_export_when_the_command_does_not_set_it(
+    home, proxy_file, monkeypatch, tmp_path, case
+):
+    if case == "standalone-fallback":
+        _settings(home, _cmd(_installed(use_daemon=False, surfacing=3.0)))
+        monkeypatch.setenv(STANDALONE_GATE, "1")
+    elif case == "shadowed":
+        # A later lower-case spelling wins the fold over the command's variable
+        # (#1503), here with the command's own value: equal values alone would
+        # wrongly credit the command.
+        _settings(home, _cmd(_installed(surfacing=3.0, daemon=4.0)))
+        monkeypatch.setenv(SURFACING_TIMEOUT, "1")
+        monkeypatch.setenv(SURFACING_TIMEOUT.lower(), "3")
+        monkeypatch.setenv(DAEMON_TIMEOUT, "1")
+        monkeypatch.setenv(DAEMON_TIMEOUT.lower(), "4")
+    else:
+        monkeypatch.setenv(SURFACING_TIMEOUT, "3")
+    _install(monkeypatch, AnswerEveryDaemon(_telemetry()))
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert checks["surfacing_timeout"]["next_action"] == (
+        "export MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=9.5"
+    ), checks["surfacing_timeout"]
+    assert checks["hook_daemon_timeout"]["next_action"] == (
+        "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=10"
+    ), checks["hook_daemon_timeout"]
+
+
+_OUTCOME_CASES = pytest.mark.parametrize(
+    ("reply", "subcommand"),
+    [(_telemetry(predates_counters=True), "restart"), (_telemetry(failures=2), "status")],
+    ids=["predates-counters", "failed-requests"],
+)
+
+
+@_OUTCOME_CASES
+def test_outcome_advice_says_the_daemon_command_builds_without_the_options(
+    home, proxy_file, monkeypatch, tmp_path, reply, subcommand
+):
+    _settings(home, _cmd(_installed()))
+    _install(monkeypatch, AnswerEveryDaemon(reply))
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    row = checks["surfacing_outcomes"]
+    assert row["next_action"] == _daemon_note(f"mms daemon {subcommand}"), row
+
+
+@_OUTCOME_CASES
+def test_outcome_advice_stays_bare_without_a_hook_command(
+    home, proxy_file, monkeypatch, tmp_path, reply, subcommand
+):
+    _install(monkeypatch, AnswerEveryDaemon(reply))
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert checks["surfacing_outcomes"]["next_action"] == f"mms daemon {subcommand}"
+
+
+def test_no_lookup_note_when_surfacing_is_disabled(home, proxy_file, monkeypatch, tmp_path):
+    # The probe is skipped, so doctor looked nothing up and says nothing about it.
+    _settings(home, _cmd(_installed(surfacing=7.25)))
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    daemons = LiveDaemons()
+    _install(monkeypatch, daemons)
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert daemons.pinged == []
+    assert checks["ltm"]["next_action"] == "mms daemon status", checks["ltm"]
+
+
+def test_no_lookup_note_when_the_shell_cannot_build(home, proxy_file, monkeypatch, tmp_path):
+    # The command's flag replaces the ambient invalid deadline for the hook, but
+    # ``mms daemon start`` in this shell fails while loading its configuration.
+    _settings(home, _cmd(_installed(surfacing=7.25)))
+    monkeypatch.setenv(DAEMON_TIMEOUT, "-1")
+    with pytest.raises(ValidationError):
+        load_env_stm_config()  # positive control: the shell's own build fails
+    _install(monkeypatch, LiveDaemons())
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
+
+    assert checks["ltm_measurement"]["next_action"] == "mms daemon start", checks
+    assert checks["ltm"]["next_action"] == "mms daemon status", checks["ltm"]
+
+
+def test_an_advice_failure_keeps_the_probe_result(home, proxy_file, monkeypatch, tmp_path):
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("advice inputs unreadable")
+
+    _settings(home, _cmd(_installed()))
+    _install(monkeypatch, LiveDaemons(_installed_fp(monkeypatch)))
+    monkeypatch.setattr(proxy_mod, "_hook_advice", broken)
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert checks["ltm"]["status"] == "PASS", checks["ltm"]
