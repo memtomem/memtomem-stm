@@ -232,11 +232,16 @@ def _read_hook_args(args: list[str]) -> HookRegistration:
     # copy has its own ``params`` list, so the command other callers use is
     # never touched, and with an empty name list parsing neither reads nor
     # updates a help option cached on the command the copy was made from.
+    # While another thread has Click build that cached option, Click's own help
+    # option sits in ``hook_command.params`` until it pops it; the hook declares
+    # no help option itself, so any parameter using a help name is left out of
+    # the copy rather than duplicated by ours.
+    help_names = CONTEXT_SETTINGS["help_option_names"]
     reader = copy.copy(hook_command)
     reader.params = [
-        *hook_command.params,
+        *(p for p in hook_command.params if not set(p.opts) & set(help_names)),
         click.Option(
-            CONTEXT_SETTINGS["help_option_names"],
+            help_names,
             is_flag=True,
             is_eager=True,
             expose_value=False,

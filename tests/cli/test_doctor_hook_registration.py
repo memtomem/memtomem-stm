@@ -930,3 +930,57 @@ def test_help_prints_nothing(flag: str, capsys: pytest.CaptureFixture[str]) -> N
     assert reading == hr.HookRegistration(None, runs_bridge=False, host="claude")
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == ("", "")
+
+
+# While another thread has Click build ``hook_command``'s help option, that option sits
+# in ``hook_command.params`` until Click pops it. A reader that copied the list then
+# would hold two ``-h``/``--help`` options: Click warns, and where warnings are errors
+# the reading came back as "does not run the hook, host unknown" (#1510 review).
+_HELP_CACHE_WINDOW_PROBE = """
+import json, threading, warnings
+
+entered, release = threading.Event(), threading.Event()
+
+
+class HeldList(list):
+    def pop(self, *args):
+        entered.set()
+        assert release.wait(10), "reader never finished"
+        return super().pop(*args)
+
+
+hook_command.params = HeldList(hook_command.params)
+hook_command._help_option = None
+warnings.simplefilter("error")
+
+
+def build_help_option():
+    hook_command.get_help_option(
+        click.Context(hook_command, help_option_names=["--help", "-h"])
+    )
+
+
+builder = threading.Thread(target=build_help_option)
+builder.start()
+# Click 8.1.x builds the help option without touching ``params``: no window.
+window_open = entered.wait(3)
+in_window = [sorted(p.opts) for p in hook_command.params if "-h" in p.opts]
+reading = _read_hook_args(["--host", "claude"])
+release.set()
+builder.join(10)
+print(json.dumps({
+    "window_open": window_open,
+    "in_window": in_window,
+    "reading": [reading.runs_bridge, reading.host],
+}))
+"""
+
+
+def test_reading_while_click_builds_the_help_option_sees_no_duplicate() -> None:
+    probe = json.loads(_run_fresh(_HELP_CACHE_WINDOW_PROBE))
+    if not probe["window_open"]:
+        pytest.skip("this Click builds its help option without touching hook_command.params")
+    # The window really was open (Click's help option was in the shared list) ...
+    assert probe["in_window"] == [["--help", "-h"]]
+    # ... and the reading is still the one an idle process gives.
+    assert probe["reading"] == [True, "claude"]
