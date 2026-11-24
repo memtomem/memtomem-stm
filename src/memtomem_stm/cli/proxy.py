@@ -12441,9 +12441,9 @@ def doctor(
                     "ltm_measurement",
                     "ltm measurement",
                     "WARN",
-                    "--measure-ltm needs a daemon route: the STM hook command at "
-                    f"{hook_advice.location} sets --no-daemon, which decides the hook's "
-                    "route, and surfacing.use_daemon is off",
+                    "--measure-ltm needs a daemon route and a running daemon: the STM hook "
+                    f"command at {hook_advice.location} sets --no-daemon, which decides "
+                    "the hook's route, and surfacing.use_daemon is off",
                     "replace --no-daemon with --use-daemon in the STM hook command at "
                     f"{hook_advice.location} (Claude Code user settings), or export "
                     "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",

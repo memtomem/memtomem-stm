@@ -981,8 +981,9 @@ def test_measure_ltm_names_the_commands_no_daemon_flag(home, proxy_file, monkeyp
 
     row = checks["ltm_measurement"]
     assert row["detail"] == (
-        f"--measure-ltm needs a daemon route: the STM hook command at {FIRST} sets "
-        "--no-daemon, which decides the hook's route, and surfacing.use_daemon is off"
+        "--measure-ltm needs a daemon route and a running daemon: the STM hook command at "
+        f"{FIRST} sets --no-daemon, which decides the hook's route, and surfacing.use_daemon "
+        "is off"
     ), row
     assert row["next_action"] == (
         f"replace --no-daemon with --use-daemon in the STM hook command at {FIRST} "
