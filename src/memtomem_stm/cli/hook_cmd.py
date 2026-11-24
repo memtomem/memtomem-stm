@@ -76,8 +76,9 @@ changes mode through ``mms hook install --daemon``/``--no-daemon``, through
 ``--inherit-runtime-env`` (no flag written, the settings decide), or by
 editing the flag. When the daemon is unreachable the hook
 degrades per ``HookConfig.fallback`` — ``skip`` (default) returns ``{}``,
-``cold`` runs the in-process path. To exercise the cold path directly, set
-``MEMTOMEM_STM_HOOK__USE_DAEMON=0``, raise
+``cold`` runs the in-process path. To exercise the cold path directly, run
+the hook with ``--no-daemon`` (or with no daemon flag and ``hook.use_daemon``
+set false, e.g. ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``), raise
 ``MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`` (e.g. 8) and lower
 ``MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS``, accepting the per-call latency.
 """
@@ -1142,8 +1143,10 @@ def hook_command(
     ``--host claude``) and/or ``additionalContext``
     (relevant LTM memories, for read-like tools). Surfacing runs in the warm
     ``mms daemon`` by default (no per-call cold start), auto-spawned on first
-    use; set ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` for the legacy cold in-process
-    path. Always exits 0; on any problem the tool output passes through unchanged
+    use; pass ``--no-daemon`` for the legacy cold in-process path. A command
+    with neither daemon flag follows the ``hook.use_daemon`` setting instead
+    (set false, e.g. ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``). Always exits 0; on any
+    problem the tool output passes through unchanged
     (prints ``{}``, or only a ``systemMessage`` when compression was refused for
     the call before a timeout or other caught failure, #1437).
 

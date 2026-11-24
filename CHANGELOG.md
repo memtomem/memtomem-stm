@@ -108,7 +108,7 @@ changes inline only. See the deprecation policy in
   checks, and a broken proxy variable the hook recovers from (nothing outside
   `proxy` is invalid) shows only in doctor's proxy checks (`env_overrides`),
   not in the `ltm` row. Which forms of the setting the hook reads is the
-  next entry's (issue #1495). `mms health`, and doctor with the hook's
+  subject of the issue #1495 entry. `mms health`, and doctor with the hook's
   daemon off, keep the standalone view built from `--config`. Known limit:
   doctor sees its own environment, not the host's, and does not read the
   options registered on the hook command, which also change the daemon's

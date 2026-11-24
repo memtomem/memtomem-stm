@@ -105,7 +105,11 @@ Codex registrations still keep the explicit `--host codex` argument.
 ## Daemon and fallback
 
 The default hook path uses the local `mms daemon`, auto-spawning it on first
-use. Configure the behavior with:
+use. The daemon choice below applies to a hook command that carries neither
+`--use-daemon` nor `--no-daemon`. A command install wrote without
+`--inherit-runtime-env` carries one, and that flag wins: change it with
+`mms hook install --host claude --no-daemon --apply` (or `--daemon`), shown
+above. Configure the behavior with:
 
 ```bash
 export MEMTOMEM_STM_HOOK__USE_DAEMON=true

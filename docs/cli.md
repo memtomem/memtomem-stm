@@ -1030,8 +1030,10 @@ block. The operator-facing install/uninstall subcommands keep the strict
 `[claude|codex|cursor|kimi]` choice. Per-host registration writes an explicit
 host. The hook always exits `0` and emits `{}` (or empty stdout) on malformed
 input, timeout, disabled surfacing, or internal errors. By default it uses the
-local daemon path; set `MEMTOMEM_STM_HOOK__USE_DAEMON=0` for the legacy cold
-in-process path. The daemon choice, both deadlines and query-text persistence
+local daemon path; pass `--no-daemon` for the legacy cold in-process path. A
+command with neither `--use-daemon` nor `--no-daemon` follows `hook.use_daemon`
+instead, in any form the settings read (`MEMTOMEM_STM_HOOK__USE_DAEMON=0`, or
+`use_daemon` in `MEMTOMEM_STM_HOOK`). The daemon choice, both deadlines and query-text persistence
 can also arrive as the runtime flags `install` writes into the host command;
 see [the hook CLI reference](reference/cli-hooks.md#mms-hook) for the list.
 
