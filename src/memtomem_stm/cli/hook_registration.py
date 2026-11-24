@@ -27,7 +27,6 @@ import copy
 import re
 import shlex
 import sys
-import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -268,11 +267,17 @@ def _registration(ctx: click.Context, *, runs_bridge: bool) -> HookRegistration:
     """The reading of a parsed context. A group stops reading options at its
     first leftover token (a subcommand name, an unknown word, or ``--``), so
     any later ``--host`` was never parsed and the host is unknown."""
-    # Click 8.x keeps the first leftover token in ``protected_args``
-    # (deprecated; folded into ``args`` in 9.0).
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        leftover = [*getattr(ctx, "protected_args", ()), *ctx.args]
+    # Click 8.2–8.5 keep the first leftover token in ``_protected_args`` behind a
+    # deprecated property, and 8.1 stores ``protected_args`` on the instance. Read
+    # the instance dict so no deprecation warning is emitted and the process-wide
+    # warning filters are never touched: where warnings are not context-aware,
+    # ``catch_warnings`` saves and restores the global filter list, which
+    # overlapping readings on threads can leave changed (#1511). With neither
+    # attribute the fallback is empty, which fits Click's announced change that
+    # ``args`` will hold every leftover token.
+    state = vars(ctx)
+    first = state.get("_protected_args", state.get("protected_args", ()))
+    leftover = [*first, *ctx.args]
     value = ctx.params.get("host")
     if leftover or not isinstance(value, str):
         return HookRegistration(None, runs_bridge=False, host=None)

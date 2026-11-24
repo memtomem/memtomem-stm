@@ -118,9 +118,9 @@ _FRESH_IMPORTS = (
 )
 
 
-def _run_fresh(body: str) -> str:
+def _run_fresh(body: str, *interpreter_args: str) -> str:
     result = subprocess.run(
-        [sys.executable, "-P", "-c", _FRESH_IMPORTS + body],
+        [sys.executable, *interpreter_args, "-P", "-c", _FRESH_IMPORTS + body],
         capture_output=True,
         text=True,
         timeout=60,
@@ -984,3 +984,107 @@ def test_reading_while_click_builds_the_help_option_sees_no_duplicate() -> None:
     assert probe["in_window"] == [["--help", "-h"]]
     # ... and the reading is still the one an idle process gives.
     assert probe["reading"] == [True, "claude"]
+
+
+# Reading must not touch the process-wide warning filters either (#1511). Silencing
+# Click's ``protected_args`` deprecation with ``catch_warnings`` saved and restored the
+# global filter list, so two readings that overlapped could restore each other's list
+# and leave ``ignore::DeprecationWarning`` in front for good. As in the stream probe, only
+# one exit order does that: A reads first, B reads while A is inside, A finishes while B
+# is still gated, then B is released. The child seeds a known policy so an inherited
+# ``ignore`` cannot hide the leak, and runs with global (not context-aware) filters, the
+# only kind ``catch_warnings`` can leave changed.
+_WARNING_FILTER_PROBE = """
+import json, sys, threading, warnings
+
+from memtomem_stm.cli import hook_registration as hr
+
+# Explicit checks, not ``assert``: under ``PYTHONOPTIMIZE`` an assert would drop the
+# waits along with the check, and the readings would no longer overlap.
+if getattr(sys.flags, "context_aware_warnings", 0) != 0:
+    raise SystemExit("warnings are context-aware; the probe needs global filters")
+warnings.simplefilter("error", DeprecationWarning)
+before = list(warnings.filters)
+a_in, b_in, a_done = threading.Event(), threading.Event(), threading.Event()
+
+
+def wait_for(event, what):
+    if not event.wait(10):
+        raise RuntimeError(what)
+
+
+class GatedContext:
+    def __init__(self, who):
+        self.who = who
+        self._protected_args = []
+        self.params = {"host": "claude"}
+
+    @property
+    def args(self):
+        if self.who == "A":
+            a_in.set()
+            wait_for(b_in, "B never entered")
+        else:
+            b_in.set()
+            wait_for(a_done, "A never finished")
+        return []
+
+
+results = {}
+
+
+def run(name):
+    try:
+        if name == "B":
+            wait_for(a_in, "A never entered")
+        r = hr._registration(GatedContext(name), runs_bridge=True)
+        results[name] = [r.runs_bridge, r.host]
+    except BaseException as exc:
+        results[name] = repr(exc)
+    finally:
+        if name == "A":
+            a_done.set()
+            b_in.set()
+
+
+ta = threading.Thread(target=run, args=("A",), name="A")
+tb = threading.Thread(target=run, args=("B",), name="B")
+ta.start(); tb.start(); ta.join(30); tb.join(30)
+print(json.dumps({"results": results, "filters_unchanged": list(warnings.filters) == before}))
+"""
+
+
+def test_overlapping_readings_leave_the_warning_filters_alone() -> None:
+    # ``-X context_aware_warnings=0`` selects global filters on Python 3.14+; older
+    # interpreters accept and ignore it, and use global filters anyway.
+    probe = json.loads(_run_fresh(_WARNING_FILTER_PROBE, "-X", "context_aware_warnings=0"))
+    assert probe == {
+        "results": {"A": [True, "claude"], "B": [True, "claude"]},
+        "filters_unchanged": True,
+    }
+
+
+# Not touching the filters must not mean emitting Click's deprecation warning instead:
+# where warnings are errors, a leftover reading would then fail rather than report
+# "does not run the hook, host unknown".
+_NO_DEPRECATION_PROBE = """
+import json, warnings
+
+leftovers = (["install"], ["--host", "claude", "extra"])
+readings = []
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    for args in leftovers:
+        r = _read_hook_args(args)
+        readings.append([r.runs_bridge, r.host])
+warnings.simplefilter("error")
+for args in leftovers:
+    r = _read_hook_args(args)
+    readings.append([r.runs_bridge, r.host])
+print(json.dumps({"readings": readings, "warnings": [str(w.message) for w in caught]}))
+"""
+
+
+def test_reading_a_leftover_emits_no_deprecation_warning() -> None:
+    probe = json.loads(_run_fresh(_NO_DEPRECATION_PROBE))
+    assert probe == {"readings": [[False, None]] * 4, "warnings": []}
