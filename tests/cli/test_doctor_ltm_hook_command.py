@@ -877,3 +877,70 @@ def test_command_values_stay_out_of_doctor_output(
     assert "ltm" in checks
     assert "SENTINEL" not in output
     assert "SENTINEL" not in caplog.text
+
+
+# --- the command's flag strings, as the hook receives them (#1508) -----------
+
+_EXTREME = "1.7976931348623157e+308"
+
+
+def _written(surfacing: str, daemon: str) -> str:
+    """An install-shaped command with literal deadline words: unlike
+    :func:`_installed`, nothing is normalized or reformatted, so a word that
+    ``format_seconds`` would rewrite reaches the hook as written."""
+    policy = [
+        "--use-daemon",
+        "--surfacing-timeout-seconds",
+        surfacing,
+        "--daemon-timeout-seconds",
+        daemon,
+        "--no-persist-query-text",
+    ]
+    return shlex.join(hook_command_words(hook_launcher(), "claude", policy))
+
+
+@pytest.mark.parametrize(
+    ("surfacing", "daemon"),
+    [("3", _EXTREME), (_EXTREME, "4")],
+    ids=["extreme-daemon", "extreme-surfacing"],
+)
+def test_a_deadline_the_hook_cannot_build_keeps_doctor_off_its_daemon(
+    home, monkeypatch, surfacing, daemon
+):
+    # The hook keeps the word's value and writes it back as
+    # ``1.79769313486232e+308``, which its build rejects, so every call passes
+    # through. Rebuilt from the parsed settings, the word was dropped instead,
+    # and doctor reported the daemon of a hook that cannot build.
+    _settings(home, _cmd(_written(surfacing, daemon)))
+    daemons = LiveDaemons(_installed_fp(monkeypatch))
+    _install(monkeypatch, daemons)
+
+    status = _doctor()
+
+    view = status["hook_view"]
+    assert (view["state"], view["hook_route"]) == ("found", False), status
+    assert status["ltm_server"]["route"] == "direct", status
+    assert daemons.pinged == [], status
+
+
+@pytest.mark.parametrize(
+    ("surfacing", "daemon", "expected"),
+    [
+        # ``format_seconds`` rounds the surfacing word; the hook adds the grace
+        # second to the value it parsed, not to the rounded one.
+        ("3.004857197904855", "4", 4.00485719790485),
+        ("3", "inf", 4.0),
+        ("3", "nan", 4.0),
+    ],
+    ids=["rounding-surfacing", "inf-daemon", "nan-daemon"],
+)
+def test_the_hook_deadline_is_the_one_the_hook_builds(
+    home, monkeypatch, surfacing, daemon, expected
+):
+    _settings(home, _cmd(_written(surfacing, daemon)))
+    _install(monkeypatch, LiveDaemons(_installed_fp(monkeypatch)))
+
+    status = _doctor()
+
+    assert status["hook_view"]["hook_route"] is True, status
+    assert status["timeouts"]["hook_daemon_seconds"] == expected, status

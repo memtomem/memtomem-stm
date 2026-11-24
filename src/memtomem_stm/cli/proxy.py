@@ -10297,37 +10297,15 @@ class _HookCommandView:
         return self.use_daemon is not None
 
 
-def _owned_settings_env(settings: Any) -> dict[str, str]:
-    """The variables ``mms hook`` sets from an owned command's flags.
-
-    ``settings`` (``OwnedHookCommand.settings``) was read from those flags
-    through ``runtime_env_overrides``; passing it through that overlay again
-    gives the same variables, since the overlay is idempotent on its own
-    output."""
-    from memtomem_stm.cli.host_runtime import format_seconds, runtime_env_overrides
-
-    def flag(value: bool | None) -> str | None:
-        return None if value is None else ("true" if value else "false")
-
-    def seconds(value: float | None) -> str | None:
-        return None if value is None else format_seconds(value)
-
-    return runtime_env_overrides(
-        use_daemon=flag(settings.use_daemon),
-        surfacing_timeout_seconds=seconds(settings.surfacing_timeout_seconds),
-        daemon_timeout_seconds=seconds(settings.daemon_timeout_seconds),
-        persist_query_text=flag(settings.persist_query_text),
-    )
-
-
 def _hook_command_view() -> _HookCommandView:
     """Read the STM hook command doctor's hook view should be built with.
 
     Reads the file ``mms hook install --host claude`` writes, as the ``hook
     registration`` row does. A handler is recognized when install owns it
     (``hook_hosts.owned_handler``: install's own words, ``"type": "command"``,
-    no ``args``) and it has no ``shell`` other than Bash. Its settings are
-    then known exactly, from its flags. Any other ``command`` handler that may
+    no ``args``) and it has no ``shell`` other than Bash. The variables the
+    hook sets from its flags are then known exactly, computed from the flag
+    words as the hook computes them. Any other ``command`` handler that may
     run STM's hook (install's look-alike test, ``unmanaged_stm_like``) makes
     the view ``unreadable``: it runs too, and what it would build is unknown.
     A handler ``mms hook`` would not run as the bridge (``--help``, a
@@ -10364,8 +10342,10 @@ def _hook_command_view() -> _HookCommandView:
             continue
         owned = hook_hosts.owned_handler("claude", handler)
         if owned is not None and handler.get("shell", "bash") == "bash":
-            settings = owned.settings
-            recognized.append((location, _owned_settings_env(settings), settings.use_daemon))
+            # The overlay of the command's own words, as the hook computes it
+            # (#1508): rebuilt from the parsed settings, a deadline the hook's
+            # build rejects is dropped and a rounded one moves.
+            recognized.append((location, owned.env_overrides(), owned.settings.use_daemon))
         elif owned is not None or is_candidate(handler) or hook_hosts._words_name_the_hook(command):
             if not cannot_run_the_bridge(handler):
                 unreadable.append(location)

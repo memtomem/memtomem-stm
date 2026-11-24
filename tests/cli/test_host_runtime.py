@@ -266,3 +266,85 @@ def test_a_long_number_slot_is_refused_in_linear_time() -> None:
     started = time.perf_counter()
     assert owned_hook_command(line, "claude") is None
     assert time.perf_counter() - started < 5.0
+
+
+# --- the variables the hook sets from an owned command's flags (#1508) -------
+
+_EXTREME = "1.7976931348623157e+308"
+
+
+def _policy(daemon_flag: str, surfacing: str, daemon: str, persist_flag: str) -> list[str]:
+    """Setting words as literal strings, in install's order: never normalized or
+    reformatted, so a word ``format_seconds`` would rewrite reaches the hook as is."""
+    return [
+        daemon_flag,
+        "--surfacing-timeout-seconds",
+        surfacing,
+        "--daemon-timeout-seconds",
+        daemon,
+        persist_flag,
+    ]
+
+
+def _hook_overlay(monkeypatch: pytest.MonkeyPatch, args: list[str]) -> dict[str, str]:
+    """The overlay ``mms hook <args>`` applies, read from a real invocation."""
+    import contextlib
+
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli import hook_cmd
+    from memtomem_stm.cli.proxy import cli
+
+    seen: list[dict[str, str]] = []
+
+    @contextlib.contextmanager
+    def record(overrides: dict[str, str]):
+        seen.append(dict(overrides))
+        yield
+
+    monkeypatch.setattr(hook_cmd, "_runtime_registration_env", record)
+    result = CliRunner().invoke(cli, ["hook", *args], input="")
+    assert result.exit_code == 0, result.output
+    assert len(seen) == 1, seen
+    return seen[0]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        [],
+        _policy("--use-daemon", "3", "4", "--no-persist-query-text"),
+        _policy("--no-daemon", "3", "4", "--persist-query-text"),
+        _policy("--use-daemon", "3", _EXTREME, "--no-persist-query-text"),
+        _policy("--use-daemon", _EXTREME, "4", "--no-persist-query-text"),
+        _policy("--use-daemon", "3", "inf", "--no-persist-query-text"),
+        _policy("--use-daemon", "3", "nan", "--no-persist-query-text"),
+        _policy("--no-daemon", "inf", "4", "--persist-query-text"),
+        _policy("--use-daemon", "9.0", "4", "--no-persist-query-text"),
+        _policy("--use-daemon", "3.004857197904855", "4", "--no-persist-query-text"),
+    ],
+    ids=[
+        "no-settings",
+        "ordinary",
+        "no-daemon-persist",
+        "extreme-daemon",
+        "extreme-surfacing",
+        "inf-daemon",
+        "nan-daemon",
+        "inf-surfacing",
+        "trailing-zero",
+        "rounding-surfacing",
+    ],
+)
+def test_env_overrides_are_the_ones_the_hook_applies(
+    monkeypatch: pytest.MonkeyPatch, policy: list[str]
+) -> None:
+    import shlex
+
+    from memtomem_stm.cli.host_runtime import hook_command_words, hook_launcher
+
+    command = shlex.join(hook_command_words(hook_launcher(), "claude", policy))
+    owned = owned_hook_command(command, "claude")
+    assert owned is not None, command
+
+    assert owned.env_overrides() == _hook_overlay(monkeypatch, ["--host", "claude", *policy])
