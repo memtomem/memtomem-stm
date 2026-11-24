@@ -260,6 +260,27 @@ def test_cli_row_names_the_command_it_read(home, proxy_file, monkeypatch, tmp_pa
     assert row["detail"].endswith("(Claude Code user settings only)"), row
 
 
+@pytest.mark.parametrize("use_daemon", [True, False], ids=["use-daemon", "no-daemon"])
+def test_cli_row_names_a_failed_hook_build_not_the_flag(
+    home, proxy_file, monkeypatch, tmp_path, use_daemon
+):
+    # The hook's build fails on a variable outside the flags: the hook then
+    # passes every call through (#1501), so the row must not say the command's
+    # flag turned the hook's daemon off.
+    _settings(home, _cmd(_installed(use_daemon=use_daemon)))
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__MAX_RESULTS", "nope")
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    detail = checks["ltm"]["detail"]
+    assert (
+        f"the hook's build with the options of the STM hook command at {FIRST} fails on a "
+        "setting, so the hook passes every call through" in detail
+    ), detail
+    assert "hook's daemon off" not in detail
+
+
 def test_cli_row_names_the_command_that_turned_the_hook_daemon_off(
     home, proxy_file, monkeypatch, tmp_path
 ):

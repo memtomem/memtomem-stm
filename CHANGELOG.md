@@ -228,7 +228,8 @@ changes inline only. See the deprecation policy in
   writes one: on a first install from the installer's own `hook.use_daemon`
   (`--use-daemon` by default), on a reinstall the existing command's, unless
   `--daemon`, `--no-daemon` or `--inherit-runtime-env` says otherwise.
-  Doctor, which reads its own environment and not the command, then takes
+  Doctor, which reads its own environment and not the command (outside
+  the case the issue #1494 entry covers), then takes
   for its `ltm` row the standalone view built from
   `--config` (the direct probe, or the `surfacing.use_daemon` daemon). Code that
   calls the hook's internal `_run_hook` without a config now gets a settings

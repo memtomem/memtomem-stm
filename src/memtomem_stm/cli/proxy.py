@@ -10389,6 +10389,7 @@ def _hook_view_summary(view: _HookCommandView, *, hook_route: bool) -> dict[str,
         "path": None if view.path is None else str(view.path),
         "locations": list(view.locations),
         "hook_route": hook_route,
+        "hook_build_failed": False,
         "gate_from_command": view.gate_from_command,
         "settings_error": view.settings_error,
     }
@@ -10431,13 +10432,28 @@ def _hook_view_note(summary: Any, ltm: Any) -> str | None:
             route = "standalone daemon route"
         else:
             route = "direct LTM probe"
-        if summary.get("gate_from_command"):
-            source = f"by the STM hook command at {locations}"
-        elif state == "found":
-            source = f"in doctor's environment (the STM hook command at {locations} sets no gate)"
+        if summary.get("hook_build_failed"):
+            # The hook passes every call through then (#1501), so neither its
+            # flag nor ``hook.use_daemon`` is why its daemon was not probed.
+            built = (
+                f"with the options of the STM hook command at {locations}"
+                if state == "found"
+                else f"from doctor's environment ({unused})"
+            )
+            note = (
+                f"route: the {route}, the hook's build {built} fails on a setting, "
+                "so the hook passes every call through"
+            )
         else:
-            source = f"in doctor's environment ({unused})"
-        note = f"route: the {route}, hook's daemon off {source}"
+            if summary.get("gate_from_command"):
+                source = f"by the STM hook command at {locations}"
+            elif state == "found":
+                source = (
+                    f"in doctor's environment (the STM hook command at {locations} sets no gate)"
+                )
+            else:
+                source = f"in doctor's environment ({unused})"
+            note = f"route: the {route}, hook's daemon off {source}"
     return f"{note} (Claude Code user settings only)"
 
 
@@ -10515,6 +10531,7 @@ def _surfacing_bootstrap_status(
                 built: STMConfig | None = load_env_stm_config(view.env).config
             except (ValidationError, SettingsError):
                 built = None
+                hook_view["hook_build_failed"] = True
             # As the hook routes (#1501): its command's daemon flag decides
             # directly, else the build's ``hook.use_daemon``. A build that fails
             # passes every call through, so its route is moot.
