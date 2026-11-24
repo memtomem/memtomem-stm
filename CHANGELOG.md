@@ -217,8 +217,10 @@ changes inline only. See the deprecation policy in
   route directly: it reaches the settings through one exact variable, which a
   case-equivalent spelling elsewhere in the environment can outrank. Doctor
   follows the same setting, and when the hook's build fails on a variable
-  outside `proxy` (the hook then passes every call through), doctor reports
-  the error of its own `--config` build instead of the environment-only one.
+  outside `proxy` (the hook then passes every call through; without the
+  command read, the environment-only build is doctor's estimate of the
+  hook's, issue #1494 entry), doctor reports the error of its own
+  `--config` build instead of the environment-only one.
   `mms daemon status` says `no (hook.use_daemon is false)` and the
   `--measure-ltm` warning names the setting, instead of naming
   `MEMTOMEM_STM_HOOK__USE_DAEMON=0`. **Behavior change**: a nested or

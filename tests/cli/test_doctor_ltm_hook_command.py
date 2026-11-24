@@ -307,9 +307,71 @@ def test_cli_row_names_doctors_environment_when_it_turned_the_hook_daemon_off(
 
     detail = checks["ltm"]["detail"]
     assert (
-        "route: the standalone daemon route, hook's daemon off in doctor's environment" in detail
+        "route: the standalone daemon route, hook.use_daemon false in doctor's environment "
+        "(no STM hook command in" in detail
     ), detail
-    assert "no STM hook command in" in detail, detail
+
+
+_FOUND = {"state": "found", "path": "/s.json", "locations": [FIRST]}
+_UNREAD = {"state": "unreadable", "path": "/s.json", "locations": [FIRST]}
+
+
+@pytest.mark.parametrize(
+    ("summary", "ltm", "reason"),
+    [
+        (
+            {**_FOUND, "hook_build_failed": True, "gate_from_command": True},
+            {"route": "direct"},
+            f"the direct LTM probe, the hook's build with the options of the STM hook command "
+            f"at {FIRST} fails on a setting, so the hook passes every call through",
+        ),
+        (
+            {**_FOUND, "gate_from_command": True},
+            {"route": "direct"},
+            f"the direct LTM probe, hook's daemon off by the STM hook command at {FIRST}",
+        ),
+        (
+            {**_FOUND, "gate_from_command": False},
+            {"route": "daemon"},
+            f"the standalone daemon route, hook.use_daemon false in the hook's build "
+            f"(the STM hook command at {FIRST} has no daemon flag)",
+        ),
+        (
+            {**_UNREAD, "hook_build_failed": True},
+            {"route": "direct"},
+            "the direct LTM probe, the build from doctor's environment fails on a setting "
+            f"(a command that may run STM's hook could not be read ({FIRST}) in /s.json)",
+        ),
+        (
+            {**_UNREAD},
+            {"route": "direct"},
+            "the direct LTM probe, hook.use_daemon false in doctor's environment "
+            f"(a command that may run STM's hook could not be read ({FIRST}) in /s.json)",
+        ),
+        (
+            {**_FOUND, "gate_from_command": True},
+            {"route": "direct", "skipped": "surfacing_disabled"},
+            "the standalone route (not probed: surfacing is disabled), hook's daemon off by "
+            f"the STM hook command at {FIRST}",
+        ),
+    ],
+    ids=[
+        "found-build-failed",
+        "found-no-daemon",
+        "found-no-flag",
+        "unread-build-failed",
+        "unread-setting-off",
+        "surfacing-disabled",
+    ],
+)
+def test_the_standalone_note_says_only_what_doctors_build_showed(summary, ltm, reason):
+    # Without the command (every state but ``found``), doctor does not know what
+    # the registered hook does, so the note speaks of doctor's build only.
+    from memtomem_stm.cli.proxy import _hook_view_note
+
+    note = _hook_view_note({**summary, "hook_route": False}, ltm)
+
+    assert note == f"route: {reason} (Claude Code user settings only)"
 
 
 def test_a_use_daemon_flag_turns_the_route_on_over_an_ambient_opt_out(home, monkeypatch):
