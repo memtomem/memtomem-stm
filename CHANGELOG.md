@@ -185,10 +185,12 @@ changes inline only. See the deprecation policy in
   `MEMTOMEM_STM_HOOK__USE_DAEMON=0`. **Behavior change**: a nested or
   other-case `use_daemon` false in the hook's environment now keeps a hook
   command with neither flag off the daemon, with no auto-spawn; a command
-  carrying either flag, as `mms hook install` writes (`--use-daemon` unless
-  the installer's own `hook.use_daemon` is false), follows the flag, as it did
-  before. Doctor, which reads its own environment and not the command, then
-  takes for its `ltm` row the standalone view built from
+  carrying either flag follows the flag, as it did before. `mms hook install`
+  writes one: on a first install from the installer's own `hook.use_daemon`
+  (`--use-daemon` by default), on a reinstall the existing command's, unless
+  `--daemon`, `--no-daemon` or `--inherit-runtime-env` says otherwise.
+  Doctor, which reads its own environment and not the command, then takes
+  for its `ltm` row the standalone view built from
   `--config` (the direct probe, or the `surfacing.use_daemon` daemon). Code that
   calls the hook's internal `_run_hook` without a config now gets a settings
   error raised from it on either route; the cold route used to log it and

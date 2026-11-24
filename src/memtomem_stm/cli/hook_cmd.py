@@ -69,9 +69,11 @@ command. A command with neither ``--use-daemon`` nor ``--no-daemon`` follows
 ``hook.use_daemon`` in any form the settings read
 (``MEMTOMEM_STM_HOOK__USE_DAEMON=0``,
 ``MEMTOMEM_STM_HOOK='{"use_daemon": false}'``); a command with either flag
-ignores it. ``mms hook install`` writes one of the two flags from
-``hook.use_daemon`` in its own environment (``--use-daemon`` by default), so an
-installed hook changes mode by reinstalling with the setting changed, or by
+ignores it. A first ``mms hook install`` writes one of the two flags from
+``hook.use_daemon`` in its own environment (``--use-daemon`` by default); a
+reinstall keeps the flag the existing command has, so an installed hook
+changes mode through ``mms hook install --daemon``/``--no-daemon``, through
+``--inherit-runtime-env`` (no flag written, the settings decide), or by
 editing the flag. When the daemon is unreachable the hook
 degrades per ``HookConfig.fallback`` — ``skip`` (default) returns ``{}``,
 ``cold`` runs the in-process path. To exercise the cold path directly, set
