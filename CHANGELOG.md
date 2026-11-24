@@ -14,7 +14,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - `mms doctor` now applies the registered hook command's flag words to its
-  own environment the way the hook does (issue #1508). 0.7.11's doctor
+  own environment the way the hook does (#1512, issue #1508). 0.7.11's doctor
   parsed the words into settings and formatted those back, and the round
   trip is not exact. A deadline too large to write back as a finite number
   (a hand-edited `1.7976931348623157e+308`, which `mms hook install` does not
