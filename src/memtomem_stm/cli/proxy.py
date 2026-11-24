@@ -348,6 +348,12 @@ def _setup_json_result(action: str):  # noqa: ANN201
             # this wrapper sits inside ``with_config_write_lock``, so it sees
             # the exception first.
             write_failure: ConfigWriteError | None = None
+            # The redirect swaps the process-wide ``sys.stdout``/``sys.stderr``.
+            # Two ``--json`` setup commands running at the same time in one
+            # process can restore each other's sink, and even one capture takes
+            # in what other threads write to the process streams meanwhile. The
+            # CLI runs one setup command per process; overlapping in-process
+            # calls are not supported (#1511).
             with redirect_stdout(out), redirect_stderr(err):
                 try:
                     fn(*args, **kwargs)
