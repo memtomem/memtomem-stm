@@ -188,8 +188,18 @@ class OwnedHookCommand:
     launcher: tuple[str, ...]
     """:func:`hook_launcher`'s words for the command."""
     settings: PartialHostRuntimePolicy
-    """The runtime settings the hook runs with when given the command's
-    flags; every field ``None`` for a command without them."""
+    """The command's flags parsed into a policy, which install carries over on
+    refresh; every field ``None`` for a command without them. Not the hook's
+    input: a deadline the hook keeps but its build rejects (one
+    ``format_seconds`` writes as ``1.79769313486232e+308``) is dropped here.
+    The hook's input from the flags is :meth:`env_overrides`."""
+    policy_words: tuple[str, ...] = ()
+    """The command's six setting words as written, or none."""
+
+    def env_overrides(self) -> dict[str, str]:
+        """The environment overlay ``mms hook`` applies from the command's
+        flags, before its build validates them."""
+        return _hook_overlay(self.policy_words)
 
 
 # What ``format_seconds`` can write for a deadline, read as text: digits, an
@@ -255,7 +265,7 @@ def owned_hook_command(command: str, host: str) -> OwnedHookCommand | None:
         launcher = hook_launcher(directory)
     if shlex.join(hook_command_words(launcher, host, policy_words)) != command:
         return None
-    return OwnedHookCommand(tuple(launcher), _hook_settings(policy_words))
+    return OwnedHookCommand(tuple(launcher), _hook_settings(policy_words), tuple(policy_words))
 
 
 def _unquoted(word: str) -> str:
@@ -267,22 +277,29 @@ def _unquoted(word: str) -> str:
     return word
 
 
-def _hook_settings(policy_words: Sequence[str]) -> PartialHostRuntimePolicy:
-    """The settings the hook runs with when given ``policy_words``.
-
-    Read through :func:`runtime_env_overrides`, the overlay ``mms hook``
-    applies to these flags, so a deadline that is not a positive finite number
-    is dropped and the daemon deadline is at least a second above a usable
-    surfacing one, exactly as at run time."""
+def _hook_overlay(policy_words: Sequence[str]) -> dict[str, str]:
+    """The variables ``mms hook`` sets when given ``policy_words``: the strings
+    its Click options hand :func:`runtime_env_overrides` (each daemon and
+    persist flag's ``flag_value``, the deadline words as written)."""
     if not policy_words:
-        return PartialHostRuntimePolicy()
+        return {}
     daemon_flag, _, surfacing, _, daemon, persist_flag = policy_words
-    overlay = runtime_env_overrides(
+    return runtime_env_overrides(
         use_daemon="true" if daemon_flag == _DAEMON_FLAGS[True] else "false",
         surfacing_timeout_seconds=surfacing,
         daemon_timeout_seconds=daemon,
         persist_query_text="true" if persist_flag == _PERSIST_FLAGS[True] else "false",
     )
+
+
+def _hook_settings(policy_words: Sequence[str]) -> PartialHostRuntimePolicy:
+    """``policy_words`` parsed into a policy.
+
+    Read from :func:`_hook_overlay`, so a deadline that is not a positive
+    finite number is dropped and the daemon deadline is at least a second
+    above a usable surfacing one, as at run time. A value that the overlay
+    writes but that does not read back as finite is dropped too."""
+    overlay = _hook_overlay(policy_words)
     return PartialHostRuntimePolicy(
         use_daemon=_parse_bool(overlay.get(_USE_DAEMON_ENV)),
         surfacing_timeout_seconds=_parse_positive_float(overlay.get(_SURFACING_TIMEOUT_ENV)),

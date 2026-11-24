@@ -11,6 +11,25 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- `mms doctor` now applies the registered hook command's flag words to its
+  own environment the way the hook does (#1512, issue #1508). 0.7.11's doctor
+  parsed the words into settings and formatted those back, and the round
+  trip is not exact. A deadline too large to write back as a finite number
+  (a hand-edited `1.7976931348623157e+308`, which `mms hook install` does not
+  write) was dropped, while the hook keeps it and then fails to build its
+  configuration. A surfacing deadline whose 15-digit form rounds moved the
+  daemon deadline by its last digit. **Behavior change**: with such an
+  extreme deadline in either slot, doctor's build of the hook's
+  configuration now fails as the hook's does, so the `ltm server` row (`ltm`
+  in `--json`) no longer reports the hook's daemon and falls back to the
+  standalone view, as when the hook's daemon is off. With a rounding
+  surfacing deadline, when doctor takes the hook's daemon route, the timeout
+  checks read the hook's own daemon deadline. Known limit: no row says that
+  a flag made the hook's build fail; `env_overrides` validates doctor's
+  environment without the flags.
+
 ## [0.7.11] — 2026-11-24
 
 ### Upgrade notes
