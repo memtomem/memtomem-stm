@@ -428,6 +428,31 @@ def test_looking_at_a_fresh_data_dir_creates_nothing(
     assert not data_dir.exists()
 
 
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"MEMTOMEM_STM_HOOK__USE_DAEMON": "0"},
+        {"MEMTOMEM_STM_HOOK": '{"use_daemon": false}'},
+    ],
+    ids=["flat", "nested"],
+)
+def test_status_names_the_setting_not_one_spelling_of_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+) -> None:
+    # The hook routes on ``hook.use_daemon`` in whatever form it was set
+    # (#1495), so the hint must not name a variable the operator never set.
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path / "fresh"))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    text = CliRunner().invoke(_cli(), ["daemon", "status"])
+    as_json = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+
+    assert text.exit_code == 0, text.output
+    assert "hook will use daemon: no (hook.use_daemon is false)" in text.output
+    assert json.loads(as_json.output)["hook_will_use_daemon"] is False
+
+
 @posix_modes
 @pytest.mark.parametrize(
     "args",

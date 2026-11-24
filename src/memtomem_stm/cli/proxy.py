@@ -10278,22 +10278,23 @@ class _HookCommandView:
     Bash or PowerShell, which this reader does not model; the ``hook
     registration`` row does not read it either) or ``settings_error``.
     ``locations`` name the handlers (``hooks.PostToolUse[i].hooks[j]``), never
-    their command text, which can hold credentials. ``env`` is only set for
-    ``found``: the variables the hook sets from that command's flags.
+    their command text, which can hold credentials. ``env`` and ``use_daemon``
+    are only set for ``found``: the variables the hook sets from that
+    command's flags, and its ``--use-daemon``/``--no-daemon`` (``None`` for
+    neither), which the hook routes on directly (#1501).
     """
 
     state: Literal["found", "none", "several", "unreadable", "windows", "settings_error"]
     path: Path | None = None
     locations: tuple[str, ...] = ()
     env: dict[str, str] = dataclass_field(default_factory=dict)
+    use_daemon: bool | None = None
     settings_error: str | None = None
 
     @property
     def gate_from_command(self) -> bool:
-        """Whether the found command sets the hook's daemon gate."""
-        from memtomem_stm.cli.host_runtime import _USE_DAEMON_ENV
-
-        return _USE_DAEMON_ENV in self.env
+        """Whether the found command carries a daemon flag, which decides the route."""
+        return self.use_daemon is not None
 
 
 def _owned_settings_env(settings: Any) -> dict[str, str]:
@@ -10353,7 +10354,7 @@ def _hook_command_view() -> _HookCommandView:
         registration = inspect_hook_registration(handler, windows=windows)
         return registration.not_checked is None and not registration.runs_bridge
 
-    recognized: list[tuple[str, dict[str, str]]] = []
+    recognized: list[tuple[str, dict[str, str], bool | None]] = []
     unreadable: list[str] = []
     for location, handler in handlers or []:
         if not isinstance(handler, dict) or handler.get("type") != "command":
@@ -10363,11 +10364,12 @@ def _hook_command_view() -> _HookCommandView:
             continue
         owned = hook_hosts.owned_handler("claude", handler)
         if owned is not None and handler.get("shell", "bash") == "bash":
-            recognized.append((location, _owned_settings_env(owned.settings)))
+            settings = owned.settings
+            recognized.append((location, _owned_settings_env(settings), settings.use_daemon))
         elif owned is not None or is_candidate(handler) or hook_hosts._words_name_the_hook(command):
             if not cannot_run_the_bridge(handler):
                 unreadable.append(location)
-    every = tuple(loc for loc, _env in recognized) + tuple(unreadable)
+    every = tuple(loc for loc, _env, _flag in recognized) + tuple(unreadable)
     if every and windows:
         return _HookCommandView("windows", path, every)
     if unreadable:
@@ -10375,8 +10377,8 @@ def _hook_command_view() -> _HookCommandView:
     if len(recognized) > 1:
         return _HookCommandView("several", path, every)
     if recognized:
-        location, env = recognized[0]
-        return _HookCommandView("found", path, (location,), env)
+        location, env, use_daemon = recognized[0]
+        return _HookCommandView("found", path, (location,), env, use_daemon)
     return _HookCommandView("none", path)
 
 
@@ -10455,14 +10457,20 @@ def _surfacing_bootstrap_status(
     with, because a daemon is found by the fingerprint of the build that
     started it (#1485):
 
-    - *prefer_hook_daemon* (doctor) and the hook's own daemon gate on: the
-      section describes the hook. The hook decides with
-      ``hook_cmd._daemon_enabled`` (a raw read of
-      ``MEMTOMEM_STM_HOOK__USE_DAEMON``, not the parsed ``hook.use_daemon``)
-      and builds with ``load_env_stm_config``: environment only, never
-      doctor's ``--config``, and tolerant of a proxy-only break. A daemon it
+    - *prefer_hook_daemon* (doctor) and the hook's daemon setting on: the
+      section describes the hook. The hook builds with
+      ``load_env_stm_config``: environment only, never doctor's ``--config``,
+      and tolerant of a proxy-only break. It routes on that build's
+      ``hook.use_daemon`` (#1495), unless its command carries
+      ``--use-daemon``/``--no-daemon``, which then decides (#1501; doctor
+      reads it from the command, below). A daemon it
       spawns reloads the same way, so that build is the daemon's identity.
       Doctor's proxy checks still report a broken proxy variable.
+    - When that build fails to decode or validate a setting
+      (``ValidationError``/``SettingsError``), the hook passes every call
+      through and its route is moot: the section is built in the command's
+      own view below, so the error reported is that view's. Any other
+      exception reaches the handler at the end as it is.
     - Otherwise (health, or the hook off): the standalone route, in the
       command's own view: built from *config_path*, the command's explicit
       ``--config``, so the ``STMConfig`` here reads the same file as the
@@ -10477,36 +10485,44 @@ def _surfacing_bootstrap_status(
     Doctor also reads the STM hook command in Claude Code's user settings
     (:func:`_hook_command_view`, #1494). When it finds exactly one that
     ``mms hook install`` owns, and nothing else that may run the hook, the
-    gate and the hook's build read the variables the hook sets from that
-    command's flags over doctor's environment, as the hook does: ``--no-daemon``
-    sends doctor to the standalone route, and the fingerprint takes the
-    query-text persistence and surfacing deadline that build resolves. They
-    are passed to the gate and the build, never set in ``os.environ``: the
-    probe and the standalone build read the environment as it is. Otherwise
-    the hook view is built from doctor's environment alone. The result's
-    ``hook_view`` says which.
+    hook's build reads the variables the hook sets from that command's flags
+    over doctor's environment, and the command's daemon flag decides the
+    route, as both do in the hook: ``--no-daemon`` sends doctor to the
+    standalone route, and the fingerprint takes the query-text persistence
+    and surfacing deadline that build resolves. The variables are passed to
+    the build, never set in ``os.environ``: the probe and the standalone
+    build read the environment as it is. Otherwise the hook view is built
+    from doctor's environment alone. The result's ``hook_view`` says which.
     """
     hook_view: dict[str, Any] | None = None
     try:
+        from pydantic import ValidationError
+        from pydantic_settings import SettingsError
+
         from memtomem_stm.cli.rrf_diagnostics import rrf_boundary_doctor_checks
-        from memtomem_stm.config import load_env_stm_config, stm_config_for_cli
+        from memtomem_stm.config import STMConfig, load_env_stm_config, stm_config_for_cli
         from memtomem_stm.surfacing.feedback_store import (
             inspect_feedback_db,
             read_surfacing_summary,
         )
         from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
 
-        hook_route = False
         ltm_status: dict[str, Any] | None = None
         if prefer_hook_daemon:
-            from memtomem_stm.cli.hook_cmd import _daemon_enabled
-
             view = _hook_command_view()
             hook_view = _hook_view_summary(view, hook_route=False)
-            hook_route = _daemon_enabled(view.env)
-            if hook_route:
+            try:
+                built: STMConfig | None = load_env_stm_config(view.env).config
+            except (ValidationError, SettingsError):
+                built = None
+            # As the hook routes (#1501): its command's daemon flag decides
+            # directly, else the build's ``hook.use_daemon``. A build that fails
+            # passes every call through, so its route is moot.
+            if built is not None and (
+                view.use_daemon if view.use_daemon is not None else built.hook.use_daemon
+            ):
                 hook_view["hook_route"] = True
-                config = load_env_stm_config(view.env).config
+                config = built
                 # Before the probe, as on the standalone route: a feedback DB
                 # path that cannot be inspected ends the section unprobed.
                 db_status = inspect_feedback_db(config.surfacing.feedback_db_path)
@@ -12320,16 +12336,17 @@ def doctor(
                     "enable surfacing (surfacing.enabled, default true), then rerun",
                 )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("route") != "daemon":
-                # The daemon route is the hook's when its daemon gate is on
-                # (#1485), else the standalone ``surfacing.use_daemon`` one.
+                # The daemon route is the hook's when its ``hook.use_daemon``
+                # is on (#1485, #1495), else the standalone
+                # ``surfacing.use_daemon`` one.
                 check(
                     "ltm_measurement",
                     "ltm measurement",
                     "WARN",
-                    "--measure-ltm needs a daemon route (the hook's, with "
-                    "MEMTOMEM_STM_HOOK__USE_DAEMON unset or true, or surfacing.use_daemon=true) "
-                    "and a running daemon",
-                    "unset MEMTOMEM_STM_HOOK__USE_DAEMON or export "
+                    "--measure-ltm needs a daemon route (the hook's, with hook.use_daemon "
+                    "true, the default, or surfacing.use_daemon=true) and a running daemon",
+                    "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
+                    "use_daemon in MEMTOMEM_STM_HOOK) or export "
                     "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
                 )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("daemon_reachable") is False:

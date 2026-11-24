@@ -40,7 +40,6 @@ from memtomem_stm.cli.hook_cmd import (
     _SAFE_DAEMON_BUDGET,
     _bounded_call,
     _build_hook_output,
-    _daemon_enabled,
     _extract_surfaced_block,
     _orchestrate,
     _read_payload,
@@ -53,7 +52,7 @@ from memtomem_stm.cli.hook_cmd import (
     run_surfacing_hook,
 )
 from memtomem_stm.cli.proxy import cli
-from memtomem_stm.config import HookCompressionConfig
+from memtomem_stm.config import HookCompressionConfig, load_env_stm_config
 from memtomem_stm.daemon.protocol import OP_SURFACE, PROTOCOL_VERSION
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
@@ -705,47 +704,6 @@ def test_resolve_host_tag_strips_whitespace():
 # ── Daemon routing + degradation ladder ──────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        ("1", True),
-        ("true", True),
-        ("YES", True),
-        ("on", True),
-        ("0", False),
-        ("false", False),
-        ("f", False),
-        ("no", False),
-        ("n", False),
-        ("off", False),
-    ],
-)
-def test_daemon_enabled_env_parsing(monkeypatch: pytest.MonkeyPatch, value: str, expected: bool):
-    # Falsy-token set matches Pydantic's bool parsing, so the hot path and
-    # `mms daemon status` (the parsed field) never disagree on a value Pydantic
-    # accepts.
-    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", value)
-    assert _daemon_enabled() is expected
-
-
-def test_daemon_enabled_default_when_unset(monkeypatch: pytest.MonkeyPatch):
-    # Daemon mode is the default now — unset → enabled.
-    monkeypatch.delenv("MEMTOMEM_STM_HOOK__USE_DAEMON", raising=False)
-    assert _daemon_enabled() is True
-
-
-@pytest.mark.parametrize(
-    ("ambient", "overlay", "expected"), [("0", "true", True), ("1", "f", False)]
-)
-def test_daemon_enabled_overlay_wins_over_the_environment(
-    monkeypatch: pytest.MonkeyPatch, ambient: str, overlay: str, expected: bool
-):
-    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", ambient)
-    assert _daemon_enabled({"MEMTOMEM_STM_HOOK__USE_DAEMON": overlay}) is expected
-    assert _daemon_enabled({"MEMTOMEM_STM_OTHER": "0"}) is (ambient == "1")
-    assert os.environ["MEMTOMEM_STM_HOOK__USE_DAEMON"] == ambient
-
-
 def test_daemon_explicitly_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     sentinel = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
@@ -758,6 +716,121 @@ def test_daemon_explicitly_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPat
     out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD)))
     assert out == sentinel
     boom.assert_not_called()
+
+
+_COLD_OUT = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
+_WARM_OUT = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "warm"}}
+
+
+def _record_routes(
+    monkeypatch: pytest.MonkeyPatch, *, daemon_out: dict[str, Any] | None = None
+) -> tuple[AsyncMock, list[object], AsyncMock]:
+    """Record every way the hook can reach the daemon, and the cold path.
+
+    The daemon answers *daemon_out*; ``None`` is an unreachable daemon, which
+    is what makes the hook ask for a spawn, so the spawn is recorded too.
+    """
+    surface = AsyncMock(return_value=daemon_out)
+    spawns: list[object] = []
+    cold = AsyncMock(return_value=_COLD_OUT)
+    monkeypatch.setattr("memtomem_stm.daemon.client.surface", surface)
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", spawns.append)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", cold)
+    return surface, spawns, cold
+
+
+@pytest.mark.parametrize("preloaded", [False, True], ids=["config-none", "config-given"])
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({"MEMTOMEM_STM_HOOK": '{"use_daemon": false}'}, id="nested"),
+        pytest.param({"memtomem_stm_hook": '{"use_daemon": false}'}, id="nested-lower-case"),
+        pytest.param({"MEMTOMEM_STM_HOOK__use_daemon": "0"}, id="mixed-case"),
+    ],
+)
+def test_every_form_of_the_opt_out_keeps_the_hook_off_the_daemon(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], preloaded: bool
+) -> None:
+    # The settings read ``hook.use_daemon`` in these forms too (#1495); the
+    # hook used to read only the exact ``MEMTOMEM_STM_HOOK__USE_DAEMON`` key,
+    # so it kept surfacing through, and spawning, the daemon.
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    config = load_env_stm_config().config
+    assert config.hook.use_daemon is False  # the settings' own reading
+    surface, spawns, cold = _record_routes(monkeypatch)
+
+    out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD), config=config if preloaded else None))
+
+    assert out == _COLD_OUT
+    surface.assert_not_called()
+    assert spawns == []
+    cold.assert_awaited_once()
+
+
+@pytest.mark.parametrize("preloaded", [False, True], ids=["config-none", "config-given"])
+def test_the_nested_form_loses_to_the_flat_key_as_the_settings_decide(
+    monkeypatch: pytest.MonkeyPatch, preloaded: bool
+) -> None:
+    # Positive control: not "any nested value disables". The flat key wins
+    # over the nested payload in the settings, and so in the hook.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": false}')
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+    config = load_env_stm_config().config
+    assert config.hook.use_daemon is True
+    surface, spawns, cold = _record_routes(monkeypatch)
+
+    out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD), config=config if preloaded else None))
+
+    assert out == {}  # unreachable daemon, default fallback=skip
+    surface.assert_awaited_once()
+    assert len(spawns) == 1
+    cold.assert_not_called()
+
+
+def _parsed_use_daemon_under(monkeypatch: pytest.MonkeyPatch, flat_value: str) -> bool:
+    """``hook.use_daemon`` as the settings read it once the hook's flag overlay
+    has set ``MEMTOMEM_STM_HOOK__USE_DAEMON`` (a new key, appended last)."""
+    with monkeypatch.context() as patch:
+        patch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", flat_value)
+        return load_env_stm_config().config.hook.use_daemon
+
+
+def test_cli_no_daemon_flag_wins_over_an_environment_that_parses_to_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Case-equivalent members of the nested payload outrank the flat key the
+    # flag's overlay sets, so the settings alone would say "on" here.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": false, "USE_DAEMON": true}')
+    assert _parsed_use_daemon_under(monkeypatch, "false") is True  # the conflict is real
+    surface, spawns, cold = _record_routes(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli, ["hook", "--host", "claude", "--no-daemon"], input=json.dumps(_READ_PAYLOAD)
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == _COLD_OUT
+    surface.assert_not_called()
+    assert spawns == []
+    cold.assert_awaited_once()
+
+
+def test_cli_use_daemon_flag_wins_over_an_environment_that_parses_to_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": true, "USE_DAEMON": false}')
+    assert _parsed_use_daemon_under(monkeypatch, "true") is False  # the conflict is real
+    surface, spawns, cold = _record_routes(monkeypatch, daemon_out=_WARM_OUT)
+
+    result = CliRunner().invoke(
+        cli, ["hook", "--host", "claude", "--use-daemon"], input=json.dumps(_READ_PAYLOAD)
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == _WARM_OUT
+    surface.assert_awaited_once()
+    cold.assert_not_called()
 
 
 def test_daemon_used_when_enabled(monkeypatch: pytest.MonkeyPatch):

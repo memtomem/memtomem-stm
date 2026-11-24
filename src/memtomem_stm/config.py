@@ -374,9 +374,12 @@ class HookConfig(BaseModel):
     """When ``True`` (the default), ``mms hook`` routes surfacing through the
     local daemon (warm LTM connection) instead of spawning a cold LTM subprocess
     per call. The daemon is auto-spawned on first use (see ``auto_spawn``), so no
-    manual ``mms daemon start`` is needed. Set
-    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` to opt out to the legacy cold in-process
-    path."""
+    manual ``mms daemon start`` is needed. Set it false (e.g.
+    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``) to opt out to the legacy cold
+    in-process path. A hook command's ``--use-daemon``/``--no-daemon`` overrides this
+    setting for that command; ``mms hook install`` writes one by default (not
+    with ``--inherit-runtime-env``), and a command with neither follows this
+    setting."""
     daemon_timeout_seconds: float = Field(default=2.5, gt=0.0, allow_inf_nan=False)
     """Per-request wall-clock budget for the hook→daemon round trip, and the
     effective ceiling on the LTM attempt inside it. Small and independent of the
@@ -812,8 +815,9 @@ HOOK_FLAG_ENV_NAMES = frozenset(
 """The variables ``mms hook`` sets from its command's flags
 (``host_runtime.runtime_env_overrides``), spelled as it sets them: the only
 names a :func:`load_env_stm_config` ``env_overlay`` accepts. Doctor's hook
-route reads them only through that build and ``hook_cmd._daemon_enabled``
-(the hook's own deadline backstop reads one directly, in the hook process)."""
+route reads them only through that build; the route itself follows the
+command's daemon flag directly when it has one, as the hook does (#1501). The
+hook's own deadline backstop reads one directly, in the hook process."""
 
 _ENV_OVERLAY: ContextVar[Mapping[str, str] | None] = ContextVar("_ENV_OVERLAY", default=None)
 """Variables :func:`load_env_stm_config` lays over the environment for one build.

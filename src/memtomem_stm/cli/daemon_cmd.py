@@ -1391,7 +1391,7 @@ def status_cmd(as_json: bool) -> None:
     elif not surfacing_on:
         hint = "no (surfacing disabled)"
     else:
-        hint = "no (opted out via MEMTOMEM_STM_HOOK__USE_DAEMON=0)"
+        hint = "no (hook.use_daemon is false)"
     click.echo(f"hook will use daemon: {hint}")
     if standalone_use_daemon:
         standalone_hint = "yes"

@@ -305,6 +305,45 @@ def test_a_use_daemon_flag_turns_the_route_on_over_an_ambient_opt_out(home, monk
     assert status["hook_view"]["hook_route"] is True
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows folds environment names itself")
+def test_the_commands_daemon_flag_decides_over_the_build(home, monkeypatch):
+    # #1501: the hook routes on its command's flag directly, because a later
+    # spelling of the variable can outrank the overlay in the build. Here the
+    # build reads ``hook.use_daemon`` false, and the ``--use-daemon`` command
+    # still routes through the daemon.
+    lower = HOOK_GATE.lower()
+    monkeypatch.delenv(HOOK_GATE, raising=False)
+    monkeypatch.delenv(lower, raising=False)
+    monkeypatch.setenv(HOOK_GATE, "false")
+    monkeypatch.setenv(lower, "false")
+    _settings(home, _cmd(_installed()))
+    assert load_env_stm_config({HOOK_GATE: "true"}).config.hook.use_daemon is False
+    hook_fp = _installed_fp(monkeypatch)
+    daemons = LiveDaemons(hook_fp)
+    _install(monkeypatch, daemons)
+
+    status = _doctor()
+
+    assert status["ltm_server"]["route"] == "daemon", status
+    assert daemons.pinged == [hook_fp]
+
+
+def test_a_command_without_a_daemon_flag_follows_the_setting_in_any_form(home, monkeypatch):
+    # No flag on the command: ``hook.use_daemon`` in the build decides, here off
+    # through the nested form the gate used to miss (#1495).
+    monkeypatch.delenv(HOOK_GATE, raising=False)
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": false}')
+    _settings(home, _cmd(shlex.join(hook_command_words(hook_launcher(), "claude", ()))))
+    daemons = LiveDaemons(_bare_fp(monkeypatch))
+    _install(monkeypatch, daemons)
+
+    status = _doctor()
+
+    assert status["hook_view"]["state"] == "found", status
+    assert status["hook_view"]["hook_route"] is False
+    assert daemons.pinged == [], status  # the standalone direct probe pings nothing
+
+
 def test_the_hook_deadline_comes_from_the_command(home, monkeypatch):
     # ``hook.daemon_timeout_seconds`` is not in the fingerprint, so only the
     # timeout checks' input shows whether the flag was applied.

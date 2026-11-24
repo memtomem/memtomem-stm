@@ -17,7 +17,7 @@ daemon deadline:
 
 | Flag | Overrides | Meaning |
 |---|---|---|
-| `--use-daemon` / `--no-daemon` | `MEMTOMEM_STM_HOOK__USE_DAEMON` | Surface through the shared warm daemon, or run in-process |
+| `--use-daemon` / `--no-daemon` | `hook.use_daemon` in any form (`MEMTOMEM_STM_HOOK__USE_DAEMON`, `use_daemon` in `MEMTOMEM_STM_HOOK`) | Surface through the shared warm daemon, or run in-process |
 | `--surfacing-timeout-seconds SECONDS` | `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` | LTM search deadline |
 | `--daemon-timeout-seconds SECONDS` | `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS` | Hook-to-daemon deadline; raised to at least one second above `--surfacing-timeout-seconds` whenever that flag is given |
 | `--persist-query-text` / `--no-persist-query-text` | `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT` | Store surfacing query text, or only its hash |
