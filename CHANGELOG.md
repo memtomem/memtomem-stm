@@ -48,8 +48,9 @@ changes inline only. See the deprecation policy in
   surfaced through the daemon; it now takes the cold in-process route, which
   can return no memories when LTM starts slower than the hook's deadline.
   Add `--use-daemon` to the command, or remove the setting, to keep the
-  daemon. `mms hook install` writes one of the two flags unless given
-  `--inherit-runtime-env`.
+  daemon. Since 0.1.40, `mms hook install` writes one of the two flags
+  unless given `--inherit-runtime-env`; a hook installed by 0.1.29–0.1.38
+  and not reinstalled since has neither.
 - **`mms doctor` describes the daemon the hook would use.** When the hook
   would use the daemon, the `ltm` row, `--measure-ltm` and the surfacing
   checks are built from the configuration a bare `mms hook` builds in
@@ -58,14 +59,18 @@ changes inline only. See the deprecation policy in
   with no `shell` or a Bash one, and nothing else that install's look-alike
   heuristic says may run STM's hook (not on Windows), doctor also applies
   that command's options, and a `--no-daemon` handler sends these checks to
-  the standalone view, where `--config` still applies (#1502). So the rows
+  the standalone view, where `--config` still applies (#1502); with
+  `surfacing.use_daemon` off there, doctor probes LTM directly and
+  `--measure-ltm` warns instead of measuring a daemon. So the rows
   doctor emits can differ from 0.7.10's on the same machine, and so can its
   exit status: a check that now reaches a daemon 0.7.10 missed can FAIL,
   and any FAIL exits 1. The #1491 and #1502 entries below say how. A proxy
   variable the hook recovers from no longer shows in the `ltm` row on the
   hook's route; `env_overrides` reports it, and `config_schema`, which
   validates the proxy configuration resolved from `--config`, reports it
-  only if it fails there. The `ltm` row's detail, in the text output and in
+  only if it fails there. `env_overrides` reads doctor's environment without
+  the registered command's options, so it can disagree with the `ltm` row
+  about whether the hook recovers. The `ltm` row's detail, in the text output and in
   `--json`, now ends with the route doctor chose and what it chose it from,
   and `--json` gains `surfacing.hook_view`.
 - **A signalled shutdown that reaches its normal exit with its close
@@ -83,7 +88,9 @@ changes inline only. See the deprecation policy in
   this version opens it for writing (the MCP server, `mms tune` or `mms
   hook`), and rebuilds its schema stamp. After an older version sharing the
   DB re-stamps it, the next such open restores the stamp and keeps the
-  table's rows; `mms stats` only reads. `mms stats` gains a
+  table's rows; `mms stats` only reads. The table is never pruned, and a
+  proxy with cache counts waiting writes them every 30 seconds even when it
+  has no new metrics row. `mms stats` gains a
   `Proxy / Cache` block (`cache` in `--json`), counted with the corrected
   accounting of #1474 from the start (#1466). The cache hit rate `stm_admin`
   `proxy_stats` reports can change for calls whose cache eligibility
@@ -172,8 +179,8 @@ changes inline only. See the deprecation policy in
 - The `otlp` extra declares `requests` and `opentelemetry-api`, which STM's OTLP
   exporter imports directly, and config validation now also checks that
   `requests` can be found (#1493, issue #1486). Both were previously installed
-  only as transitive dependencies; the lock resolves the same versions as
-  before. Validation used to check only the SDK and the HTTP exporter, so an
+  only as transitive dependencies; the lock keeps the versions of both that
+  0.7.10 locked. Validation used to check only the SDK and the HTTP exporter, so an
   install without `requests` passed it and then failed when the exporter
   started.
   **Behavior change**: with `otlp.enabled=true` and `requests` missing, STM
@@ -199,7 +206,9 @@ changes inline only. See the deprecation policy in
   `proxy` is invalid) drops out of the `ltm` row on that route. Doctor's
   proxy checks still see it: `env_overrides` reports it, and `config_schema`,
   which validates the proxy configuration resolved from `--config`, reports
-  it if it fails there. Which forms of the setting the hook reads is the
+  it if it fails there. `env_overrides` reads doctor's environment without
+  the registered command's options (issue #1494 entry), so it can disagree
+  with the `ltm` row about whether the hook recovers. Which forms of the setting the hook reads is the
   subject of the issue #1495 entry. `mms health`, and doctor with the hook's
   daemon off, keep the standalone view built from `--config`. Known limit:
   doctor sees its own environment, not the host's, and reads the options
@@ -221,9 +230,11 @@ changes inline only. See the deprecation policy in
   (#1502, issue #1494). The hook applies that command's runtime options over its
   environment, and two of them change the daemon's fingerprint: install
   writes `--no-persist-query-text`, while the settings default to persisting
-  query text. So doctor reported the daemon of an ordinarily installed hook
-  as unreachable, and next to a hook installed with `--no-daemon` it probed
-  the hook's daemon instead of the standalone route. Doctor now reads the
+  query text. 0.7.10's doctor ignored the registered command: it looked a
+  daemon up under its `--config` build whenever that build had
+  `surfacing.use_daemon` or `hook.use_daemon` (default true) on, so it
+  missed the daemon of an ordinarily installed hook and did not follow a
+  `--no-daemon` registration. Doctor now reads the
   file `mms hook install --host claude` writes. It acts only when that file
   holds exactly one handler install owns (the rule of #1499) and nothing
   else that may run STM's hook. Then doctor builds the hook's configuration
@@ -250,7 +261,9 @@ changes inline only. See the deprecation policy in
   **Behavior change**: with an installed hook, the `ltm` row,
   `--measure-ltm` and the timeout checks describe the daemon the hook's
   options select. A `--no-daemon` hook sends them to the standalone route or
-  the direct LTM route. The row's detail gains that note. Not covered:
+  the direct LTM route: with `surfacing.use_daemon` off, doctor probes LTM
+  directly where 0.7.10 probed a daemon, and `--measure-ltm` warns that it
+  needs a daemon instead of measuring. The row's detail gains that note. Not covered:
   Claude Code project, local and managed settings, other hosts' hook
   configurations, and the host's own environment. The `--measure-ltm`,
   timeout and `mms daemon status` advice still names commands that run in
@@ -403,9 +416,10 @@ changes inline only. See the deprecation policy in
   in `checks[].detail` of `mms doctor --json`. Its statuses, the conditions
   for showing it, and doctor's exit code do not.
 - The 0.7.10 notes for `mms doctor`'s `hook registration` row now state the
-  conditions of its quote-removal match: never for a handler whose `args` is
-  a list (exec form), a line of plain-word characters (ASCII letters and
-  digits, and `_./:=+-`), spaces, tabs and quotes, and balanced quotes. They
+  conditions of its quote-removal match: a line of at most 4,096 characters,
+  made only of plain-word characters (ASCII letters and digits, and
+  `_./:=+-`), spaces, tabs and quotes, with balanced quotes; never for a
+  handler whose `args` is a list (exec form). They
   said only "a line made only of plain words and quotes, up to 4,096
   characters" (#1469).
   **Behavior change**: none external (documentation only).
