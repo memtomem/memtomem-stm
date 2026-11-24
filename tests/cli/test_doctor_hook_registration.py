@@ -853,3 +853,134 @@ def test_fifo_settings_warn_instead_of_blocking(tmp_path: Path, claude_dir: Path
         "the Claude Code user settings path is not a regular file; "
         "STM hook registrations were not checked"
     )
+
+
+# Reading must not touch the process-wide streams (#1507). Two readings that overlap
+# used to restore each other's StringIO sink and leave stdout/stderr redirected for
+# good. Only one exit order does that, so the probe orders the readings with events:
+# A enters the strict parse first, B enters while A is inside, A finishes while B is
+# still gated, then B is released. It runs in its own interpreter because a red run
+# leaves the process streams swapped, which would corrupt pytest's capture.
+_OVERLAP_PROBE = """
+import json, sys, threading
+
+real = (sys.stdout, sys.stderr)
+out = sys.__stdout__
+orig = type(hook_command).make_context
+a_in, b_in, a_done = threading.Event(), threading.Event(), threading.Event()
+seen = {}
+
+def gated(self, info_name, args, parent=None, **extra):
+    if extra.get("resilient_parsing"):
+        return orig(self, info_name, args, parent=parent, **extra)
+    who = threading.current_thread().name
+    seen[who] = (sys.stdout is real[0], sys.stderr is real[1])
+    try:
+        if who == "A":
+            a_in.set()
+            assert b_in.wait(10), "B never entered"
+        else:
+            b_in.set()
+            assert a_done.wait(10), "A never finished"
+        return orig(self, info_name, args, parent=parent, **extra)
+    finally:
+        if who == "B":
+            a_done.set()
+
+type(hook_command).make_context = gated
+
+results = {}
+
+def run(name, args, wait_for=None):
+    try:
+        if wait_for is not None:
+            assert wait_for.wait(10)
+        r = _read_hook_args(args)
+        results[name] = [r.runs_bridge, r.host]
+    except BaseException as exc:
+        results[name] = repr(exc)
+    finally:
+        if name == "A":
+            a_done.set()
+            b_in.set()
+
+ta = threading.Thread(target=run, name="A", args=("A", ["--help", "--host", "claude"]))
+tb = threading.Thread(target=run, name="B", args=("B", ["--host", "claude"], a_in))
+ta.start(); tb.start(); ta.join(30); tb.join(30)
+print(json.dumps({
+    "results": results,
+    "streams_on_entry": seen,
+    "streams_restored": [sys.stdout is real[0], sys.stderr is real[1]],
+}), file=out)
+"""
+
+
+def test_overlapping_readings_leave_the_process_streams_alone() -> None:
+    probe = json.loads(_run_fresh(_OVERLAP_PROBE))
+    assert probe == {
+        "results": {"A": [False, "claude"], "B": [True, "claude"]},
+        "streams_on_entry": {"A": [True, True], "B": [True, True]},
+        "streams_restored": [True, True],
+    }
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_prints_nothing(flag: str, capsys: pytest.CaptureFixture[str]) -> None:
+    reading = hr._read_hook_args(["--host", "claude", flag])
+    assert reading == hr.HookRegistration(None, runs_bridge=False, host="claude")
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "")
+
+
+# While another thread has Click build ``hook_command``'s help option, that option sits
+# in ``hook_command.params`` until Click pops it. A reader that copied the list then
+# would hold two ``-h``/``--help`` options: Click warns, and where warnings are errors
+# the reading came back as "does not run the hook, host unknown" (#1510 review).
+_HELP_CACHE_WINDOW_PROBE = """
+import json, threading, warnings
+
+entered, release = threading.Event(), threading.Event()
+
+
+class HeldList(list):
+    def pop(self, *args):
+        entered.set()
+        assert release.wait(10), "reader never finished"
+        return super().pop(*args)
+
+
+hook_command.params = HeldList(hook_command.params)
+hook_command._help_option = None
+warnings.simplefilter("error")
+
+
+def build_help_option():
+    hook_command.get_help_option(
+        click.Context(hook_command, help_option_names=["--help", "-h"])
+    )
+
+
+builder = threading.Thread(target=build_help_option)
+builder.start()
+# Click 8.1.x builds the help option without touching ``params``: no window.
+window_open = entered.wait(3)
+in_window = [sorted(p.opts) for p in hook_command.params if "-h" in p.opts]
+reading = _read_hook_args(["--host", "claude"])
+release.set()
+builder.join(10)
+print(json.dumps({
+    "window_open": window_open,
+    "in_window": in_window,
+    "reading": [reading.runs_bridge, reading.host],
+}))
+"""
+
+
+def test_reading_while_click_builds_the_help_option_sees_no_duplicate() -> None:
+    probe = json.loads(_run_fresh(_HELP_CACHE_WINDOW_PROBE))
+    if not probe["window_open"]:
+        pytest.skip("this Click builds its help option without touching hook_command.params")
+    # The window really was open (Click's help option was in the shared list) ...
+    assert probe["in_window"] == [["--help", "-h"]]
+    # ... and the reading is still the one an idle process gives.
+    assert probe["reading"] == [True, "claude"]

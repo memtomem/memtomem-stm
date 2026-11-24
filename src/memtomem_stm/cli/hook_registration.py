@@ -23,9 +23,7 @@ asks what a registration would run, that one asks whether install wrote it.
 
 from __future__ import annotations
 
-import contextlib
 import copy
-import io
 import re
 import shlex
 import sys
@@ -220,25 +218,43 @@ def _read_hook_args(args: list[str]) -> HookRegistration:
     from memtomem_stm.cli.hook_cmd import hook_command
     from memtomem_stm.cli.proxy import CONTEXT_SETTINGS
 
+    def stop_at_help(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+        if value and not ctx.resilient_parsing:
+            raise click.exceptions.Exit(0)
+
+    # Click's own help option prints the help when it fires, and silencing that
+    # by swapping ``sys.stdout``/``sys.stderr`` is process-wide: readings that
+    # overlap on threads restore each other's sink and leave the process writing
+    # into one nobody reads (#1507). Ask Click for no help option at all and
+    # give this copy a silent one that only stops parsing. Like Click's, it is
+    # eager, so it fires after the options were scanned: an error found while
+    # scanning (an unknown option, a missing value) still wins over help. The
+    # copy has its own ``params`` list, so the command other callers use is
+    # never touched, and with an empty name list parsing neither reads nor
+    # updates a help option cached on the command the copy was made from.
+    # While another thread has Click build that cached option, Click's own help
+    # option sits in ``hook_command.params`` until it pops it; the hook declares
+    # no help option itself, so any parameter using a help name is left out of
+    # the copy rather than duplicated by ours.
     help_names = CONTEXT_SETTINGS["help_option_names"]
-    # Click (8.1.8+) builds a command's help option once and caches it on the
-    # command, named by whichever context asked first. Parse on a copy with no
-    # cache, so an earlier ``--help``-only context cannot turn ``-h`` into a
-    # usage error here, and this reading does not hand ``-h`` to later callers
-    # of ``hook_command``. Building the option appends to ``params``, so the
-    # copy gets its own list.
     reader = copy.copy(hook_command)
-    reader.params = list(hook_command.params)
-    reader._help_option = None
-    sink = io.StringIO()
+    reader.params = [
+        *(p for p in hook_command.params if not set(p.opts) & set(help_names)),
+        click.Option(
+            help_names,
+            is_flag=True,
+            is_eager=True,
+            expose_value=False,
+            callback=stop_at_help,
+        ),
+    ]
     try:
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            strict = reader.make_context("hook", list(args), help_option_names=help_names)
+        strict = reader.make_context("hook", list(args), help_option_names=[])
     except click.exceptions.Exit:
         # ``--help``/``-h``: parsing finished before the help callback exited,
         # so a resilient parse of the same words reads the host.
         resilient = reader.make_context(
-            "hook", list(args), resilient_parsing=True, help_option_names=help_names
+            "hook", list(args), resilient_parsing=True, help_option_names=[]
         )
         return _registration(resilient, runs_bridge=False)
     except Exception:
