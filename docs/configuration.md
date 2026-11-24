@@ -178,7 +178,10 @@ for Claude Code, Codex CLI, Cursor, and Kimi Code (`mms hook --host <name>`
 at runtime, or `mms hook install --host <name>` to register it with a host —
 see [docs/cli.md](cli.md#mms-hook--built-in-tool-bridge--per-host-registration)).
 It is independent of the MCP proxy path and is configured with
-`MEMTOMEM_STM_HOOK__*`.
+`MEMTOMEM_STM_HOOK__*`. A daemon flag on the registered command
+(`--use-daemon` / `--no-daemon`, which `mms hook install` writes unless given
+`--inherit-runtime-env`) takes precedence over `MEMTOMEM_STM_HOOK__USE_DAEMON`;
+see the [hook CLI reference](reference/cli-hooks.md#mms-hook).
 
 ```bash
 export MEMTOMEM_STM_HOOK__USE_DAEMON=true              # default: warm daemon path

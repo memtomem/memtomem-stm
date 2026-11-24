@@ -100,16 +100,15 @@ changes inline only. See the deprecation policy in
   `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` (which the hook then drops) made doctor
   report a running daemon as unreachable, and without a `--config` file that
   builds, the row reported the configuration error without probing. When the
-  hook would use the daemon (`MEMTOMEM_STM_HOOK__USE_DAEMON` unset or true,
-  read as the hook reads it), doctor's surfacing checks now use the
+  hook would use the daemon (`hook.use_daemon` true, read as the hook reads
+  it), doctor's surfacing checks now use the
   configuration the hook builds in doctor's environment. That covers the `ltm`
   row, the measurement, the feedback database and the RRF, profile and timeout
   checks. **Behavior change**: on that route `--config` no longer steers those
   checks, and a broken proxy variable the hook recovers from (nothing outside
   `proxy` is invalid) shows only in doctor's proxy checks (`env_overrides`),
-  not in the `ltm` row. A `MEMTOMEM_STM_HOOK` JSON value
-  that sets `use_daemon` to false no longer moves the row to the direct
-  route, since the hook ignores it. `mms health`, and doctor with the hook's
+  not in the `ltm` row. Which forms of the setting the hook reads is the
+  subject of the issue #1495 entry. `mms health`, and doctor with the hook's
   daemon off, keep the standalone view built from `--config`. Known limit:
   doctor sees its own environment, not the host's, and does not read the
   options registered on the hook command, which also change the daemon's
@@ -119,8 +118,8 @@ changes inline only. See the deprecation policy in
   unreachable unless `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=false` is set
   in doctor's environment too. `--no-daemon` and the timeout options are not
   read either. So next to a hook installed with `--no-daemon`, with a
-  standalone `surfacing.use_daemon` daemon and `MEMTOMEM_STM_HOOK__USE_DAEMON`
-  unset or true in doctor's environment, doctor now looks under the bare
+  standalone `surfacing.use_daemon` daemon and `hook.use_daemon` true in
+  doctor's environment, doctor now looks under the bare
   hook's fingerprint, not the `--config` one (#1494).
 - `mms hook install` and `mms hook uninstall` now manage only the handlers
   install writes (#1499, issues #1453, #1460, #1461, #1476, #1483, #1484).
@@ -168,6 +167,34 @@ changes inline only. See the deprecation policy in
   `--no-daemon` set the surfacing deadline and the daemon mode again; a
   custom daemon deadline or `--persist-query-text` has no install option and
   is edited into the written command by hand, which install then keeps.
+- `mms hook` decides whether to use the daemon from `hook.use_daemon` as the
+  settings read it, rather than from a raw read of
+  `MEMTOMEM_STM_HOOK__USE_DAEMON` alone (issue #1495). The settings also accept
+  the nested form (`MEMTOMEM_STM_HOOK='{"use_daemon": false}'`) and any letter
+  case of either variable; those forms turned `hook.use_daemon` off for
+  `mms daemon status` while the hook kept surfacing through the daemon and
+  spawning it, and doctor, which follows the hook, agreed with the hook. An
+  explicit `--use-daemon` or `--no-daemon` on the hook command decides the
+  route directly: it reaches the settings through one exact variable, which a
+  case-equivalent spelling elsewhere in the environment can outrank. Doctor
+  follows the same setting, and when the hook's build fails on a variable
+  outside `proxy` (the hook then passes every call through), doctor reports
+  the error of its own `--config` build instead of the environment-only one.
+  `mms daemon status` says `no (hook.use_daemon is false)` and the
+  `--measure-ltm` warning names the setting, instead of naming
+  `MEMTOMEM_STM_HOOK__USE_DAEMON=0`. **Behavior change**: a nested or
+  other-case `use_daemon` false in the hook's environment now keeps a hook
+  command with neither flag off the daemon, with no auto-spawn; a command
+  carrying either flag follows the flag, as it did before. `mms hook install`
+  writes one: on a first install from the installer's own `hook.use_daemon`
+  (`--use-daemon` by default), on a reinstall the existing command's, unless
+  `--daemon`, `--no-daemon` or `--inherit-runtime-env` says otherwise.
+  Doctor, which reads its own environment and not the command, then takes
+  for its `ltm` row the standalone view built from
+  `--config` (the direct probe, or the `surfacing.use_daemon` daemon). Code that
+  calls the hook's internal `_run_hook` without a config now gets a settings
+  error raised from it on either route; the cold route used to log it and
+  return nothing.
 - An unstorable cache miss is now counted only for a call that counted the
   miss itself (#1474, issue #1473). Whether a call had counted a miss was
   decided again when it completed, from the tool's cache eligibility at that

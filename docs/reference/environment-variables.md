@@ -213,7 +213,7 @@ Status meanings:
 | `MEMTOMEM_STM_OTLP__MAX_EXPORT_BATCH_SIZE` | positive integer | `512` | Spans per request; no greater than queue size. | Startup |
 | `MEMTOMEM_STM_OTLP__SCHEDULE_DELAY_MS` | positive integer | `5000` | Batch flush interval. | Startup |
 | `MEMTOMEM_STM_OTLP__FLUSH_TIMEOUT_SECONDS` | positive float | `5.0` | Whole OTLP shutdown budget. | Startup |
-| `MEMTOMEM_STM_HOOK__USE_DAEMON` | boolean | `true` | Use the shared warm surfacing daemon. | Bundled |
+| `MEMTOMEM_STM_HOOK__USE_DAEMON` | boolean | `true` | Use the shared warm surfacing daemon. A hook command's `--use-daemon` / `--no-daemon` overrides it. | Bundled |
 | `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS` | positive float | `2.5` | Outer hook-to-daemon deadline. | Bundled |
 | `MEMTOMEM_STM_HOOK__FALLBACK` | `skip / cold` | `skip` | Behavior when the daemon is unavailable; a daemon that answers busy or out of time skips either way. | Bundled |
 | `MEMTOMEM_STM_HOOK__AUTO_SPAWN` | boolean | `true` | Start a missing daemon. | Bundled |

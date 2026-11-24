@@ -371,9 +371,12 @@ class HookConfig(BaseModel):
     """When ``True`` (the default), ``mms hook`` routes surfacing through the
     local daemon (warm LTM connection) instead of spawning a cold LTM subprocess
     per call. The daemon is auto-spawned on first use (see ``auto_spawn``), so no
-    manual ``mms daemon start`` is needed. Set
-    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` to opt out to the legacy cold in-process
-    path."""
+    manual ``mms daemon start`` is needed. Set it false (e.g.
+    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``) to opt out to the legacy cold
+    in-process path. A hook command's ``--use-daemon``/``--no-daemon`` overrides this
+    setting for that command; ``mms hook install`` writes one by default (not
+    with ``--inherit-runtime-env``), and a command with neither follows this
+    setting."""
     daemon_timeout_seconds: float = Field(default=2.5, gt=0.0, allow_inf_nan=False)
     """Per-request wall-clock budget for the hook→daemon round trip, and the
     effective ceiling on the LTM attempt inside it. Small and independent of the
