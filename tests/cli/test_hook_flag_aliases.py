@@ -155,6 +155,21 @@ def test_a_collision_beside_an_invalid_proxy_variable_still_degrades(monkeypatch
         assert load.config.surfacing.persist_query_text is False
 
 
+def test_an_empty_overlay_imports_no_settings():
+    """A hook command without flags must not pay for the settings stack before
+    it reads its payload (#1503 review: about 2 ms against 60 ms)."""
+    code = (
+        "import sys\n"
+        "from memtomem_stm.cli.hook_cmd import _runtime_registration_env\n"
+        "assert 'memtomem_stm.config' not in sys.modules\n"
+        "with _runtime_registration_env({}):\n"
+        "    pass\n"
+        "print('memtomem_stm.config' in sys.modules)\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "False"
+
+
 _CHILD = (
     "import json\n"
     "from memtomem_stm.config import load_env_stm_config\n"
