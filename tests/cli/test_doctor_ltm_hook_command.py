@@ -1126,3 +1126,350 @@ def test_an_advice_failure_keeps_the_probe_result(home, proxy_file, monkeypatch,
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
 
     assert checks["ltm"]["status"] == "PASS", checks["ltm"]
+
+
+# --- the env_overrides row reports the hook command's build too (#1506) -------
+
+_BAD_VALUE = {
+    PERSIST: "not-a-bool",
+    HOOK_GATE: "not-a-bool",
+    SURFACING_TIMEOUT: "nope",
+    "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS": "nope",
+}
+_HOOK_PASS_THROUGH = "passes surfacing/compression through"
+_DAEMON_EXITS = "mms daemon start from it exits 1"
+_PROXY_IGNORED = "MEMTOMEM_STM_PROXY* is invalid"
+_VARIABLE_ADVICE = "unset or fix the MEMTOMEM_STM_* variable(s) named above"
+_PROXY_BREAK = {"MEMTOMEM_STM_PROXY__ENABLED": "maybe"}
+
+
+_BARE_ADVICE = "unset or fix the MEMTOMEM_STM_* variable(s) named for doctor's environment alone"
+
+
+def _command_advice(location: str = FIRST) -> str:
+    return (
+        f"fix the options of the STM hook command at {location} (Claude Code user settings) "
+        "or the variables its build reads, then rerun mms doctor"
+    )
+
+
+def _env_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str
+) -> tuple[dict[str, Any], str, str]:
+    """The ``env_overrides`` row and its two clauses: the hook command's build, then
+    doctor's environment alone."""
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, *args)
+    row = checks["env_overrides"]
+    hook, sep, bare = row["detail"].partition("; doctor's environment alone")
+    assert sep, row
+    assert hook.startswith("with the options of the STM hook command at "), row
+    return row, hook, bare
+
+
+def _build_class(overlay: dict[str, str] | None) -> str:
+    try:
+        load = load_env_stm_config(overlay)
+    except Exception:
+        return "fail"
+    return "proxy" if load.proxy_error is not None else "ok"
+
+
+@pytest.mark.parametrize("name", sorted(_BAD_VALUE))
+def test_env_row_says_the_hook_commands_build_succeeds_when_a_flag_shadows_the_value(
+    home, proxy_file, monkeypatch, tmp_path, name
+):
+    # The issue's case: the installed command sets all four variables, so an
+    # invalid ambient value of any of them breaks only doctor's bare build.
+    path = _settings(home, _cmd(_installed()))
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setenv(name, _BAD_VALUE[name])
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert row["status"] == "WARN", row
+    assert hook == (
+        f"with the options of the STM hook command at {FIRST} in {path} "
+        "(Claude Code user settings): STMConfig() constructs"
+    ), row
+    assert _DAEMON_EXITS in bare and name in bare, row
+    assert "through" not in row["detail"] and "degrade" not in row["detail"], row
+    assert row["next_action"] == _BARE_ADVICE, row
+
+
+def test_env_row_reports_a_hook_build_only_the_commands_options_break(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # #1512's known limit: the extreme surfacing deadline breaks the hook's
+    # build, and nothing in doctor's environment is wrong.
+    _settings(home, _cmd(_written(_EXTREME, "4")))
+    _install(monkeypatch, LiveDaemons())
+    assert _build_class(None) == "ok"
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert row["status"] == "WARN", row
+    assert "STMConfig() fails" in hook and _HOOK_PASS_THROUGH in hook, row
+    assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS" in hook, row
+    assert bare.endswith("STMConfig() constructs"), row
+    assert row["next_action"] == _command_advice(), row
+
+
+def test_env_row_keeps_each_builds_cause_when_both_fail(home, proxy_file, monkeypatch, tmp_path):
+    _settings(home, _cmd(_written("3", _EXTREME)))
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__MAX_RESULTS", "nope")
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert row["status"] == "WARN", row
+    assert _HOOK_PASS_THROUGH in hook and _DAEMON_EXITS in bare, row
+    assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS" in hook, row
+    assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in hook, row
+    assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS" not in bare, row
+    assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in bare, row
+    assert row["next_action"] == f"{_BARE_ADVICE}; {_command_advice()}", row
+
+
+@pytest.mark.parametrize(
+    ("expected_hook", "expected_bare"),
+    [("fail", "proxy"), ("proxy", "fail"), ("proxy", "proxy")],
+    ids=["hook-fails-bare-proxy", "hook-proxy-bare-fails", "both-proxy"],
+)
+def test_env_row_never_copies_one_builds_outcome_into_the_other(
+    home, proxy_file, monkeypatch, tmp_path, expected_hook, expected_bare
+):
+    command = _written(_EXTREME, "4") if expected_hook == "fail" else _installed()
+    _settings(home, _cmd(command))
+    for name, value in _PROXY_BREAK.items():
+        monkeypatch.setenv(name, value)
+    if expected_bare == "fail":
+        monkeypatch.setenv(HOOK_GATE, "not-a-bool")
+    _install(monkeypatch, LiveDaemons())
+    assert _build_class(None) == expected_bare  # the inputs give the case's classes
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert row["status"] == "WARN", row
+    claims = {"fail": (_HOOK_PASS_THROUGH, _DAEMON_EXITS), "proxy": (_PROXY_IGNORED,) * 2}
+    others = {"fail": "proxy", "proxy": "fail"}
+    assert claims[expected_hook][0] in hook, row
+    assert claims[others[expected_hook]][0] not in hook, row
+    assert claims[expected_bare][1] in bare, row
+    assert claims[others[expected_bare]][1] not in bare, row
+    assert "MEMTOMEM_STM_PROXY__ENABLED" in hook and "MEMTOMEM_STM_PROXY__ENABLED" in bare, row
+    # Each clause carries its own build's variables, never the other's.
+    deadline = "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"
+    assert (deadline in hook, deadline in bare) == (expected_hook == "fail", False), row
+    assert (HOOK_GATE in hook, HOOK_GATE in bare) == (False, expected_bare == "fail"), row
+    assert row["next_action"] == f"{_BARE_ADVICE}; {_command_advice()}", row
+
+
+def test_env_row_advises_the_command_when_an_undecodable_proxy_hides_its_cause(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # The hook's build re-raises the proxy payload's SettingsError (no names),
+    # while the bare build recovers with proxy defaults: only the command's
+    # deadline is left to break the hook, so unsetting the payload is not enough.
+    _settings(home, _cmd(_written(_EXTREME, "4")))
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY", "{")
+    _install(monkeypatch, LiveDaemons())
+    assert _build_class(None) == "proxy"
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert _HOOK_PASS_THROUGH in hook and "implicated" not in hook, row
+    assert _PROXY_IGNORED in bare, row
+    assert row["next_action"] == (
+        "check MEMTOMEM_STM_PROXY and its MEMTOMEM_STM_PROXY__* overrides for a value "
+        f"settings cannot decode; {_command_advice()}"
+    ), row
+
+
+def test_env_row_passes_with_the_hook_command_named(home, proxy_file, monkeypatch, tmp_path):
+    path = _settings(home, _cmd(_installed()))
+    _install(monkeypatch, LiveDaemons())
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert row["status"] == "PASS", row
+    assert hook.endswith(f"{FIRST} in {path} (Claude Code user settings): STMConfig() constructs")
+    assert bare.endswith("STMConfig() constructs"), row
+    assert row["next_action"] is None, row
+
+
+def test_env_row_keeps_the_command_and_its_values_out(home, proxy_file, monkeypatch, tmp_path):
+    command = _written(_EXTREME, "4")
+    _settings(home, _cmd(command))
+    _install(monkeypatch, LiveDaemons())
+
+    row, _, _ = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    shown = f"{row['detail']}\n{row['next_action']}"
+    for secret in (command, _EXTREME, "1.79769313486232e+308", "e+308"):
+        assert secret not in shown, (secret, row)
+
+
+_BARE_PASS = "bare STMConfig() constructs — hook/daemon env path healthy"
+_BARE_PROXY_UNDECODABLE = (
+    "MEMTOMEM_STM_PROXY* is invalid — mms hook and the daemon ignore it and run with proxy "
+    "settings at defaults; hook metrics are not recorded"
+)
+_BARE_FAIL = (
+    "bare STMConfig() fails — hook surfacing/compression degrade to pass-through (logged per "
+    "call) and the daemon cannot start (env var(s) implicated: "
+    "MEMTOMEM_STM_SURFACING__MAX_RESULTS)"
+)
+
+
+_LEGACY = {
+    "healthy": ({}, "PASS", _BARE_PASS, None),
+    "named": (
+        {"MEMTOMEM_STM_SURFACING__MAX_RESULTS": "nope"},
+        "WARN",
+        _BARE_FAIL,
+        _VARIABLE_ADVICE,
+    ),
+    "undecodable": (
+        {"MEMTOMEM_STM_SURFACING": "{"},
+        "WARN",
+        "bare STMConfig() fails — hook surfacing/compression degrade to pass-through (logged "
+        "per call) and the daemon cannot start",
+        "check the MEMTOMEM_STM_* variables for a value settings cannot decode",
+    ),
+    "proxy-undecodable": (
+        {"MEMTOMEM_STM_PROXY": "{"},
+        "WARN",
+        _BARE_PROXY_UNDECODABLE,
+        "check MEMTOMEM_STM_PROXY and its MEMTOMEM_STM_PROXY__* overrides for a value "
+        "settings cannot decode",
+    ),
+}
+
+
+@pytest.mark.parametrize("handlers", [0, 2], ids=["no-command", "two-commands"])
+@pytest.mark.parametrize("case", sorted(_LEGACY))
+def test_env_row_keeps_its_text_without_one_found_command(
+    home, proxy_file, monkeypatch, tmp_path, handlers, case
+):
+    if handlers:
+        _settings(home, *[_cmd(_installed())] * handlers)
+    _install(monkeypatch, LiveDaemons())
+    env, status, detail, action = _LEGACY[case]
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    row = checks["env_overrides"]
+    assert (row["status"], row["detail"], row["next_action"]) == (status, detail, action), row
+
+
+def test_env_row_reads_the_view_doctor_routed_with(home, proxy_file, monkeypatch, tmp_path):
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    _settings(home, _cmd(_installed()))
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setenv(PERSIST, "not-a-bool")
+    import memtomem_stm.config as config_mod
+
+    reads: list[None] = []
+    overlay_builds: list[None] = []
+    real = proxy_mod._hook_command_view
+    real_load = config_mod.load_env_stm_config
+
+    def counted() -> Any:
+        reads.append(None)
+        return real()
+
+    def counted_load(env_overlay: Any = None) -> Any:
+        if env_overlay:
+            overlay_builds.append(None)
+        return real_load(env_overlay)
+
+    monkeypatch.setattr(proxy_mod, "_hook_command_view", counted)
+    monkeypatch.setattr(config_mod, "load_env_stm_config", counted_load)
+
+    checks, output = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    payload = json.loads(output)
+    assert payload["surfacing"]["hook_view"]["state"] == "found", payload["surfacing"]
+    assert "_hook_build" not in payload["surfacing"], payload["surfacing"]
+    assert len(reads) == 1
+    assert len(overlay_builds) == 1
+    assert checks["env_overrides"]["detail"].startswith("with the options of the STM hook")
+
+
+def test_env_row_reads_the_command_when_the_config_file_is_missing(home, monkeypatch, tmp_path):
+    # The config-file short circuit skips the surfacing section; the row still
+    # runs and reads the command itself.
+    _settings(home, _cmd(_installed()))
+    monkeypatch.setenv(PERSIST, "not-a-bool")
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(tmp_path / "missing.json"))
+
+    assert checks["config_file"]["status"] == "FAIL", checks["config_file"]
+    row = checks["env_overrides"]
+    assert row["detail"].startswith("with the options of the STM hook command at "), row
+    assert _DAEMON_EXITS in row["detail"], row
+
+
+def test_env_row_reports_the_build_the_section_failed_on(home, proxy_file, monkeypatch, tmp_path):
+    # An unexpected error in the hook's build ends the surfacing section; the
+    # row reports that same build instead of reading the command and building
+    # once more.
+    import memtomem_stm.config as config_mod
+
+    _settings(home, _cmd(_installed()))
+    _install(monkeypatch, LiveDaemons())
+    overlay_builds: list[None] = []
+    real_load = config_mod.load_env_stm_config
+
+    def failing_overlay(env_overlay: Any = None) -> Any:
+        if env_overlay:
+            overlay_builds.append(None)
+            raise RuntimeError("boom")
+        return real_load(env_overlay)
+
+    monkeypatch.setattr(config_mod, "load_env_stm_config", failing_overlay)
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert len(overlay_builds) == 1
+    assert _HOOK_PASS_THROUGH in hook and bare.endswith("STMConfig() constructs"), row
+    assert "boom" not in f"{row['detail']}{row['next_action']}", row
+    assert row["next_action"] == _command_advice(), row
+
+
+def test_env_row_does_not_advise_unsetting_a_valid_block_the_hint_names(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # The hint names every variable under the failing field: a valid
+    # ``MEMTOMEM_STM_HOOK`` block is named next to the command's deadline.
+    _settings(home, _cmd(_written(_EXTREME, "4")))
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"compression": {"enabled": true}}')
+    _install(monkeypatch, LiveDaemons())
+    assert _build_class(None) == "ok"
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS" in hook, row
+    assert bare.endswith("STMConfig() constructs"), row
+    assert row["next_action"] == _command_advice(), row
+
+
+def test_env_row_asks_for_a_rerun_when_a_decode_error_hides_the_hooks_cause(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # Both builds stop at the undecodable payload; once it is fixed, the
+    # command's deadline still breaks the hook's build.
+    _settings(home, _cmd(_written(_EXTREME, "4")))
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING", "{")
+    _install(monkeypatch, LiveDaemons())
+
+    row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert _HOOK_PASS_THROUGH in hook and _DAEMON_EXITS in bare, row
+    assert row["next_action"] == (
+        "check the MEMTOMEM_STM_* variables for a value settings cannot decode; "
+        f"{_command_advice()}"
+    ), row

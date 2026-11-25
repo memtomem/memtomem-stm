@@ -10387,6 +10387,23 @@ _HOOK_DAEMON_TIMEOUT_ENV = "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"
 # inputs. Doctor pops it before anything renders the result, so it never
 # reaches ``doctor --json``; ``mms health`` never sets it.
 _HOOK_ADVICE_KEY = "_hook_advice"
+# Likewise for the hook view and the build of the hook's configuration doctor
+# routed with, which the ``env_overrides`` row reports (#1506).
+_HOOK_BUILD_KEY = "_hook_build"
+
+
+@dataclass(frozen=True)
+class _HookBuild:
+    """The hook view doctor read, and its build of the hook's configuration.
+
+    ``outcome`` is the ``EnvSTMConfigLoad`` of ``load_env_stm_config(view.env)``
+    or the exception it raised; ``None`` when no build was made from this view
+    yet. Never rendered: the ``env_overrides`` row names the handler's location
+    and the variables an error implicates, never the command or its values.
+    """
+
+    view: _HookCommandView
+    outcome: Any = None
 
 
 @dataclass(frozen=True)
@@ -10477,8 +10494,8 @@ def _hook_view_note(summary: Any, ltm: Any) -> str | None:
     its build of the hook's configuration. Not why the hook behaves as it
     does: doctor builds from its own environment, not the host's, so what the
     registered hook builds is not known here. The ``env_overrides`` row
-    reports a failure of doctor's environment-only build, naming the
-    variables when the error identifies them.
+    reports whether that build and doctor's environment-only build succeed,
+    naming the variables when the error identifies them (#1506).
     """
     if not isinstance(summary, dict):
         return None
@@ -10523,6 +10540,95 @@ def _hook_view_note(summary: Any, ltm: Any) -> str | None:
     else:
         inputs = f"doctor's environment only: no STM hook command recognized in {path}"
     return f"route: {route}, chosen from {inputs} (Claude Code user settings only)"
+
+
+_ENV_FIX_NAMED = "unset or fix the MEMTOMEM_STM_* variable(s) named above"
+_ENV_FIX_IN_BARE_CLAUSE = (
+    "unset or fix the MEMTOMEM_STM_* variable(s) named for doctor's environment alone"
+)
+_ENV_FIX_UNDECODABLE = "check the MEMTOMEM_STM_* variables for a value settings cannot decode"
+_ENV_FIX_PROXY_UNDECODABLE = (
+    "check MEMTOMEM_STM_PROXY and its MEMTOMEM_STM_PROXY__* overrides "
+    "for a value settings cannot decode"
+)
+
+
+def _env_overrides_found_row(
+    view: _HookCommandView, hook_outcome: Any, bare_outcome: Any
+) -> tuple[str, str, str | None]:
+    """The ``env_overrides`` row when doctor read one STM hook command (#1506).
+
+    Two builds, each reported in its own clause with its own consequence and
+    the variables its own error implicates: ``load_env_stm_config(view.env)``,
+    the command's options over doctor's environment, as the hook builds; and
+    doctor's environment alone, as ``mms daemon start`` from it builds. Each
+    outcome is an ``EnvSTMConfigLoad`` or the exception the build raised.
+
+    The next action does not attribute a failure to a variable or to the
+    command: the hints name every variable under the failing field, a valid
+    one included, and an undecodable payload hides any later error. It says
+    which clause to act on and, for the hook's build, to rerun doctor. Names
+    the handler by location and path, never its command text or values.
+    """
+    from memtomem_stm.proxy.config import env_vars_implicated_by_validation_error
+
+    def classify(outcome: Any) -> tuple[str, Exception | None]:
+        if isinstance(outcome, Exception):
+            return "fail", outcome
+        if outcome.proxy_error is not None:
+            return "proxy", outcome.proxy_error
+        return "ok", None
+
+    def hint(names: frozenset[str]) -> str:
+        return " (env var(s) implicated: " + ", ".join(sorted(names)) + ")" if names else ""
+
+    hook_kind, hook_exc = classify(hook_outcome)
+    bare_kind, bare_exc = classify(bare_outcome)
+    # Each build's hint reads the environment that build read: the overlay
+    # replaces in place or comes last, as ``config._overlaid_env_vars`` merges.
+    hook_names = (
+        frozenset()
+        if hook_exc is None
+        else env_vars_implicated_by_validation_error(hook_exc, {**os.environ, **view.env})
+    )
+    bare_names = (
+        frozenset() if bare_exc is None else env_vars_implicated_by_validation_error(bare_exc)
+    )
+    hook_says = {
+        "ok": "STMConfig() constructs",
+        "fail": "STMConfig() fails — a hook run with doctor's environment and these options "
+        "passes surfacing/compression through (logged per call that reaches its configuration)",
+        "proxy": "MEMTOMEM_STM_PROXY* is invalid — a hook run with doctor's environment and "
+        "these options ignores it and runs with proxy settings at defaults; hook metrics are "
+        "not recorded",
+    }
+    bare_says = {
+        "ok": "STMConfig() constructs",
+        "fail": "STMConfig() fails — mms daemon start from it exits 1",
+        "proxy": "MEMTOMEM_STM_PROXY* is invalid — mms daemon start from it ignores it and "
+        "runs with proxy settings at defaults",
+    }
+    location = view.locations[0]
+    detail = (
+        f"with the options of the STM hook command at {location} in {view.path} "
+        f"(Claude Code user settings): {hook_says[hook_kind]}{hint(hook_names)}; "
+        f"doctor's environment alone: {bare_says[bare_kind]}{hint(bare_names)}"
+    )
+    actions: list[str] = []
+    if bare_kind != "ok":
+        if bare_names:
+            actions.append(_ENV_FIX_IN_BARE_CLAUSE)
+        else:
+            actions.append(
+                _ENV_FIX_PROXY_UNDECODABLE if bare_kind == "proxy" else _ENV_FIX_UNDECODABLE
+            )
+    if hook_kind != "ok":
+        actions.append(
+            f"fix the options of the STM hook command at {location} (Claude Code user "
+            "settings) or the variables its build reads, then rerun mms doctor"
+        )
+    status = "PASS" if hook_kind == bare_kind == "ok" else "WARN"
+    return status, detail, "; ".join(actions) if actions else None
 
 
 def _surfacing_bootstrap_status(
@@ -10580,6 +10686,7 @@ def _surfacing_bootstrap_status(
     """
     hook_view: dict[str, Any] | None = None
     hook_advice: _HookAdvice | None = None
+    hook_build: _HookBuild | None = None
     try:
         from pydantic import ValidationError
         from pydantic_settings import SettingsError
@@ -10597,9 +10704,18 @@ def _surfacing_bootstrap_status(
             view = _hook_command_view()
             hook_view = _hook_view_summary(view, hook_route=False)
             try:
-                built: STMConfig | None = load_env_stm_config(view.env).config
-            except (ValidationError, SettingsError):
-                built = None
+                hook_load = load_env_stm_config(view.env)
+            except (ValidationError, SettingsError) as exc:
+                hook_build = _HookBuild(view, exc)
+                built: STMConfig | None = None
+            except Exception as exc:
+                # The section reports it as its error; the ``env_overrides``
+                # row still reports this view's build, not a second one.
+                hook_build = _HookBuild(view, exc)
+                raise
+            else:
+                hook_build = _HookBuild(view, hook_load)
+                built = hook_load.config
             # As the hook routes (#1501): its command's daemon flag decides
             # directly, else the build's ``hook.use_daemon``. A build that fails
             # passes every call through, so its route is moot.
@@ -10674,6 +10790,8 @@ def _surfacing_bootstrap_status(
         status["hook_view"] = hook_view
     if hook_advice is not None:
         status[_HOOK_ADVICE_KEY] = hook_advice
+    if hook_build is not None:
+        status[_HOOK_BUILD_KEY] = hook_build
     return status
 
 
@@ -11751,6 +11869,7 @@ def doctor(
 
     servers_payload: dict[str, Any] | None = None
     surfacing_status: dict[str, Any] | None = None
+    hook_build: _HookBuild | None = None
 
     # 1. config file exists — every later check reads it, so FAIL
     # short-circuits the report instead of cascading noise. The detail names
@@ -12298,6 +12417,7 @@ def doctor(
             )
             # Before anything renders the status: never part of ``--json``.
             hook_advice = surfacing_status.pop(_HOOK_ADVICE_KEY, None)
+            hook_build = surfacing_status.pop(_HOOK_BUILD_KEY, None)
             ltm = surfacing_status.get("ltm_server")
             view_note = _hook_view_note(surfacing_status.get("hook_view"), ltm)
             view_suffix = f"; {view_note}" if view_note else ""
@@ -12716,13 +12836,46 @@ def doctor(
     # flag-driven checks above may be fully healthy, and doctor's exit code
     # must not flip for a degradation the proxy itself does not share. Runs
     # outside the config_file short-circuit — it does not read the file.
+    #
+    # When doctor read exactly one STM hook command (the ``found`` view the
+    # ``ltm`` row routed with), the hook builds with that command's options
+    # over its environment, not the bare environment: the row then reports
+    # that build and the bare one separately (#1506). It reuses the view and
+    # the build the surfacing section made, so both rows describe one build;
+    # only when that section did not reach it does the row read the view.
     from memtomem_stm.config import load_env_stm_config
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
+    env_view: _HookCommandView | None = None
+    hook_outcome: Any = None
+    if hook_build is not None:
+        env_view, hook_outcome = hook_build.view, hook_build.outcome
+    else:
+        try:
+            env_view = _hook_command_view()
+        except Exception as exc:
+            # The type alone: a message can quote the settings (#1075).
+            logger.debug("hook command view unavailable (%s)", type(exc).__name__)
+    found_view = env_view if env_view is not None and env_view.state == "found" else None
+    if found_view is not None and hook_outcome is None:
+        try:
+            hook_outcome = load_env_stm_config(found_view.env)
+        except Exception as exc:
+            hook_outcome = exc
+
+    bare_outcome: Any
     try:
-        env_load = load_env_stm_config()
+        bare_outcome = load_env_stm_config()
     except Exception as exc:
-        hint = env_var_hint_for_validation_error(exc)
+        bare_outcome = exc
+    if found_view is not None:
+        check(
+            "env_overrides",
+            "env overrides",
+            *_env_overrides_found_row(found_view, hook_outcome, bare_outcome),
+        )
+    elif isinstance(bare_outcome, Exception):
+        hint = env_var_hint_for_validation_error(bare_outcome)
         check(
             "env_overrides",
             "env overrides",
@@ -12730,32 +12883,26 @@ def doctor(
             "bare STMConfig() fails — hook surfacing/compression degrade "
             "to pass-through (logged per call) and the daemon cannot start" + hint,
             # A SettingsError (an undecodable payload) has no hint by design.
-            "unset or fix the MEMTOMEM_STM_* variable(s) named above"
-            if hint
-            else "check the MEMTOMEM_STM_* variables for a value settings cannot decode",
+            _ENV_FIX_NAMED if hint else _ENV_FIX_UNDECODABLE,
+        )
+    elif bare_outcome.proxy_error is not None:
+        hint = env_var_hint_for_validation_error(bare_outcome.proxy_error)
+        check(
+            "env_overrides",
+            "env overrides",
+            "WARN",
+            "MEMTOMEM_STM_PROXY* is invalid — mms hook and the daemon ignore it "
+            "and run with proxy settings at defaults; hook metrics are not "
+            "recorded" + hint,
+            _ENV_FIX_NAMED if hint else _ENV_FIX_PROXY_UNDECODABLE,
         )
     else:
-        if env_load.proxy_error is not None:
-            hint = env_var_hint_for_validation_error(env_load.proxy_error)
-            check(
-                "env_overrides",
-                "env overrides",
-                "WARN",
-                "MEMTOMEM_STM_PROXY* is invalid — mms hook and the daemon ignore it "
-                "and run with proxy settings at defaults; hook metrics are not "
-                "recorded" + hint,
-                "unset or fix the MEMTOMEM_STM_* variable(s) named above"
-                if hint
-                else "check MEMTOMEM_STM_PROXY and its MEMTOMEM_STM_PROXY__* overrides "
-                "for a value settings cannot decode",
-            )
-        else:
-            check(
-                "env_overrides",
-                "env overrides",
-                "PASS",
-                "bare STMConfig() constructs — hook/daemon env path healthy",
-            )
+        check(
+            "env_overrides",
+            "env overrides",
+            "PASS",
+            "bare STMConfig() constructs — hook/daemon env path healthy",
+        )
 
     _doctor_hook_registration_check(check)
 
