@@ -181,7 +181,9 @@ class ErrorCategory(StrEnum):
 
     TRANSPORT = "transport"  # OSError, ConnectionError, EOFError
     TIMEOUT = "timeout"  # asyncio.TimeoutError on upstream call_tool (#206)
-    PROTOCOL = "protocol"  # JSON-RPC errors (-32600..-32603)
+    # JSON-RPC errors (-32600..-32603), or an upstream result the SDK rejects
+    # (no ``error_code`` then)
+    PROTOCOL = "protocol"
     UPSTREAM_ERROR = "upstream_error"  # result.isError=True from upstream
     DELIVERY = "delivery"  # configured structured output budget cannot make progress
     OVERSIZE = "oversize"  # inbound MCP message/result exceeded byte budget
