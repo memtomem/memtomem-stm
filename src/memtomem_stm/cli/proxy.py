@@ -36,6 +36,7 @@ from click.core import ParameterSource
 if TYPE_CHECKING:
     import httpx
 
+    from memtomem_stm.config import EnvSTMConfigLoad
     from memtomem_stm.proxy.config import ProxyConfig
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
@@ -10403,7 +10404,7 @@ class _HookBuild:
     """
 
     view: _HookCommandView
-    outcome: Any = None
+    outcome: EnvSTMConfigLoad | Exception | None = None
 
 
 @dataclass(frozen=True)
@@ -10554,7 +10555,9 @@ _ENV_FIX_PROXY_UNDECODABLE = (
 
 
 def _env_overrides_found_row(
-    view: _HookCommandView, hook_outcome: Any, bare_outcome: Any
+    view: _HookCommandView,
+    hook_outcome: EnvSTMConfigLoad | Exception,
+    bare_outcome: EnvSTMConfigLoad | Exception,
 ) -> tuple[str, str, str | None]:
     """The ``env_overrides`` row when doctor read one STM hook command (#1506).
 
@@ -10572,7 +10575,7 @@ def _env_overrides_found_row(
     """
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
-    def classify(outcome: Any) -> tuple[str, Exception | None]:
+    def classify(outcome: EnvSTMConfigLoad | Exception) -> tuple[str, Exception | None]:
         if isinstance(outcome, Exception):
             return "fail", outcome
         if outcome.proxy_error is not None:
@@ -12842,7 +12845,7 @@ def doctor(
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
     env_view: _HookCommandView | None = None
-    hook_outcome: Any = None
+    hook_outcome: EnvSTMConfigLoad | Exception | None = None
     if hook_build is not None:
         env_view, hook_outcome = hook_build.view, hook_build.outcome
     else:
@@ -12852,22 +12855,25 @@ def doctor(
             # The type alone: a message can quote the settings (#1075).
             logger.debug("hook command view unavailable (%s)", type(exc).__name__)
     found_view = env_view if env_view is not None and env_view.state == "found" else None
-    if found_view is not None and hook_outcome is None:
-        try:
-            hook_outcome = load_env_stm_config(found_view.env)
-        except Exception as exc:
-            hook_outcome = exc
+    found_outcome: EnvSTMConfigLoad | Exception | None = None
+    if found_view is not None:
+        found_outcome = hook_outcome
+        if found_outcome is None:
+            try:
+                found_outcome = load_env_stm_config(found_view.env)
+            except Exception as exc:
+                found_outcome = exc
 
-    bare_outcome: Any
+    bare_outcome: EnvSTMConfigLoad | Exception
     try:
         bare_outcome = load_env_stm_config()
     except Exception as exc:
         bare_outcome = exc
-    if found_view is not None:
+    if found_view is not None and found_outcome is not None:
         check(
             "env_overrides",
             "env overrides",
-            *_env_overrides_found_row(found_view, hook_outcome, bare_outcome),
+            *_env_overrides_found_row(found_view, found_outcome, bare_outcome),
         )
     elif isinstance(bare_outcome, Exception):
         hint = env_var_hint_for_validation_error(bare_outcome)
