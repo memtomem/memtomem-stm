@@ -681,6 +681,86 @@ class TestMaxUpstreamChars:
         # Joined with "\n" between text_parts.
         assert body == "a" * 30 + "\n" + "b" * 20
 
+    # ── #1530: the guard fires only when text is actually lost ──────────
+
+    async def _call_with_blocks(self, blocks: list, cap: int) -> str:
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        mgr._config_loader._cached.max_upstream_chars = cap  # type: ignore[union-attr]
+        session = _get_session(mgr)
+        session.call_tool.return_value = SimpleNamespace(content=blocks, is_error=False)
+        result = await mgr.call_tool("srv", "tool", {})
+        assert isinstance(result, str)
+        return result
+
+    async def test_exact_cap_then_empty_block_has_no_notice(self):
+        """A block that exactly fills the cap, followed by an empty block, loses
+        no text — the client must not be told the payload was oversized."""
+        result = await self._call_with_blocks([_text_content("a" * 50), _text_content("")], 50)
+
+        assert "max_upstream_chars guard" not in result
+        assert result == "a" * 50
+
+    async def test_exact_cap_then_none_text_block_has_no_notice(self):
+        """A spec-noncompliant ``text=None`` block is empty text, not lost text."""
+        none_text = SimpleNamespace(type="text", text=None)
+        result = await self._call_with_blocks([_text_content("a" * 50), none_text], 50)
+
+        assert "max_upstream_chars guard" not in result
+        assert result == "a" * 50
+
+    async def test_exact_cap_then_nonempty_block_keeps_notice(self):
+        """Positive control: a following block that has text DOES lose it."""
+        result = await self._call_with_blocks([_text_content("a" * 50), _text_content("b")], 50)
+
+        assert "max_upstream_chars guard" in result
+        assert result.split("\n\n[response truncated")[0] == "a" * 50
+
+    async def test_empty_block_between_full_and_nonempty_keeps_notice(self):
+        """Positive control: an empty block does not hide a later block's loss."""
+        result = await self._call_with_blocks(
+            [_text_content("a" * 50), _text_content(""), _text_content("b")], 50
+        )
+
+        assert "max_upstream_chars guard" in result
+
+    def _shape(self, blocks: list, cap: int):
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        cfg_snap = mgr._config.model_copy(update={"max_upstream_chars": cap})
+        return mgr._shape_response(
+            SimpleNamespace(content=blocks, is_error=False), "srv", "tool", cfg_snap=cfg_snap
+        )
+
+    @staticmethod
+    def _guard_warnings(caplog) -> list:
+        return [
+            r
+            for r in caplog.records
+            if r.name == "memtomem_stm.proxy.manager"
+            and r.levelname == "WARNING"
+            and "exceeded max_upstream_chars" in r.getMessage()
+        ]
+
+    def test_shape_exact_cap_then_empty_block_is_just_the_text(self, caplog):
+        """The issue's reproduction (cap=3): no notice, no truncation warning."""
+        with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
+            shaped = self._shape([_text_content("abc"), _text_content("")], 3)
+
+        assert shaped.original_text == "abc"
+        assert self._guard_warnings(caplog) == []
+
+    def test_shape_real_truncation_after_empty_block_is_unchanged(self, caplog):
+        """Positive control, and the byte-identity pin: the text, the single
+        notice and the one warning are what the guard produced before #1530 —
+        the skipped empty block adds no separator."""
+        with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
+            shaped = self._shape([_text_content("abc"), _text_content(""), _text_content("b")], 3)
+
+        assert shaped.original_text == (
+            "abc\n\n\n[response truncated to 3 chars at max_upstream_chars guard — "
+            "upstream returned an oversized payload]"
+        )
+        assert len(self._guard_warnings(caplog)) == 1
+
 
 # ── Surfacing failure: graceful degradation ──────────────────────────────
 
