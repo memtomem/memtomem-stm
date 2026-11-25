@@ -13,6 +13,23 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms doctor`'s `env_overrides` row no longer says the hook degrades when
+  the registered hook command's options shadow the invalid variable (issue
+  #1506). When doctor reads exactly one STM hook command `mms hook install`
+  owns, the row now reports two builds, each with its own consequence and the
+  variables its own error implicates: the command's options over doctor's
+  environment (when the `ltm server` check runs, the build doctor decides the
+  hook-daemon route with) and doctor's environment alone (what `mms daemon
+  start` from it builds). When the command's build warns (it fails, or
+  ignores an invalid `MEMTOMEM_STM_PROXY*`), the next action points to that
+  command's options, named by its location, or the variables its build
+  reads, then a rerun of doctor. **Behavior change**: in that case the
+  row's text changes; an invalid ambient value one of the command's four
+  options overrides is still a WARN, now attributed to `mms daemon start`
+  rather than to the hook; and a hook build that only the command's options
+  break (such as #1508's extreme deadline) now WARNs where the row passed.
+  Without such a command (none, several, unreadable, Windows, or a settings
+  error) the row is unchanged.
 - `mms doctor --measure-ltm` no longer advises `mms daemon start` when the
   daemon discovery key (`stm-discovery.key` under `data_dir`) cannot be used
   (#1520, issue #1519). `start` reads the same key and exits 1 on it. The
@@ -76,9 +93,8 @@ changes inline only. See the deprecation policy in
   in `--json`) no longer reports the hook's daemon and falls back to the
   standalone view, as when the hook's daemon is off. With a rounding
   surfacing deadline, when doctor takes the hook's daemon route, the timeout
-  checks read the hook's own daemon deadline. Known limit: no row says that
-  a flag made the hook's build fail; `env_overrides` validates doctor's
-  environment without the flags.
+  checks read the hook's own daemon deadline. The `env_overrides` row now
+  reports such a failure (issue #1506).
 - `mms doctor`'s advice no longer asks to export an environment variable or
   to set a setting that the registered Claude Code hook command's options
   override (#1505). **Behavior change**: when doctor reads exactly one STM
