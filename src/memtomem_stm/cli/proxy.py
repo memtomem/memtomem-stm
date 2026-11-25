@@ -10045,25 +10045,62 @@ def _known_ltm_state(value: object) -> str:
 # Fixed text, not the exception's message: that one quotes ``data_dir`` and
 # the OS error, and this report carries no config-derived values (#1079).
 # ``mms daemon status`` is where the file is named.
-_DISCOVERY_KEY_ERROR = (
-    "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
-    "(LocalKeyError); run `mms daemon status`"
-)
+def _discovery_key_error(*, hook_command: bool = False) -> str:
+    return (
+        "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
+        f"(LocalKeyError); run `{_daemon_command('status', hook_command=hook_command)}`"
+    )
 
 
-def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False) -> dict[str, Any]:
+_HOOK_COMMAND_OPTION = "--hook-command claude"
+
+
+def _daemon_command(sub: str, *, hook_command: bool) -> str:
+    """``mms daemon <sub>``, with ``--hook-command claude`` for the hook's daemon.
+
+    *hook_command* is set when doctor built the hook's configuration from the
+    one STM hook command it read (route the hook's, view ``found``): that
+    option builds as the command does (#1515), and the bare command, from the
+    shell's environment alone, can address another daemon.
+    """
+    command = f"mms daemon {sub}"
+    return f"{command} {_HOOK_COMMAND_OPTION}" if hook_command else command
+
+
+def _names_hook_command(surfacing_status: Mapping[str, Any]) -> bool:
+    """Whether doctor's daemon advice should carry ``--hook-command claude``.
+
+    Read from the ``hook_view`` summary the bootstrap records before its probe,
+    so every row agrees with the probe's own error text; the advice inputs are
+    best-effort and may be missing when the probe ran.
+    """
+    view = surfacing_status.get("hook_view")
+    return (
+        isinstance(view, dict) and view.get("state") == "found" and view.get("hook_route") is True
+    )
+
+
+_DISCOVERY_KEY_ERROR = _discovery_key_error()
+
+
+def _ltm_daemon_status(
+    config: Any, timeout: float, *, measure_ltm: bool = False, hook_command: bool = False
+) -> dict[str, Any]:
     """Shared-daemon readiness and telemetry; active only with ``measure_ltm``.
 
     An unusable discovery key reads as an unreachable daemon with its own
-    error text, wherever in the probe or the measurement it surfaces.
+    error text, wherever in the probe or the measurement it surfaces. The
+    texts that name a daemon command name it as :func:`_daemon_command` does.
     """
     from memtomem_stm.utils.local_key import LocalKeyError
 
     try:
-        return _ltm_daemon_probe(config, timeout, measure_ltm=measure_ltm)
+        return _ltm_daemon_probe(
+            config, timeout, measure_ltm=measure_ltm, hook_command=hook_command
+        )
     except LocalKeyError:
         status = _ltm_daemon_status_base(config)
-        status["error"] = _DISCOVERY_KEY_ERROR
+        status["error"] = _discovery_key_error(hook_command=hook_command)
         return status
 
 
@@ -10087,7 +10124,9 @@ def _ltm_daemon_status_base(config: Any) -> dict[str, Any]:
     }
 
 
-def _ltm_daemon_probe(config: Any, timeout: float, *, measure_ltm: bool) -> dict[str, Any]:
+def _ltm_daemon_probe(
+    config: Any, timeout: float, *, measure_ltm: bool, hook_command: bool = False
+) -> dict[str, Any]:
     from memtomem_stm.daemon import client as daemon_client
 
     surfacing = config.surfacing
@@ -10097,7 +10136,10 @@ def _ltm_daemon_probe(config: Any, timeout: float, *, measure_ltm: bool) -> dict
         return status
     hs = asyncio.run(daemon_client.ping(config, timeout=max(0.1, float(timeout))))
     if hs is None:
-        status["error"] = "shared daemon is not reachable; run `mms daemon status`"
+        status["error"] = (
+            "shared daemon is not reachable; run "
+            f"`{_daemon_command('status', hook_command=hook_command)}`"
+        )
         return status
     # A missing field keeps the old "cold" default; a present value outside
     # the known set is "unknown", whatever it is.
@@ -10143,13 +10185,18 @@ def _ltm_status(
     *,
     measure_ltm: bool = False,
     hook_route: bool = False,
+    hook_command: bool = False,
 ) -> dict[str, Any]:
     # Standalone proxy surfacing and native hooks have independent routing
     # knobs. *hook_route* is the caller's decision that the row describes the
     # hook's daemon (see ``_surfacing_bootstrap_status``), and *config* is then
     # the hook's own build; otherwise this is the standalone route.
+    # *hook_command*: that build came from one STM hook command
+    # (:func:`_daemon_command`).
     if hook_route or config.surfacing.use_daemon:
-        return _ltm_daemon_status(config, timeout, measure_ltm=measure_ltm)
+        return _ltm_daemon_status(
+            config, timeout, measure_ltm=measure_ltm, hook_command=hook_route and hook_command
+        )
     return _ltm_mcp_status(config.surfacing, timeout)
 
 
@@ -10403,10 +10450,10 @@ class _HookAdvice:
     build of the hook's configuration is the command's, so editing the flag
     changes it and exporting that variable in doctor's shell does not.
 
-    The bare ``mms daemon start`` / ``status`` / ``restart`` advice for the
-    hook's daemon does not read these: a daemon command for the hook's
-    configuration cannot be stated truthfully from doctor's side, so it keeps
-    its text (#1505).
+    The ``mms daemon start`` / ``status`` / ``restart`` advice for the hook's
+    daemon does not read these: it carries ``--hook-command claude`` from the
+    ``hook_view`` summary (:func:`_names_hook_command`, #1515), which is
+    recorded before the probe while these inputs are best-effort.
     """
 
     location: str
@@ -10614,7 +10661,13 @@ def _surfacing_bootstrap_status(
                 # The probe reads the flags' variables only through *config*;
                 # the fingerprint's direct read of the environment is
                 # ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``, which no flag sets.
-                ltm_status = _ltm_status(config, timeout, measure_ltm=measure_ltm, hook_route=True)
+                ltm_status = _ltm_status(
+                    config,
+                    timeout,
+                    measure_ltm=measure_ltm,
+                    hook_route=True,
+                    hook_command=_names_hook_command({"hook_view": hook_view}),
+                )
             try:
                 hook_advice = _hook_advice(view, built, hook_route=bool(hook_view["hook_route"]))
             except Exception as exc:
@@ -12298,6 +12351,7 @@ def doctor(
             )
             # Before anything renders the status: never part of ``--json``.
             hook_advice = surfacing_status.pop(_HOOK_ADVICE_KEY, None)
+            hook_command = _names_hook_command(surfacing_status)
             ltm = surfacing_status.get("ltm_server")
             view_note = _hook_view_note(surfacing_status.get("hook_view"), ltm)
             view_suffix = f"; {view_note}" if view_note else ""
@@ -12381,7 +12435,7 @@ def doctor(
                     f"{cause} — only LTM-dependent features (memory surfacing) are "
                     f"disabled; the proxy core is unaffected{view_suffix}",
                     (
-                        "mms daemon status"
+                        _daemon_command("status", hook_command=hook_command)
                         if isinstance(ltm, dict) and ltm.get("route") == "daemon"
                         else "export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=<memtomem-server>"
                         "  # see docs/surfacing.md"
@@ -12474,7 +12528,7 @@ def doctor(
                     "ltm measurement",
                     "WARN",
                     "--measure-ltm requires a running daemon for the probed configuration",
-                    "mms daemon start",
+                    _daemon_command("start", hook_command=hook_command),
                 )
             elif isinstance(ltm, dict) and ltm.get("route") == "daemon":
                 measurement = ltm.get("measurement")
@@ -12644,7 +12698,7 @@ def doctor(
                             "the running daemon predates the surfacing outcome counters; "
                             "its failures are unreported and its timeout recommendation is "
                             "derived from durations that include failed searches",
-                            "mms daemon restart",
+                            _daemon_command("restart", hook_command=hook_command),
                         )
                     elif failures:
                         # Neutral about the cause on purpose: this population
@@ -12661,7 +12715,7 @@ def doctor(
                             f"warm LTM search ({breakdown['timeout_samples']} timed out, "
                             f"{breakdown['error_samples']} faulted after issuing one, "
                             f"{breakdown['pre_rpc_faults']} never issued one)",
-                            "mms daemon status",
+                            _daemon_command("status", hook_command=hook_command),
                         )
                     elif isinstance(surface_summary, dict) and surface_summary.get("samples"):
                         # No count on this side: ``samples`` is windowed, so

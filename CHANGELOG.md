@@ -13,6 +13,28 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms doctor`'s `mms daemon start` / `status` / `restart` advice for the
+  hook's daemon now names a command that acts on that daemon (#1515). Since
+  #1494 doctor looks the hook's daemon up with the registered Claude Code hook
+  command's options laid over its environment, and two of them enter the
+  daemon fingerprint, so the bare commands, which build from the shell's
+  environment alone, could address another daemon (a default install writes
+  `--no-persist-query-text`). `mms daemon start`, `stop`, `status` and
+  `restart` accept a new `--hook-command claude`: it reads the STM hook command
+  `mms hook install --host claude` wrote, sets the variables its options name
+  in the command's environment as the hook does (a daemon it starts inherits
+  them), and exits 1 when there is not exactly one such command, or on
+  Windows. The hints those subcommands print during such a run name the option
+  too, and none suggests `stop --all`, which targets every daemon under
+  `data_dir`, the hook's own included.
+  **Behavior change**: when doctor reads exactly one such command and
+  takes the hook's daemon route, the next action of the `ltm server` (`ltm`),
+  `ltm measurement` and `surfacing outcomes` rows, and the `ltm` row's
+  "run `mms daemon status`" detail, name `mms daemon <subcommand>
+  --hook-command claude`. Known limit: doctor and the option both build from
+  the shell's environment plus the command's options; a hook Claude Code runs
+  with a different environment, working directory or STM version can still
+  use another daemon.
 - `mms doctor` now applies the registered hook command's flag words to its
   own environment the way the hook does (#1512, issue #1508). 0.7.11's doctor
   parsed the words into settings and formatted those back, and the round
