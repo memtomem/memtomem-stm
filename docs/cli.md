@@ -1108,11 +1108,32 @@ of adding another. Install keeps the daemon, timeout and query-text settings
 of the handler it updates. They are read from its setting words the way
 `mms hook` applies them: a deadline that is not a positive finite number is
 not kept, and the daemon deadline is at least one second above a usable
-surfacing deadline. No setting is read from any other handler, or from an
-environment prefix. Claude Code and Codex also fold any further handlers
-install owns into it; Cursor and Kimi update the first one and leave the rest
-as they are. `uninstall` removes every handler install owns, prunes the
-emptied containers, and leaves other hooks untouched.
+surfacing deadline. No setting is read from an environment prefix, or from a
+handler install does not own. Claude Code and Codex also fold any further
+handlers install owns into the one it updates; Cursor and Kimi update the
+first one and leave the rest as they are.
+
+Before Claude Code or Codex folds two or more owned handlers, install reads
+the settings of each, the same way, and compares them, before the new
+command is built. When they differ in a setting install would carry over
+from the first one, install refuses: it exits non-zero, with or without
+`--apply`, and leaves the config as it was with no backup (an `--apply` can
+still create the hook-host lock file). The error names the handlers'
+locations and the settings they differ in, never their values. A setting an
+option sets is not carried over, so `--daemon` / `--no-daemon` and
+`--surfacing-timeout` resolve a difference in that setting; the daemon
+deadline and query-text settings have no such option. Because the daemon
+deadline is read as at least one second above the surfacing deadline, two
+handlers that differ only in surfacing deadline can differ in daemon
+deadline too. A handler without setting words, which 0.1.29–0.1.38 and
+`--inherit-runtime-env` write, inherits every setting, so it differs from
+any handler with them even when the values in effect would match.
+`--inherit-runtime-env` carries nothing over: it folds them into one handler
+without setting words. Otherwise, remove all but one handler by hand and
+re-run.
+
+`uninstall` removes every handler install owns, prunes the emptied
+containers, and leaves other hooks untouched.
 
 A handler that looks like STM's hook but is not install's, such as
 `mms hook --host claude` or `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms

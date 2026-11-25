@@ -2672,3 +2672,301 @@ def test_plan_install_hands_the_builder_the_owned_handlers_in_file_order(redirec
     assert first.settings.surfacing_timeout_seconds == 7.0
     assert second.launcher == ("memtomem-stm",)
     assert second.settings == PartialHostRuntimePolicy()
+
+
+# ── #1470: owned handlers that disagree are not folded ───────────────────────
+#
+# Claude Code and Codex fold every owned handler into one and carry the first
+# one's settings over, so a later handler with other settings would lose them.
+# Install refuses there instead, unless the CLI sets every setting they differ
+# in, or ``--inherit-runtime-env`` carries none.
+
+_FOLDING = ["claude", "codex"]
+# Distinctive, so a refusal that quoted command text would be caught.
+_SENTINEL_DIR = "/zz-sentinel-1470"
+
+
+def _pinned(
+    host: str,
+    *,
+    daemon_flag: str = "--use-daemon",
+    surfacing: str = "3",
+    daemon: str = "12",
+    persist_flag: str = "--no-persist-query-text",
+    uv: bool = False,
+) -> str:
+    head = f"uv run --directory {_SENTINEL_DIR} " if uv else ""
+    return (
+        f"{head}memtomem-stm hook --host {host} {daemon_flag} --surfacing-timeout-seconds "
+        f"{surfacing} --daemon-timeout-seconds {daemon} {persist_flag}"
+    )
+
+
+def _read_host_file(path: Path, host: str) -> dict:
+    return _parse(path.read_text(encoding="utf-8"), HOOK_HOSTS[host].fmt)
+
+
+def _nested_commands(data: dict) -> list[str]:
+    return [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
+
+
+def _seed_owned(host: str, path: Path, *groups: list[str]) -> str:
+    for group in groups:
+        for command in group:
+            assert owned_hook_command(command, host) is not None, command
+    _seed(path, _claude_groups(*[[_h(c) for c in g] for g in groups]), HOOK_HOSTS[host].fmt)
+    return path.read_text(encoding="utf-8")
+
+
+def _install(host: str, *args: str):
+    return CliRunner().invoke(cli, ["hook", "install", "--host", host, *args])
+
+
+def _assert_refused(result, path: Path, before: str, *names: str) -> None:
+    assert result.exit_code == 1, result.output
+    assert path.read_text(encoding="utf-8") == before
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]  # no backup
+    for name in names:
+        assert name in result.output
+    assert "zz-sentinel" not in result.output
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+@pytest.mark.parametrize("apply_", [True, False])
+def test_install_refuses_owned_handlers_whose_surfacing_differs(
+    host: str, apply_: bool, redirect
+) -> None:
+    path = redirect(host)
+    before = _seed_owned(
+        host,
+        path,
+        [_pinned(host, surfacing="3.25", uv=True), _pinned(host, surfacing="9.75", uv=True)],
+    )
+
+    result = _install(host, *(["--apply"] if apply_ else []))
+
+    _assert_refused(
+        result,
+        path,
+        before,
+        "hooks.PostToolUse[0].hooks[0]",
+        "hooks.PostToolUse[0].hooks[1]",
+        "--surfacing-timeout-seconds",
+    )
+    assert "--daemon-timeout-seconds" not in result.output
+    assert "--use-daemon/--no-daemon" not in result.output
+    # The one option that sets the differing setting is offered.
+    assert "To go on, pass --surfacing-timeout, pass --inherit-runtime-env" in result.output
+    # Neither value is printed.
+    assert "3.25" not in result.output
+    assert "9.75" not in result.output
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_install_refuses_when_only_a_third_owned_handler_differs(host: str, redirect) -> None:
+    path = redirect(host)
+    before = _seed_owned(
+        host,
+        path,
+        [_pinned(host), _pinned(host)],
+        [_pinned(host, persist_flag="--persist-query-text")],
+    )
+
+    _assert_refused(
+        _install(host, "--apply"),
+        path,
+        before,
+        "holds 3 handlers",
+        "hooks.PostToolUse[1].hooks[0]",
+        "--persist-query-text/--no-persist-query-text",
+    )
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+@pytest.mark.parametrize(
+    ("first", "second", "name"),
+    [
+        # The issue's pair, both orders: daemon mode and surfacing differ.
+        ({}, {"daemon_flag": "--no-daemon", "surfacing": "9"}, "--use-daemon/--no-daemon"),
+        ({"daemon_flag": "--no-daemon", "surfacing": "9"}, {}, "--use-daemon/--no-daemon"),
+        (
+            {"persist_flag": "--no-persist-query-text"},
+            {"persist_flag": "--persist-query-text"},
+            "--persist-query-text/--no-persist-query-text",
+        ),
+        ({"daemon": "12"}, {"daemon": "20"}, "--daemon-timeout-seconds"),
+    ],
+)
+def test_install_refuses_owned_handlers_that_differ(
+    host: str, first: dict, second: dict, name: str, redirect
+) -> None:
+    path = redirect(host)
+    before = _seed_owned(host, path, [_pinned(host, **first), _pinned(host, **second)])
+
+    _assert_refused(_install(host, "--apply"), path, before, name)
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_install_refuses_a_flagless_owned_handler_beside_a_pinned_one(host: str, redirect) -> None:
+    """A flagless handler inherits its settings, so it differs from any pin."""
+    path = redirect(host)
+    before = _seed_owned(host, path, [_CMD.format(host=host), _pinned(host)])
+
+    _assert_refused(_install(host, "--apply"), path, before, "--surfacing-timeout-seconds")
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_install_refuses_owned_handlers_in_separate_groups(host: str, redirect) -> None:
+    path = redirect(host)
+    before = _seed_owned(host, path, [_pinned(host)], [_pinned(host, surfacing="9")])
+
+    _assert_refused(
+        _install(host, "--apply"),
+        path,
+        before,
+        "hooks.PostToolUse[0].hooks[0]",
+        "hooks.PostToolUse[1].hooks[0]",
+    )
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_a_derived_daemon_deadline_conflict_survives_a_surfacing_override(
+    host: str, redirect
+) -> None:
+    """Surfacing 9 with daemon 4 runs with a daemon deadline of 10, so the pair
+    also differs in the daemon deadline, which no install flag sets."""
+    path = redirect(host)
+    first = _pinned(host, surfacing="3", daemon="4")
+    second = _pinned(host, surfacing="9", daemon="4")
+    before = _seed_owned(host, path, [first, second])
+
+    result = _install(host, "--surfacing-timeout", "2", "--apply")
+
+    _assert_refused(result, path, before, "--daemon-timeout-seconds")
+    # No option sets the daemon deadline, so none is offered, and the hint
+    # says --inherit-runtime-env replaces the --surfacing-timeout given here
+    # (the two together are a usage error).
+    assert (
+        "To go on, pass --inherit-runtime-env "
+        "(in place of --daemon, --no-daemon and --surfacing-timeout)"
+    ) in result.output
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+@pytest.mark.parametrize(
+    ("second", "args", "expected"),
+    [
+        (
+            {"surfacing": "9"},
+            ["--surfacing-timeout", "2"],
+            PartialHostRuntimePolicy(True, 2.0, 12.0, False),
+        ),
+        (
+            {"daemon_flag": "--no-daemon"},
+            ["--no-daemon"],
+            PartialHostRuntimePolicy(False, 3.0, 12.0, False),
+        ),
+        # Equal settings fold as before.
+        ({}, [], PartialHostRuntimePolicy(True, 3.0, 12.0, False)),
+    ],
+)
+def test_install_folds_owned_handlers_when_the_cli_sets_what_they_differ_in(
+    host: str, second: dict, args: list[str], expected: PartialHostRuntimePolicy, redirect
+) -> None:
+    path = redirect(host)
+    _seed_owned(host, path, [_pinned(host), _pinned(host, **second)])
+
+    result = _install(host, *args, "--apply")
+
+    assert result.exit_code == 0, result.output
+    (command,) = _nested_commands(_read_host_file(path, host))
+    owned = owned_hook_command(command, host)
+    assert owned is not None
+    assert owned.settings == expected
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_inherit_runtime_env_folds_owned_handlers_that_differ(host: str, redirect) -> None:
+    path = redirect(host)
+    _seed_owned(host, path, [_pinned(host, daemon="12"), _pinned(host, daemon="20")])
+
+    refused = _install(host, "--surfacing-timeout", "2", "--daemon", "--apply")
+    assert refused.exit_code == 1, refused.output
+
+    result = _install(host, "--inherit-runtime-env", "--apply")
+
+    assert result.exit_code == 0, result.output
+    (command,) = _nested_commands(_read_host_file(path, host))
+    owned = owned_hook_command(command, host)
+    assert owned is not None
+    assert owned.settings == PartialHostRuntimePolicy()
+
+
+def _cursor_pair(a: str, b: str) -> dict:
+    return {"version": 1, "hooks": {"postToolUse": [{"command": a}, {"command": b}]}}
+
+
+def _kimi_pair(a: str, b: str) -> dict:
+    entries = [{"event": "PostToolUse", "matcher": "Bash", "command": c} for c in (a, b)]
+    return {"hooks": entries}
+
+
+@pytest.mark.parametrize(("host", "pair"), [("cursor", _cursor_pair), ("kimi", _kimi_pair)])
+def test_hosts_that_do_not_fold_keep_owned_handlers_that_differ(host: str, pair, redirect) -> None:
+    path = redirect(host)
+    later = _pinned(host, surfacing="9")
+    _seed(path, pair(_pinned(host), later), HOOK_HOSTS[host].fmt)
+
+    result = _install(host, "--apply")
+
+    assert result.exit_code == 0, result.output
+    data = _read_host_file(path, host)
+    entries = data["hooks"]["postToolUse"] if host == "cursor" else data["hooks"]
+    written = [e["command"] for e in entries]
+    assert len(written) == 2
+    assert written[1] == later
+
+
+def test_plan_install_without_carried_settings_folds_as_before(redirect) -> None:
+    path = redirect("claude")
+    _seed_owned("claude", path, [_pinned("claude"), _pinned("claude", surfacing="9")])
+
+    change = plan_install("claude", _CMD.format(host="claude"))
+
+    assert _nested_commands(json.loads(change.new_text)) == [_CMD.format(host="claude")]
+
+
+def test_plan_install_refuses_a_conflict_before_building_the_command(redirect) -> None:
+    from memtomem_stm.cli.hook_hosts import OwnedSettingsConflict
+
+    path = redirect("claude")
+    _seed_owned("claude", path, [_pinned("claude"), _pinned("claude", surfacing="9")])
+
+    def build(owned: tuple) -> str:
+        raise AssertionError("the command was built before the conflict check")
+
+    with pytest.raises(OwnedSettingsConflict):
+        plan_install("claude", build, carried=frozenset({"surfacing_timeout_seconds"}))
+
+
+@pytest.mark.parametrize("apply_", [True, False])
+def test_a_conflict_is_refused_from_the_one_read(
+    apply_: bool, redirect, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from memtomem_stm.cli import hook_hosts
+
+    path = redirect("claude")
+    before = _seed_owned("claude", path, [_pinned("claude"), _pinned("claude", surfacing="9")])
+    reads: list[Path] = []
+    real = hook_hosts._read_current
+
+    def counting(read_path: Path, fmt: str):
+        reads.append(read_path)
+        return real(read_path, fmt)
+
+    monkeypatch.setattr(hook_hosts, "_read_current", counting)
+
+    result = _install("claude", *(["--apply"] if apply_ else []))
+
+    _assert_refused(result, path, before)
+    assert reads == [path]

@@ -1583,10 +1583,22 @@ def hook_install_command(
         # notice, so the two cannot disagree (#1379).
         project = _stm_project()
 
+        # The settings the command takes from the first owned handler: each
+        # one no option sets, none under --inherit-runtime-env. The plan
+        # refuses to fold owned handlers that differ in one of them (#1470).
+        carried: frozenset[str] = frozenset()
+        if not inherit_runtime_env:
+            carried = frozenset({"daemon_timeout_seconds", "persist_query_text"})
+            if daemon_mode is None:
+                carried |= {"use_daemon"}
+            if surfacing_timeout is None:
+                carried |= {"surfacing_timeout_seconds"}
+
         def build_command(owned: tuple[OwnedHookCommand, ...]) -> str:
             # ``owned`` are install's handlers in the one read of the config
             # that the merge also works on. The first one's settings carry
-            # over, as the first one is the handler the merge refreshes.
+            # over, as the first one is the handler the merge refreshes; the
+            # plan has already refused handlers that differ in ``carried``.
             policy = None
             if not inherit_runtime_env:
                 policy = resolve_host_runtime_policy(
@@ -1600,7 +1612,7 @@ def hook_install_command(
 
         try:
             project_binding = _binding_for(project)
-            change = hook_hosts.plan_install(host, build_command)
+            change = hook_hosts.plan_install(host, build_command, carried=carried)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
             # One choke point for every ``HookInstallError`` raise: the

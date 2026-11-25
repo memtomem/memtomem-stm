@@ -13,6 +13,22 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook install` no longer drops the runtime settings of a second hook
+  handler it manages in Claude Code or Codex (issue #1470). Install merges every
+  handler it owns there into one and carried the settings of the first one
+  over, so a later handler's daemon mode, deadlines or query-text setting were
+  replaced with nothing said. **Behavior change**: when two or more owned
+  handlers differ in a setting install would carry over, install now exits
+  non-zero, with or without `--apply`, leaves the host config unchanged and
+  makes no backup.
+  The error names the handlers' locations and the settings they differ in.
+  `--daemon` / `--no-daemon` and `--surfacing-timeout` resolve a difference in
+  their own setting (a surfacing difference can also be a daemon-deadline
+  difference, which no option sets), `--inherit-runtime-env` writes one
+  handler without settings, and removing all but one handler by hand works
+  for any case. A handler without setting words (what 0.1.29–0.1.38 and
+  `--inherit-runtime-env` write) differs from one with them. Cursor and Kimi
+  keep the further handlers as they are and are unchanged.
 - `mms doctor`'s `mms daemon start` / `status` / `restart` advice for the
   hook's daemon now names a command that acts on that daemon (#1515). Since
   #1494 doctor looks the hook's daemon up with the registered Claude Code hook
