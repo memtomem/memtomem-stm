@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging as _logging
 import re
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Protocol
 
 _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
@@ -237,6 +237,81 @@ def _drop_from_segments(segments: list[int], matches: Iterator[re.Match[str]]) -
     return out
 
 
+def _strip_block(text: str, masked: str, protected: list[int]) -> str:
+    """``text`` with its tags and script/style elements removed.
+
+    ``masked`` is ``text`` with the ``protected`` spans (flat, in ``text``'s
+    offsets) blanked to ``_MASK_CHAR``; see ``DefaultContentCleaner._strip_html_jsx``.
+    A span may be cut short at either edge of ``text`` when it continues into
+    a neighboring block: it still touches that edge, and no removal match can
+    begin or end inside it.
+    """
+    if not protected:
+        # Nothing to keep out of the patterns' way, so there is nothing for
+        # the offset bookkeeping below to preserve: remove in place.
+        stripped = _drop_matches(text, _script_style_matches(text))
+        stripped = _drop_matches(stripped, _html_tag_matches(stripped))
+        return _CLOSE_TAG_RE.sub("", stripped)
+
+    # Every removal pattern opens on "<" and closes on ">", and a masked
+    # region is all _MASK_CHAR, so a match can neither begin nor end inside
+    # one: a protected region is removed whole or not at all. When the run
+    # count and lengths still line up afterwards — and the text brought no
+    # _MASK_CHAR of its own to be mistaken for one — no protected region
+    # was removed and no two were brought together, so the k-th run is the
+    # k-th region and the originals splice straight back in order. Tags and
+    # script blocks around them may well have been removed; that is the
+    # point, and it does not disturb the alignment.
+    stripped = _drop_matches(masked, _script_style_matches(masked))
+    stripped = _drop_matches(stripped, _html_tag_matches(stripped))
+    stripped = _CLOSE_TAG_RE.sub("", stripped)
+    if _MASK_CHAR not in text:
+        # Checked and spliced in the same walk: a separate pass to validate
+        # would materialize one string per run, and a fence-dense response
+        # has hundreds of thousands of them. A run that does not line up
+        # abandons the attempt and the segment walk below takes over.
+        parts: list[str] = []
+        pos = 0
+        index = 0
+        aligned = True
+        for run_match in _MASK_RUN_RE.finditer(stripped):
+            run_start = run_match.start()
+            if index >= len(protected) or (
+                run_match.end() - run_start != protected[index + 1] - protected[index]
+            ):
+                aligned = False
+                break
+            parts.append(stripped[pos:run_start])
+            parts.append(text[protected[index] : protected[index + 1]])
+            pos = run_match.end()
+            index += 2
+        if aligned and index == len(protected):
+            parts.append(stripped[pos:])
+            return "".join(parts)
+        del parts
+
+    total = len(text)
+    segments = [0, total]
+    view = masked
+    finders: tuple[Callable[[str], Iterator[re.Match[str]]], ...] = (
+        _script_style_matches,
+        _html_tag_matches,
+        _CLOSE_TAG_RE.finditer,
+    )
+    for index, find in enumerate(finders):
+        dropped = _drop_from_segments(segments, find(view))
+        if dropped is None:
+            continue
+        segments = dropped
+        if index + 1 < len(finders):
+            view = "".join(
+                masked[segments[i] : segments[i + 1]] for i in range(0, len(segments), 2)
+            )
+    if segments == [0, total]:
+        return text
+    return "".join(text[segments[i] : segments[i + 1]] for i in range(0, len(segments), 2))
+
+
 class ContentCleaner(Protocol):
     def clean(self, text: str) -> str: ...
 
@@ -249,13 +324,40 @@ class DefaultContentCleaner:
         self._collapse = getattr(config, "collapse_links", True) if config else True
 
     def clean(self, text: str) -> str:
+        return self.clean_parts(text, (len(text),))
+
+    def clean_parts(self, text: str, part_lengths: Sequence[int]) -> str:
+        r"""Clean ``text``, the upstream text blocks joined with ``"\n"``.
+
+        ``part_lengths`` are the blocks' lengths, in order (none for no
+        blocks), so the blocks are read out of ``text`` by offset rather than
+        held as a second copy of it. Line-ending normalization and markup
+        removal read one block at a time: no removal match spans two blocks,
+        so markup split across a boundary cannot take text from both blocks
+        with it (#1531). Everything else reads the join: a code fence or
+        generic split across blocks stays protected, and duplicate paragraphs,
+        link floods and blank-line runs are collapsed across blocks.
+        """
+        if len(text) != sum(part_lengths) + max(len(part_lengths) - 1, 0):
+            raise ValueError("part_lengths do not add up to text")
         if not text:
             return text
-        # Normalize line endings — upstream servers on Windows may send \r\n
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if "\r" in text:
+            # Normalize line endings — upstream servers on Windows may send
+            # \r\n. Per block, so a block ending in "\r" is not read as a CRLF
+            # with the separator after it.
+            parts: list[str] = []
+            pos = 0
+            for length in part_lengths:
+                part = text[pos : pos + length]
+                parts.append(part.replace("\r\n", "\n").replace("\r", "\n"))
+                pos += length + 1
+            text = "\n".join(parts)
+            part_lengths = [len(part) for part in parts]
+            del parts
         self._check_injection(text)
         if self._strip_html:
-            text = self._strip_html_jsx(text)
+            text = self._strip_html_jsx(text, part_lengths)
         if self._dedup:
             text = self._deduplicate_paragraphs(text)
         if self._collapse:
@@ -292,8 +394,15 @@ class DefaultContentCleaner:
                     )
                     return
 
-    def _strip_html_jsx(self, text: str) -> str:
+    def _strip_html_jsx(self, text: str, part_lengths: Sequence[int]) -> str:
         r"""Strip HTML/JSX tags, leaving code fences and generic types intact.
+
+        ``text`` is parts of ``part_lengths`` joined with ``"\n"``. The
+        protected regions are found on all of it, so a fence or generic an
+        upstream split across two blocks is still kept; the removal patterns
+        then run on each part alone (``_strip_block``), so no removal match
+        spans two parts (#1531). The newline between two parts is copied
+        through as it is.
 
         The protected regions are never substituted into the text. An earlier
         design swapped each fence and generic for a NUL-delimited marker, and
@@ -316,72 +425,39 @@ class DefaultContentCleaner:
         with_fences_hidden = _mask_spans(text, fences)
         generics = _find_spans(_gt_closed_matches(_GENERIC_RE, with_fences_hidden))
         protected = _merge_spans(fences, generics)
-        if not protected:
-            # Nothing to keep out of the patterns' way, so there is nothing for
-            # the offset bookkeeping below to preserve: remove in place.
-            stripped = _drop_matches(text, _script_style_matches(text))
-            stripped = _drop_matches(stripped, _html_tag_matches(stripped))
-            return _CLOSE_TAG_RE.sub("", stripped)
-
         masked = _mask_spans(text, protected)
+        if len(part_lengths) == 1:
+            return _strip_block(text, masked, protected)
 
-        # Every removal pattern opens on "<" and closes on ">", and a masked
-        # region is all _MASK_CHAR, so a match can neither begin nor end inside
-        # one: a protected region is removed whole or not at all. When the run
-        # count and lengths still line up afterwards — and the text brought no
-        # _MASK_CHAR of its own to be mistaken for one — no protected region
-        # was removed and no two were brought together, so the k-th run is the
-        # k-th region and the originals splice straight back in order. Tags and
-        # script blocks around them may well have been removed; that is the
-        # point, and it does not disturb the alignment.
-        stripped = _drop_matches(masked, _script_style_matches(masked))
-        stripped = _drop_matches(stripped, _html_tag_matches(stripped))
-        stripped = _CLOSE_TAG_RE.sub("", stripped)
-        if _MASK_CHAR not in text:
-            # Checked and spliced in the same walk: a separate pass to validate
-            # would materialize one string per run, and a fence-dense response
-            # has hundreds of thousands of them. A run that does not line up
-            # abandons the attempt and the segment walk below takes over.
-            parts: list[str] = []
-            pos = 0
-            index = 0
-            aligned = True
-            for run_match in _MASK_RUN_RE.finditer(stripped):
-                run_start = run_match.start()
-                if index >= len(protected) or (
-                    run_match.end() - run_start != protected[index + 1] - protected[index]
-                ):
-                    aligned = False
-                    break
-                parts.append(stripped[pos:run_start])
-                parts.append(text[protected[index] : protected[index + 1]])
-                pos = run_match.end()
-                index += 2
-            if aligned and index == len(protected):
-                parts.append(stripped[pos:])
-                return "".join(parts)
-            del parts
-
-        total = len(text)
-        segments = [0, total]
-        view = masked
-        finders: tuple[Callable[[str], Iterator[re.Match[str]]], ...] = (
-            _script_style_matches,
-            _html_tag_matches,
-            _CLOSE_TAG_RE.finditer,
-        )
-        for index, find in enumerate(finders):
-            dropped = _drop_from_segments(segments, find(view))
-            if dropped is None:
-                continue
-            segments = dropped
-            if index + 1 < len(finders):
-                view = "".join(
-                    masked[segments[i] : segments[i + 1]] for i in range(0, len(segments), 2)
-                )
-        if segments == [0, total]:
-            return text
-        return "".join(text[segments[i] : segments[i + 1]] for i in range(0, len(segments), 2))
+        # Each part gets the protected spans that overlap it, clipped to it and
+        # in its own offsets. ``protected`` is sorted and so are the parts, so
+        # one cursor walks both: a span stays under the cursor until a part
+        # starts at or after its end, which keeps the walk linear even when one
+        # fence covers many parts. Every span is non-empty (no pattern matches
+        # the empty string) and the part is non-empty, so a clipped span is too.
+        stripped_parts: list[str] = []
+        cursor = 0
+        start = 0
+        for length in part_lengths:
+            end = start + length
+            if length:
+                part = text[start:end]
+                while cursor < len(protected) and protected[cursor + 1] <= start:
+                    cursor += 2
+                local: list[int] = []
+                index = cursor
+                while index < len(protected) and protected[index] < end:
+                    local.append(max(protected[index], start) - start)
+                    local.append(min(protected[index + 1], end) - start)
+                    index += 2
+                block_masked = masked[start:end] if local else part
+                stripped_parts.append(_strip_block(part, block_masked, local))
+            else:
+                # Empty blocks cost no max_upstream_chars budget, so a response
+                # can carry many; they keep only their separator.
+                stripped_parts.append("")
+            start = end + 1
+        return "\n".join(stripped_parts)
 
     def _deduplicate_paragraphs(self, text: str) -> str:
         paragraphs = re.split(r"\n{2,}", text)
