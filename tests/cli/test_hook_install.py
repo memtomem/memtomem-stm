@@ -223,15 +223,14 @@ def test_install_owns_every_command_it_writes(
         )
 
 
-@pytest.mark.parametrize("surfacing", [float("inf"), float("nan"), 1.7976931348623157e308])
-def test_install_owns_a_command_written_with_a_non_finite_deadline(surfacing: float) -> None:
-    """The writer does not refuse these (#1492), so the reader must not
-    either; the unusable deadline itself is not carried over."""
-    policy = HostRuntimePolicy(
-        use_daemon=True, surfacing_timeout_seconds=surfacing, daemon_timeout_seconds=3.5
-    )
-
-    owned = owned_hook_command(_written("claude", None, policy), "claude")
+@pytest.mark.parametrize(
+    "command",
+    [c for _, c in _RELEASED_LINES if "inf" in c or "nan" in c or "e+308" in c],
+)
+def test_install_owns_a_command_written_with_a_non_finite_deadline(command: str) -> None:
+    """Releases wrote these (#1492), so the reader must keep owning them; the
+    unusable deadline itself is not carried over."""
+    owned = owned_hook_command(command, "claude")
 
     assert owned is not None
     assert owned.settings.surfacing_timeout_seconds is None
@@ -2672,3 +2671,455 @@ def test_plan_install_hands_the_builder_the_owned_handlers_in_file_order(redirec
     assert first.settings.surfacing_timeout_seconds == 7.0
     assert second.launcher == ("memtomem-stm",)
     assert second.settings == PartialHostRuntimePolicy()
+
+
+# ── #1470: owned handlers that disagree are not folded ───────────────────────
+#
+# Claude Code and Codex fold every owned handler into one and carry the first
+# one's settings over, so a later handler with other settings would lose them.
+# Install refuses there instead, unless the CLI sets every setting they differ
+# in, or ``--inherit-runtime-env`` carries none.
+
+_FOLDING = ["claude", "codex"]
+# Distinctive, so a refusal that quoted command text would be caught.
+_SENTINEL_DIR = "/zz-sentinel-1470"
+
+
+def _pinned(
+    host: str,
+    *,
+    daemon_flag: str = "--use-daemon",
+    surfacing: str = "3",
+    daemon: str = "12",
+    persist_flag: str = "--no-persist-query-text",
+    uv: bool = False,
+) -> str:
+    head = f"uv run --directory {_SENTINEL_DIR} " if uv else ""
+    return (
+        f"{head}memtomem-stm hook --host {host} {daemon_flag} --surfacing-timeout-seconds "
+        f"{surfacing} --daemon-timeout-seconds {daemon} {persist_flag}"
+    )
+
+
+def _read_host_file(path: Path, host: str) -> dict:
+    return _parse(path.read_text(encoding="utf-8"), HOOK_HOSTS[host].fmt)
+
+
+def _nested_commands(data: dict) -> list[str]:
+    return [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
+
+
+def _seed_owned(host: str, path: Path, *groups: list[str]) -> str:
+    for group in groups:
+        for command in group:
+            assert owned_hook_command(command, host) is not None, command
+    _seed(path, _claude_groups(*[[_h(c) for c in g] for g in groups]), HOOK_HOSTS[host].fmt)
+    return path.read_text(encoding="utf-8")
+
+
+def _install(host: str, *args: str):
+    return CliRunner().invoke(cli, ["hook", "install", "--host", host, *args])
+
+
+def _assert_refused(result, path: Path, before: str, *names: str) -> None:
+    assert result.exit_code == 1, result.output
+    assert path.read_text(encoding="utf-8") == before
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]  # no backup
+    for name in names:
+        assert name in result.output
+    assert "zz-sentinel" not in result.output
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+@pytest.mark.parametrize("apply_", [True, False])
+def test_install_refuses_owned_handlers_whose_surfacing_differs(
+    host: str, apply_: bool, redirect
+) -> None:
+    path = redirect(host)
+    before = _seed_owned(
+        host,
+        path,
+        [_pinned(host, surfacing="3.25", uv=True), _pinned(host, surfacing="9.75", uv=True)],
+    )
+
+    result = _install(host, *(["--apply"] if apply_ else []))
+
+    _assert_refused(
+        result,
+        path,
+        before,
+        "hooks.PostToolUse[0].hooks[0]",
+        "hooks.PostToolUse[0].hooks[1]",
+        "--surfacing-timeout-seconds",
+    )
+    assert "--daemon-timeout-seconds" not in result.output
+    assert "--use-daemon/--no-daemon" not in result.output
+    # The one option that sets the differing setting is offered.
+    assert "To go on, pass --surfacing-timeout, pass --inherit-runtime-env" in result.output
+    # Neither value is printed.
+    assert "3.25" not in result.output
+    assert "9.75" not in result.output
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_install_refuses_when_only_a_third_owned_handler_differs(host: str, redirect) -> None:
+    path = redirect(host)
+    before = _seed_owned(
+        host,
+        path,
+        [_pinned(host), _pinned(host)],
+        [_pinned(host, persist_flag="--persist-query-text")],
+    )
+
+    _assert_refused(
+        _install(host, "--apply"),
+        path,
+        before,
+        "holds 3 handlers",
+        "hooks.PostToolUse[1].hooks[0]",
+        "--persist-query-text/--no-persist-query-text",
+    )
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+@pytest.mark.parametrize(
+    ("first", "second", "name"),
+    [
+        # The issue's pair, both orders: daemon mode and surfacing differ.
+        ({}, {"daemon_flag": "--no-daemon", "surfacing": "9"}, "--use-daemon/--no-daemon"),
+        ({"daemon_flag": "--no-daemon", "surfacing": "9"}, {}, "--use-daemon/--no-daemon"),
+        (
+            {"persist_flag": "--no-persist-query-text"},
+            {"persist_flag": "--persist-query-text"},
+            "--persist-query-text/--no-persist-query-text",
+        ),
+        ({"daemon": "12"}, {"daemon": "20"}, "--daemon-timeout-seconds"),
+    ],
+)
+def test_install_refuses_owned_handlers_that_differ(
+    host: str, first: dict, second: dict, name: str, redirect
+) -> None:
+    path = redirect(host)
+    before = _seed_owned(host, path, [_pinned(host, **first), _pinned(host, **second)])
+
+    _assert_refused(_install(host, "--apply"), path, before, name)
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_install_refuses_a_flagless_owned_handler_beside_a_pinned_one(host: str, redirect) -> None:
+    """A flagless handler inherits its settings, so it differs from any pin."""
+    path = redirect(host)
+    before = _seed_owned(host, path, [_CMD.format(host=host), _pinned(host)])
+
+    _assert_refused(_install(host, "--apply"), path, before, "--surfacing-timeout-seconds")
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_install_refuses_owned_handlers_in_separate_groups(host: str, redirect) -> None:
+    path = redirect(host)
+    before = _seed_owned(host, path, [_pinned(host)], [_pinned(host, surfacing="9")])
+
+    _assert_refused(
+        _install(host, "--apply"),
+        path,
+        before,
+        "hooks.PostToolUse[0].hooks[0]",
+        "hooks.PostToolUse[1].hooks[0]",
+    )
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_a_derived_daemon_deadline_conflict_survives_a_surfacing_override(
+    host: str, redirect
+) -> None:
+    """Surfacing 9 with daemon 4 runs with a daemon deadline of 10, so the pair
+    also differs in the daemon deadline, which no install flag sets."""
+    path = redirect(host)
+    first = _pinned(host, surfacing="3", daemon="4")
+    second = _pinned(host, surfacing="9", daemon="4")
+    before = _seed_owned(host, path, [first, second])
+
+    result = _install(host, "--surfacing-timeout", "2", "--apply")
+
+    _assert_refused(result, path, before, "--daemon-timeout-seconds")
+    # No option sets the daemon deadline, so none is offered, and the hint
+    # says --inherit-runtime-env replaces the --surfacing-timeout given here
+    # (the two together are a usage error).
+    assert (
+        "To go on, pass --inherit-runtime-env "
+        "(in place of --daemon, --no-daemon and --surfacing-timeout)"
+    ) in result.output
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+@pytest.mark.parametrize(
+    ("second", "args", "expected"),
+    [
+        (
+            {"surfacing": "9"},
+            ["--surfacing-timeout", "2"],
+            PartialHostRuntimePolicy(True, 2.0, 12.0, False),
+        ),
+        (
+            {"daemon_flag": "--no-daemon"},
+            ["--no-daemon"],
+            PartialHostRuntimePolicy(False, 3.0, 12.0, False),
+        ),
+        # Equal settings fold as before.
+        ({}, [], PartialHostRuntimePolicy(True, 3.0, 12.0, False)),
+    ],
+)
+def test_install_folds_owned_handlers_when_the_cli_sets_what_they_differ_in(
+    host: str, second: dict, args: list[str], expected: PartialHostRuntimePolicy, redirect
+) -> None:
+    path = redirect(host)
+    _seed_owned(host, path, [_pinned(host), _pinned(host, **second)])
+
+    result = _install(host, *args, "--apply")
+
+    assert result.exit_code == 0, result.output
+    (command,) = _nested_commands(_read_host_file(path, host))
+    owned = owned_hook_command(command, host)
+    assert owned is not None
+    assert owned.settings == expected
+
+
+@pytest.mark.parametrize("host", _FOLDING)
+def test_inherit_runtime_env_folds_owned_handlers_that_differ(host: str, redirect) -> None:
+    path = redirect(host)
+    _seed_owned(host, path, [_pinned(host, daemon="12"), _pinned(host, daemon="20")])
+
+    refused = _install(host, "--surfacing-timeout", "2", "--daemon", "--apply")
+    assert refused.exit_code == 1, refused.output
+
+    result = _install(host, "--inherit-runtime-env", "--apply")
+
+    assert result.exit_code == 0, result.output
+    (command,) = _nested_commands(_read_host_file(path, host))
+    owned = owned_hook_command(command, host)
+    assert owned is not None
+    assert owned.settings == PartialHostRuntimePolicy()
+
+
+def _cursor_pair(a: str, b: str) -> dict:
+    return {"version": 1, "hooks": {"postToolUse": [{"command": a}, {"command": b}]}}
+
+
+def _kimi_pair(a: str, b: str) -> dict:
+    entries = [{"event": "PostToolUse", "matcher": "Bash", "command": c} for c in (a, b)]
+    return {"hooks": entries}
+
+
+@pytest.mark.parametrize(("host", "pair"), [("cursor", _cursor_pair), ("kimi", _kimi_pair)])
+def test_hosts_that_do_not_fold_keep_owned_handlers_that_differ(host: str, pair, redirect) -> None:
+    path = redirect(host)
+    later = _pinned(host, surfacing="9")
+    _seed(path, pair(_pinned(host), later), HOOK_HOSTS[host].fmt)
+
+    result = _install(host, "--apply")
+
+    assert result.exit_code == 0, result.output
+    data = _read_host_file(path, host)
+    entries = data["hooks"]["postToolUse"] if host == "cursor" else data["hooks"]
+    written = [e["command"] for e in entries]
+    assert len(written) == 2
+    assert written[1] == later
+
+
+def test_plan_install_without_carried_settings_folds_as_before(redirect) -> None:
+    path = redirect("claude")
+    _seed_owned("claude", path, [_pinned("claude"), _pinned("claude", surfacing="9")])
+
+    change = plan_install("claude", _CMD.format(host="claude"))
+
+    assert _nested_commands(json.loads(change.new_text)) == [_CMD.format(host="claude")]
+
+
+def test_plan_install_refuses_a_conflict_before_building_the_command(redirect) -> None:
+    from memtomem_stm.cli.hook_hosts import OwnedSettingsConflict
+
+    path = redirect("claude")
+    _seed_owned("claude", path, [_pinned("claude"), _pinned("claude", surfacing="9")])
+
+    def build(owned: tuple) -> str:
+        raise AssertionError("the command was built before the conflict check")
+
+    with pytest.raises(OwnedSettingsConflict):
+        plan_install("claude", build, carried=frozenset({"surfacing_timeout_seconds"}))
+
+
+@pytest.mark.parametrize("apply_", [True, False])
+def test_a_conflict_is_refused_from_the_one_read(
+    apply_: bool, redirect, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from memtomem_stm.cli import hook_hosts
+
+    path = redirect("claude")
+    before = _seed_owned("claude", path, [_pinned("claude"), _pinned("claude", surfacing="9")])
+    reads: list[Path] = []
+    real = hook_hosts._read_current
+
+    def counting(read_path: Path, fmt: str):
+        reads.append(read_path)
+        return real(read_path, fmt)
+
+    monkeypatch.setattr(hook_hosts, "_read_current", counting)
+
+    result = _install("claude", *(["--apply"] if apply_ else []))
+
+    _assert_refused(result, path, before)
+    assert reads == [path]
+
+
+# ── deadlines the hook command cannot carry (#1492) ──────────────────────────
+#
+# The hook reads each deadline back with ``_parse_positive_float``, which drops
+# anything that is not a positive finite number. Install refuses to write such
+# a deadline instead of writing one the hook would ignore.
+
+_UNWRITABLE_FLAGS = ["inf", "infinity", "1e400", "nan", "1.7976931348623157e308"]
+
+
+def _deadlines(command: str) -> tuple[str, str]:
+    words = shlex.split(command)
+    return (
+        words[words.index("--surfacing-timeout-seconds") + 1],
+        words[words.index("--daemon-timeout-seconds") + 1],
+    )
+
+
+@pytest.mark.parametrize("value", _UNWRITABLE_FLAGS)
+@pytest.mark.parametrize("apply_", [True, False])
+def test_install_refuses_a_surfacing_timeout_the_hook_command_cannot_carry(
+    value: str, apply_: bool, redirect
+) -> None:
+    path = redirect("claude")
+
+    result = _install("claude", "--surfacing-timeout", value, *(["--apply"] if apply_ else []))
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid value for '--surfacing-timeout'" in result.output
+    assert "positive finite number" in result.output
+    assert not path.parent.exists()
+
+
+def test_install_still_writes_a_large_surfacing_timeout_that_reads_back(redirect) -> None:
+    """Positive control for the refusal above: ``1e308`` survives
+    ``format_seconds`` as a finite number, so it is written."""
+    path = redirect("claude")
+
+    result = _install("claude", "--surfacing-timeout", "1e308", "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert _deadlines(_claude_commands(path)[0]) == ("1e+308", "1e+308")
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "field"),
+    [
+        ("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf", "surfacing.timeout_seconds"),
+        ("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "infinity", "surfacing.timeout_seconds"),
+        (
+            "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+            "1.7976931348623157e308",
+            "surfacing.timeout_seconds",
+        ),
+        (
+            "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
+            "1.7976931348623157e308",
+            "hook.daemon_timeout_seconds",
+        ),
+    ],
+)
+@pytest.mark.parametrize("apply_", [True, False])
+def test_install_refuses_a_resolved_deadline_the_hook_command_cannot_carry(
+    variable: str,
+    value: str,
+    field: str,
+    apply_: bool,
+    redirect,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = redirect("claude")
+    # A command without settings, so the deadline resolves from the environment.
+    before = _seed_owned("claude", path, [_CMD.format(host="claude")])
+    before_bytes = path.read_bytes()
+    monkeypatch.setenv(variable, value)
+
+    result = _install("claude", *(["--apply"] if apply_ else []))
+
+    _assert_refused(result, path, before, field, variable, "--inherit-runtime-env")
+    assert path.read_bytes() == before_bytes
+    # It cannot be combined with the runtime options, so it replaces them.
+    assert "--inherit-runtime-env in place of --surfacing-timeout" in result.output
+    # The configured value is not echoed back.
+    assert value not in result.output
+    assert "1.79769313486232e+308" not in result.output
+    if field == "surfacing.timeout_seconds":
+        assert "pass --surfacing-timeout SECONDS" in result.output
+    else:
+        assert f"set {variable} to a smaller value" in result.output
+
+
+def test_a_surfacing_timeout_flag_overrides_an_unwritable_environment_value(
+    redirect, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = redirect("claude")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf")
+
+    result = _install("claude", "--surfacing-timeout", "5", "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert _deadlines(_claude_commands(path)[0]) == ("5", "6")
+
+
+def test_inherit_runtime_env_installs_beside_an_unwritable_environment_value(
+    redirect, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = redirect("claude")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf")
+
+    result = _install("claude", "--inherit-runtime-env", "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert "--surfacing-timeout-seconds" not in _claude_commands(path)[0]
+
+
+# Lines releases wrote before #1492, given such a deadline.
+_UNWRITABLE_RELEASED = [
+    _pinned("claude", surfacing="inf", daemon="inf"),
+    _pinned("claude", surfacing="nan", daemon="3.5"),
+    _pinned("claude", surfacing="1.79769313486232e+308", daemon="1.79769313486232e+308"),
+]
+
+
+@pytest.mark.parametrize("command", _UNWRITABLE_RELEASED)
+def test_reinstall_replaces_a_deadline_the_hook_ignored(command: str, redirect) -> None:
+    path = redirect("claude")
+    _seed_owned("claude", path, [command])
+
+    result = _install("claude", "--apply")
+
+    assert result.exit_code == 0, result.output
+    commands = _claude_commands(path)
+    assert len(commands) == 1
+    # The unusable deadline is not carried over: the defaults are written.
+    assert _deadlines(commands[0]) == ("3", "4")
+    assert " hook --host claude --use-daemon " in commands[0]
+
+    removed = CliRunner().invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+    assert removed.exit_code == 0, removed.output
+    assert json.loads(path.read_text()) == {}
+
+
+@pytest.mark.parametrize("command", _UNWRITABLE_RELEASED)
+def test_uninstall_removes_a_line_written_with_a_deadline_the_hook_ignored(
+    command: str, redirect
+) -> None:
+    path = redirect("claude")
+    _seed_owned("claude", path, [command])
+
+    result = CliRunner().invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(path.read_text()) == {}

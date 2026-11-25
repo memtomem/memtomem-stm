@@ -1072,7 +1072,9 @@ Options:
   --apply                         Write the change (default: dry-run preview).
                                   Backs up any prior file to <path>.bak
                                   (.bak.1, … if one already exists).
-  --surfacing-timeout SECONDS     Pin the LTM search deadline. [x>0.0]
+  --surfacing-timeout SECONDS     Pin the LTM search deadline in the installed
+                                  hook command. A positive, finite number that
+                                  stays finite when written there.  [x>0.0]
   --daemon                        Install an explicit shared-daemon route.
   --no-daemon                     Install an explicit cold/in-process route.
   --inherit-runtime-env           Do not serialize daemon, timeout, or query-
@@ -1109,11 +1111,45 @@ of adding another. Install keeps the daemon, timeout and query-text settings
 of the handler it updates. They are read from its setting words the way
 `mms hook` applies them: a deadline that is not a positive finite number is
 not kept, and the daemon deadline is at least one second above a usable
-surfacing deadline. No setting is read from any other handler, or from an
-environment prefix. Claude Code and Codex also fold any further handlers
-install owns into it; Cursor and Kimi update the first one and leave the rest
-as they are. `uninstall` removes every handler install owns, prunes the
-emptied containers, and leaves other hooks untouched.
+surfacing deadline. No setting is read from an environment prefix, or from a
+handler install does not own. Claude Code and Codex also fold any further
+handlers install owns into the one it updates; Cursor and Kimi update the
+first one and leave the rest as they are.
+
+Before Claude Code or Codex folds two or more owned handlers, install reads
+the settings of each, the same way, and compares them, before the new
+command is built. When they differ in a setting install would carry over
+from the first one, install refuses: it exits non-zero, with or without
+`--apply`, and leaves the config as it was with no backup (an `--apply` can
+still create the hook-host lock file). The error names the handlers'
+locations and the settings they differ in, never their values. A setting an
+option sets is not carried over, so `--daemon` / `--no-daemon` and
+`--surfacing-timeout` resolve a difference in that setting; the daemon
+deadline and query-text settings have no such option. Because the daemon
+deadline is read as at least one second above the surfacing deadline, two
+handlers that differ only in surfacing deadline can differ in daemon
+deadline too. A handler without setting words, which 0.1.29–0.1.38 and
+`--inherit-runtime-env` write, inherits every setting, so it differs from
+any handler with them even when the values in effect would match.
+`--inherit-runtime-env` carries nothing over: it folds them into one handler
+without setting words. Otherwise, remove all but one handler by hand and
+re-run.
+
+Install writes a deadline only when the hook will keep it: written the way
+install writes it, it must read back as a positive finite number. A
+`--surfacing-timeout` that does not (`inf`, `nan`, or a value so large that
+its 15-digit spelling reads back as infinity, such as
+`1.7976931348623157e308`) is a usage error. A deadline resolved from STM's
+configuration that does not (`MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=inf`,
+or such a large `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS`) stops install the
+same way a conflict does: non-zero exit, config left as it was, no backup.
+The error names the setting and its variable, never the value, and offers
+`--surfacing-timeout` (for the surfacing deadline) or `--inherit-runtime-env`.
+A handler releases wrote with such a deadline is still install's own; its
+deadline is not carried over, so re-installing replaces it.
+
+`uninstall` removes every handler install owns, prunes the emptied
+containers, and leaves other hooks untouched.
 
 A handler that looks like STM's hook but is not install's, such as
 `mms hook --host claude` or `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms
@@ -1207,6 +1243,31 @@ that the lock could not be checked), `starting` (no handshake yet, lock held),
 to be free before it starts a replacement, and exits 1 without starting one if
 the lock is still held ("previous daemon still shutting down") or could not be
 checked ("could not check the previous daemon's lock").
+
+`start`, `stop`, `status` and `restart` accept `--hook-command claude`, which
+builds the daemon's configuration the way the STM hook command that
+`mms hook install --host claude` wrote in Claude Code's user settings does.
+The hook sets the variables its options name (`--surfacing-timeout-seconds`,
+`--[no-]persist-query-text`, …) in its environment before it builds, and a
+daemon it spawns inherits them. Two of them enter the daemon's fingerprint,
+so a bare command run from a shell can address a daemon other than the hook's
+(a default install writes `--no-persist-query-text`). With the option, the
+command sets the same variables the same way for its run. So when `mms doctor`
+takes the hook's daemon route for that command, the option acts on the daemon
+doctor probed, and doctor names it in its advice for that daemon. `status` then
+reports whether the hook uses the daemon from the command's
+`--use-daemon`/`--no-daemon` when it has one, since the hook routes on that
+flag. No message of such a run suggests `stop --all`, which targets every
+accepting daemon under `data_dir`, the hook's own included: `status` lists
+daemons under other configurations without the cleanup hint, and `stop` names
+no `stop --all` way out of an unusable discovery key. The command
+exits 1 without acting when the settings hold no STM hook command that install
+owns, more than one, or one that may run the hook but could not be read, when
+the settings cannot be read, and on Windows, where hook commands are not read.
+Everything else still comes from the shell's environment: when Claude Code
+runs the hook with a different environment or working directory, or a
+`uv run --directory` launcher selects another STM version, the hook can use a
+different daemon.
 
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. `mms daemon status` lists every live

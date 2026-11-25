@@ -1030,22 +1030,27 @@ _OUTCOME_CASES = pytest.mark.parametrize(
 )
 
 
-def test_daemon_start_stays_bare_with_a_hook_command(home, proxy_file, monkeypatch, tmp_path):
+HOOKED = "--hook-command claude"
+
+
+def test_daemon_advice_names_the_hook_command(home, proxy_file, monkeypatch, tmp_path):
     # The command's options change the fingerprint here (a default install
-    # writes --no-persist-query-text), but no runnable daemon command for the
-    # hook's configuration can be stated from doctor's side: the advice keeps
-    # main's bare commands (#1505).
+    # writes --no-persist-query-text), so the bare commands, which build from
+    # the shell's environment alone, would address another daemon (#1515).
     _settings(home, _cmd(_installed(surfacing=7.25)))
     _install(monkeypatch, LiveDaemons())
 
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
 
-    assert checks["ltm_measurement"]["next_action"] == "mms daemon start"
-    assert checks["ltm"]["next_action"] == "mms daemon status"
+    assert checks["ltm_measurement"]["next_action"] == f"mms daemon start {HOOKED}"
+    assert checks["ltm"]["next_action"] == f"mms daemon status {HOOKED}"
+    assert checks["ltm"]["detail"].startswith(
+        f"shared daemon is not reachable; run `mms daemon status {HOOKED}`"
+    ), checks["ltm"]
 
 
 @_OUTCOME_CASES
-def test_outcome_advice_stays_bare_with_a_hook_command(
+def test_outcome_advice_names_the_hook_command(
     home, proxy_file, monkeypatch, tmp_path, reply, subcommand
 ):
     _settings(home, _cmd(_installed()))
@@ -1053,7 +1058,149 @@ def test_outcome_advice_stays_bare_with_a_hook_command(
 
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
 
-    assert checks["surfacing_outcomes"]["next_action"] == f"mms daemon {subcommand}"
+    assert checks["surfacing_outcomes"]["next_action"] == f"mms daemon {subcommand} {HOOKED}"
+
+
+@pytest.mark.parametrize("case", ["no-command", "several", "standalone"])
+def test_daemon_advice_stays_bare_without_one_hook_command(
+    home, proxy_file, monkeypatch, tmp_path, case
+):
+    # Without exactly one command doctor builds from its environment alone,
+    # which is what the bare command builds; a --no-daemon command sends it
+    # to the standalone route, whose daemon is not the hook's (#1504).
+    if case == "several":
+        _settings(home, _cmd(_installed()), _cmd(_installed()))
+    elif case == "standalone":
+        _settings(home, _cmd(_installed(use_daemon=False)))
+        monkeypatch.setenv(STANDALONE_GATE, "true")
+    _install(monkeypatch, LiveDaemons())
+
+    checks, output = _doctor_cli(
+        monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm"
+    )
+
+    assert checks["ltm_measurement"]["next_action"] == "mms daemon start"
+    assert checks["ltm"]["next_action"] == "mms daemon status"
+    assert HOOKED not in output
+
+
+def test_an_advice_failure_keeps_the_hook_command_in_every_row(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # The probe's own text and the rows' actions read the same decision.
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("advice inputs unreadable")
+
+    _settings(home, _cmd(_installed()))
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setattr(proxy_mod, "_hook_advice", broken)
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert checks["ltm"]["next_action"] == f"mms daemon status {HOOKED}"
+    assert f"run `mms daemon status {HOOKED}`" in checks["ltm"]["detail"]
+
+
+@pytest.mark.parametrize("route", ["hook", "standalone"])
+def test_an_unusable_discovery_key_names_the_matching_status_command(
+    home, proxy_file, monkeypatch, tmp_path, route
+):
+    from memtomem_stm.daemon import discovery
+
+    data_dir = Path(os.environ["MEMTOMEM_STM_DATA_DIR"])
+    data_dir.mkdir(parents=True, exist_ok=True)
+    discovery.discovery_key_path(data_dir).write_bytes(b"not a key\n")
+    if route == "hook":
+        _settings(home, _cmd(_installed()))
+        expected = f"mms daemon status {HOOKED}"
+    else:
+        _settings(home, _cmd(_installed(use_daemon=False)))
+        monkeypatch.setenv(STANDALONE_GATE, "true")
+        expected = "mms daemon status"
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert checks["ltm"]["next_action"] == expected
+    assert checks["ltm"]["detail"].startswith(
+        "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
+        f"(LocalKeyError); run `{expected}`"
+    ), checks["ltm"]
+
+
+_KEY_MEASUREMENT_DETAIL = (
+    "--measure-ltm result unavailable: the daemon discovery key cannot be used "
+    "(see the ltm server row)"
+)
+
+
+@pytest.mark.parametrize("route", ["hook", "standalone"])
+def test_an_unusable_discovery_key_keeps_the_measurement_row_off_daemon_start(
+    home, proxy_file, monkeypatch, tmp_path, route
+):
+    # ``mms daemon start`` reads the same key and exits on it, so the row
+    # names the status command the ltm server row names (#1519).
+    from memtomem_stm.daemon import discovery
+
+    data_dir = Path(os.environ["MEMTOMEM_STM_DATA_DIR"])
+    data_dir.mkdir(parents=True, exist_ok=True)
+    discovery.discovery_key_path(data_dir).write_bytes(b"not a key\n")
+    if route == "hook":
+        _settings(home, _cmd(_installed()))
+        expected = f"mms daemon status {HOOKED}"
+    else:
+        _settings(home, _cmd(_installed(use_daemon=False)))
+        monkeypatch.setenv(STANDALONE_GATE, "true")
+        expected = "mms daemon status"
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
+
+    row = checks["ltm_measurement"]
+    assert (row["status"], row["detail"], row["next_action"]) == (
+        "WARN",
+        _KEY_MEASUREMENT_DETAIL,
+        expected,
+    ), row
+    assert checks["ltm"]["next_action"] == expected
+
+
+def test_a_key_failure_after_the_samples_is_not_reported_as_a_measurement_that_never_ran(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # The first ping answers warm and every sample completes; the key fails
+    # only at the refresh ping, and the samples' result is discarded with it.
+    from memtomem_stm.utils.local_key import LocalKeyError
+
+    pings: list[int] = []
+    samples: list[str] = []
+
+    async def ping(config: STMConfig, *, timeout: float = 2.0, **_: Any) -> Any:
+        pings.append(1)
+        if len(pings) > 1:
+            raise LocalKeyError("cannot read the key file /cnryKeyPath/stm-discovery.key")
+        return {"ltm": "warm", "pid": 1, "port": 2}
+
+    async def ltm_request(config: STMConfig, op: str, payload: Any, **_: Any) -> Any:
+        samples.append(op)
+        return "ok", {"ok": True, "outcome": "ok"}
+
+    _settings(home, _cmd(_installed()))
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", ping)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ltm_request", ltm_request)
+
+    checks, output = _doctor_cli(
+        monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm"
+    )
+
+    assert len(samples) == 5 and len(pings) == 2, (samples, pings)
+    row = checks["ltm_measurement"]
+    assert (row["status"], row["detail"], row["next_action"]) == (
+        "WARN",
+        _KEY_MEASUREMENT_DETAIL,
+        f"mms daemon status {HOOKED}",
+    ), row
+    assert "cnryKeyPath" not in output
 
 
 def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, tmp_path):

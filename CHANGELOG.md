@@ -27,8 +27,59 @@ changes inline only. See the deprecation policy in
   row's text changes; an invalid ambient value one of the command's four
   options overrides is still a WARN, now attributed to `mms daemon start`
   rather than to the hook; and a hook build that only the command's options
-  break (such as #1508's extreme deadline) now WARNs where the row passed. Without such a command (none,
-  several, unreadable, Windows, or a settings error) the row is unchanged.
+  break (such as #1508's extreme deadline) now WARNs where the row passed.
+  Without such a command (none, several, unreadable, Windows, or a settings
+  error) the row is unchanged.
+- `mms doctor --measure-ltm` no longer advises `mms daemon start` when the
+  daemon discovery key (`stm-discovery.key` under `data_dir`) cannot be used
+  (#1520, issue #1519). `start` reads the same key and exits 1 on it. The
+  `ltm measurement` row read the key error as a daemon that was not running.
+  **Behavior change**: with an unusable key, that row's detail is
+  `--measure-ltm result unavailable: the daemon discovery key cannot be used
+  (see the ltm server row)` and its next action is the command the
+  `ltm server` row names: `mms daemon status`, or `mms daemon status
+  --hook-command claude` when doctor reads exactly one STM hook command and
+  takes the hook's daemon route. On the daemon route, `surfacing.ltm_server`
+  in `doctor --json` and `health --json` gains a `discovery_key_unusable`
+  field, `true` only for this case.
+- `mms hook install` no longer drops the runtime settings of a second hook
+  handler it manages in Claude Code or Codex (issue #1470). Install merges every
+  handler it owns there into one and carried the settings of the first one
+  over, so a later handler's daemon mode, deadlines or query-text setting were
+  replaced with nothing said. **Behavior change**: when two or more owned
+  handlers differ in a setting install would carry over, install now exits
+  non-zero, with or without `--apply`, leaves the host config unchanged and
+  makes no backup.
+  The error names the handlers' locations and the settings they differ in.
+  `--daemon` / `--no-daemon` and `--surfacing-timeout` resolve a difference in
+  their own setting (a surfacing difference can also be a daemon-deadline
+  difference, which no option sets), `--inherit-runtime-env` writes one
+  handler without settings, and removing all but one handler by hand works
+  for any case. A handler without setting words (what 0.1.29–0.1.38 and
+  `--inherit-runtime-env` write) differs from one with them. Cursor and Kimi
+  keep the further handlers as they are and are unchanged.
+- `mms doctor`'s `mms daemon start` / `status` / `restart` advice for the
+  hook's daemon now names a command that acts on that daemon (#1515). Since
+  #1494 doctor looks the hook's daemon up with the registered Claude Code hook
+  command's options laid over its environment, and two of them enter the
+  daemon fingerprint, so the bare commands, which build from the shell's
+  environment alone, could address another daemon (a default install writes
+  `--no-persist-query-text`). `mms daemon start`, `stop`, `status` and
+  `restart` accept a new `--hook-command claude`: it reads the STM hook command
+  `mms hook install --host claude` wrote, sets the variables its options name
+  in the command's environment as the hook does (a daemon it starts inherits
+  them), and exits 1 when there is not exactly one such command, or on
+  Windows. The hints those subcommands print during such a run name the option
+  too, and none suggests `stop --all`, which targets every daemon under
+  `data_dir`, the hook's own included.
+  **Behavior change**: when doctor reads exactly one such command and
+  takes the hook's daemon route, the next action of the `ltm server` (`ltm`),
+  `ltm measurement` and `surfacing outcomes` rows, and the `ltm` row's
+  "run `mms daemon status`" detail, name `mms daemon <subcommand>
+  --hook-command claude`. Known limit: doctor and the option both build from
+  the shell's environment plus the command's options; a hook Claude Code runs
+  with a different environment, working directory or STM version can still
+  use another daemon.
 - `mms doctor` now applies the registered hook command's flag words to its
   own environment the way the hook does (#1512, issue #1508). 0.7.11's doctor
   parsed the words into settings and formatted those back, and the round
