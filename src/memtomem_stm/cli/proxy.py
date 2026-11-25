@@ -10486,20 +10486,6 @@ class _HookAdvice:
     command_deadlines: frozenset[str]
 
 
-def _overlay_value_wins(name: str, overlay: Mapping[str, str]) -> bool:
-    """Whether *name*'s overlay value is the one the build reads.
-
-    Mirrors ``config._overlaid_env_vars``: the overlay replaces the same
-    spelling in place or comes last, and names fold to lower case, so a later
-    case-equivalent spelling in the environment wins instead (#1503).
-    """
-    winner = None
-    for key in {**os.environ, **overlay}:
-        if key.lower() == name.lower():
-            winner = key
-    return winner == name
-
-
 def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _HookAdvice | None:
     """Doctor's advice inputs for a ``found`` view, else ``None``."""
     if view.state != "found":
@@ -10511,8 +10497,13 @@ def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _Ho
             _HOOK_DAEMON_TIMEOUT_ENV: float(built.hook.daemon_timeout_seconds),
         }
         for name, value in effective.items():
+            # Every flat spelling carries the overlay's value
+            # (``config.hook_flag_assignments``), so an equal value is the
+            # command's. A case variant of the field in the block's JSON, or a
+            # ``null`` block, can still set the build's deadline to the same
+            # number; that limit of #1503 is not checked here.
             raw = view.env.get(name)
-            if raw is None or not _overlay_value_wins(name, view.env):
+            if raw is None:
                 continue
             try:
                 if float(raw) == value:
@@ -10625,6 +10616,7 @@ def _env_overrides_found_row(
     which clause to act on and, for the hook's build, to rerun doctor. Names
     the handler by location and path, never its command text or values.
     """
+    from memtomem_stm.config import hook_flag_environ
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
     def classify(outcome: EnvSTMConfigLoad | Exception) -> tuple[str, Exception | None]:
@@ -10636,12 +10628,12 @@ def _env_overrides_found_row(
 
     hook_kind, hook_exc = classify(hook_outcome)
     bare_kind, bare_exc = classify(bare_outcome)
-    # Each build's hint reads the environment that build read: the overlay
-    # replaces in place or comes last, as ``config._overlaid_env_vars`` merges.
+    # Each build's hint reads the environment that build read, each variable
+    # the command sets named as it sets it (#1503).
     hook_hint = (
         ""
         if hook_exc is None
-        else env_var_hint_for_validation_error(hook_exc, {**os.environ, **view.env})
+        else env_var_hint_for_validation_error(hook_exc, hook_flag_environ(os.environ, view.env))
     )
     bare_hint = "" if bare_exc is None else env_var_hint_for_validation_error(bare_exc)
     hook_says = {

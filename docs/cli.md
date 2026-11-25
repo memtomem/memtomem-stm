@@ -1037,6 +1037,15 @@ instead, in any form the settings read (`MEMTOMEM_STM_HOOK__USE_DAEMON=0`, or
 `use_daemon` in `MEMTOMEM_STM_HOOK`). The daemon choice, both deadlines and query-text persistence
 can also arrive as the runtime flags `install` writes into the host command;
 see [the hook CLI reference](reference/cli-hooks.md#mms-hook) for the list.
+The hook applies each flag by setting its variable, and every other spelling
+of that name already in its environment, to the flag's value for the call,
+so a lower-case spelling such as `memtomem_stm_surfacing__timeout_seconds`
+does not outrank the flag. The settings build has two known limits: the
+field repeated under another letter case in the block's JSON
+(`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`)
+and a `null` block (`MEMTOMEM_STM_SURFACING=null`) still outrank the flag's
+variable there. The route is not affected: an explicit `--use-daemon` or
+`--no-daemon` decides it directly.
 
 ### `install` / `uninstall` — per-host registration
 

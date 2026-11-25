@@ -13,6 +13,23 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- A runtime flag of the `mms hook` command (`--surfacing-timeout-seconds`,
+  `--daemon-timeout-seconds`, `--[no-]persist-query-text`, `--use-daemon` /
+  `--no-daemon`) is no longer outranked by another letter-case spelling of
+  its variable later in the environment (issue #1503), such as
+  `memtomem_stm_surfacing__persist_query_text=true` against
+  `--no-persist-query-text`. The hook now sets every spelling of the name to
+  the flag's value for the call and restores each in place afterwards; a
+  daemon it spawns inherits that environment, and `mms daemon …
+  --hook-command claude` and `mms doctor`'s build of the hook's configuration
+  read the same values. **Behavior change**: where such a spelling outranked
+  a flag, the hook, the daemon it spawns and doctor now use the flag's value,
+  and doctor's timeout advice names the command's flag instead of an export.
+  Not covered: a case variant of the field in the block's JSON
+  (`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`)
+  and a `null` block, which can still outrank a flag; when one of them sets
+  a deadline to the flag's own value, doctor's timeout advice still names
+  the flag.
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
   #1506). When doctor reads exactly one STM hook command `mms hook install`

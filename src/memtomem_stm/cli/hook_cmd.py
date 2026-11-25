@@ -748,9 +748,9 @@ async def _run_hook(
     The route is ``hook.use_daemon`` as the settings read it, in any form they
     accept (#1495), unless *use_daemon* carries the hook command's explicit
     ``--use-daemon``/``--no-daemon``. That flag reaches the settings only
-    through one variable of an environment overlay, which a case-equivalent
-    spelling elsewhere in the environment can outrank, so it decides here
-    directly.
+    through one variable of an environment overlay, which a case variant of
+    the field in the block's JSON (``MEMTOMEM_STM_HOOK``) can still outrank,
+    so it decides here directly.
     """
     if not _hook_eligible(call):
         return {}
@@ -1048,9 +1048,17 @@ def _runtime_registration_env(overrides: dict[str, str]) -> Iterator[None]:
     therefore keeps both consumers aligned without adding a second config path.
     Restoring every value matters for ``CliRunner`` and embedders that invoke
     multiple commands in one Python process.
+
+    Every spelling of each variable already in the environment is assigned
+    the command's value too (``config.hook_flag_assignments``), so a later
+    case-variant spelling cannot outrank it (#1503). Assigning an existing
+    name keeps its place in the environment, and so does restoring it.
     """
-    previous = {key: os.environ.get(key) for key in overrides}
-    os.environ.update(overrides)
+    from memtomem_stm.config import hook_flag_assignments
+
+    assignments = hook_flag_assignments(os.environ, overrides)
+    previous = {key: os.environ.get(key) for key in assignments}
+    os.environ.update(assignments)
     try:
         yield
     finally:

@@ -391,17 +391,14 @@ def test_a_use_daemon_flag_turns_the_route_on_over_an_ambient_opt_out(home, monk
     assert status["hook_view"]["hook_route"] is True
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Windows folds environment names itself")
 def test_the_commands_daemon_flag_decides_over_the_build(home, monkeypatch):
-    # #1501: the hook routes on its command's flag directly, because a later
-    # spelling of the variable can outrank the overlay in the build. Here the
-    # build reads ``hook.use_daemon`` false, and the ``--use-daemon`` command
-    # still routes through the daemon.
-    lower = HOOK_GATE.lower()
+    # #1501: the hook routes on its command's flag directly, because the
+    # build can read the opposite: a case variant of the field in the block's
+    # JSON still outranks the flat variable the overlay sets (#1503 covers
+    # flat spellings only). Here the build reads ``hook.use_daemon`` false,
+    # and the ``--use-daemon`` command still routes through the daemon.
     monkeypatch.delenv(HOOK_GATE, raising=False)
-    monkeypatch.delenv(lower, raising=False)
-    monkeypatch.setenv(HOOK_GATE, "false")
-    monkeypatch.setenv(lower, "false")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": true, "USE_DAEMON": false}')
     _settings(home, _cmd(_installed()))
     assert load_env_stm_config({HOOK_GATE: "true"}).config.hook.use_daemon is False
     hook_fp = _installed_fp(monkeypatch)
@@ -829,30 +826,31 @@ def test_the_overlay_names_are_the_ones_the_hook_sets():
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows folds environment names itself")
 @pytest.mark.parametrize("later", ["true", "not-a-bool"])
-def test_a_later_spelling_of_the_name_wins_as_it_does_for_the_hook(monkeypatch, later):
-    # POSIX keeps both spellings; pydantic folds names to lower case and the later
-    # one wins. The hook sets the variable in place, so its flag loses to a later
-    # spelling, and doctor must build what the hook builds.
+def test_a_later_spelling_of_the_name_does_not_outrank_the_command(monkeypatch, later):
+    # POSIX keeps both spellings; pydantic folds names to lower case and the
+    # later one wins the fold. The hook gives every spelling the command's
+    # value (#1503), so neither a valid nor an invalid later spelling is read,
+    # and doctor builds what the hook builds.
+    from memtomem_stm.cli.hook_cmd import _runtime_registration_env
+
     lower = PERSIST.lower()
     monkeypatch.delenv(PERSIST, raising=False)
     monkeypatch.delenv(lower, raising=False)
     monkeypatch.setenv(PERSIST, "true")
     monkeypatch.setenv(lower, later)
     assert [k for k in os.environ if k.lower() == lower] == [PERSIST, lower]
-
-    def hook_build() -> Any:
-        with monkeypatch.context() as patch:
-            patch.setenv(PERSIST, "false")  # in place, as the hook sets it
-            return STMConfig()
-
+    # Positive control: without the command, the later spelling is read.
     if later == "true":
-        assert load_env_stm_config({PERSIST: "false"}).config.surfacing.persist_query_text is True
-        assert hook_build().surfacing.persist_query_text is True
+        assert STMConfig().surfacing.persist_query_text is True
     else:
         with pytest.raises(ValidationError):
-            load_env_stm_config({PERSIST: "false"})
-        with pytest.raises(ValidationError):
-            hook_build()
+            STMConfig()
+
+    with _runtime_registration_env({PERSIST: "false"}):
+        hook_build = STMConfig()
+
+    assert hook_build.surfacing.persist_query_text is False
+    assert load_env_stm_config({PERSIST: "false"}).config.surfacing.persist_query_text is False
 
 
 # --- nothing from the command reaches output ----------------------------------
@@ -1203,8 +1201,21 @@ def test_a_key_failure_after_the_samples_is_not_reported_as_a_measurement_that_n
     assert "cnryKeyPath" not in output
 
 
-def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, tmp_path):
+_POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows folds environment names itself"
+)
+
+
+@pytest.mark.parametrize("case", ["plain", pytest.param("later-spellings", marks=_POSIX_ONLY)])
+def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, tmp_path, case):
     _settings(home, _cmd(_installed(surfacing=3.0)))
+    if case == "later-spellings":
+        # A later lower-case spelling, with another value, no longer outranks
+        # the command's variable (#1503): the command still sets the deadline.
+        monkeypatch.setenv(SURFACING_TIMEOUT, "1")
+        monkeypatch.setenv(SURFACING_TIMEOUT.lower(), "2")
+        monkeypatch.setenv(DAEMON_TIMEOUT, "1")
+        monkeypatch.setenv(DAEMON_TIMEOUT.lower(), "2")
     _install(monkeypatch, AnswerEveryDaemon(_telemetry()))
 
     checks, output = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
@@ -1222,30 +1233,13 @@ def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, 
     assert "_hook_advice" not in output
 
 
-_POSIX_ONLY = pytest.mark.skipif(
-    sys.platform == "win32", reason="Windows folds environment names itself"
-)
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["no-hook-command", "standalone-fallback", pytest.param("shadowed", marks=_POSIX_ONLY)],
-)
+@pytest.mark.parametrize("case", ["no-hook-command", "standalone-fallback"])
 def test_timeout_advice_keeps_the_export_when_the_command_does_not_set_it(
     home, proxy_file, monkeypatch, tmp_path, case
 ):
     if case == "standalone-fallback":
         _settings(home, _cmd(_installed(use_daemon=False, surfacing=3.0)))
         monkeypatch.setenv(STANDALONE_GATE, "1")
-    elif case == "shadowed":
-        # A later lower-case spelling wins the fold over the command's variable
-        # (#1503), here with the command's own value: equal values alone would
-        # wrongly credit the command.
-        _settings(home, _cmd(_installed(surfacing=3.0, daemon=4.0)))
-        monkeypatch.setenv(SURFACING_TIMEOUT, "1")
-        monkeypatch.setenv(SURFACING_TIMEOUT.lower(), "3")
-        monkeypatch.setenv(DAEMON_TIMEOUT, "1")
-        monkeypatch.setenv(DAEMON_TIMEOUT.lower(), "4")
     else:
         monkeypatch.setenv(SURFACING_TIMEOUT, "3")
     _install(monkeypatch, AnswerEveryDaemon(_telemetry()))
