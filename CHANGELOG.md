@@ -13,6 +13,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The `max_upstream_chars` guard no longer reports an oversized payload when
+  no text was cut (issue #1530). A text block that exactly filled the cap
+  followed by an empty text block used to get the "response truncated …
+  upstream returned an oversized payload" notice appended to the joined
+  text, and a truncation warning in the log; the guard now fires only when
+  a block with text loses some or all of it. **Behavior change**: such a
+  reply is now delivered without that notice and no longer logs the
+  warning; a reply that really is cut is unchanged. A cache hit can still
+  serve a notice stored earlier while that entry stays valid.
+
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
   #1506). When doctor reads exactly one STM hook command `mms hook install`
