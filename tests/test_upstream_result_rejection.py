@@ -1,4 +1,4 @@
-"""An upstream reply the MCP SDK rejects is the upstream's protocol error, not STM's bug.
+"""An upstream reply the MCP SDK rejects is recorded as ``protocol``, not as STM's bug.
 
 ``ClientSession.call_tool`` validates the reply before STM sees it. A reply outside
 the negotiated schema raises ``pydantic.ValidationError``; on a 2026-07-28

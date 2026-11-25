@@ -877,8 +877,13 @@ _REJECTED_RESULT_RUNTIME_SUFFIX = " has an output schema but did not return stru
 def _is_upstream_result_rejection(exc: BaseException) -> bool:
     """Whether ``exc`` is the SDK refusing the upstream's ``tools/call`` reply.
 
-    Such a failure is the upstream breaking the protocol, not an STM bug. The
-    match is on the SDK's own titles and messages, so an SDK release that
+    Such a failure is not an STM bug, so it is recorded as ``protocol``: the
+    category for results the SDK rejects. Most break the protocol or the
+    tool's own ``outputSchema``; an ``InputRequiredResult`` is valid on a
+    2026-07-28 connection, and is rejected only because STM cannot relay it
+    and leaves ``allow_input_required`` off.
+
+    The match is on the SDK's own titles and messages, so an SDK release that
     rewords them makes this return ``False`` and the call keeps the
     ``programming`` category it had before; the tests built from the real SDK
     then fail.
@@ -6560,9 +6565,10 @@ class ProxyManager:
                     raise
                 if _is_upstream_result_rejection(exc):
                     # The upstream replied with a result the SDK rejects for
-                    # this connection. It is the upstream's protocol error, not
-                    # ours. Replaying would fetch the same reply, and the
-                    # connection itself is fine, so no retry and no reconnect.
+                    # this connection, which is not an STM bug (see
+                    # ``_is_upstream_result_rejection``). Replaying would
+                    # fetch the same reply, and the connection itself is
+                    # fine, so no retry and no reconnect.
                     # The round trip completed, which closes the breaker as
                     # the oversize branch above does.
                     self.tracker.record_error(
