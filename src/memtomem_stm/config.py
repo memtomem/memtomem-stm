@@ -827,30 +827,6 @@ A context variable, not ``os.environ``: a build running in another context
 it, and the scope resets it on every exit, a raising build included."""
 
 
-def hook_flag_assignments(environ: Mapping[str, str], overlay: Mapping[str, str]) -> dict[str, str]:
-    """The assignments that make *overlay*'s values the ones a build reads.
-
-    Settings fold names to lower case, so the last spelling of a name in the
-    environment wins, and POSIX allows both ``MEMTOMEM_STM_X`` and
-    ``memtomem_stm_x``. Each *overlay* name is therefore assigned together
-    with every other spelling of it already in *environ*, all to its value:
-    whichever spelling the fold keeps, it carries the command's value (#1503).
-    On Windows the environment folds names itself, so there is only one.
-
-    Only flat spellings are covered. A field of the block's JSON
-    (``MEMTOMEM_STM_SURFACING='{"…": …}'``) repeated in another letter case,
-    or a ``null`` block, can still outrank the flat variable.
-    """
-    assignments: dict[str, str] = {}
-    for name, value in overlay.items():
-        folded = name.lower()
-        for existing in environ:
-            if existing.lower() == folded:
-                assignments[existing] = value
-        assignments[name] = value
-    return assignments
-
-
 def hook_flag_environ(environ: Mapping[str, str], overlay: Mapping[str, str]) -> dict[str, str]:
     """*environ* as a build under *overlay* reads it, each variable *overlay*
     sets named as it sets it: the other spellings carry the same value and
@@ -866,7 +842,7 @@ def _overlaid_env_vars(
     env_settings: EnvSettingsSource, overlay: Mapping[str, str]
 ) -> dict[str, str | None]:
     """``env_settings.env_vars`` with *overlay*'s values, as the hook's own
-    overlay leaves the environment (:func:`hook_flag_assignments`): every
+    overlay leaves the environment (``host_runtime.hook_flag_assignments``): every
     spelling of each name carries the overlay's value, so its folded name
     does. Only those entries change, so a snapshot a subclass filtered (the
     proxy retry) stays filtered. Values pass through unparsed: ``STMConfig``

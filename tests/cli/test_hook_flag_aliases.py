@@ -155,14 +155,21 @@ def test_a_collision_beside_an_invalid_proxy_variable_still_degrades(monkeypatch
         assert load.config.surfacing.persist_query_text is False
 
 
-def test_an_empty_overlay_imports_no_settings():
-    """A hook command without flags must not pay for the settings stack before
-    it reads its payload (#1503 review: about 2 ms against 60 ms)."""
+@pytest.mark.parametrize(
+    "overlay",
+    [{}, {name: value for name, value, *_ in _FLAGS}],
+    ids=["no-flags", "installed-flags"],
+)
+def test_the_overlay_imports_no_settings(overlay):
+    """The hook enters the overlay before it reads its payload, and an empty
+    or malformed one needs no settings, so the overlay must not pay for the
+    settings stack (#1503 review: about 2 ms against 60 ms). ``mms hook
+    install`` writes all four flags, so both shapes are the common path."""
     code = (
         "import sys\n"
         "from memtomem_stm.cli.hook_cmd import _runtime_registration_env\n"
         "assert 'memtomem_stm.config' not in sys.modules\n"
-        "with _runtime_registration_env({}):\n"
+        f"with _runtime_registration_env({overlay!r}):\n"
         "    pass\n"
         "print('memtomem_stm.config' in sys.modules)\n"
     )

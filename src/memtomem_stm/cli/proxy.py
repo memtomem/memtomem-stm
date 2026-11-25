@@ -10498,7 +10498,7 @@ def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _Ho
         }
         for name, value in effective.items():
             # Every flat spelling carries the overlay's value
-            # (``config.hook_flag_assignments``), so an equal value is the
+            # (``host_runtime.hook_flag_assignments``), so an equal value is the
             # command's. A case variant of the field in the block's JSON, or a
             # ``null`` block, can still set the build's deadline to the same
             # number; that limit of #1503 is not checked here.

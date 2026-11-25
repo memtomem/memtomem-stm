@@ -113,6 +113,7 @@ from memtomem_stm.cli.host_runtime import (
     _parse_bool,
     format_seconds,
     hook_command_words,
+    hook_flag_assignments,
     resolve_host_runtime_policy,
     runtime_env_overrides,
     writable_seconds,
@@ -1050,17 +1051,12 @@ def _runtime_registration_env(overrides: dict[str, str]) -> Iterator[None]:
     multiple commands in one Python process.
 
     Every spelling of each variable already in the environment is assigned
-    the command's value too (``config.hook_flag_assignments``), so a later
-    case-variant spelling cannot outrank it (#1503). Assigning an existing
-    name keeps its place in the environment, and so does restoring it.
+    the command's value too (``host_runtime.hook_flag_assignments``), so a
+    later case-variant spelling cannot outrank it (#1503). Assigning an
+    existing name keeps its place in the environment, and so does restoring
+    it. Nothing here imports the settings: the hook enters this before it has
+    read its payload.
     """
-    if not overrides:
-        # Nothing to set: a command without flags must not import the
-        # settings stack before it has read its payload.
-        yield
-        return
-    from memtomem_stm.config import hook_flag_assignments
-
     assignments = hook_flag_assignments(os.environ, overrides)
     previous = {key: os.environ.get(key) for key in assignments}
     os.environ.update(assignments)
