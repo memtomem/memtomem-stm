@@ -1129,6 +1129,80 @@ def test_an_unusable_discovery_key_names_the_matching_status_command(
     ), checks["ltm"]
 
 
+_KEY_MEASUREMENT_DETAIL = (
+    "--measure-ltm result unavailable: the daemon discovery key cannot be used "
+    "(see the ltm server row)"
+)
+
+
+@pytest.mark.parametrize("route", ["hook", "standalone"])
+def test_an_unusable_discovery_key_keeps_the_measurement_row_off_daemon_start(
+    home, proxy_file, monkeypatch, tmp_path, route
+):
+    # ``mms daemon start`` reads the same key and exits on it, so the row
+    # names the status command the ltm server row names (#1519).
+    from memtomem_stm.daemon import discovery
+
+    data_dir = Path(os.environ["MEMTOMEM_STM_DATA_DIR"])
+    data_dir.mkdir(parents=True, exist_ok=True)
+    discovery.discovery_key_path(data_dir).write_bytes(b"not a key\n")
+    if route == "hook":
+        _settings(home, _cmd(_installed()))
+        expected = f"mms daemon status {HOOKED}"
+    else:
+        _settings(home, _cmd(_installed(use_daemon=False)))
+        monkeypatch.setenv(STANDALONE_GATE, "true")
+        expected = "mms daemon status"
+
+    checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
+
+    row = checks["ltm_measurement"]
+    assert (row["status"], row["detail"], row["next_action"]) == (
+        "WARN",
+        _KEY_MEASUREMENT_DETAIL,
+        expected,
+    ), row
+    assert checks["ltm"]["next_action"] == expected
+
+
+def test_a_key_failure_after_the_samples_is_not_reported_as_a_measurement_that_never_ran(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # The first ping answers warm and every sample completes; the key fails
+    # only at the refresh ping, and the samples' result is discarded with it.
+    from memtomem_stm.utils.local_key import LocalKeyError
+
+    pings: list[int] = []
+    samples: list[str] = []
+
+    async def ping(config: STMConfig, *, timeout: float = 2.0, **_: Any) -> Any:
+        pings.append(1)
+        if len(pings) > 1:
+            raise LocalKeyError("cannot read the key file /cnryKeyPath/stm-discovery.key")
+        return {"ltm": "warm", "pid": 1, "port": 2}
+
+    async def ltm_request(config: STMConfig, op: str, payload: Any, **_: Any) -> Any:
+        samples.append(op)
+        return "ok", {"ok": True, "outcome": "ok"}
+
+    _settings(home, _cmd(_installed()))
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", ping)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ltm_request", ltm_request)
+
+    checks, output = _doctor_cli(
+        monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm"
+    )
+
+    assert len(samples) == 5 and len(pings) == 2, (samples, pings)
+    row = checks["ltm_measurement"]
+    assert (row["status"], row["detail"], row["next_action"]) == (
+        "WARN",
+        _KEY_MEASUREMENT_DETAIL,
+        f"mms daemon status {HOOKED}",
+    ), row
+    assert "cnryKeyPath" not in output
+
+
 def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, tmp_path):
     _settings(home, _cmd(_installed(surfacing=3.0)))
     _install(monkeypatch, AnswerEveryDaemon(_telemetry()))

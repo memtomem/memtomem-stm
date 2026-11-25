@@ -10089,8 +10089,11 @@ def _ltm_daemon_status(
     """Shared-daemon readiness and telemetry; active only with ``measure_ltm``.
 
     An unusable discovery key reads as an unreachable daemon with its own
-    error text, wherever in the probe or the measurement it surfaces. The
-    texts that name a daemon command name it as :func:`_daemon_command` does.
+    error text, wherever in the probe or the measurement it surfaces, and
+    ``discovery_key_unusable`` set: doctor's ``ltm measurement`` row keys on
+    that field, not the text, so it does not advise ``mms daemon start``,
+    which exits on the same key. The texts that name a daemon command name it as
+    :func:`_daemon_command` does.
     """
     from memtomem_stm.utils.local_key import LocalKeyError
 
@@ -10101,6 +10104,7 @@ def _ltm_daemon_status(
     except LocalKeyError:
         status = _ltm_daemon_status_base(config)
         status["error"] = _discovery_key_error(hook_command=hook_command)
+        status["discovery_key_unusable"] = True
         return status
 
 
@@ -10118,6 +10122,7 @@ def _ltm_daemon_status_base(config: Any) -> dict[str, Any]:
         "runtime_profile": None,
         "error": None,
         "daemon_reachable": False,
+        "discovery_key_unusable": False,
         "ltm_state": None,
         "latency": None,
         "measurement": None,
@@ -12521,6 +12526,20 @@ def doctor(
                     "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
                     "use_daemon in MEMTOMEM_STM_HOOK) or export "
                     "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                )
+            elif (
+                measure_ltm and isinstance(ltm, dict) and ltm.get("discovery_key_unusable") is True
+            ):
+                # Not "did not run": the key can fail at the refresh ping
+                # after every sample completed, and that result is discarded.
+                # ``mms daemon start`` exits on the same key (#1519).
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm result unavailable: the daemon discovery key cannot be "
+                    "used (see the ltm server row)",
+                    _daemon_command("status", hook_command=hook_command),
                 )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("daemon_reachable") is False:
                 check(

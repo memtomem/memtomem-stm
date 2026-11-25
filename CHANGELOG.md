@@ -13,6 +13,18 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms doctor --measure-ltm` no longer advises `mms daemon start` when the
+  daemon discovery key (`stm-discovery.key` under `data_dir`) cannot be used
+  (#1520, issue #1519). `start` reads the same key and exits 1 on it. The
+  `ltm measurement` row read the key error as a daemon that was not running.
+  **Behavior change**: with an unusable key, that row's detail is
+  `--measure-ltm result unavailable: the daemon discovery key cannot be used
+  (see the ltm server row)` and its next action is the command the
+  `ltm server` row names: `mms daemon status`, or `mms daemon status
+  --hook-command claude` when doctor reads exactly one STM hook command and
+  takes the hook's daemon route. On the daemon route, `surfacing.ltm_server`
+  in `doctor --json` and `health --json` gains a `discovery_key_unusable`
+  field, `true` only for this case.
 - `mms hook install` no longer drops the runtime settings of a second hook
   handler it manages in Claude Code or Codex (issue #1470). Install merges every
   handler it owns there into one and carried the settings of the first one

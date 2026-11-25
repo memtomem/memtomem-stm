@@ -1369,7 +1369,28 @@ def test_ltm_daemon_status_names_an_unusable_discovery_key_in_fixed_text(tmp_pat
     assert "stm-discovery.key" in status["error"]
     assert status["connected"] is False
     assert status["daemon_reachable"] is False
+    assert status["discovery_key_unusable"] is True
     assert "cnryDataDir" not in json.dumps(status)
+
+
+def test_ltm_daemon_status_leaves_the_key_marker_off_for_an_unreachable_daemon(monkeypatch):
+    # Positive control for the marker: the doctor row keys on it (#1519).
+    from memtomem_stm.cli import proxy as proxy_mod
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.daemon import client as daemon_client
+
+    config = STMConfig()
+    config.surfacing.enabled = True
+
+    async def no_daemon(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(daemon_client, "ping", no_daemon)
+
+    status = proxy_mod._ltm_daemon_status(config, 3.0)
+
+    assert status["daemon_reachable"] is False
+    assert status["discovery_key_unusable"] is False
 
 
 def test_ltm_daemon_status_covers_a_key_error_raised_during_measurement(monkeypatch):
@@ -1397,13 +1418,15 @@ def test_ltm_daemon_status_covers_a_key_error_raised_during_measurement(monkeypa
     assert status["connected"] is False
     assert status["daemon_reachable"] is False
     assert status["ltm_state"] is None
+    assert status["discovery_key_unusable"] is True
     assert "cnryKeyPath" not in json.dumps(status)
 
 
 @pytest.mark.parametrize("command", ["health", "doctor"])
 def test_an_unusable_discovery_key_reads_as_an_unreachable_daemon(tmp_path, monkeypatch, command):
     """Same exit code and same report as no daemon at all, apart from the
-    error text — these commands' conventions do not change for a key error."""
+    error text and the ``discovery_key_unusable`` marker (#1519) — these
+    commands' conventions do not change for a key error."""
     from memtomem_stm.cli import proxy as proxy_mod
 
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "true")
@@ -1428,7 +1451,9 @@ def test_an_unusable_discovery_key_reads_as_an_unreachable_daemon(tmp_path, monk
     assert block["route"] == baseline["route"] == "daemon"
     assert block["error"] == proxy_mod._DISCOVERY_KEY_ERROR
     assert baseline["error"] != block["error"]
-    assert {k: v for k, v in block.items() if k != "error"} == {
-        k: v for k, v in baseline.items() if k != "error"
+    assert (block["discovery_key_unusable"], baseline["discovery_key_unusable"]) == (True, False)
+    marked = ("error", "discovery_key_unusable")
+    assert {k: v for k, v in block.items() if k not in marked} == {
+        k: v for k, v in baseline.items() if k not in marked
     }
     assert "cnryDataDir" not in broken_out
