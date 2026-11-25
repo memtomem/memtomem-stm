@@ -223,15 +223,14 @@ def test_install_owns_every_command_it_writes(
         )
 
 
-@pytest.mark.parametrize("surfacing", [float("inf"), float("nan"), 1.7976931348623157e308])
-def test_install_owns_a_command_written_with_a_non_finite_deadline(surfacing: float) -> None:
-    """The writer does not refuse these (#1492), so the reader must not
-    either; the unusable deadline itself is not carried over."""
-    policy = HostRuntimePolicy(
-        use_daemon=True, surfacing_timeout_seconds=surfacing, daemon_timeout_seconds=3.5
-    )
-
-    owned = owned_hook_command(_written("claude", None, policy), "claude")
+@pytest.mark.parametrize(
+    "command",
+    [c for _, c in _RELEASED_LINES if "inf" in c or "nan" in c or "e+308" in c],
+)
+def test_install_owns_a_command_written_with_a_non_finite_deadline(command: str) -> None:
+    """Releases wrote these (#1492), so the reader must keep owning them; the
+    unusable deadline itself is not carried over."""
+    owned = owned_hook_command(command, "claude")
 
     assert owned is not None
     assert owned.settings.surfacing_timeout_seconds is None
@@ -2970,3 +2969,157 @@ def test_a_conflict_is_refused_from_the_one_read(
 
     _assert_refused(result, path, before)
     assert reads == [path]
+
+
+# ── deadlines the hook command cannot carry (#1492) ──────────────────────────
+#
+# The hook reads each deadline back with ``_parse_positive_float``, which drops
+# anything that is not a positive finite number. Install refuses to write such
+# a deadline instead of writing one the hook would ignore.
+
+_UNWRITABLE_FLAGS = ["inf", "infinity", "1e400", "nan", "1.7976931348623157e308"]
+
+
+def _deadlines(command: str) -> tuple[str, str]:
+    words = shlex.split(command)
+    return (
+        words[words.index("--surfacing-timeout-seconds") + 1],
+        words[words.index("--daemon-timeout-seconds") + 1],
+    )
+
+
+@pytest.mark.parametrize("value", _UNWRITABLE_FLAGS)
+@pytest.mark.parametrize("apply_", [True, False])
+def test_install_refuses_a_surfacing_timeout_the_hook_command_cannot_carry(
+    value: str, apply_: bool, redirect
+) -> None:
+    path = redirect("claude")
+
+    result = _install("claude", "--surfacing-timeout", value, *(["--apply"] if apply_ else []))
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid value for '--surfacing-timeout'" in result.output
+    assert "positive finite number" in result.output
+    assert not path.parent.exists()
+
+
+def test_install_still_writes_a_large_surfacing_timeout_that_reads_back(redirect) -> None:
+    """Positive control for the refusal above: ``1e308`` survives
+    ``format_seconds`` as a finite number, so it is written."""
+    path = redirect("claude")
+
+    result = _install("claude", "--surfacing-timeout", "1e308", "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert _deadlines(_claude_commands(path)[0]) == ("1e+308", "1e+308")
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "field"),
+    [
+        ("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf", "surfacing.timeout_seconds"),
+        ("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "infinity", "surfacing.timeout_seconds"),
+        (
+            "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+            "1.7976931348623157e308",
+            "surfacing.timeout_seconds",
+        ),
+        (
+            "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
+            "1.7976931348623157e308",
+            "hook.daemon_timeout_seconds",
+        ),
+    ],
+)
+@pytest.mark.parametrize("apply_", [True, False])
+def test_install_refuses_a_resolved_deadline_the_hook_command_cannot_carry(
+    variable: str,
+    value: str,
+    field: str,
+    apply_: bool,
+    redirect,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = redirect("claude")
+    # A command without settings, so the deadline resolves from the environment.
+    before = _seed_owned("claude", path, [_CMD.format(host="claude")])
+    before_bytes = path.read_bytes()
+    monkeypatch.setenv(variable, value)
+
+    result = _install("claude", *(["--apply"] if apply_ else []))
+
+    _assert_refused(result, path, before, field, variable, "--inherit-runtime-env")
+    assert path.read_bytes() == before_bytes
+    # It cannot be combined with the runtime options, so it replaces them.
+    assert "--inherit-runtime-env in place of --surfacing-timeout" in result.output
+    # The configured value is not echoed back.
+    assert value not in result.output
+    assert "1.79769313486232e+308" not in result.output
+    if field == "surfacing.timeout_seconds":
+        assert "pass --surfacing-timeout SECONDS" in result.output
+    else:
+        assert f"set {variable} to a smaller value" in result.output
+
+
+def test_a_surfacing_timeout_flag_overrides_an_unwritable_environment_value(
+    redirect, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = redirect("claude")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf")
+
+    result = _install("claude", "--surfacing-timeout", "5", "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert _deadlines(_claude_commands(path)[0]) == ("5", "6")
+
+
+def test_inherit_runtime_env_installs_beside_an_unwritable_environment_value(
+    redirect, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = redirect("claude")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf")
+
+    result = _install("claude", "--inherit-runtime-env", "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert "--surfacing-timeout-seconds" not in _claude_commands(path)[0]
+
+
+# Lines releases wrote before #1492, given such a deadline.
+_UNWRITABLE_RELEASED = [
+    _pinned("claude", surfacing="inf", daemon="inf"),
+    _pinned("claude", surfacing="nan", daemon="3.5"),
+    _pinned("claude", surfacing="1.79769313486232e+308", daemon="1.79769313486232e+308"),
+]
+
+
+@pytest.mark.parametrize("command", _UNWRITABLE_RELEASED)
+def test_reinstall_replaces_a_deadline_the_hook_ignored(command: str, redirect) -> None:
+    path = redirect("claude")
+    _seed_owned("claude", path, [command])
+
+    result = _install("claude", "--apply")
+
+    assert result.exit_code == 0, result.output
+    commands = _claude_commands(path)
+    assert len(commands) == 1
+    # The unusable deadline is not carried over: the defaults are written.
+    assert _deadlines(commands[0]) == ("3", "4")
+    assert " hook --host claude --use-daemon " in commands[0]
+
+    removed = CliRunner().invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+    assert removed.exit_code == 0, removed.output
+    assert json.loads(path.read_text()) == {}
+
+
+@pytest.mark.parametrize("command", _UNWRITABLE_RELEASED)
+def test_uninstall_removes_a_line_written_with_a_deadline_the_hook_ignored(
+    command: str, redirect
+) -> None:
+    path = redirect("claude")
+    _seed_owned("claude", path, [command])
+
+    result = CliRunner().invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(path.read_text()) == {}

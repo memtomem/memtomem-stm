@@ -1071,7 +1071,9 @@ Options:
   --apply                         Write the change (default: dry-run preview).
                                   Backs up any prior file to <path>.bak
                                   (.bak.1, … if one already exists).
-  --surfacing-timeout SECONDS     Pin the LTM search deadline. [x>0.0]
+  --surfacing-timeout SECONDS     Pin the LTM search deadline in the installed
+                                  hook command. A positive, finite number that
+                                  stays finite when written there.  [x>0.0]
   --daemon                        Install an explicit shared-daemon route.
   --no-daemon                     Install an explicit cold/in-process route.
   --inherit-runtime-env           Do not serialize daemon, timeout, or query-
@@ -1131,6 +1133,19 @@ any handler with them even when the values in effect would match.
 `--inherit-runtime-env` carries nothing over: it folds them into one handler
 without setting words. Otherwise, remove all but one handler by hand and
 re-run.
+
+Install writes a deadline only when the hook will keep it: written the way
+install writes it, it must read back as a positive finite number. A
+`--surfacing-timeout` that does not (`inf`, `nan`, or a value so large that
+its 15-digit spelling reads back as infinity, such as
+`1.7976931348623157e308`) is a usage error. A deadline resolved from STM's
+configuration that does not (`MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=inf`,
+or such a large `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS`) stops install the
+same way a conflict does: non-zero exit, config left as it was, no backup.
+The error names the setting and its variable, never the value, and offers
+`--surfacing-timeout` (for the surfacing deadline) or `--inherit-runtime-env`.
+A handler releases wrote with such a deadline is still install's own; its
+deadline is not carried over, so re-installing replaces it.
 
 `uninstall` removes every handler install owns, prunes the emptied
 containers, and leaves other hooks untouched.

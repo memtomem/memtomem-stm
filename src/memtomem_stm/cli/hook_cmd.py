@@ -109,11 +109,13 @@ from memtomem_stm.cli.hook_adapter import (
 )
 from memtomem_stm.cli.host_runtime import (
     HostRuntimePolicy,
+    UnwritableDeadlineError,
     _parse_bool,
     format_seconds,
     hook_command_words,
     resolve_host_runtime_policy,
     runtime_env_overrides,
+    writable_seconds,
 )
 
 if TYPE_CHECKING:
@@ -1499,6 +1501,41 @@ def _emit_hook_change(
         )
 
 
+def _writable_surfacing_timeout(
+    ctx: click.Context, param: click.Parameter, value: float | None
+) -> float | None:
+    """Refuse a ``--surfacing-timeout`` the hook command cannot carry: the
+    hook drops a deadline that does not read back as a positive finite number
+    (``inf``, ``nan``, or one ``format_seconds`` rounds to infinity), so the
+    pinned value would not be the one in effect."""
+    if value is not None and not writable_seconds(value):
+        raise click.BadParameter(
+            "must be a positive finite number that stays finite in the hook command",
+            ctx=ctx,
+            param=param,
+        )
+    return value
+
+
+def _unwritable_deadline_message(field: str) -> str:
+    """The refusal for a resolved deadline the hook command cannot carry.
+    Names the setting and its variable, never the value."""
+    variable = "MEMTOMEM_STM_" + field.upper().replace(".", "__")
+    # ``--inherit-runtime-env`` cannot be combined with the runtime options,
+    # so it is offered in their place.
+    way_out = (
+        "pass --surfacing-timeout SECONDS"
+        if field == "surfacing.timeout_seconds"
+        else f"set {variable} to a smaller value"
+    )
+    return (
+        f"the configured {field} ({variable}) cannot be written into the hook command "
+        "as a positive finite number, and the hook would ignore the value written there; "
+        f"to go on, {way_out}, or pass --inherit-runtime-env in place of "
+        "--surfacing-timeout, --daemon and --no-daemon"
+    )
+
+
 @hook_command.command(name="install")
 @click.option(
     "--host",
@@ -1519,7 +1556,9 @@ def _emit_hook_change(
     type=click.FloatRange(min=0.0, min_open=True),
     default=None,
     metavar="SECONDS",
-    help="Pin the LTM search deadline in the installed hook command.",
+    callback=_writable_surfacing_timeout,
+    help="Pin the LTM search deadline in the installed hook command. A positive, "
+    "finite number that stays finite when written there.",
 )
 @click.option(
     "--daemon",
@@ -1619,6 +1658,11 @@ def hook_install_command(
             # messages interpolate a config path and a parser's own text, and
             # this is where they become terminal output (#780).
             raise click.ClickException(_disp(str(exc))) from exc
+        except UnwritableDeadlineError as exc:
+            # Raised by ``hook_args`` inside ``build_command``, before
+            # ``apply_change``: the host config is unchanged and no backup is
+            # made (an ``--apply`` may still have created the lock file).
+            raise click.ClickException(_unwritable_deadline_message(exc.field)) from exc
         except (ValidationError, SettingsError) as exc:
             # A broken MEMTOMEM_STM_* env fails the policy's STMConfig
             # construction (#847): a ValidationError for a wrong value, a

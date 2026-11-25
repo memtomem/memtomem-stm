@@ -124,6 +124,25 @@ def format_seconds(value: float) -> str:
     return format(value, ".15g")
 
 
+def writable_seconds(value: float) -> bool:
+    """Whether ``value``, written by :func:`format_seconds`, reads back as a
+    deadline the hook keeps: a positive finite number. ``inf``, ``nan`` and
+    ``1.7976931348623157e308`` (written ``1.79769313486232e+308``, which reads
+    back as infinity) do not. Defined by the hook's own reader, so the writer
+    cannot accept what the reader drops."""
+    return _parse_positive_float(format_seconds(value)) is not None
+
+
+class UnwritableDeadlineError(ValueError):
+    """A resolved deadline :func:`writable_seconds` refuses: the hook would
+    ignore it in the command."""
+
+    def __init__(self, field: str) -> None:
+        super().__init__(field)
+        self.field = field
+        """The ``STMConfig`` field the deadline is resolved from, dotted."""
+
+
 @dataclass(frozen=True)
 class PartialHostRuntimePolicy:
     """Settings recovered from an existing managed registration."""
@@ -171,8 +190,17 @@ class HostRuntimePolicy:
         }
 
     def hook_args(self) -> list[str]:
-        """Cross-platform flags managed in a native hook command."""
+        """Cross-platform flags managed in a native hook command.
+
+        Raises :class:`UnwritableDeadlineError` for a deadline the hook would
+        drop. The surfacing deadline is checked first: a writable one keeps
+        ``surfacing + 1`` writable, so a daemon deadline that fails comes from
+        the daemon setting itself."""
         normalized = self.normalized()
+        if not writable_seconds(normalized.surfacing_timeout_seconds):
+            raise UnwritableDeadlineError("surfacing.timeout_seconds")
+        if not writable_seconds(normalized.daemon_timeout_seconds):
+            raise UnwritableDeadlineError("hook.daemon_timeout_seconds")
         return _policy_words(
             _DAEMON_FLAGS[normalized.use_daemon],
             format_seconds(normalized.surfacing_timeout_seconds),
@@ -406,10 +434,12 @@ __all__ = [
     "HostRuntimePolicy",
     "OwnedHookCommand",
     "PartialHostRuntimePolicy",
+    "UnwritableDeadlineError",
     "format_seconds",
     "hook_command_words",
     "hook_launcher",
     "owned_hook_command",
     "resolve_host_runtime_policy",
     "runtime_env_overrides",
+    "writable_seconds",
 ]
