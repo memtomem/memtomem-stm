@@ -18,8 +18,8 @@ changes inline only. See the deprecation policy in
   handler's words in time linear in the line's length (issue #1498). For a
   line the cheaper candidate test does not name, it read the words of the
   whole line with `shlex`, whose cost is quadratic in a word's length: a
-  handler `echo ` + 160,000 × `x` took about 0.35 s per scan (macOS,
-  CPython 3.14), and install and uninstall scan twice. The words are read
+  handler `echo ` + 160,000 × `x` took about 0.34 s per scan (macOS,
+  CPython 3.14.7), and install and uninstall scan twice. The words are read
   the way `shlex` reads them, so the same handlers are named as before.
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
