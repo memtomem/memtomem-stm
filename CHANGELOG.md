@@ -20,13 +20,14 @@ changes inline only. See the deprecation policy in
   variables its own error implicates: the command's options over doctor's
   environment (when the `ltm server` check runs, the build doctor decides the
   hook-daemon route with) and doctor's environment alone (what `mms daemon
-  start` from it builds). When the command's build fails, the next action
-  points to that command's options, named by its location, or the variables
-  its build reads, then a rerun of doctor. **Behavior change**: in that case the row's text changes; an
-  invalid ambient value one of the command's four options overrides is still
-  a WARN, now attributed to `mms daemon start` rather than to the hook; and a
-  hook build that only the command's options break (such as #1508's extreme
-  deadline) now WARNs where the row passed. Without such a command (none,
+  start` from it builds). When the command's build warns (it fails, or
+  ignores an invalid `MEMTOMEM_STM_PROXY*`), the next action points to that
+  command's options, named by its location, or the variables its build
+  reads, then a rerun of doctor. **Behavior change**: in that case the
+  row's text changes; an invalid ambient value one of the command's four
+  options overrides is still a WARN, now attributed to `mms daemon start`
+  rather than to the hook; and a hook build that only the command's options
+  break (such as #1508's extreme deadline) now WARNs where the row passed. Without such a command (none,
   several, unreadable, Windows, or a settings error) the row is unchanged.
 - `mms doctor` now applies the registered hook command's flag words to its
   own environment the way the hook does (#1512, issue #1508). 0.7.11's doctor

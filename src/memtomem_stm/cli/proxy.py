@@ -10570,7 +10570,7 @@ def _env_overrides_found_row(
     which clause to act on and, for the hook's build, to rerun doctor. Names
     the handler by location and path, never its command text or values.
     """
-    from memtomem_stm.proxy.config import env_vars_implicated_by_validation_error
+    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
     def classify(outcome: Any) -> tuple[str, Exception | None]:
         if isinstance(outcome, Exception):
@@ -10579,21 +10579,16 @@ def _env_overrides_found_row(
             return "proxy", outcome.proxy_error
         return "ok", None
 
-    def hint(names: frozenset[str]) -> str:
-        return " (env var(s) implicated: " + ", ".join(sorted(names)) + ")" if names else ""
-
     hook_kind, hook_exc = classify(hook_outcome)
     bare_kind, bare_exc = classify(bare_outcome)
     # Each build's hint reads the environment that build read: the overlay
     # replaces in place or comes last, as ``config._overlaid_env_vars`` merges.
-    hook_names = (
-        frozenset()
+    hook_hint = (
+        ""
         if hook_exc is None
-        else env_vars_implicated_by_validation_error(hook_exc, {**os.environ, **view.env})
+        else env_var_hint_for_validation_error(hook_exc, {**os.environ, **view.env})
     )
-    bare_names = (
-        frozenset() if bare_exc is None else env_vars_implicated_by_validation_error(bare_exc)
-    )
+    bare_hint = "" if bare_exc is None else env_var_hint_for_validation_error(bare_exc)
     hook_says = {
         "ok": "STMConfig() constructs",
         "fail": "STMConfig() fails — a hook run with doctor's environment and these options "
@@ -10611,12 +10606,12 @@ def _env_overrides_found_row(
     location = view.locations[0]
     detail = (
         f"with the options of the STM hook command at {location} in {view.path} "
-        f"(Claude Code user settings): {hook_says[hook_kind]}{hint(hook_names)}; "
-        f"doctor's environment alone: {bare_says[bare_kind]}{hint(bare_names)}"
+        f"(Claude Code user settings): {hook_says[hook_kind]}{hook_hint}; "
+        f"doctor's environment alone: {bare_says[bare_kind]}{bare_hint}"
     )
     actions: list[str] = []
     if bare_kind != "ok":
-        if bare_names:
+        if bare_hint:
             actions.append(_ENV_FIX_IN_BARE_CLAUSE)
         else:
             actions.append(

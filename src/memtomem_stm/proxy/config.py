@@ -1023,17 +1023,6 @@ def live_env_paths(
 def env_var_hint_for_validation_error(
     exc: Exception, environ: Mapping[str, str] | None = None
 ) -> str:
-    """`` (env var(s) implicated: …)`` for :func:`env_vars_implicated_by_validation_error`,
-    or ``""`` when it names none."""
-    implicated = env_vars_implicated_by_validation_error(exc, environ)
-    if not implicated:
-        return ""
-    return " (env var(s) implicated: " + ", ".join(sorted(implicated)) + ")"
-
-
-def env_vars_implicated_by_validation_error(
-    exc: Exception, environ: Mapping[str, str] | None = None
-) -> frozenset[str]:
     """Name the ``MEMTOMEM_STM_*`` var(s) implicated in an ``STMConfig`` error.
 
     The sibling of ``_env_override_hint`` for the OTHER failure point: that one
@@ -1067,7 +1056,7 @@ def env_vars_implicated_by_validation_error(
     names, never values, are rendered (cf. ``hide_input_in_errors``).
     """
     if not isinstance(exc, ValidationError):
-        return frozenset()
+        return ""
     env = os.environ if environ is None else environ
     prefix = "memtomem_stm_"
     var_paths: dict[tuple[str, ...], str] = {}
@@ -1173,7 +1162,9 @@ def env_vars_implicated_by_validation_error(
                     implicated.add(name)
             elif _starts_with(loc, path) or _starts_with(path, loc):
                 implicated.add(name)
-    return frozenset(implicated)
+    if not implicated:
+        return ""
+    return " (env var(s) implicated: " + ", ".join(sorted(implicated)) + ")"
 
 
 class CompressionStrategy(StrEnum):

@@ -1134,7 +1134,7 @@ _BAD_VALUE = {
     PERSIST: "not-a-bool",
     HOOK_GATE: "not-a-bool",
     SURFACING_TIMEOUT: "nope",
-    "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS": "nope",
+    DAEMON_TIMEOUT: "nope",
 }
 _HOOK_PASS_THROUGH = "passes surfacing/compression through"
 _DAEMON_EXITS = "mms daemon start from it exits 1"
@@ -1209,7 +1209,7 @@ def test_env_row_reports_a_hook_build_only_the_commands_options_break(
 
     assert row["status"] == "WARN", row
     assert "STMConfig() fails" in hook and _HOOK_PASS_THROUGH in hook, row
-    assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS" in hook, row
+    assert DAEMON_TIMEOUT in hook, row
     assert bare.endswith("STMConfig() constructs"), row
     assert row["next_action"] == _command_advice(), row
 
@@ -1223,9 +1223,9 @@ def test_env_row_keeps_each_builds_cause_when_both_fail(home, proxy_file, monkey
 
     assert row["status"] == "WARN", row
     assert _HOOK_PASS_THROUGH in hook and _DAEMON_EXITS in bare, row
-    assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS" in hook, row
+    assert DAEMON_TIMEOUT in hook, row
     assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in hook, row
-    assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS" not in bare, row
+    assert DAEMON_TIMEOUT not in bare, row
     assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in bare, row
     assert row["next_action"] == f"{_BARE_ADVICE}; {_command_advice()}", row
 
@@ -1258,7 +1258,7 @@ def test_env_row_never_copies_one_builds_outcome_into_the_other(
     assert claims[others[expected_bare]][1] not in bare, row
     assert "MEMTOMEM_STM_PROXY__ENABLED" in hook and "MEMTOMEM_STM_PROXY__ENABLED" in bare, row
     # Each clause carries its own build's variables, never the other's.
-    deadline = "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"
+    deadline = DAEMON_TIMEOUT
     assert (deadline in hook, deadline in bare) == (expected_hook == "fail", False), row
     assert (HOOK_GATE in hook, HOOK_GATE in bare) == (False, expected_bare == "fail"), row
     assert row["next_action"] == f"{_BARE_ADVICE}; {_command_advice()}", row
@@ -1452,7 +1452,8 @@ def test_env_row_does_not_advise_unsetting_a_valid_block_the_hint_names(
 
     row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
 
-    assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS" in hook, row
+    # The premise: the valid block is named next to the command's deadline.
+    assert f"MEMTOMEM_STM_HOOK, {DAEMON_TIMEOUT}" in hook, row
     assert bare.endswith("STMConfig() constructs"), row
     assert row["next_action"] == _command_advice(), row
 
