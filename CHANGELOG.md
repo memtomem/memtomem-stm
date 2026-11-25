@@ -13,6 +13,19 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook install` and `mms hook uninstall` no longer manage a Claude Code
+  handler whose `shell` field is present and anything but `"bash"` (issue
+  #1497). Install writes a POSIX line; with `"shell": "powershell"`
+  PowerShell reads it, yet install used to read settings from that line,
+  rewrite it and keep the `shell` field, and uninstall deleted it. Such a
+  handler (any other `shell` value, `null` included) is now left in place,
+  and named as a look-alike when its command looks like STM's hook, as
+  `mms doctor` already treated it. Codex
+  handlers are unchanged: what Codex does with a `shell` key is not
+  established. **Behavior change**: a Claude Code handler install wrote, to
+  which a `shell` other than `"bash"` was added by hand, is no longer
+  refreshed or removed; install refreshes the handler it does own, or adds
+  one beside it when it owns none.
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
   #1506). When doctor reads exactly one STM hook command `mms hook install`
