@@ -610,28 +610,95 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
     return data, raw
 
 
-def _owned_hooks(host_tag: str, data: dict[str, Any]) -> tuple[OwnedHookCommand, ...]:
+def _located_owned_hooks(
+    host_tag: str, data: dict[str, Any]
+) -> tuple[tuple[str, OwnedHookCommand], ...]:
     """The handlers :func:`owned_handler` accepts in parsed config ``data``,
-    in file order, read from the containers install writes to."""
-    handlers: list[Any] = []
+    in file order, read from the containers install writes to, each with its
+    location in the form :func:`unmanaged_stm_like` gives."""
+    handlers: list[tuple[str, Any]] = []
     if host_tag in _NESTED_HOSTS:
         hooks = data.get("hooks")
         entries = hooks.get("PostToolUse", []) if isinstance(hooks, dict) else []
         if isinstance(entries, list):
-            for entry in entries:
+            for i, entry in enumerate(entries):
                 if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
-                    handlers.extend(entry["hooks"])
+                    handlers.extend(
+                        (f"hooks.PostToolUse[{i}].hooks[{j}]", handler)
+                        for j, handler in enumerate(entry["hooks"])
+                    )
     elif host_tag == "cursor":
         hooks = data.get("hooks")
         entries = hooks.get("postToolUse", []) if isinstance(hooks, dict) else []
         if isinstance(entries, list):
-            handlers.extend(entries)
+            handlers.extend((f"hooks.postToolUse[{i}]", e) for i, e in enumerate(entries))
     else:  # kimi
         entries = data.get("hooks", [])
         if isinstance(entries, list):
-            handlers.extend(entries)
-    owned = (owned_handler(host_tag, handler) for handler in handlers)
-    return tuple(hook for hook in owned if hook is not None)
+            handlers.extend((f"hooks[{i}]", e) for i, e in enumerate(entries))
+    owned = ((location, owned_handler(host_tag, handler)) for location, handler in handlers)
+    return tuple((location, hook) for location, hook in owned if hook is not None)
+
+
+def _owned_hooks(host_tag: str, data: dict[str, Any]) -> tuple[OwnedHookCommand, ...]:
+    """:func:`_located_owned_hooks` without the locations."""
+    return tuple(hook for _, hook in _located_owned_hooks(host_tag, data))
+
+
+# A ``PartialHostRuntimePolicy`` field, and the setting words of a hook
+# command that set it, for naming a setting without its value.
+CARRIED_SETTINGS: dict[str, str] = {
+    "use_daemon": "--use-daemon/--no-daemon",
+    "surfacing_timeout_seconds": "--surfacing-timeout-seconds",
+    "daemon_timeout_seconds": "--daemon-timeout-seconds",
+    "persist_query_text": "--persist-query-text/--no-persist-query-text",
+}
+
+
+class OwnedSettingsConflict(HookInstallError):
+    """Install would fold owned handlers that differ in a setting it carries
+    over from the first one, so the others' settings would be lost (#1470)."""
+
+
+def _refuse_conflicting_owned(
+    host_tag: str, path: Path, data: dict[str, Any], carried: frozenset[str]
+) -> None:
+    """Raise :class:`OwnedSettingsConflict` when ``host_tag`` folds owned
+    handlers and the ones in ``data`` differ in a field of ``carried``.
+
+    Only Claude Code and Codex fold: Cursor and Kimi refresh the first owned
+    handler and leave the rest as they are. Settings are compared as parsed
+    (:attr:`OwnedHookCommand.settings`), so a flagless handler (every field
+    ``None``) differs from a pinned one. The message gives the locations and
+    the settings' words, never a command or a value."""
+    if host_tag not in _NESTED_HOSTS or not carried:
+        return
+    located = _located_owned_hooks(host_tag, data)
+    if len(located) < 2:
+        return
+    differing = [
+        field
+        for field in CARRIED_SETTINGS
+        if field in carried and len({getattr(hook.settings, field) for _, hook in located}) > 1
+    ]
+    if not differing:
+        return
+    # The install options that set a field; the other two have none.
+    options = {
+        "use_daemon": "--daemon or --no-daemon",
+        "surfacing_timeout_seconds": "--surfacing-timeout",
+    }
+    chosen = [options[field] for field in differing if field in options]
+    ways = f"pass {' and '.join(chosen)}, " if len(chosen) == len(differing) else ""
+    raise OwnedSettingsConflict(
+        f"{path} holds {len(located)} handlers that install manages "
+        f"({', '.join(location for location, _ in located)}), and they differ in "
+        f"{', '.join(CARRIED_SETTINGS[field] for field in differing)}. Install merges "
+        "them into one and would keep only the first one's settings, so it left the "
+        f"file unchanged and made no backup. To go on, {ways}pass --inherit-runtime-env "
+        "(in place of --daemon, --no-daemon and --surfacing-timeout) to write the hook "
+        "without runtime settings, or remove all but one of them by hand, then re-run."
+    )
 
 
 def unmanaged_stm_like(host_tag: str, data: dict[str, Any]) -> tuple[str, ...]:
@@ -788,7 +855,9 @@ that builds it from the owned handlers already in the config (in file order),
 for a caller that carries their settings over."""
 
 
-def plan_install(host_tag: str, command: CommandSource) -> HookChange:
+def plan_install(
+    host_tag: str, command: CommandSource, *, carried: frozenset[str] = frozenset()
+) -> HookChange:
     """Plan registering ``command`` as ``host_tag``'s PostToolUse hook.
 
     Pure (no writes): parses the current config (if any), computes the merged
@@ -802,12 +871,19 @@ def plan_install(host_tag: str, command: CommandSource) -> HookChange:
     that same read, so the settings it carries over and the handlers the merge
     replaces cannot come from two versions of the file; ``current_text`` is
     that read too, which :func:`apply_change` compares with the file before it
-    writes."""
+    writes.
+
+    ``carried`` names the :data:`CARRIED_SETTINGS` fields the command takes
+    from the first owned handler. Where the merge folds owned handlers into
+    one (Claude Code, Codex) and they differ in one of those fields, the plan
+    raises :class:`OwnedSettingsConflict` from the same read, before the
+    command is built."""
     spec = HOOK_HOSTS[host_tag]
     path = _config_path(spec)
     current = _read_current(path, spec.fmt)
     base: dict[str, Any] = current[0] if current else {}
     current_text = current[1] if current else None
+    _refuse_conflicting_owned(host_tag, path, base, carried)
     if not isinstance(command, str):
         command = command(_owned_hooks(host_tag, base))
 
