@@ -404,6 +404,13 @@ def _unreadable(home: Path) -> None:
         (lambda home, mp: _settings(home), "no STM hook command"),
         (lambda home, mp: _settings(home, _cmd(_installed()), _cmd(_installed())), "2 STM hook"),
         (lambda home, mp: _unreadable(home), "could not be read"),
+        # Named by the notice's word reader alone (#1498).
+        (
+            lambda home, mp: _settings(
+                home, _cmd(_installed()), _cmd('m"m"s hook --host claude # pinned')
+            ),
+            "could not be read",
+        ),
         (
             lambda home, mp: (
                 _settings(home, _cmd(_installed())),
@@ -419,7 +426,7 @@ def _unreadable(home: Path) -> None:
             "settings",
         ),
     ],
-    ids=["none", "several", "unreadable", "windows", "settings-error"],
+    ids=["none", "several", "unreadable", "quoted-look-alike", "windows", "settings-error"],
 )
 @pytest.mark.parametrize("subcommand", ["start", "stop", "status", "restart"])
 def test_no_single_command_refuses_without_acting(home, monkeypatch, arrange, words, subcommand):
