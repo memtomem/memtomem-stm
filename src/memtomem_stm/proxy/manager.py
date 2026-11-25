@@ -39,7 +39,7 @@ from mcp import ClientSession
 from mcp import types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.proxy import tool_name_budget
@@ -851,6 +851,52 @@ def _safe_error_text(exc: BaseException) -> str:
     """
     text = _stm_composed_text(exc) or exception_summary(exc)
     return text[:MAX_ERROR_MESSAGE_CHARS]
+
+
+# ``ClientSession.call_tool`` validates the ``tools/call`` reply twice: against
+# the negotiated version's wire schema (the error is titled after the result
+# model) and then through its result adapter (titled after the union it tries).
+# Request construction and the SDK's own ``tools/list`` refresh raise
+# ``ValidationError`` too, titled ``CallToolRequestParams`` / ``ListToolsResult``,
+# and are deliberately not matched: the first sent nothing, the second is not
+# the invoked tool's reply.
+_REJECTED_RESULT_TITLE = "CallToolResult"
+_REJECTED_RESULT_UNION_PREFIX = "union[CallToolResult,"
+
+# Messages the SDK raises as a bare ``RuntimeError`` for a reply it rejects:
+# an ``InputRequiredResult`` STM did not ask for (2026-07-28 connections), and a
+# result that breaks the tool's own declared ``outputSchema``.
+_REJECTED_RESULT_RUNTIME_PREFIXES = (
+    "Server returned InputRequiredResult",
+    "Invalid structured content returned by tool ",
+    "Invalid schema for tool ",
+)
+_REJECTED_RESULT_RUNTIME_SUFFIX = " has an output schema but did not return structured content"
+
+
+def _is_upstream_result_rejection(exc: BaseException) -> bool:
+    """Whether ``exc`` is the SDK refusing the upstream's ``tools/call`` reply.
+
+    Such a failure is not an STM bug, so it is recorded as ``protocol``: the
+    category for results the SDK rejects. Most break the protocol or the
+    tool's own ``outputSchema``; an ``InputRequiredResult`` is valid on a
+    2026-07-28 connection, and is rejected only because STM cannot relay it
+    and leaves ``allow_input_required`` off.
+
+    The match is on the SDK's own titles and messages, so an SDK release that
+    rewords them makes this return ``False`` and the call keeps the
+    ``programming`` category it had before; the tests built from the real SDK
+    then fail.
+    """
+    if isinstance(exc, ValidationError):
+        title = exc.title
+        return title == _REJECTED_RESULT_TITLE or title.startswith(_REJECTED_RESULT_UNION_PREFIX)
+    if type(exc) is RuntimeError:
+        message = str(exc)
+        return message.startswith(_REJECTED_RESULT_RUNTIME_PREFIXES) or (
+            message.startswith("Tool ") and message.endswith(_REJECTED_RESULT_RUNTIME_SUFFIX)
+        )
+    return False
 
 
 def _mark_cache_invalidated(exc: BaseException) -> None:
@@ -6514,6 +6560,30 @@ class ProxyManager:
                     # success path above: leaving the breaker's prior failures
                     # standing as "consecutive" would let an unrelated later
                     # failure trip it.
+                    if breaker is not None:
+                        breaker.record_success()
+                    raise
+                if _is_upstream_result_rejection(exc):
+                    # The upstream replied with a result the SDK rejects for
+                    # this connection, which is not an STM bug (see
+                    # ``_is_upstream_result_rejection``). Replaying would
+                    # fetch the same reply, and the connection itself is
+                    # fine, so no retry and no reconnect.
+                    # The round trip completed, which closes the breaker as
+                    # the oversize branch above does.
+                    self.tracker.record_error(
+                        CallMetrics(
+                            server=server,
+                            tool=tool,
+                            original_chars=0,
+                            compressed_chars=0,
+                            is_error=True,
+                            error_category=ErrorCategory.PROTOCOL,
+                            error_message=_safe_error_text(exc),
+                            trace_id=trace_id,
+                        )
+                    )
+                    _mark_recorded(exc)
                     if breaker is not None:
                         breaker.record_success()
                     raise

@@ -30,6 +30,26 @@ changes inline only. See the deprecation policy in
   break (such as #1508's extreme deadline) now WARNs where the row passed.
   Without such a command (none, several, unreadable, Windows, or a settings
   error) the row is unchanged.
+
+- A proxied call whose upstream reply fails the MCP SDK's result checks is now
+  recorded with the `protocol` error category instead of `programming`
+  (issue #1131). The checks matched are a reply outside the negotiated schema
+  (for example a list `structuredContent`, or `resultType: "input_required"`
+  on a 2025-11-25 connection), an `InputRequiredResult` on a 2026-07-28
+  connection (valid there, but STM cannot relay it yet), a result that
+  breaks the tool's own `outputSchema` or omits the structured content it
+  declares, and an `outputSchema` the SDK cannot resolve. A failure these
+  checks do not match keeps the category it had before. Such a call is
+  still not retried, and it now resets the circuit breaker's failure count,
+  since a reply arrived. **Behavior change**: tool health counts
+  `programming` rows as calls but not as errors; these rows now count as
+  upstream errors too.
+  Health is evaluated at proxy startup, so once a tool that keeps sending
+  such replies crosses the health thresholds, the `strict` exposure profile
+  withholds it on a later startup and `review` gives it a risk penalty. Known
+  limit: a malformed `tools/list` reply to the SDK's output-schema refresh
+  during the call is still `programming`.
+
 - `mms doctor --measure-ltm` no longer advises `mms daemon start` when the
   daemon discovery key (`stm-discovery.key` under `data_dir`) cannot be used
   (#1520, issue #1519). `start` reads the same key and exits 1 on it. The
