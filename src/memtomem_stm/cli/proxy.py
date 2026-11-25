@@ -10068,23 +10068,6 @@ def _daemon_command(sub: str, *, hook_command: bool) -> str:
     return f"{command} {_HOOK_COMMAND_OPTION}" if hook_command else command
 
 
-def _hook_daemon_can_start(surfacing_status: Mapping[str, Any]) -> bool:
-    """Whether doctor names ``mms daemon start --hook-command claude``: it took
-    the hook's daemon route, and knows of nothing that makes that start
-    pointless or refused. Surfacing off means the hook never calls the daemon;
-    an unusable discovery key makes ``start`` exit 1 too. A probe that failed,
-    or a key not created yet (``start`` creates it), is no such sign. Not a
-    check that the start would succeed."""
-    if not _names_hook_command(surfacing_status):
-        return False
-    ltm = surfacing_status.get("ltm_server")
-    if not isinstance(ltm, dict):
-        return True
-    return (
-        ltm.get("skipped") != "surfacing_disabled" and ltm.get("discovery_key_unusable") is not True
-    )
-
-
 def _names_hook_command(surfacing_status: Mapping[str, Any]) -> bool:
     """Whether doctor's daemon advice should carry ``--hook-command claude``.
 
@@ -10629,7 +10612,6 @@ def _env_overrides_found_row(
     bare_outcome: EnvSTMConfigLoad | Exception,
     *,
     hook_daemon: bool = False,
-    hook_daemon_can_start: bool = False,
 ) -> tuple[str, str, str | None]:
     """The ``env_overrides`` row when doctor read one STM hook command (#1506).
 
@@ -10646,11 +10628,12 @@ def _env_overrides_found_row(
     the handler by location and path, never its command text or values.
 
     *hook_daemon*: doctor took the hook's daemon route for this command
-    (:func:`_names_hook_command`), so a failing bare clause says it describes
-    plain ``mms daemon start``. *hook_daemon_can_start*
-    (:func:`_hook_daemon_can_start`): when only the bare build fails, the
-    next action also names ``mms daemon start --hook-command claude``, which
-    builds as the hook's command does (#1524).
+    (:func:`_names_hook_command`). When only the bare build fails, its
+    clause then says it describes plain ``mms daemon start``, and the next
+    action also names ``mms daemon start --hook-command claude``, which builds
+    as the hook's command does (#1524). Whether that start would succeed is
+    not judged here: the ``ltm server`` row reports what its probe found (an
+    unusable discovery key, surfacing off).
     """
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
@@ -10705,7 +10688,7 @@ def _env_overrides_found_row(
             )
         # Only a bare build that fails outright: an invalid proxy variable
         # reaches the hook's build too, so it never leaves that one ``ok``.
-        if bare_kind == "fail" and hook_kind == "ok" and hook_daemon and hook_daemon_can_start:
+        if bare_kind == "fail" and hook_kind == "ok" and hook_daemon:
             actions.append(
                 "or start the hook's daemon as its command builds it: "
                 f"{_daemon_command('start', hook_command=True)}"
@@ -12992,7 +12975,6 @@ def doctor(
                 found_outcome,
                 bare_outcome,
                 hook_daemon=decided is not None and _names_hook_command(decided),
-                hook_daemon_can_start=decided is not None and _hook_daemon_can_start(decided),
             ),
         )
     elif isinstance(bare_outcome, Exception):

@@ -1368,19 +1368,17 @@ _PLAIN_BARE_FAILS = ": STMConfig() fails — plain mms daemon start from it exit
     [
         # The command runs without the daemon: no daemon of the hook to start.
         ("no-daemon", _BARE_FAILS, _BARE_ADVICE),
-        # ``mms daemon start`` exits on the key it cannot use, with the option too.
-        ("key-unusable", _PLAIN_BARE_FAILS, _BARE_ADVICE),
-        # Surfacing off: doctor's probe stops before discovery, so it has not
-        # seen whether the key can be used.
-        ("surfacing-off-key-unusable", _PLAIN_BARE_FAILS, _BARE_ADVICE),
-        # Surfacing off: the hook never calls the daemon, so starting it is moot.
-        ("surfacing-off", _PLAIN_BARE_FAILS, _BARE_ADVICE),
-        # The route was chosen, then the probe failed: nothing says start
-        # would be refused, so the command that uses the hook's build is named.
+        # On the hook's daemon route the row names the command that builds as
+        # the hook does, whatever the ``ltm server`` probe found: that row
+        # reports an unusable key or surfacing off itself, and this one does
+        # not judge whether the start would succeed.
+        ("key-unusable", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
+        ("surfacing-off-key-unusable", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
+        ("surfacing-off", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
         ("probe-error", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
     ],
 )
-def test_env_row_names_the_hooks_daemon_start_only_when_it_can_start(
+def test_env_row_names_the_hooks_daemon_start_on_its_route(
     home, proxy_file, monkeypatch, tmp_path, case, clause, next_action
 ):
     from memtomem_stm.cli import proxy as proxy_mod

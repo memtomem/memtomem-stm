@@ -21,12 +21,10 @@ changes inline only. See the deprecation policy in
   exits 1, and the next action adds `or start the hook's daemon as its
   command builds it: mms daemon start --hook-command claude` (the option
   #1518 added). The addition is left out when the command says
-  `--no-daemon`, when doctor's config file is missing (the route is not
-  decided), when surfacing is off (the hook never calls the daemon), and
-  when the `ltm server` probe found the discovery key unusable, on which
-  `start` exits 1 too. A probe that failed, or a key not created yet
-  (`start` creates one), does not withhold it. Doctor does not check that
-  the start itself would succeed.
+  `--no-daemon` and when doctor's config file is missing (the route is not
+  decided). The row does not judge whether that start would succeed; the
+  `ltm server` row reports what its probe found, such as an unusable
+  discovery key or surfacing off.
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
   #1506). When doctor reads exactly one STM hook command `mms hook install`
