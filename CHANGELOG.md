@@ -11,6 +11,26 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms stats --all-time` now covers the **Progressive delivery** block too
+  (issue #1328, part B of #1316). Reads removed by the
+  `proxy.progressive_reads.retention_days` purge at server start were lost,
+  so its produced and delivered chars covered only that window (90 days by
+  default). A database trigger now folds every deleted `progressive_reads`
+  row into a never-pruned `progressive_reads_rollup` table in
+  `stm_feedback.db`, one row per response and tool, so a response purged in
+  part is still counted once. It is installed when the MCP server of this
+  version starts with progressive-read collection enabled, before that
+  start's purge; reads purged earlier are counted as lost, not recovered.
+  Until then `--all-time` reports the progressive totals as unavailable.
+  `--json` adds `progressive_scope`, and a `rollup` coverage object under
+  `progressive` in all-time mode. Without `--all-time` the text output is
+  unchanged; the JSON gains `progressive_scope: "retained"` and a `scope` key
+  in `progressive`. To reset the history, delete from `progressive_reads` and
+  then from `progressive_reads_rollup` in one transaction; never `DROP` the
+  rollup table while its trigger exists.
+
 ### Fixed
 
 - The `max_upstream_chars` guard no longer reports an oversized payload when

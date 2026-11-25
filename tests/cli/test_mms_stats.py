@@ -1277,6 +1277,124 @@ class TestStatsProgressive:
         assert data["compression"]["total_calls"] == 1
 
 
+class TestStatsProgressiveAllTime:
+    """``--all-time`` covers progressive delivery through its rollup (#1328)."""
+
+    def _db(self, tmp_path: Path) -> Path:
+        return tmp_path / ".memtomem" / "stm_feedback.db"
+
+    def test_purged_reads_still_count(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_progressive(db)
+        conn = sqlite3.connect(db)
+        conn.execute("DELETE FROM progressive_reads WHERE key = 'a'")
+        conn.commit()
+        conn.close()
+
+        retained = runner.invoke(cli, ["stats"]).output
+        result = runner.invoke(cli, ["stats", "--all-time"])
+
+        assert result.exit_code == 0, result.output
+        assert "  responses: 1  (with follow-up reads: 0; reads recorded: 1)" in retained
+        assert "Progressive delivery (all time)" in result.output
+        assert "  responses: 2  (with follow-up reads: 1; reads recorded: 3)" in result.output
+        assert "  chars: 20,000 produced -> 5,000 delivered (25.0%)" in result.output
+        assert "  Window: all time — retained rows plus the rollup, since " in result.output
+        assert "Incomplete" not in result.output
+        assert "rows older than" not in result.output
+
+    def test_json_names_the_scope_and_the_coverage(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_progressive(self._db(tmp_path))
+
+        data = json.loads(runner.invoke(cli, ["stats", "--all-time", "--json"]).output)
+        default = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["progressive_scope"] == "all_time"
+        rollup = data["progressive"]["rollup"]
+        assert rollup["installed"] is True
+        assert rollup["lost_before_install"] == 0
+        assert rollup["incomplete_before"] is None
+        assert rollup["earliest_created_at"] == data["progressive"]["oldest_at"]
+        assert default["progressive_scope"] == "retained"
+        assert "rollup" not in default["progressive"]
+
+    def test_a_db_without_the_rollup_is_unavailable(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        db.parent.mkdir(parents=True)
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE progressive_reads (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, "
+            "trace_id TEXT, server TEXT, tool TEXT, offset INTEGER, chars INTEGER, "
+            "served_to INTEGER, total_chars INTEGER, created_at REAL, is_initial INTEGER);"
+            "INSERT INTO progressive_reads (key, server, tool, offset, chars, served_to, "
+            "total_chars, created_at, is_initial) VALUES ('k', 's', 't', 0, 1, 1, 1, 1.0, 1);"
+        )
+        conn.commit()
+        conn.close()
+
+        result = runner.invoke(cli, ["stats", "--all-time"])
+        data = json.loads(runner.invoke(cli, ["stats", "--all-time", "--json"]).output)
+
+        assert "All-time totals unavailable: this feedback DB has no usable progressive" in (
+            result.output
+        )
+        assert "No progressive responses recorded yet." not in result.output
+        assert data["progressive"]["available"] is False
+        assert data["progressive"]["rollup"]["installed"] is False
+
+    def test_a_malformed_marker_is_unavailable_in_text_and_json(
+        self, runner, tmp_path, monkeypatch
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_progressive(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE progressive_reads_meta SET value = 'nan' WHERE key = 'rollup_complete_from'"
+        )
+        conn.commit()
+        conn.close()
+
+        output = runner.invoke(cli, ["stats", "--all-time"]).output
+        data = json.loads(runner.invoke(cli, ["stats", "--all-time", "--json"]).output)
+
+        assert "All-time totals unavailable" in output
+        assert data["progressive"]["available"] is False
+        assert data["progressive"]["rollup"]["installed"] is False
+
+    def test_an_empty_installed_rollup_still_shows_coverage(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        store = ProgressiveReadsStore(self._db(tmp_path), retention_days=0)
+        store.initialize()
+        store.close()
+
+        output = runner.invoke(cli, ["stats", "--all-time"]).output
+
+        assert "No progressive responses recorded yet." in output
+        assert "  Window: all time — retained rows plus the rollup." in output
+
+    def test_a_repaired_rollup_says_the_loss_is_unknown(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_progressive(db)
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TRIGGER progressive_reads_rollup_on_delete_v1")
+        conn.commit()
+        conn.close()
+        store = ProgressiveReadsStore(db, retention_days=0)
+        store.initialize()
+        store.close()
+
+        output = runner.invoke(cli, ["stats", "--all-time"]).output
+
+        assert "  Possibly incomplete before " in output
+        assert "an unknown number of reads\n    recorded before then may be missing." in output
+        assert "before the\n    rollup was installed" not in output
+
+
 class TestReadProgressiveSummary:
     def test_missing_file_is_unavailable_and_not_created(self, tmp_path):
         db = tmp_path / "nope" / "reads.db"
