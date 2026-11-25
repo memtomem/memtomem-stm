@@ -693,6 +693,30 @@ def _text_block_metadata(block: Any) -> dict[str, Any]:
     return block.model_dump(by_alias=True, exclude={"type", "text"}, exclude_none=True)
 
 
+# Annotation fields that describe a block's text as a whole, so one value can
+# describe the joined text of blocks that all carry it. Opaque block ``_meta``
+# is never shared: equal values may still be block-relative (offsets, spans).
+_BLOCK_INDEPENDENT_ANNOTATIONS = frozenset({"audience", "priority", "lastModified"})
+
+
+def _shared_block_independent_metadata(metas: list[dict[str, Any]]) -> bool:
+    """Whether every dumped text-block metadata is the same annotations-only value.
+
+    Equality is on the JSON text, so values Python ``==`` conflates (``True``
+    and ``1``, ``1`` and ``1.0``) stay distinct; list order counts.
+    """
+    for meta in metas:
+        if not meta.keys() <= {"annotations"}:
+            return False
+        annotations = meta.get("annotations", {})
+        if not isinstance(annotations, dict):
+            return False
+        if not annotations.keys() <= _BLOCK_INDEPENDENT_ANNOTATIONS:
+            return False
+    canonical = {json.dumps(meta, sort_keys=True) for meta in metas}
+    return len(canonical) == 1
+
+
 def _scrub_surrogates_in(value: Any) -> Any:
     """``value`` with lone surrogates escaped, or ``value`` itself if it has none.
 
@@ -8235,12 +8259,17 @@ class ProxyManager:
         native_bypass = tc.delivery_format == "structured" and (
             structured_content is not None or bool(non_text_content)
         )
-        if text_blocks and (
-            native_bypass
-            or (len(text_blocks) > 1 and any(_text_block_metadata(block) for block in text_blocks))
-        ):
+        metadata_bypass = False
+        if not native_bypass and len(text_blocks) > 1:
+            block_metas = [_text_block_metadata(block) for block in text_blocks]
+            metadata_bypass = any(block_metas) and not _shared_block_independent_metadata(
+                block_metas
+            )
+        if text_blocks and (native_bypass or metadata_bypass):
             # Combining blocks can assign one block's audience or metadata to
-            # another's text. Preserve this response's boundaries instead of
+            # another's text; blocks that all carry the same annotations and no
+            # block _meta are joined like one annotated block instead (#1120).
+            # Otherwise preserve this response's boundaries instead of
             # compressing/surfacing/indexing it as a single string. Cleaning
             # rewrites one string without moving text between strings, so each
             # block is cleaned on its own: markup and repeats inside a block

@@ -14,6 +14,8 @@ Pins the envelope contract introduced with the ⑥ first-user fixes:
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -29,8 +31,9 @@ from memtomem_stm.proxy.config import (
     UpstreamServerConfig,
 )
 from memtomem_stm.proxy.manager import _NON_TEXT_ERROR_TEXT, ProxyManager, UpstreamConnection
-from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.proxy.metrics import STRUCTURED_BYPASS_STRATEGY, TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore, read_compression_summary
+from memtomem_stm.server import _continuation_result
 
 # ── fixtures / helpers (style mirrors test_call_tool_inner_characterization) ─
 
@@ -225,12 +228,16 @@ class TestEnvelopePreservation:
         cfg.min_result_retention = 0.0
         cfg.upstream_servers["srv"].max_result_chars = 500
         mgr._config_loader.seed(cfg)
+        # Identical annotations alone are merged (#1120); identical block _meta
+        # still keeps the boundaries.
         audiences = ("assistant", "assistant") if identical else ("assistant", "user")
+        block_meta = {"span": [0, 5]} if identical else None
         blocks = [
             TextContent(
                 type="text",
                 text=char * 200_000,
                 annotations=Annotations(audience=[audience]),
+                _meta=block_meta,
             )
             for char, audience in zip(("a", "b"), audiences)
         ]
@@ -247,6 +254,7 @@ class TestEnvelopePreservation:
                 blocks[0].annotations,
                 blocks[1].annotations,
             )
+            assert (first.meta, second.meta) == (blocks[0].meta, blocks[1].meta)
             assert notice.text.startswith("[response truncated to 500 chars: text blocks")
             assert "raise max_result_chars" in notice.text
         assert session.call_tool.await_count == 2
@@ -397,11 +405,17 @@ class TestEnvelopePreservation:
         _set_upstream(mgr, _result("x" * 60_000))
         await mgr.call_tool("srv", "tool", {})
         blocks = [
-            TextContent(type="text", text=c * 200_000, annotations=Annotations(priority=0.5))
+            TextContent(
+                type="text",
+                text=c * 200_000,
+                annotations=Annotations(priority=0.5),
+                _meta={"chunk": "same"},
+            )
             for c in "ab"
         ]
         _set_upstream(mgr, CallToolResult(content=blocks))
-        await mgr.call_tool("srv", "tool", {})
+        res = await mgr.call_tool("srv", "tool", {})
+        assert [block.meta for block in res.content[:2]] == [{"chunk": "same"}] * 2
 
         summary = read_compression_summary(tmp_path / "metrics.db")
         assert (summary["total_calls"], summary["unclassified_mcp_calls"]) == (2, 0)
@@ -601,6 +615,255 @@ class TestEnvelopePreservation:
         assert isinstance(res, list)
         assert isinstance(res[0], TextContent)
         assert res[1] is img
+
+
+# ── identically annotated text blocks (#1120) ─────────────────────────────
+
+
+def _seed_budget(mgr: ProxyManager, budget: int, **server_fields) -> None:
+    cfg = mgr._config.model_copy(deep=True)
+    cfg.min_result_retention = 0.0
+    server = cfg.upstream_servers["srv"]
+    server.max_result_chars = budget
+    for name, value in server_fields.items():
+        setattr(server, name, value)
+    mgr._config_loader.seed(cfg)
+
+
+def _first_row(store: MetricsStore) -> tuple:
+    return tuple(
+        store._db.execute(
+            "SELECT original_chars, cleaned_chars, compressed_chars, compression_strategy "
+            "FROM proxy_metrics ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+    )
+
+
+_SHARED = Annotations(audience=["assistant"])
+_SHARED_FULL = Annotations(
+    audience=["assistant"], priority=0.5, lastModified="2026-11-01T00:00:00Z"
+)
+
+
+class TestSharedMetadataPredicate:
+    """Raw dumped metadata, so no SDK validation normalizes the values first."""
+
+    @pytest.mark.parametrize(
+        "metas",
+        [
+            # Python ``==`` calls each of these pairs equal.
+            [{"annotations": {"priority": True}}, {"annotations": {"priority": 1}}],
+            [{"annotations": {"priority": 1}}, {"annotations": {"priority": 1.0}}],
+            [{"annotations": {"audience": [False]}}, {"annotations": {"audience": [0]}}],
+            # Order is part of the value.
+            [
+                {"annotations": {"audience": ["user", "assistant"]}},
+                {"annotations": {"audience": ["assistant", "user"]}},
+            ],
+            # One block tagged, one not.
+            [{"annotations": {"audience": ["user"]}}, {}],
+            # Keys outside the allowlist, equal or not.
+            [{"annotations": {"audience": ["user"], "title": "x"}}] * 2,
+            [{"annotations": {"audience": ["user"]}, "_meta": {}}] * 2,
+            [{"annotations": {"audience": ["user"]}, "_meta": {"span": [0, 5]}}] * 2,
+            [{"annotations": {"audience": ["user"]}, "extra": 1}] * 2,
+        ],
+    )
+    def test_not_shared(self, metas):
+        from memtomem_stm.proxy.manager import _shared_block_independent_metadata
+
+        assert _shared_block_independent_metadata(metas) is False
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            {"annotations": {"audience": ["user"], "priority": 0.5, "lastModified": "2026"}},
+            {"annotations": {}},
+        ],
+    )
+    def test_shared(self, meta):
+        from memtomem_stm.proxy.manager import _shared_block_independent_metadata
+
+        assert _shared_block_independent_metadata([dict(meta), dict(meta), dict(meta)]) is True
+
+
+class TestIdenticalAnnotationMerge:
+    @pytest.mark.parametrize("annotations", [_SHARED, _SHARED_FULL])
+    async def test_identically_annotated_blocks_compress_and_replay_as_one_block(
+        self, make_mgr, annotations
+    ):
+        mgr, store, cache = make_mgr(with_cache=True)
+        _seed_budget(mgr, 500)
+        blocks = [
+            TextContent(type="text", text="MARKER_A first block", annotations=annotations),
+            TextContent(type="text", text="MARKER_B " + "word " * 2000, annotations=annotations),
+        ]
+        session = _set_upstream(mgr, CallToolResult(content=blocks))
+        cold = await mgr.call_tool("srv", "tool", {})
+        cache.close()
+        cache.initialize()
+        warm = await mgr.call_tool("srv", "tool", {})
+        assert session.call_tool.await_count == 1
+        for res in (cold, warm):
+            assert isinstance(res, CallToolResult)
+            [block] = res.content
+            assert block.annotations == annotations
+            assert block.meta is None
+            # Text from both upstream blocks, in order: the second was not dropped.
+            assert block.text.startswith("MARKER_A first block\nMARKER_B word")
+        assert cold.model_dump() == warm.model_dump()
+        original, cleaned, compressed, strategy = _first_row(store)
+        assert strategy == "truncate"
+        assert compressed < cleaned
+        assert original == sum(len(b.text) for b in blocks) + 1  # the "\n" join
+
+    async def test_merged_text_takes_the_first_text_position_like_unannotated_blocks(
+        self, make_mgr
+    ):
+        mgr, _, _ = make_mgr()
+        lead, middle = (
+            _image_content(),
+            ImageContent(type="image", data="d29ybGQ=", mimeType="image/png"),
+        )
+        results = []
+        for tag in (_SHARED, None):
+            blocks = [
+                lead,
+                TextContent(type="text", text="alpha", annotations=tag),
+                middle,
+                TextContent(type="text", text="beta", annotations=tag),
+            ]
+            _set_upstream(mgr, CallToolResult(content=blocks))
+            res = await mgr.call_tool("srv", "tool", {})
+            results.append(res.content if isinstance(res, CallToolResult) else res)
+        annotated, plain = results
+        for content in (annotated, plain):
+            assert [b.type for b in content] == ["image", "text", "image"]
+            assert content[0] is lead and content[2] is middle
+            assert content[1].text == "alpha\nbeta"
+        assert annotated[1].annotations == _SHARED
+        assert plain[1].annotations is None
+
+    async def test_structured_frame_carries_the_annotations(self, make_mgr):
+        mgr, store, _ = make_mgr()
+        _seed_budget(
+            mgr,
+            2000,
+            delivery_format="structured",
+            compression=CompressionStrategy.PROGRESSIVE,
+        )
+        blocks = [
+            TextContent(type="text", text=f"MARKER_{c} " + "word " * 400, annotations=_SHARED)
+            for c in "AB"
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert isinstance(res, CallToolResult)
+        [block] = res.content
+        assert block.annotations == _SHARED
+        frame = json.loads(block.text)
+        assert frame["stm"]["kind"] == "progressive"
+        assert "MARKER_A word" in json.dumps(frame)
+        assert _first_row(store)[3] == "progressive"
+
+    @pytest.mark.parametrize("native", ["structured_content", "image"])
+    async def test_native_structured_bypass_wins_over_shared_annotations(self, make_mgr, native):
+        mgr, store, _ = make_mgr()
+        _seed_budget(mgr, 5000, delivery_format="structured")
+        blocks: list = [
+            TextContent(type="text", text=f"block {c}", annotations=_SHARED) for c in "AB"
+        ]
+        if native == "image":
+            blocks.insert(1, _image_content())
+        structured = {"answer": 42} if native == "structured_content" else None
+        _set_upstream(mgr, CallToolResult(content=blocks, structured_content=structured))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert isinstance(res, CallToolResult)
+        assert res.content == blocks
+        assert res.structured_content == structured
+        assert _first_row(store)[3] == STRUCTURED_BYPASS_STRATEGY
+
+    async def test_progressive_first_chunk_carries_the_annotations(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        _seed_budget(mgr, 1500, compression=CompressionStrategy.PROGRESSIVE)
+        blocks = [
+            TextContent(type="text", text="MARKER_A " + "alpha " * 400, annotations=_SHARED),
+            TextContent(type="text", text="MARKER_B " + "beta " * 400, annotations=_SHARED),
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert isinstance(res, CallToolResult)
+        [block] = res.content
+        assert block.annotations == _SHARED
+        assert block.text.startswith("MARKER_A alpha")
+        footer = re.compile(r'stm_proxy_read_more\(key="([^"]+)", offset=(\d+)\)')
+        delivered, text = [block.text], block.text
+        while match := footer.findall(text):
+            key, offset = match[-1]
+            # What stm_proxy_read_more returns: the text, without the annotations.
+            [continuation] = _continuation_result(mgr.read_more(key, int(offset)), None).content
+            assert continuation.annotations is None
+            text = continuation.text
+            delivered.append(text)
+        assert len(delivered) > 1
+        assert "MARKER_B beta" in "".join(delivered)
+
+    async def test_upstream_guard_notice_is_part_of_the_merged_block(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(update={"max_upstream_chars": 1000})
+        mgr._config_loader.seed(cfg)
+        blocks = [TextContent(type="text", text=c * 600, annotations=_SHARED) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        cleaned_inputs: list[str] = []
+        clean = mgr._clean_content
+
+        def spy(text, cfg):
+            cleaned_inputs.append(text)
+            return clean(text, cfg)
+
+        mgr._clean_content = spy
+        res = await mgr.call_tool("srv", "tool", {})
+        assert isinstance(res, CallToolResult)
+        [block] = res.content
+        assert block.annotations == _SHARED
+        assert block.text.startswith("a" * 600 + "\n" + "b" * 400)
+        assert "max_upstream_chars guard" in block.text
+        # The notice is in the text the pipeline cleans and compresses.
+        [cleaned_input] = cleaned_inputs
+        assert "max_upstream_chars guard" in cleaned_input
+
+    @pytest.mark.parametrize(
+        "metas",
+        [
+            # Equal opaque block _meta may be block-relative (offsets, spans).
+            [{"annotations": _SHARED, "_meta": {"span": [0, 5]}}] * 2,
+            # Values Python ``==`` calls equal, as the upstream sent them.
+            [{"_meta": {"flag": True}}, {"_meta": {"flag": 1}}],
+            [{"_meta": {"values": [False]}}, {"_meta": {"values": [0]}}],
+            [{"annotations": _SHARED}, {}],
+            [
+                {"annotations": Annotations(audience=["user", "assistant"])},
+                {"annotations": Annotations(audience=["assistant", "user"])},
+            ],
+        ],
+    )
+    async def test_other_metadata_keeps_the_boundaries(self, make_mgr, metas):
+        mgr, store, cache = make_mgr(with_cache=True)
+        blocks = [
+            TextContent(type="text", text=f"block {i}", **meta) for i, meta in enumerate(metas)
+        ]
+        session = _set_upstream(mgr, CallToolResult(content=blocks))
+        for _ in range(2):
+            res = await mgr.call_tool("srv", "tool", {})
+            assert isinstance(res, CallToolResult)
+            assert res.content == blocks
+            for got, meta in zip(res.content, metas):
+                if "_meta" in meta:
+                    # JSON text tells True from 1 and [False] from [0].
+                    assert json.dumps(got.meta) == json.dumps(meta["_meta"])
+        assert session.call_tool.await_count == 2
+        assert cache.stats()["total_entries"] == 0
+        assert _latest_bypass_row(store)[3] == "none→metadata_bypass"
 
 
 class TestMaxUpstreamBytes:

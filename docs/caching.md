@@ -63,7 +63,7 @@ Key details:
 - **Annotations stay fresh at runtime** — the proxy subscribes to `notifications/tools/list_changed` on every upstream session. When an upstream re-declares its tools mid-connection, the advertised snapshot is re-fetched and any tool whose eligibility flipped toward may-mutate — or that disappeared from the list — has its existing cache rows invalidated, so a pre-flip row can't be served after the flip (or once the annotations move back). Explicit `cache` overrides still win: a tool forced in with `cache: true` is never auto-invalidated. Upstreams that change annotations *without* emitting `list_changed` are picked up on the next reconnect, as before.
 - **Per-tool / per-server cache override** — set `cache: true|false` on a `tool_overrides` entry or on an `UpstreamServerConfig` to force a tool/server in or out of the cache, overriding the annotation policy (precedence: tool > server > policy). Use `cache: false` for a volatile read tool or a writer on an upstream that omits annotations; `cache: true` to re-enable caching for a tool an upstream mis-annotates — under the `strict` policy this is the supported allowlist for un-annotated read-only tools (no separate allowlist setting exists).
 - **Per-tool / per-server TTL override** — set `cache_ttl_seconds` on a `tool_overrides` entry or on an `UpstreamServerConfig` to override how long that tool's/server's responses stay cached, independent of the on/off `cache` gate (precedence: tool > server > global `cache.default_ttl_seconds`). `null` (default) inherits the next level down — at the tool/server level `null` means *inherit*, not *never expires*. A positive value sets the TTL in seconds; `0` disables caching for that tool/server — while the resolved TTL is `≤ 0` the lookup is bypassed, so a stale row is never served (mirroring a global `default_ttl_seconds` of 0); existing on-disk rows are then cleaned up opportunistically (the next identical call invalidates the row regardless of its response shape — text, non-text, mixed, error, or empty). `cache: false` still wins outright, and `cache: true` with `cache_ttl_seconds: 0` is eligible-but-TTL-disabled, i.e. effectively off.
-- **Envelope-aware successful text responses** — cache schema v6 stores the compressed text, pre-compression cleaned length, JSON-safe `structuredContent`, result-level `_meta`, and single text-block metadata (`annotations` and block `_meta`). Cache hits reconstruct the same metadata. Upgrading from v5 discards only response-cache rows; metrics and feedback remain intact. Privacy scanning covers both text and envelope JSON. Multiple text blocks carrying metadata retain their boundaries and bypass compression, surfacing, indexing, extraction, and caching; each block is cleaned on its own and their text is capped at the tool's compression budget instead (see below). Errors and non-text/mixed content remain uncached, and so does a response carrying upstream `structuredContent` or non-text blocks for a tool on `delivery_format: "structured"`, which takes the same block-preserving path ([Structured chunk delivery](compression.md#structured-chunk-delivery)); malformed, non-JSON-safe, or unmarked out-of-band rows are never served.
+- **Envelope-aware successful text responses** — since cache schema v6, the cache stores the compressed text, pre-compression cleaned length, JSON-safe `structuredContent`, result-level `_meta`, and single text-block metadata (`annotations` and block `_meta`). Cache hits reconstruct the same metadata. Upgrading from v5 discards only response-cache rows; metrics and feedback remain intact. Privacy scanning covers both text and envelope JSON. Multiple text blocks carrying metadata retain their boundaries and bypass compression, surfacing, indexing, extraction, and caching; each block is cleaned on its own and their text is capped at the tool's compression budget instead (see below). Blocks that all carry the same annotations and no block `_meta` are the exception: they are joined and handled as one annotated block. Errors and non-text/mixed content remain uncached, and so does a response carrying upstream `structuredContent` or non-text blocks for a tool on `delivery_format: "structured"`, which takes the same block-preserving path ([Structured chunk delivery](compression.md#structured-chunk-delivery)); malformed, non-JSON-safe, or unmarked out-of-band rows are never served.
 - **Privacy exclusion** — responses that look like secrets are never persisted to the cache; see [SECURITY.md](../SECURITY.md). The check reads through JSON string escaping (up to three levels of JSON inside a JSON string; text that still decodes further counts as sensitive), so a false positive costs one uncached response. This guard always applies on top of the policy/override above.
 - **One-time privacy sweep after an upgrade** — the cache records the privacy policy its rows were last checked under: a digest of the sensitive-content patterns (credentials and PII such as email addresses) plus a policy epoch. When an upgrade changes that policy (a new or changed pattern, or a new epoch; every upgrade from 0.6.6 through 0.7.0 did), the first open re-checks every cached row and removes the ones the new policy refuses, along with rows that carry a transient key, so the first start takes longer on a large cache (measured at about 16 ms per 32 KB cached row on the upgrade to 0.6.7). Later opens check only the rows queued since the last check. An older build records its own policy, so opening one `proxy_cache.db` alternately from an older and a newer build repeats the sweep at each switch.
 - **Transient-key exclusion** — to prevent serving expired progressive/selective keys on a cache hit (which would drop the response tail), the cache automatically skips storing any response carrying a transient-key marker (like a `PROGRESSIVE_FOOTER_TOKEN`, a `selection_key` JSON field, or a structured STM envelope with `stm.schema_version` 1, a `kind` of `progressive`, `selective`, `hybrid` or `selection`, and a non-empty `stm.payload.key`). The next identical call re-runs the pipeline to generate live keys.
@@ -75,13 +75,25 @@ Key details:
 
 **Behavior change**: when a response contains multiple text blocks and any
 block has `annotations` or block `_meta`, the proxy preserves every block's
-boundary and metadata, even when all metadata values are identical. This is
-a preservation policy: equal annotations do not make separate blocks a single
-upstream block. These responses skip compression, surfacing, indexing,
-extraction, and caching. An explicit `_context_query` does not re-enable
-surfacing on this path.
+boundary and metadata, unless the blocks share their annotations (below).
+These responses skip compression, surfacing, indexing, extraction, and
+caching. An explicit `_context_query` does not re-enable surfacing on this
+path.
 
-Each text block is cleaned on its own with the tool's resolved `cleaning`
+**Shared annotations** (#1120): when every text block carries the same
+`annotations` and no block carries `_meta`, the blocks are joined and handled
+as one annotated block (see the end of this section). The comparison reads the
+blocks after the MCP SDK has validated them. Only `audience`, `priority` and
+`lastModified` may be present, and any other annotation field that survives
+validation keeps the boundaries. The values must be equal as JSON, so
+`audience: ["user", "assistant"]` and `["assistant", "user"]` differ, and so
+do a block with annotations and one without. The SDK has already normalized
+wire values by then: `priority: true` and `priority: 1` both arrive as `1.0`,
+and unknown annotation fields are dropped. Equal block `_meta` always keeps the
+boundaries, since it may describe the block's position (offsets, spans, chunk
+ids).
+
+On the preservation path, each text block is cleaned on its own with the tool's resolved `cleaning`
 settings, so markup, repeated paragraphs and link floods inside a block are
 removed as on the normal path. A paragraph repeated in a *different* block is
 kept, since that block may be addressed to a different audience. A block that
@@ -111,12 +123,34 @@ only `max_upstream_chars` cut it, and equal values mean neither did. The auto-tu
 per-tool profiles, and `mms status` and `mms doctor` leave them out of their
 tuning-readiness count, because no compressor ran on them.
 
-There is no switch to merge annotated blocks. Raise `max_result_chars` (or
-`max_result_tokens`) for the tool to receive more of such a response, or have
-the upstream return a single annotated block when compression and surfacing are
-desired.
-Single annotated blocks retain their metadata through compression and cache
-replay, and unannotated multi-block responses retain the existing merge
-behavior, unless the tool is on `delivery_format: "structured"` and the
-response also carries upstream `structuredContent` or non-text blocks: that
-response takes the preservation path above instead.
+There is no switch to merge other annotated blocks. Raise `max_result_chars`
+(or `max_result_tokens`) for the tool to receive more of such a response, or
+have the upstream return a single annotated block, or tag every block the same
+way, when compression and surfacing are desired.
+Single annotated blocks and blocks merged under shared annotations retain their
+metadata through compression and cache replay, and unannotated multi-block
+responses retain the existing merge behavior. None of the three applies when
+the tool is on `delivery_format: "structured"` and the response also carries
+upstream `structuredContent` or non-text blocks: that response takes the
+preservation path above instead.
+
+A merged response is one annotated block to the rest of the pipeline, including
+where a single block's metadata does not reach:
+
+- The blocks are joined with a newline before cleaning, as unannotated blocks
+  are, so markup that opens in one block and closes in the next is cleaned as
+  one span.
+- The merged text takes the first text block's position, so a text block that
+  followed a non-text block moves ahead of it.
+- Surfaced memories and index notices, when the pipeline adds them, go into
+  that block and carry its annotations. A cache hit can surface again but does
+  not index again.
+- A `max_upstream_chars` notice is part of the text that is compressed, not a
+  separate block, so compression can shorten or drop it.
+- Continuations fetched with `stm_proxy_read_more` or `stm_proxy_select_chunks`
+  do not carry the annotations.
+- On `delivery_format: "structured"`, the annotations count against the initial
+  frame, as they do for a single annotated block.
+
+A successful live call records the normal pipeline's strategy label, not
+`none→metadata_bypass`.

@@ -11,6 +11,27 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- A response with two or more text blocks that all carry the same
+  `annotations` and no block `_meta` is now joined and handled as one annotated
+  block (issue #1120). It goes through the normal pipeline under that path's
+  usual rules for compression, surfacing, indexing and caching, and the merged
+  block keeps the shared annotations, warm cache hits included. A tool on
+  `delivery_format: "structured"` whose response also carries upstream
+  `structuredContent` or non-text blocks still takes the block-preserving path.
+  **Behavior change**: other such responses no longer take the block-preserving
+  path, so their blocks are no longer cleaned one by one and cut to one shared
+  text budget without compression, and a successful live call's
+  `proxy_metrics` row records the normal pipeline's strategy label instead of
+  `none→metadata_bypass`. Annotations must match after MCP SDK validation:
+  only `audience`, `priority` and `lastModified`, equal as JSON (order counts).
+  Any block `_meta`, even an identical one, keeps the boundaries, as does any
+  difference between blocks. The merged block is subject to what a single
+  annotated block is subject to: its continuations carry no annotations,
+  surfaced memories carry its annotations, and cleaning reads the joined text.
+  See [Annotated text-block boundaries](docs/caching.md#annotated-text-block-boundaries).
+
 ### Fixed
 
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
