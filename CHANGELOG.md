@@ -34,7 +34,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - The `max_upstream_chars` guard no longer reports an oversized payload when
-  no text was cut (issue #1530). A text block that exactly filled the cap
+  no text was cut (#1536, issue #1530). A text block that exactly filled the cap
   followed by an empty text block used to get the "response truncated …
   upstream returned an oversized payload" notice appended to the joined
   text, and a truncation warning in the log; the guard now fires only when
