@@ -43,10 +43,11 @@ changes inline only. See the deprecation policy in
   less content and a selection that fit before can return `budget_exceeded`;
   a read at or past the end carries none. With a SQLite pending store, a
   credential in that metadata now refuses the persistent write the way one
-  in the text does (progressive falls back to passthrough, selective and
-  hybrid to truncation). A present but invalid stored value is a delivery
-  error that keeps the row. Responses without block metadata, and keys
-  written before this version, are unchanged.
+  in the text does: progressive falls back to passthrough (in structured
+  delivery, to a truncation fitted to the budget when the passthrough would
+  not fit), selective and hybrid to truncation. A present but invalid stored
+  value is a delivery error that keeps the row. Responses without block
+  metadata, and keys written before this version, are unchanged.
 
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue

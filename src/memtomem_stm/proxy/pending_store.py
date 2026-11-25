@@ -21,8 +21,8 @@ from memtomem_stm.proxy.compression import (
 )
 from memtomem_stm.proxy.delivery import (
     progressive_metadata_format,
+    progressive_text_block,
     stored_progressive_format,
-    stored_text_block,
 )
 from memtomem_stm.proxy.heading_index import HeadingIndex, ensure_heading_index
 from memtomem_stm.utils.json_out import dumps as _json_dumps
@@ -31,9 +31,6 @@ from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
-
-
-_NO_BLOCK = object()
 
 
 def _parse_progressive_metadata(raw: str | bytes | None) -> dict[str, Any] | None:
@@ -48,13 +45,7 @@ def _parse_progressive_metadata(raw: str | bytes | None) -> dict[str, Any] | Non
             for identity in ("server", "tool", "trace_id"):
                 if isinstance(meta.get(identity), str):
                     meta[identity].encode("utf-8")
-            # The upstream text block's metadata (#1529) is validated by
-            # ``stored_text_block`` instead, which refuses a bad value with an
-            # error: a failure here would be a miss, and delete the row.
-            block = meta.pop("text_block", _NO_BLOCK)
             meta = scrub_lone_surrogates(meta)
-            if block is not _NO_BLOCK and isinstance(meta, dict):
-                meta["text_block"] = block
         if not isinstance(meta, dict):
             return None
         ttl = meta.get("ttl_seconds", 1800.0)
@@ -256,7 +247,7 @@ class InMemoryPendingStore:
                 self._order.remove(key)
                 return None
             progressive_metadata_format(meta)
-            stored_text_block(meta)
+            progressive_text_block(sel.metadata_json)
             _classify_progressive_content(sel, meta, classify_content)
             index = None
             if meta.get("include_structure_hint", True):
@@ -601,7 +592,7 @@ class SQLitePendingStore:
                     db.execute("DELETE FROM pending_selections WHERE key = ?", (key,))
                     return None
                 progressive_metadata_format(meta)
-                stored_text_block(meta)
+                progressive_text_block(sel.metadata_json)
                 index = None
                 repaired = _classify_progressive_content(sel, meta, classify_content)
                 if meta.get("include_structure_hint", True):

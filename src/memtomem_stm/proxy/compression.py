@@ -1055,9 +1055,9 @@ def text_block_has_credentials(block: dict[str, Any] | None) -> bool:
 
     The same real-bytes verdict as :func:`payload_has_credentials`, over the
     metadata as the client receives it (serialized once) and over every key
-    and string value as it is. A pending row escapes these: progressive keeps
-    them inside a JSON string, and a quote inside a key or value is escaped in
-    any serialization, so the store's own row scan cannot see them.
+    and string value as it is. The store's own row scan sees only a
+    serialization, where a quote inside a key or value is escaped, so it
+    cannot see a credential written there.
     """
     if not block:
         return False

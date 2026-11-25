@@ -197,6 +197,27 @@ def stored_text_block(meta: dict[str, Any]) -> dict[str, Any] | None:
     return raw
 
 
+def progressive_text_block(metadata_json: str | None) -> dict[str, Any] | None:
+    """The text block metadata a progressive row keeps in ``metadata_json``.
+
+    Kept out of ``__meta__``: every publication's expiry pass decodes the
+    ``__meta__`` of each live row, and block metadata can be large, so only
+    the read of the requested key decodes it. ``None`` for a row without it
+    (every row written before #1529). Only this code writes the column for
+    progressive rows, so one that does not decode is a :class:`DeliveryError`,
+    which keeps the row, and never a miss.
+    """
+    if metadata_json is None:
+        return None
+    try:
+        data = json.loads(metadata_json)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise DeliveryError("Invalid text block metadata.") from exc
+    if not isinstance(data, dict):
+        raise DeliveryError("Invalid text block metadata.")
+    return stored_text_block(data)
+
+
 def apply_text_block(result: CallToolResult, block: dict[str, Any] | None) -> CallToolResult:
     """*result* with its first content block carrying *block* (#1529)."""
     if not block:

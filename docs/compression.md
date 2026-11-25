@@ -578,15 +578,18 @@ serverInfo metadata and resultType, and legacy clients' field filtering.
 can be shortened to fit. A TOC that cannot fit without dropping keys falls back
 to progressive delivery. A budget too small for one progressing envelope returns
 `budget_exceeded`. A non-final progressive key is published only when its owned
-continuation can also fit a progressing response. Initial upstream metadata uses
-the initial budget only; continuations retain the full derived tool budget.
+continuation can also fit a progressing response. Result-level upstream metadata
+uses the initial budget only. The text block's `annotations` and `_meta` are
+repeated on every continuation, so each structured continuation reserves their
+serialized size from the full derived tool budget it retains.
 With `max_result_tokens` and `token_estimation_mode: "unicode"`, the cleaned
 response's estimated token density derives one character cap before any retention
 floor. Structured frames use the smaller of that cap and the configured static
 character conversion, both for compression and serialized-result fitting. Initial
 upstream metadata is reserved from that cap; the full cap is stored for owned
-continuations. Lossless TOC/progressive delivery does not widen this limit to
-meet a lossy-content retention floor. This is an estimated token budget, not a
+continuations, which reserve the repeated text block metadata from it. Lossless
+TOC/progressive delivery does not widen this limit to meet a lossy-content
+retention floor. This is an estimated token budget, not a
 model-specific tokenizer guarantee.
 Selective and hybrid (`tail_mode: "toc"`) responses short enough to return
 unchanged do so only when that serialized result also fits; JSON escaping can

@@ -342,7 +342,11 @@ def _rows(path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", INVALID_BLOCKS, ids=INVALID_IDS)
+@pytest.mark.parametrize(
+    "bad",
+    [*INVALID_BLOCKS, "raw:not json", "raw:[1, 2]"],
+    ids=[*INVALID_IDS, "undecodable", "array"],
+)
 async def test_invalid_progressive_text_block_is_an_error_and_keeps_the_row(tmp_path, bad):
     import sqlite3
 
@@ -352,18 +356,51 @@ async def test_invalid_progressive_text_block_is_an_error_and_keeps_the_row(tmp_
     key, offset = await _publish(proxy, session, "progressive", "legacy", _block())
     db_path = tmp_path / "pending.db"
     with sqlite3.connect(db_path) as db:
-        (raw,) = db.execute("SELECT chunks_json FROM pending_selections").fetchone()
-        chunks = json.loads(raw)
-        meta = json.loads(chunks["__meta__"])
-        meta["text_block"] = bad
-        chunks["__meta__"] = json.dumps(meta)
-        db.execute("UPDATE pending_selections SET chunks_json = ?", (json.dumps(chunks),))
+        (raw,) = db.execute("SELECT metadata_json FROM pending_selections").fetchone()
+        assert json.loads(raw) == {
+            "text_block": {
+                "annotations": ANNOTATIONS.model_dump(mode="json", exclude_none=True),
+                "_meta": BLOCK_META,
+            }
+        }
+        stored = bad if isinstance(bad, str) and bad.startswith("raw:") else None
+        container = stored[4:] if stored else json.dumps({"text_block": bad})
+        db.execute("UPDATE pending_selections SET metadata_json = ?", (container,))
     before = _rows(db_path)
 
     restarted, _ = _manager(tmp_path, "progressive", "legacy", sqlite=True)
     with pytest.raises(DeliveryError):
         restarted.read_more(key, offset)
     assert _rows(db_path) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sqlite", [False, True])
+async def test_expiry_passes_do_not_decode_block_metadata(tmp_path, monkeypatch, sqlite):
+    """Every publication's expiry pass decodes each live row's ``__meta__``;
+    block metadata, which can be large, stays out of it."""
+    import memtomem_stm.proxy.pending_store as pending_store
+
+    proxy, session = _manager(tmp_path, "progressive", "legacy", sqlite=sqlite)
+    big = {"blob": "z" * 500_000}
+    for i in range(3):
+        await _publish(
+            proxy, session, "progressive", "legacy", _block(text=SOURCE + str(i), meta=big)
+        )
+    decoded: list[int] = []
+    real = pending_store._parse_progressive_metadata
+    monkeypatch.setattr(
+        pending_store,
+        "_parse_progressive_metadata",
+        lambda raw: decoded.append(len(raw or "")) or real(raw),
+    )
+
+    key, offset = await _publish(proxy, session, "progressive", "legacy", _block(meta=big))
+
+    assert len(decoded) >= 3  # the pass ran over the earlier rows
+    assert max(decoded) < 2_000
+    more = _continue(proxy, "progressive", key, offset)
+    assert more.content[0].meta == big
 
 
 @pytest.mark.asyncio
