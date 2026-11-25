@@ -440,8 +440,9 @@ class TestRecordPersistsNewFields:
         assert {(p["server"], p["tool"]) for p in profiles} == {("lf", "search")}
 
     def test_get_tool_profiles_excludes_metadata_bypass_rows(self, store):
-        # Annotated multi-block responses are never compressed (#1112), so
-        # their rows say nothing about the settings the tuner adjusts (#1122).
+        # Annotated multi-block responses that keep their boundaries are never
+        # compressed (#1112, #1120), so their rows say nothing about the
+        # settings the tuner adjusts (#1122).
         # Rows with no strategy at all (passthrough, legacy) stay in.
         for original, violation in ((1000, False), (2000, True), (3000, False)):
             store.record(

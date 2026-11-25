@@ -686,6 +686,15 @@ class TestSharedMetadataPredicate:
 
         assert _shared_block_independent_metadata([dict(meta), dict(meta), dict(meta)]) is True
 
+    def test_key_order_does_not_count(self):
+        from memtomem_stm.proxy.manager import _shared_block_independent_metadata
+
+        metas = [
+            {"annotations": {"audience": ["user"], "priority": 0.5}},
+            {"annotations": {"priority": 0.5, "audience": ["user"]}},
+        ]
+        assert _shared_block_independent_metadata(metas) is True
+
 
 class TestIdenticalAnnotationMerge:
     @pytest.mark.parametrize("annotations", [_SHARED, _SHARED_FULL])
