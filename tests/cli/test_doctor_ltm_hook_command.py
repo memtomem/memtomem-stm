@@ -1291,6 +1291,9 @@ _PROXY_BREAK = {"MEMTOMEM_STM_PROXY__ENABLED": "maybe"}
 
 
 _BARE_ADVICE = "unset or fix the MEMTOMEM_STM_* variable(s) named for doctor's environment alone"
+_START_HOOKED = (
+    "or start the hook's daemon as its command builds it: mms daemon start --hook-command claude"
+)
 
 
 def _command_advice(location: str = FIRST) -> str:
@@ -1338,9 +1341,65 @@ def test_env_row_says_the_hook_commands_build_succeeds_when_a_flag_shadows_the_v
         f"with the options of the STM hook command at {FIRST} in {path} "
         "(Claude Code user settings): STMConfig() constructs"
     ), row
-    assert _DAEMON_EXITS in bare and name in bare, row
+    # The bare clause is plain ``mms daemon start``; the hook's daemon builds
+    # as the command does, so the row names how to start that one (#1524).
+    assert bare == (
+        f": STMConfig() fails — plain mms daemon start from it exits 1"
+        f" (env var(s) implicated: {name})"
+    ), row
     assert "through" not in row["detail"] and "degrade" not in row["detail"], row
-    assert row["next_action"] == _BARE_ADVICE, row
+    assert row["next_action"] == f"{_BARE_ADVICE}; {_START_HOOKED}", row
+
+
+def _bad_discovery_key() -> None:
+    from memtomem_stm.daemon import discovery
+
+    data_dir = Path(os.environ["MEMTOMEM_STM_DATA_DIR"])
+    data_dir.mkdir(parents=True, exist_ok=True)
+    discovery.discovery_key_path(data_dir).write_bytes(b"not a key\n")
+
+
+_BARE_FAILS = ": STMConfig() fails — mms daemon start from it exits 1"
+_PLAIN_BARE_FAILS = ": STMConfig() fails — plain mms daemon start from it exits 1"
+
+
+@pytest.mark.parametrize(
+    ("case", "clause", "next_action"),
+    [
+        # The command runs without the daemon: no daemon of the hook to start.
+        ("no-daemon", _BARE_FAILS, _BARE_ADVICE),
+        # ``mms daemon start`` exits on the key it cannot use, with the option too.
+        ("key-unusable", _PLAIN_BARE_FAILS, _BARE_ADVICE),
+        # Surfacing off: doctor's probe stops before discovery, so it has not
+        # seen whether the key can be used.
+        ("surfacing-off-key-unusable", _PLAIN_BARE_FAILS, _BARE_ADVICE),
+        # The route was chosen, then the probe failed: no probe result to go by.
+        ("probe-error", _PLAIN_BARE_FAILS, _BARE_ADVICE),
+    ],
+)
+def test_env_row_names_the_hooks_daemon_start_only_when_it_can_start(
+    home, proxy_file, monkeypatch, tmp_path, case, clause, next_action
+):
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    _settings(home, _cmd(_installed(use_daemon=case != "no-daemon")))
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setenv(PERSIST, "not-a-bool")
+    if case in ("key-unusable", "surfacing-off-key-unusable"):
+        _bad_discovery_key()
+    if case == "surfacing-off-key-unusable":
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    if case == "probe-error":
+
+        def broken(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("probe failed")
+
+        monkeypatch.setattr(proxy_mod, "_ltm_status", broken)
+
+    row, _hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert bare == f"{clause} (env var(s) implicated: {PERSIST})", row
+    assert row["next_action"] == next_action, row
 
 
 def test_env_row_reports_a_hook_build_only_the_commands_options_break(
@@ -1374,6 +1433,8 @@ def test_env_row_keeps_each_builds_cause_when_both_fail(home, proxy_file, monkey
     assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in hook, row
     assert DAEMON_TIMEOUT not in bare, row
     assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in bare, row
+    # A hook build that fails: no ``plain``, and no start of the hook's daemon.
+    assert bare.startswith(f"{_BARE_FAILS} (env var(s) implicated: "), row
     assert row["next_action"] == f"{_BARE_ADVICE}; {_command_advice()}", row
 
 
@@ -1403,6 +1464,9 @@ def test_env_row_never_copies_one_builds_outcome_into_the_other(
     assert claims[others[expected_hook]][0] not in hook, row
     assert claims[expected_bare][1] in bare, row
     assert claims[others[expected_bare]][1] not in bare, row
+    if expected_bare == "fail":
+        # Beside a hook build that is not ``ok``, the clause is unchanged.
+        assert bare.startswith(f"{_BARE_FAILS} (env var(s) implicated: "), row
     assert "MEMTOMEM_STM_PROXY__ENABLED" in hook and "MEMTOMEM_STM_PROXY__ENABLED" in bare, row
     # Each clause carries its own build's variables, never the other's.
     deadline = DAEMON_TIMEOUT
@@ -1557,7 +1621,10 @@ def test_env_row_reads_the_command_when_the_config_file_is_missing(home, monkeyp
     assert checks["config_file"]["status"] == "FAIL", checks["config_file"]
     row = checks["env_overrides"]
     assert row["detail"].startswith("with the options of the STM hook command at "), row
-    assert _DAEMON_EXITS in row["detail"], row
+    # The section that decides the hook's route did not run, so the row names
+    # no daemon of the hook's.
+    assert row["detail"].endswith(f"{_BARE_FAILS} (env var(s) implicated: {PERSIST})"), row
+    assert row["next_action"] == _BARE_ADVICE, row
 
 
 def test_env_row_reports_the_build_the_section_failed_on(home, proxy_file, monkeypatch, tmp_path):
