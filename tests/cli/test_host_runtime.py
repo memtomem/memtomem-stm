@@ -348,3 +348,53 @@ def test_env_overrides_are_the_ones_the_hook_applies(
     assert owned is not None, command
 
     assert owned.env_overrides() == _hook_overlay(monkeypatch, ["--host", "claude", *policy])
+
+
+# ── what the hook command can carry (#1492) ──────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (3.0, True),
+        (1e-7, True),
+        (1e308, True),
+        (5e-324, True),
+        (float("inf"), False),
+        (float("nan"), False),
+        (1.7976931348623157e308, False),  # ``format_seconds`` rounds it to infinity
+        (0.0, False),
+        (-1.0, False),
+    ],
+)
+def test_writable_seconds(value: float, expected: bool) -> None:
+    from memtomem_stm.cli.host_runtime import writable_seconds
+
+    assert writable_seconds(value) is expected
+    # Same answer as the hook's reader on the written text.
+    assert (_parse_positive_float(format_seconds(value)) is not None) is expected
+
+
+@pytest.mark.parametrize(
+    ("surfacing", "daemon", "field"),
+    [
+        (float("inf"), 3.5, "surfacing.timeout_seconds"),
+        (float("nan"), 3.5, "surfacing.timeout_seconds"),
+        (1.7976931348623157e308, 3.5, "surfacing.timeout_seconds"),
+        (3.0, 1.7976931348623157e308, "hook.daemon_timeout_seconds"),
+        (3.0, float("inf"), "hook.daemon_timeout_seconds"),
+    ],
+)
+def test_hook_args_refuses_a_deadline_the_hook_would_drop(
+    surfacing: float, daemon: float, field: str
+) -> None:
+    from memtomem_stm.cli.host_runtime import UnwritableDeadlineError
+
+    policy = HostRuntimePolicy(
+        use_daemon=True, surfacing_timeout_seconds=surfacing, daemon_timeout_seconds=daemon
+    )
+
+    with pytest.raises(UnwritableDeadlineError) as excinfo:
+        policy.hook_args()
+
+    assert excinfo.value.field == field
