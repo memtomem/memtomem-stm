@@ -10069,19 +10069,19 @@ def _daemon_command(sub: str, *, hook_command: bool) -> str:
 
 
 def _hook_daemon_can_start(surfacing_status: Mapping[str, Any]) -> bool:
-    """Whether doctor has no sign that ``mms daemon start --hook-command
-    claude`` would be refused: it took the hook's daemon route, and its probe
-    reached discovery without finding the discovery key unusable. A probe that
-    stopped before (surfacing off, an error) has not looked at the key; with an
-    unusable one ``start`` exits 1 too. A key not created yet is not a sign:
-    ``start`` creates it. Not a check that the start would succeed."""
+    """Whether doctor names ``mms daemon start --hook-command claude``: it took
+    the hook's daemon route, and knows of nothing that makes that start
+    pointless or refused. Surfacing off means the hook never calls the daemon;
+    an unusable discovery key makes ``start`` exit 1 too. A probe that failed,
+    or a key not created yet (``start`` creates it), is no such sign. Not a
+    check that the start would succeed."""
+    if not _names_hook_command(surfacing_status):
+        return False
     ltm = surfacing_status.get("ltm_server")
+    if not isinstance(ltm, dict):
+        return True
     return (
-        _names_hook_command(surfacing_status)
-        and isinstance(ltm, dict)
-        and ltm.get("route") == "daemon"
-        and "skipped" not in ltm
-        and ltm.get("discovery_key_unusable") is False
+        ltm.get("skipped") != "surfacing_disabled" and ltm.get("discovery_key_unusable") is not True
     )
 
 

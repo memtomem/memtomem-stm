@@ -1373,8 +1373,11 @@ _PLAIN_BARE_FAILS = ": STMConfig() fails — plain mms daemon start from it exit
         # Surfacing off: doctor's probe stops before discovery, so it has not
         # seen whether the key can be used.
         ("surfacing-off-key-unusable", _PLAIN_BARE_FAILS, _BARE_ADVICE),
-        # The route was chosen, then the probe failed: no probe result to go by.
-        ("probe-error", _PLAIN_BARE_FAILS, _BARE_ADVICE),
+        # Surfacing off: the hook never calls the daemon, so starting it is moot.
+        ("surfacing-off", _PLAIN_BARE_FAILS, _BARE_ADVICE),
+        # The route was chosen, then the probe failed: nothing says start
+        # would be refused, so the command that uses the hook's build is named.
+        ("probe-error", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
     ],
 )
 def test_env_row_names_the_hooks_daemon_start_only_when_it_can_start(
@@ -1387,7 +1390,7 @@ def test_env_row_names_the_hooks_daemon_start_only_when_it_can_start(
     monkeypatch.setenv(PERSIST, "not-a-bool")
     if case in ("key-unusable", "surfacing-off-key-unusable"):
         _bad_discovery_key()
-    if case == "surfacing-off-key-unusable":
+    if case in ("surfacing-off", "surfacing-off-key-unusable"):
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
     if case == "probe-error":
 

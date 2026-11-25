@@ -13,18 +13,19 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- `mms doctor`'s `env_overrides` row now names the daemon command each of
-  its clauses describes (issue #1524). When doctor takes the hook's daemon
-  route for the one STM hook command it read and that command's build
-  constructs, a failing clause for doctor's environment alone says
-  `plain mms daemon start` exits 1, and the next action adds
-  `or start the hook's daemon as its command builds it: mms daemon start
-  --hook-command claude` (the option #1518 added). The addition is left out
-  when the command says `--no-daemon`, when doctor's config file is missing
-  (the route is not decided), and when the `ltm server` probe did not reach
-  the daemon's discovery (surfacing off, a probe error) or found the
-  discovery key unusable, on which `start` exits 1 too. A key not created
-  yet does not withhold it: `start` creates one. Doctor does not check that
+- `mms doctor`'s `env_overrides` row now says which daemon command its
+  failing clause for doctor's environment alone describes, and names the
+  one that starts the hook's daemon (issue #1524). When doctor takes the
+  hook's daemon route for the one STM hook command it read and that
+  command's build constructs, that clause says `plain mms daemon start`
+  exits 1, and the next action adds `or start the hook's daemon as its
+  command builds it: mms daemon start --hook-command claude` (the option
+  #1518 added). The addition is left out when the command says
+  `--no-daemon`, when doctor's config file is missing (the route is not
+  decided), when surfacing is off (the hook never calls the daemon), and
+  when the `ltm server` probe found the discovery key unusable, on which
+  `start` exits 1 too. A probe that failed, or a key not created yet
+  (`start` creates one), does not withhold it. Doctor does not check that
   the start itself would succeed.
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
