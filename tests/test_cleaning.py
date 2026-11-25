@@ -306,9 +306,18 @@ class TestCleanParts:
         cleaner = DefaultContentCleaner(config)
         return cleaner.clean_parts("\n".join(texts), [len(text) for text in texts])
 
-    def test_lengths_that_do_not_add_up_are_refused(self):
+    @pytest.mark.parametrize(
+        "lengths",
+        [
+            [2, 3],  # too long
+            [2, 1],  # too short
+            [-1, 5],  # adds up, but a negative length would duplicate text
+            [1, 3],  # adds up, but "b" sits where the separator should be
+        ],
+    )
+    def test_lengths_that_do_not_partition_the_text_are_refused(self, lengths):
         with pytest.raises(ValueError):
-            DefaultContentCleaner().clean_parts("ab\ncd", [2, 3])
+            DefaultContentCleaner().clean_parts("ab\ncd", lengths)
 
     def test_no_blocks_is_empty_text(self):
         assert DefaultContentCleaner().clean_parts("", ()) == ""

@@ -337,8 +337,23 @@ class DefaultContentCleaner:
         with it (#1531). Everything else reads the join: a code fence or
         generic split across blocks stays protected, and duplicate paragraphs,
         link floods and blank-line runs are collapsed across blocks.
+
+        Raises ``ValueError`` unless ``part_lengths`` partition ``text`` exactly:
+        no negative length, a ``"\n"`` after every block but the last, and
+        nothing left over — a partition that only adds up could duplicate or
+        drop text.
         """
-        if len(text) != sum(part_lengths) + max(len(part_lengths) - 1, 0):
+        pos = 0
+        last = len(part_lengths) - 1
+        for index, length in enumerate(part_lengths):
+            if length < 0:
+                raise ValueError("part_lengths must not be negative")
+            pos += length
+            if index < last:
+                if text[pos : pos + 1] != "\n":
+                    raise ValueError("part_lengths do not end on a separator")
+                pos += 1
+        if pos != len(text):
             raise ValueError("part_lengths do not add up to text")
         if not text:
             return text
