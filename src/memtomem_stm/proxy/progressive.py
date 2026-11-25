@@ -10,12 +10,14 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from memtomem_stm.proxy.delivery import (
     DeliveryFormat,
     read_delivery_scope,
     progressive_metadata_format,
     stored_progressive_format,
+    stored_text_block,
 )
 from memtomem_stm.proxy.markdown_structure import headings
 from memtomem_stm.proxy.compression import PendingSelection, _mm_json_loads
@@ -67,6 +69,10 @@ class ProgressiveResponse:
     heading_index: HeadingIndex | None = None
     delivery_format: DeliveryFormat = "legacy"
     delivery_budget: int = 16000
+    # The upstream text block's ``annotations`` / ``_meta`` in JSON form, which
+    # every continuation repeats (#1529). ``None``: the block had none, or the
+    # row was written before this field existed.
+    text_block: dict[str, Any] | None = None
 
 
 class ProgressiveStoreAdapter:
@@ -118,6 +124,7 @@ class ProgressiveStoreAdapter:
                     "delivery_format": resp.delivery_format,
                     "budget": resp.delivery_budget,
                 },
+                **({"text_block": resp.text_block} if resp.text_block else {}),
             },
             ensure_ascii=False,
         )
@@ -180,6 +187,8 @@ class ProgressiveStoreAdapter:
             heading_index=entry.heading_index,
             delivery_format=mode,
             delivery_budget=budget,
+            # The store validated it before renewing the row; this reads it.
+            text_block=stored_text_block(meta),
         )
 
     def touch(self, key: str) -> None:

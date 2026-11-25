@@ -29,6 +29,9 @@ _CONTINUATION_BUDGET: contextvars.ContextVar[int] = contextvars.ContextVar(
 _READ_FORMAT: contextvars.ContextVar[DeliveryFormat | None] = contextvars.ContextVar(
     "stm_read_format", default=None
 )
+_TEXT_BLOCK: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "stm_text_block", default=None
+)
 _WIRE_PROJECTOR: contextvars.ContextVar[Callable[[dict[str, Any]], dict[str, Any]] | None] = (
     contextvars.ContextVar("stm_wire_projector", default=None)
 )
@@ -83,7 +86,27 @@ class DeliveryBudgetExceeded(DeliveryError):
         self.excess = excess
 
 
-class DeliveryText(str):
+class BlockText(str):
+    """Continuation text that carries the upstream text block's metadata (#1529).
+
+    ``text_block`` is the ``annotations`` / ``_meta`` of the text block the
+    continuation is a part of, in its JSON form; ``None`` for a block that had
+    none and for STM's own messages. The continuation formatter re-applies it.
+    """
+
+    text_block: dict[str, Any] | None = None
+
+
+def with_text_block(value: str, block: dict[str, Any] | None) -> str:
+    """*value* carrying *block*; *value* itself when there is nothing to carry."""
+    if not block:
+        return value
+    carried = value if isinstance(value, BlockText) else BlockText(value)
+    carried.text_block = block
+    return carried
+
+
+class DeliveryText(BlockText):
     """Legacy-compatible compressor result carrying its typed origin, never parsed.
 
     The descriptor is created at the key publisher. Its presence is also the
@@ -101,19 +124,31 @@ class DeliveryText(str):
 
 @contextmanager
 def delivery_scope(
-    value: DeliveryFormat, budget: int = 16000, *, continuation_budget: int | None = None
+    value: DeliveryFormat,
+    budget: int = 16000,
+    *,
+    continuation_budget: int | None = None,
+    text_block: dict[str, Any] | None = None,
 ) -> Iterator[None]:
+    """Delivery settings for one response's publishers.
+
+    *text_block* is the metadata of the upstream text block being published,
+    as :func:`text_block_overhead` and :func:`stored_text_block` read it; the
+    publishers store it with the pending entry so continuations repeat it.
+    """
     token = _FORMAT.set(value)
     budget_token = _BUDGET.set(budget)
     continuation_token = _CONTINUATION_BUDGET.set(
         budget if continuation_budget is None else continuation_budget
     )
+    block_token = _TEXT_BLOCK.set(text_block or None)
     try:
         yield
     finally:
         _FORMAT.reset(token)
         _BUDGET.reset(budget_token)
         _CONTINUATION_BUDGET.reset(continuation_token)
+        _TEXT_BLOCK.reset(block_token)
 
 
 def delivery_budget() -> int:
@@ -121,8 +156,79 @@ def delivery_budget() -> int:
 
 
 def continuation_budget() -> int:
-    """Full tool limit; initial upstream metadata is not repeated on owned reads."""
+    """Full tool limit, as stored with a pending entry.
+
+    Result-level upstream metadata is not repeated on owned reads. The text
+    block's metadata is, and a structured reader subtracts its size
+    (:func:`text_block_overhead`) from this limit when it fits a frame.
+    """
     return _CONTINUATION_BUDGET.get()
+
+
+def text_block_metadata() -> dict[str, Any] | None:
+    """The text block metadata of the response being published, if any."""
+    return _TEXT_BLOCK.get()
+
+
+def stored_text_block(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """The ``text_block`` a pending entry's metadata stores, validated (#1529).
+
+    ``None`` when *meta* has no such key. A present value — ``null`` included —
+    that is not a non-empty object, or that the SDK's ``TextContent`` refuses,
+    is a :class:`DeliveryError`, never a miss: a miss deletes the live row.
+    Lone surrogates are escaped here, as the rest of the row's metadata is by
+    its parser. This is a structural check: publishers only write metadata the
+    first response already carried, and a row corrupted past what the SDK can
+    serialize fails at send like any other corrupted field.
+    """
+    if "text_block" not in meta:
+        return None
+    from mcp.types import TextContent
+
+    from memtomem_stm.utils.json_out import scrub_lone_surrogates
+
+    try:
+        raw = scrub_lone_surrogates(meta["text_block"])
+        if not isinstance(raw, dict) or not raw or "type" in raw or "text" in raw:
+            raise TypeError("text block metadata must be a non-empty object")
+        TextContent.model_validate({**raw, "type": "text", "text": ""})
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise DeliveryError("Invalid text block metadata.") from exc
+    return raw
+
+
+def apply_text_block(result: CallToolResult, block: dict[str, Any] | None) -> CallToolResult:
+    """*result* with its first content block carrying *block* (#1529)."""
+    if not block:
+        return result
+    from mcp.types import TextContent
+
+    first = result.content[0]
+    assert isinstance(first, TextContent)
+    result.content[0] = TextContent.model_validate({**block, "type": "text", "text": first.text})
+    return result
+
+
+def text_block_overhead(block: dict[str, Any] | None) -> int:
+    """Serialized characters *block* adds to a result's text block.
+
+    The larger of :func:`wire_json`'s count, the unit the structured fitters
+    budget, and the SDK serializer's: under a projector ``wire_json`` writes
+    with ``json``, which spells some floats shorter than the SDK sends them
+    (``1e-05`` against ``0.00001``). The difference does not depend on the
+    block's text.
+    """
+    if not block:
+        return 0
+    from mcp.types import CallToolResult, TextContent
+
+    bare = CallToolResult(content=[TextContent(type="text", text="")])
+    carried = apply_text_block(CallToolResult(content=[TextContent(type="text", text="")]), block)
+
+    def sdk(result: CallToolResult) -> int:
+        return len(result.model_dump_json(by_alias=True, exclude_none=True))
+
+    return max(0, len(wire_json(carried)) - len(wire_json(bare)), sdk(carried) - sdk(bare))
 
 
 @contextmanager

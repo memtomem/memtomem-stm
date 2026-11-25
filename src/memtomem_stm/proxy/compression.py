@@ -44,6 +44,10 @@ from memtomem_stm.proxy.delivery import (
     fit_toc,
     metadata_format,
     plain_result_fits,
+    stored_text_block,
+    text_block_metadata,
+    text_block_overhead,
+    with_text_block,
 )
 from memtomem_stm.proxy.markdown_structure import (
     Heading,
@@ -1046,6 +1050,34 @@ def payload_has_credentials(text: str) -> bool:
     return contains_sensitive_content(text, CREDENTIAL_PATTERNS)
 
 
+def text_block_has_credentials(block: dict[str, Any] | None) -> bool:
+    """Whether a text block's metadata (#1529) carries a credential.
+
+    The same real-bytes verdict as :func:`payload_has_credentials`, over the
+    metadata as the client receives it (serialized once) and over every key
+    and string value as it is. A pending row escapes these: progressive keeps
+    them inside a JSON string, and a quote inside a key or value is escaped in
+    any serialization, so the store's own row scan cannot see them.
+    """
+    if not block:
+        return False
+    if payload_has_credentials(surrogate_safe_dumps(block, ensure_ascii=False)):
+        return True
+    stack: list[Any] = [block]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(key, str) and payload_has_credentials(key):
+                    return True
+                stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(value)
+        elif isinstance(value, str) and payload_has_credentials(value):
+            return True
+    return False
+
+
 def _store_persists(store: object) -> bool:
     return bool(getattr(store, "persists_to_disk", False))
 
@@ -1064,6 +1096,24 @@ class PendingSelection:
     # (#1370). ``None``: a row written before that, which expires by the
     # caller's TTL. Progressive rows keep theirs in ``__meta__`` instead.
     ttl_seconds: float | None = None
+
+
+def _pending_text_block(metadata_json: str | None) -> dict[str, Any] | None:
+    """The text block metadata a selective row stores (#1529), validated.
+
+    Read apart from the presentation metadata and whatever the requested
+    format: a legacy read serves rows whose presentation it does not validate,
+    so an unreadable container, or one that is not an object, yields no block
+    metadata and the text is served as before. Only a present, invalid value
+    is refused.
+    """
+    try:
+        data = json.loads(metadata_json) if metadata_json else None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return stored_text_block(data)
 
 
 class ChunkMap(dict[str, str]):
@@ -1272,11 +1322,15 @@ class SelectiveCompressor:
         # installs on the event loop wait for; a retarget onto a persisting
         # store from a non-persisting one evaluates it under the lock instead.
         sources = (text,) if sensitivity_source is None else (text, sensitivity_source)
+        block = text_block_metadata()
         verdict: list[bool] = []
 
         def sensitive() -> bool:
             if not verdict:
-                verdict.append(any(payload_has_credentials(s) for s in sources))
+                verdict.append(
+                    any(payload_has_credentials(s) for s in sources)
+                    or text_block_has_credentials(block)
+                )
             return verdict[0]
 
         if _store_persists(self._store):
@@ -1324,6 +1378,7 @@ class SelectiveCompressor:
             "source_offset": source_offset,
             "chunks": records,
             "metadata_complete": bool(getattr(chunks, "records", {})),
+            **({"text_block": block} if block else {}),
         }
         ttl = self._ttl
         # Once per entry, not per ``build``: a JSON chunk's type comes from
@@ -1462,6 +1517,7 @@ class SelectiveCompressor:
             return None
 
         mode = metadata_format(pending.metadata_json, response_format)
+        block = _pending_text_block(pending.metadata_json)
 
         selected_parts: list[str] = []
         for section in sections:
@@ -1497,14 +1553,14 @@ class SelectiveCompressor:
                 ],
             },
         )
-        if mode == "structured" and delivery_size(descriptor, owned=True) > raw.get(
-            "budget", 16000
-        ):
+        if mode == "structured" and delivery_size(descriptor, owned=True) + text_block_overhead(
+            block
+        ) > raw.get("budget", 16000):
             raise DeliveryBudgetExceeded("Select fewer sections or request legacy output.")
         self._store.touch(key)
         result = DeliveryText("\n\n".join(selected_parts), descriptor)
         result.response_format = mode
-        return result
+        return with_text_block(result, block)
 
     def begin_use(self) -> None:
         """Register an in-flight ``compress()`` before the manager lock drops.

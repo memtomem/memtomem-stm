@@ -58,6 +58,7 @@ from memtomem_stm.proxy.compression import (
     count_markdown_headings,
     get_compressor,
     payload_has_credentials,
+    text_block_has_credentials,
 )
 from memtomem_stm.proxy.config import (
     CleaningConfig,
@@ -100,7 +101,11 @@ from memtomem_stm.proxy.delivery import (
     plain_result_fits,
     progressive_envelope,
     require_progressive_continuation,
+    apply_text_block,
+    text_block_metadata,
+    text_block_overhead,
     wire_json,
+    with_text_block,
 )
 from memtomem_stm.proxy.extraction import FactExtractor
 from memtomem_stm.proxy.index_observability import IndexObservability
@@ -691,6 +696,21 @@ def _text_block_metadata(block: Any) -> dict[str, Any]:
     if not isinstance(block, mcp_types.TextContent):
         return {}
     return block.model_dump(by_alias=True, exclude={"type", "text"}, exclude_none=True)
+
+
+def _continued_text_block(block: Any) -> dict[str, Any] | None:
+    """The metadata a pending entry stores for its continuations (#1529).
+
+    In JSON form, as the client receives the first chunk: a Python-mode dump
+    keeps a non-finite float in ``_meta``, which the selective row's
+    ``allow_nan=False`` serialization would refuse.
+    """
+    if not isinstance(block, mcp_types.TextContent):
+        return None
+    return (
+        block.model_dump(mode="json", by_alias=True, exclude={"type", "text"}, exclude_none=True)
+        or None
+    )
 
 
 def _scrub_surrogates_in(value: Any) -> Any:
@@ -5404,6 +5424,7 @@ class ProxyManager:
             include_structure_hint=cfg.include_structure_hint,
             delivery_format=delivery_format(),
             delivery_budget=continuation_budget(),
+            text_block=text_block_metadata(),
         )
         descriptor = None
         if delivery_format() == "structured":
@@ -5423,7 +5444,7 @@ class ProxyManager:
                     key=key,
                     source_format=resp.content_type,
                     ttl=cfg.ttl_seconds,
-                    budget=resp.delivery_budget,
+                    budget=max(1, resp.delivery_budget - text_block_overhead(resp.text_block)),
                 )
         pin_is_live = self._pin_is_live_generation(cfg_snap)
         _publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
@@ -5433,7 +5454,9 @@ class ProxyManager:
         # escaping can hide (a quoted label inside the content is written with
         # escaped quotes); the adapter has the store check the row itself
         # before it runs ``evict`` below.
-        if store.persists_to_disk and payload_has_credentials(text):
+        if store.persists_to_disk and (
+            payload_has_credentials(text) or text_block_has_credentials(resp.text_block)
+        ):
             raise SensitivePayloadNotStored(
                 "credential-bearing response not written to the persistent pending store"
             )
@@ -5559,6 +5582,9 @@ class ProxyManager:
                 "key": key,
             },
         ):
+            # A read at or past the end serves no upstream text, so it repeats no
+            # upstream metadata, in either format.
+            text_block = resp.text_block if offset < len(resp.content) else None
             if getattr(resp, "delivery_format", "legacy") == "structured":
                 descriptor = fit_progressive(
                     resp.content,
@@ -5567,7 +5593,8 @@ class ProxyManager:
                     limit=limit or resp.chunk_size,
                     source_format=resp.content_type,
                     ttl=resp.ttl_seconds,
-                    budget=resp.delivery_budget,
+                    # Each frame repeats the text block's metadata (#1529).
+                    budget=max(1, resp.delivery_budget - text_block_overhead(text_block)),
                     owned=True,
                 )
                 chars = len(descriptor["payload"]["content"])
@@ -5584,13 +5611,14 @@ class ProxyManager:
                 response = DeliveryText(delivery_json(descriptor), descriptor)
                 response.response_format = "structured"
                 if self._progressive_reads_tracker is not None and chars:
+                    wire_result = apply_text_block(delivery_result(descriptor), text_block)
                     self._progressive_reads_tracker.record_wire(
                         key,
-                        len(wire_json(delivery_result(descriptor)).encode("utf-8")),
+                        len(wire_json(wire_result).encode("utf-8")),
                         initial=False,
                         offset=offset,
                     )
-                return response
+                return with_text_block(response, text_block)
             # Continue with the chunking the first chunk used (persisted on
             # the ProgressiveResponse) — an explicit ``limit`` from the agent
             # still wins. Hardcoding ``4000`` here made follow-ups diverge
@@ -5622,9 +5650,12 @@ class ProxyManager:
             if self._progressive_reads_tracker is not None and output.payload_chars > 0:
                 from mcp.types import CallToolResult, TextContent
 
-                wire = CallToolResult(
-                    content=[TextContent(type="text", text=output.text)],
-                    structured_content={"result": output.text},
+                wire = apply_text_block(
+                    CallToolResult(
+                        content=[TextContent(type="text", text=output.text)],
+                        structured_content={"result": output.text},
+                    ),
+                    text_block,
                 )
                 try:
                     wire_bytes = len(wire_json(wire).encode("utf-8"))
@@ -5634,7 +5665,7 @@ class ProxyManager:
                     self._progressive_reads_tracker.record_wire(
                         key, wire_bytes, initial=False, offset=offset
                     )
-            return output.text
+            return with_text_block(output.text, text_block)
 
     def get_upstream_health(self) -> dict[str, dict]:
         """Return per-server health: connection status, tool counts.
@@ -8486,7 +8517,8 @@ class ProxyManager:
             )
             # The fitter serializes a plain TextContent/CallToolResult. Reserve
             # any extra upstream text/result metadata retained by final assembly.
-            # Owned continuations do not repeat that upstream metadata.
+            # Owned continuations repeat only the text block's metadata, and
+            # their reader subtracts its size from the stored full limit.
             metadata_overhead = 0
             if tc.delivery_format == "structured":
                 empty_base = mcp_types.CallToolResult(
@@ -8509,6 +8541,7 @@ class ProxyManager:
                 tc.delivery_format,
                 max(1, frame_budget - metadata_overhead),
                 continuation_budget=frame_budget,
+                text_block=_continued_text_block(shaped.first_text_content),
             ):
                 comp = await self._compress_and_surface(
                     server=server,

@@ -48,6 +48,7 @@ from memtomem_stm.proxy.delivery import (
     DeliveryError,
     DeliveryFormat,
     DeliveryText,
+    apply_text_block,
     delivery_result,
     error_result,
 )
@@ -1408,15 +1409,20 @@ async def stm_proxy_describe_tool(
 
 
 def _continuation_result(value: str, requested: DeliveryFormat | None) -> CallToolResult:
+    """The MCP result of a continuation, repeating its text block's metadata (#1529)."""
     from mcp.types import TextContent
 
+    block = getattr(value, "text_block", None)
     if isinstance(value, DeliveryText) and value.response_format == "structured":
-        return delivery_result(value.descriptor)
+        return apply_text_block(delivery_result(value.descriptor), block)
     if requested == "structured":
         return error_result("missing_or_expired", "Requested key was not found or expired.")
-    return CallToolResult(
-        content=[TextContent(type="text", text=str(value))],
-        structured_content={"result": str(value)},
+    return apply_text_block(
+        CallToolResult(
+            content=[TextContent(type="text", text=str(value))],
+            structured_content={"result": str(value)},
+        ),
+        block,
     )
 
 
