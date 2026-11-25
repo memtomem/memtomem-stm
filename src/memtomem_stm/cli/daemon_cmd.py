@@ -30,6 +30,7 @@ import math
 import os
 import signal
 import time
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 import click
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from memtomem_stm.cli.proxy import _HookCommandView
     from memtomem_stm.config import EnvSTMConfigLoad, STMConfig
 
 
@@ -240,6 +242,95 @@ def _exit_on_key_error[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
         except LocalKeyError as exc:
             click.echo(_warn(_disp(_key_error_text(exc))), err=True)
             raise SystemExit(1) from None
+
+    return wrapper
+
+
+_HOOK_VIEW: ContextVar[_HookCommandView | None] = ContextVar("_HOOK_VIEW", default=None)
+"""The hook command a ``--hook-command`` run builds from, ``None`` otherwise.
+
+Set for the whole run, so the subcommands ``restart`` invokes see it and every
+hint names the option."""
+
+_HOOK_COMMAND_OPTION = "--hook-command claude"
+
+
+def _daemon_cli(sub: str) -> str:
+    """```mms daemon <sub>``` as this run should be repeated: with
+    ``--hook-command claude`` when it was given, so a hint never points at the
+    shell's daemon instead of the hook's."""
+    suffix = f" {_HOOK_COMMAND_OPTION}" if _HOOK_VIEW.get() is not None else ""
+    return f"`mms daemon {sub}{suffix}`"
+
+
+def _found_hook_command(host: str) -> _HookCommandView:
+    """The one STM hook command ``mms hook install --host <host>`` owns, or exit 1.
+
+    The reader is doctor's (``proxy._hook_command_view``, #1494), so a
+    ``--hook-command`` run builds from the command doctor built from. The
+    message names the settings file and handler locations, never a command's
+    text, which can hold credentials.
+    """
+    from memtomem_stm.cli.proxy import _hook_command_view
+
+    view = _hook_command_view()
+    if view.state == "found":
+        return view
+    where = "" if view.path is None else f" in {view.path}"
+    locations = ", ".join(view.locations)
+    if view.state == "none":
+        reason = f"no STM hook command that `mms hook install --host {host}` owns{where}"
+    elif view.state == "several":
+        reason = (
+            f"{len(view.locations)} STM hook commands ({locations}){where}, "
+            "so which options to build with is ambiguous"
+        )
+    elif view.state == "unreadable":
+        reason = f"a command that may run STM's hook could not be read ({locations}){where}"
+    elif view.state == "windows":
+        reason = f"hook commands are not read on Windows ({locations}){where}"
+    else:
+        reason = f"the hook settings could not be read: {view.settings_error}"
+    click.echo(_warn(_disp(f"--hook-command {host}: {reason}")), err=True)
+    raise SystemExit(1)
+
+
+def _hook_command_option(fn: Callable[..., None]) -> Callable[..., None]:
+    """Add ``--hook-command claude``: build as the registered hook command does.
+
+    The hook sets the variables its command's flags name in ``os.environ``
+    before it builds its config, and a daemon it spawns inherits them
+    (``hook_cmd._runtime_registration_env``). This applies the same variables
+    the same way for the whole run, so the fingerprint looked up, and the one
+    a spawned daemon rebuilds, are the ones doctor probes for that command
+    (#1515). The environment and the view are restored when the run ends. A
+    call without the option (``restart``'s own ``stop`` and ``start``) leaves
+    both as they are.
+    """
+
+    @click.option(
+        "--hook-command",
+        "hook_command",
+        type=click.Choice(["claude"]),
+        default=None,
+        help="Build from this shell's environment with the options of the STM hook "
+        "command `mms hook install --host claude` wrote in Claude Code's user settings "
+        "applied, as the hook applies them: the daemon configuration `mms doctor` probes "
+        "on the hook's daemon route.",
+    )
+    @functools.wraps(fn)
+    def wrapper(*args: Any, hook_command: str | None, **kwargs: Any) -> None:
+        if hook_command is None:
+            return fn(*args, **kwargs)
+        from memtomem_stm.cli.hook_cmd import _runtime_registration_env
+
+        view = _found_hook_command(hook_command)
+        token = _HOOK_VIEW.set(view)
+        try:
+            with _runtime_registration_env(dict(view.env)):
+                return fn(*args, **kwargs)
+        finally:
+            _HOOK_VIEW.reset(token)
 
     return wrapper
 
@@ -467,6 +558,7 @@ def _can_force_terminate() -> bool:
 
 
 @daemon_group.command(name="start")
+@_hook_command_option
 @_exit_on_key_error
 def start_cmd() -> None:
     """Spawn the daemon detached if one isn't already running for this config.
@@ -549,6 +641,7 @@ def start_cmd() -> None:
 
 
 @daemon_group.command(name="stop")
+@_hook_command_option
 @click.option(
     "--all",
     "stop_all",
@@ -608,7 +701,10 @@ def stop_cmd(stop_all: bool) -> None:
         except SystemExit as exc:
             stop_error = exc
     if key_error is not None:
-        if stop_all:
+        if stop_all or _HOOK_VIEW.get() is not None:
+            # Under --hook-command, ``stop --all`` would look scoped to the
+            # hook while it reaches every daemon under data_dir, the hook's
+            # own included, so no run of it is suggested (#1515).
             hint = ""
         elif _can_force_terminate():
             hint = (
@@ -617,7 +713,7 @@ def stop_cmd(stop_all: bool) -> None:
             )
         else:
             # ``stop --all`` refuses to signal by pid on Windows.
-            hint = "; end the daemon processes `mms daemon status` lists from Task Manager"
+            hint = f"; end the daemon processes {_daemon_cli('status')} lists from Task Manager"
         click.echo(_warn(_disp(_key_error_text(key_error)) + hint), err=True)
         raise SystemExit(1)
     if stop_error is not None:
@@ -812,7 +908,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
         if _key_absence_confirmed(config):
             click.echo("no running daemon")
             return
-        click.echo(_warn(f"{_DATA_DIR_UNKNOWN} — run `mms daemon status`"), err=True)
+        click.echo(_warn(f"{_DATA_DIR_UNKNOWN} — run {_daemon_cli('status')}"), err=True)
         raise SystemExit(1)
     hs_path = handshake_path(config.data_dir, fp)
     lock = lock_path(config.data_dir, fp)
@@ -837,7 +933,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
         click.echo(
             _warn(
                 "daemon accepted shutdown but is still cleaning up — "
-                "run `mms daemon status` before starting a replacement"
+                f"run {_daemon_cli('status')} before starting a replacement"
             ),
             err=True,
         )
@@ -856,7 +952,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
             click.echo(
                 _warn(
                     "a handshake is present but unreadable, so whether a daemon is "
-                    "running cannot be determined — run `mms daemon status`"
+                    f"running cannot be determined — run {_daemon_cli('status')}"
                 ),
                 err=True,
             )
@@ -875,7 +971,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
                 click.echo(
                     _warn(
                         "no handshake, but this config's daemon lock is held — a daemon "
-                        "is starting or shutting down; run `mms daemon status`"
+                        f"is starting or shutting down; run {_daemon_cli('status')}"
                     ),
                     err=True,
                 )
@@ -884,7 +980,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
                 click.echo(
                     _warn(
                         "no handshake, and this config's daemon lock could not be "
-                        "checked — run `mms daemon status`"
+                        f"checked — run {_daemon_cli('status')}"
                     ),
                     err=True,
                 )
@@ -904,7 +1000,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
                 _warn(
                     "daemon endpoint is still listening but rejected graceful shutdown; "
                     "Windows does not provide the POSIX SIGTERM fallback. Close the owning "
-                    "terminal/process, then run `mms daemon status`."
+                    f"terminal/process, then run {_daemon_cli('status')}."
                 ),
                 err=True,
             )
@@ -931,7 +1027,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
             click.echo(
                 _warn(
                     f"daemon pid={pid} did not finish shutting down after SIGTERM — "
-                    "run `mms daemon status` before starting a replacement"
+                    f"run {_daemon_cli('status')} before starting a replacement"
                 ),
                 err=True,
             )
@@ -959,7 +1055,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
             _warn(
                 f"recorded daemon pid={pid} is not accepting, but this config's daemon lock "
                 "is still held — a daemon is starting or shutting down; run "
-                "`mms daemon status`"
+                f"{_daemon_cli('status')}"
             ),
             err=True,
         )
@@ -968,7 +1064,7 @@ def _stop_current_config_daemon(config: STMConfig, fp: str | None) -> None:
         click.echo(
             _warn(
                 f"recorded daemon pid={pid} is not accepting, and this config's daemon lock "
-                "could not be checked — run `mms daemon status`"
+                f"could not be checked — run {_daemon_cli('status')}"
             ),
             err=True,
         )
@@ -1096,7 +1192,7 @@ def _stop_foreign_daemons(config: STMConfig, current: str | None) -> None:
             _warn(
                 "found daemon(s) under a different config, but Windows cannot safely "
                 "SIGTERM them by pid. Stop the owning processes from Task Manager or "
-                "restart Windows, then run `mms daemon status`."
+                f"restart Windows, then run {_daemon_cli('status')}."
             ),
             err=True,
         )
@@ -1115,7 +1211,7 @@ def _stop_foreign_daemons(config: STMConfig, current: str | None) -> None:
             click.echo(
                 _warn(
                     f"daemon {_foreign_name(d)} is not accepting and its lock could not be "
-                    "checked — run `mms daemon status`"
+                    f"checked — run {_daemon_cli('status')}"
                 ),
                 err=True,
             )
@@ -1123,7 +1219,7 @@ def _stop_foreign_daemons(config: STMConfig, current: str | None) -> None:
             click.echo(
                 _warn(
                     f"daemon {_foreign_name(d)} still holds its lock — it is starting or "
-                    "shutting down; run `mms daemon status`"
+                    f"shutting down; run {_daemon_cli('status')}"
                 ),
                 err=True,
             )
@@ -1170,6 +1266,7 @@ _SURFACE_COUNTERS = (
 
 
 @daemon_group.command(name="status")
+@_hook_command_option
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def status_cmd(as_json: bool) -> None:
     """Report whether a daemon is running, with pid/port/uptime/LTM warmth."""
@@ -1181,7 +1278,12 @@ def status_cmd(as_json: bool) -> None:
     # The hook only reaches the daemon for eligible surfacing calls, so global
     # surfacing-off means it never will — regardless of the use_daemon knob.
     surfacing_on = config.surfacing.enabled
-    use_daemon = config.hook.use_daemon and surfacing_on
+    # A hook command's --use-daemon/--no-daemon decides its route directly
+    # (#1501), even where a later case-equivalent spelling of the variable it
+    # sets makes the build read the opposite.
+    view = _HOOK_VIEW.get()
+    hook_flag = None if view is None else view.use_daemon
+    use_daemon = (config.hook.use_daemon if hook_flag is None else hook_flag) and surfacing_on
     standalone_use_daemon = config.surfacing.use_daemon and surfacing_on
     key_error: LocalKeyError | None = None
     hs: dict[str, Any] | None = None
@@ -1390,6 +1492,8 @@ def status_cmd(as_json: bool) -> None:
         hint = "yes"
     elif not surfacing_on:
         hint = "no (surfacing disabled)"
+    elif view is not None and hook_flag is False:
+        hint = _disp(f"no (the STM hook command at {view.locations[0]} sets --no-daemon)")
     else:
         hint = "no (hook.use_daemon is false)"
     click.echo(f"hook will use daemon: {hint}")
@@ -1467,6 +1571,12 @@ def _render_foreign(foreign: list[dict[str, Any]]) -> None:
         click.echo("each exits on its own once idle; nothing to stop")
         return
     click.echo(_warn(line))
+    if _HOOK_VIEW.get() is not None:
+        # Under --hook-command the current daemon is the hook's, and
+        # ``stop --all`` stops it before the ones listed, so "if nothing uses
+        # them" is not the condition for running it. The listing alone is
+        # reported (#1515).
+        return
     if _can_force_terminate() and all_listening:
         click.echo(
             "if no running STM process uses them, stop them with `mms daemon stop --all` "
@@ -1487,6 +1597,7 @@ def _render_foreign(foreign: list[dict[str, Any]]) -> None:
 
 
 @daemon_group.command(name="restart")
+@_hook_command_option
 @click.pass_context
 @_exit_on_key_error
 def restart_cmd(ctx: click.Context) -> None:
@@ -1496,13 +1607,13 @@ def restart_cmd(ctx: click.Context) -> None:
     from memtomem_stm.daemon.locking import lock_path
 
     config = _load_config()
-    ctx.invoke(stop_cmd)
+    ctx.invoke(stop_cmd, hook_command=None)
     fp = _current_fingerprint(config)
     if fp is None:
         # No discovery key: ``stop`` had no current-config daemon to stop,
         # so there is no lock to wait on, nor a fingerprint to name one.
         # ``start`` creates the key.
-        ctx.invoke(start_cmd)
+        ctx.invoke(start_cmd, hook_command=None)
         return
     # Wait for the old daemon to release its lifetime lock before starting. A
     # fixed sleep could race: _teardown() awaits the warm LTM child's stop and
@@ -1519,7 +1630,7 @@ def restart_cmd(ctx: click.Context) -> None:
     while time.time() < deadline:
         state = _probe_lock(lp)
         if state is LockProbe.FREE:
-            ctx.invoke(start_cmd)
+            ctx.invoke(start_cmd, hook_command=None)
             return
         time.sleep(0.2)
     # Exit nonzero: the docs recommend `mms daemon restart` after an upgrade,
@@ -1529,14 +1640,14 @@ def restart_cmd(ctx: click.Context) -> None:
         click.echo(
             _warn(
                 "daemon NOT restarted: could not check the previous daemon's lock — "
-                "run `mms daemon status`"
+                f"run {_daemon_cli('status')}"
             )
         )
     else:
         click.echo(
             _warn(
                 "daemon NOT restarted: previous daemon still shutting down — "
-                "run `mms daemon start` again shortly"
+                f"run {_daemon_cli('start')} again shortly"
             )
         )
     raise SystemExit(1)

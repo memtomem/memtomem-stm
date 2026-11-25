@@ -1228,6 +1228,31 @@ to be free before it starts a replacement, and exits 1 without starting one if
 the lock is still held ("previous daemon still shutting down") or could not be
 checked ("could not check the previous daemon's lock").
 
+`start`, `stop`, `status` and `restart` accept `--hook-command claude`, which
+builds the daemon's configuration the way the STM hook command that
+`mms hook install --host claude` wrote in Claude Code's user settings does.
+The hook sets the variables its options name (`--surfacing-timeout-seconds`,
+`--[no-]persist-query-text`, …) in its environment before it builds, and a
+daemon it spawns inherits them. Two of them enter the daemon's fingerprint,
+so a bare command run from a shell can address a daemon other than the hook's
+(a default install writes `--no-persist-query-text`). With the option, the
+command sets the same variables the same way for its run. So when `mms doctor`
+takes the hook's daemon route for that command, the option acts on the daemon
+doctor probed, and doctor names it in its advice for that daemon. `status` then
+reports whether the hook uses the daemon from the command's
+`--use-daemon`/`--no-daemon` when it has one, since the hook routes on that
+flag. No message of such a run suggests `stop --all`, which targets every
+accepting daemon under `data_dir`, the hook's own included: `status` lists
+daemons under other configurations without the cleanup hint, and `stop` names
+no `stop --all` way out of an unusable discovery key. The command
+exits 1 without acting when the settings hold no STM hook command that install
+owns, more than one, or one that may run the hook but could not be read, when
+the settings cannot be read, and on Windows, where hook commands are not read.
+Everything else still comes from the shell's environment: when Claude Code
+runs the hook with a different environment or working directory, or a
+`uv run --directory` launcher selects another STM version, the hook can use a
+different daemon.
+
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. `mms daemon status` lists every live
 daemon under a different config fingerprint, and a different fingerprint does
