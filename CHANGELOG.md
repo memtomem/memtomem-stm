@@ -36,10 +36,11 @@ changes inline only. See the deprecation policy in
   (issue #1131). The checks matched are a reply outside the negotiated schema
   (for example a list `structuredContent`, or `resultType: "input_required"`
   on a 2025-11-25 connection), an `InputRequiredResult` on a 2026-07-28
-  connection, and a result that breaks the tool's own `outputSchema`; other
-  exceptions the SDK raises keep `programming`. Such a call is still not
-  retried, and it now resets the circuit breaker's failure count, since a
-  reply arrived. **Behavior change**: tool health counts `programming` rows
+  connection, a result that breaks the tool's own `outputSchema` or omits
+  the structured content it declares, and an `outputSchema` the SDK cannot
+  resolve; other exceptions the SDK raises keep `programming`. Such a call
+  is still not retried, and it now resets the circuit breaker's failure
+  count, since a reply arrived. **Behavior change**: tool health counts `programming` rows
   as calls but not as errors; these rows now count as upstream errors too.
   Health is evaluated at proxy startup, so once a tool that keeps sending
   such replies crosses the health thresholds, the `strict` exposure profile
