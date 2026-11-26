@@ -47,6 +47,26 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- An MCP server registration's runtime policy now holds against a `null`
+  parent block and against the field repeated under another letter case in
+  the block's JSON (issue #1544), as the hook's flags already do (#1537).
+  With `MEMTOMEM_STM_SURFACING=null` in the host's environment, a server
+  registered with query hashing persisted raw query text and did not use the
+  daemon; with `persist_query_text` repeated as `PERSIST_QUERY_TEXT` in that
+  block's JSON, it persisted raw query text and its daemon configuration
+  differed from the hook's, so the two did not share a daemon. `mms
+  register` and `mms init` now also write the policy as
+  `MEMTOMEM_STM_SERVER_FLAGS`, a JSON object of its three variables, and the
+  server applies it as a settings layer; a daemon it spawns receives the
+  same values. **Behavior change**: in a new registration the plain
+  `MEMTOMEM_STM_SURFACING__USE_DAEMON`, `…__TIMEOUT_SECONDS` and
+  `…__PERSIST_QUERY_TEXT` are kept for older releases but outranked, so
+  editing one of them alone changes nothing. A
+  `MEMTOMEM_STM_SERVER_FLAGS` that is not exactly those three keys, each
+  once, with string values, stops the server with exit 1 and a line naming
+  the variable. Registrations written before this version are not rewritten:
+  they carry only the plain variables and behave as before.
+
 - `stm_proxy_read_more` and `stm_proxy_select_chunks` continuations now
   carry the upstream text block's `annotations` and block `_meta`, as the
   first progressive, selective or hybrid response already did (issue #1529).

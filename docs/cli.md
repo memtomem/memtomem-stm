@@ -1057,11 +1057,16 @@ A value that is not a JSON object of the flags' variables with string values
 ends that run with exit 1 and a stderr line naming the variable; a daemon the
 hook spawns has its stderr discarded, so the line shows only in a run started
 by hand. An MCP server
-registration still carries its policy as plain variables, so there one of
-those environment forms can still outrank them, and the server can then
-build a daemon configuration other than the hook's. The route is not
-affected either way: an explicit `--use-daemon` or `--no-daemon` decides it
-directly.
+registration that `mms register` or `mms init` writes carries its policy the
+same way: as `MEMTOMEM_STM_SERVER_FLAGS`, a JSON object of its three
+variables, which the server applies over another spelling of the variable,
+a case variant of the field in the block's JSON and a `null` block, so the
+server and the hook with the same policy read the same values for it. The
+registration also keeps the three as plain variables for older releases;
+they are outranked, so editing one of them alone changes nothing. A
+registration written before this carries only the plain variables, which
+those environment forms can still outrank. The route is not affected either
+way: an explicit `--use-daemon` or `--no-daemon` decides it directly.
 
 ### `install` / `uninstall` — per-host registration
 

@@ -169,10 +169,20 @@ def test_runtime_overlay_ignores_invalid_values_and_normalizes_deadline() -> Non
 
 def test_mcp_policy_serializes_shared_daemon_contract() -> None:
     policy = HostRuntimePolicy(True, 12.0, 13.0, False)
-    assert policy.mcp_env() == {
+    flat = {
         "MEMTOMEM_STM_SURFACING__USE_DAEMON": "true",
         "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS": "12",
         "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT": "false",
+    }
+    # The same policy again in the channel the server applies as a settings
+    # layer (#1544), keys sorted.
+    assert policy.mcp_env() == {
+        **flat,
+        "MEMTOMEM_STM_SERVER_FLAGS": (
+            '{"MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT": "false", '
+            '"MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS": "12", '
+            '"MEMTOMEM_STM_SURFACING__USE_DAEMON": "true"}'
+        ),
     }
 
 

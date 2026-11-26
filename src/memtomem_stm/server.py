@@ -30,7 +30,13 @@ from mcp.types import CallToolResult
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
 
 from memtomem_stm import __version__ as _stm_version
-from memtomem_stm.config import STMConfig
+from memtomem_stm.cli.host_runtime import (
+    SERVER_FLAGS_CHANNEL_ENV,
+    HookFlagsChannelError,
+    decode_server_flags_channel,
+    hook_flags_scope,
+)
+from memtomem_stm.config import STMConfig, server_flags_hint
 from memtomem_stm.logging_setup import configure_server_logging, configure_stderr_logging
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.proxy._fastmcp_compat import install_delivery_wire_context
@@ -3216,6 +3222,39 @@ def main() -> None:
     from memtomem_stm.utils.exec_env import harden_exec_search
 
     harden_exec_search()
+    flags = _server_flags()
+    with nullcontext() if flags is None else hook_flags_scope(flags):
+        _serve(flags)
+
+
+def _server_flags() -> dict[str, str] | None:
+    """The registration's runtime policy from ``SERVER_FLAGS_CHANNEL_ENV``
+    (#1544), or ``None`` when the variable is unset (a registration written
+    before it, or a server started by hand). Applied as a settings layer,
+    as the hook applies its flags, so neither a ``null`` parent block nor a
+    case variant of the field in the block's JSON outranks the policy. The
+    variable stays in the environment, so an embedding caller's next start
+    reads it again. A daemon this server spawns is not handed it
+    (``daemon.spawn`` drops it and passes the flags its own way), and the SDK
+    starts upstream servers with an allowlist environment; other programs it
+    runs (``pgrep``, ``git``) inherit it like the flat variables, and nothing
+    there reads it.
+
+    A value the registration did not write ends the start with exit 1 and a
+    line naming the variable, never its value: building without it would
+    fall back to the flat variables, which the forms above outrank."""
+    raw = os.environ.get(SERVER_FLAGS_CHANNEL_ENV)
+    if raw is None:
+        return None
+    try:
+        return decode_server_flags_channel(raw)
+    except HookFlagsChannelError as exc:
+        configure_stderr_logging(level=logging.WARNING, force=True)
+        logger.error("%s", exc)
+        raise SystemExit(1) from None
+
+
+def _serve(flags: Mapping[str, str] | None) -> None:
     # STMConfig folds MEMTOMEM_STM_LOG_LEVEL and MEMTOMEM_STM_LOG_FILE into
     # one env surface (#612). A bad env value used to fall back to WARNING
     # silently here while the lifespan's own STMConfig() raised the same
@@ -3239,7 +3278,11 @@ def main() -> None:
         logger.exception(
             "Invalid MEMTOMEM_STM_* environment configuration%s",
             # Variable names can carry a newline or a bidi control (#1166).
-            _disp(env_var_hint_for_validation_error(exc)),
+            _disp(
+                env_var_hint_for_validation_error(exc)
+                if flags is None
+                else server_flags_hint(exc, flags)
+            ),
         )
         # Exit 1 as before, but not by re-raising: the interpreter would print
         # the same traceback a second time, outside the escaping formatter

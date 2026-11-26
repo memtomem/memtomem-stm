@@ -268,6 +268,7 @@ provider, host, or standard SDK. They do not change `STMConfig` completeness.
 | Variable | Purpose |
 |---|---|
 | `MEMTOMEM_STM_HOOK_SURFACE_TOOLS` | Legacy comma-separated canonical native-tool allowlist (`read,grep,glob,shell,web_fetch`); mutating `write`/`edit` tokens are refused. |
+| `MEMTOMEM_STM_SERVER_FLAGS` | Written by `mms register` / `mms init` into an MCP server registration: a JSON object of exactly `MEMTOMEM_STM_SURFACING__USE_DAEMON`, `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` and `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT`, each once, with string values. The server applies them over another spelling of the variable, a case variant of the field in the parent block's JSON and a `null` parent block, the way the hook applies its flags (a block that is not a JSON object still fails); the registration's flat variables of those names carry the same values for older releases and are outranked, so editing one of them alone changes nothing. Any other value stops the server with exit 1 and a line naming the variable. |
 | `MMS_CLIENT_SERVER_NAME` | Client-visible STM registration name used only for composed tool-name budget checks. |
 | `MMS_NO_TUI` | Disable the interactive server-discovery TUI. |
 | `NO_COLOR` | Disable ANSI color in CLI output. |
