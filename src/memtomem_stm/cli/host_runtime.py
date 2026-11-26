@@ -236,7 +236,8 @@ def active_hook_flags() -> dict[str, str]:
 
 
 def encode_hook_flags_channel(flags: Mapping[str, str]) -> str:
-    """:data:`HOOK_FLAGS_CHANNEL_ENV`'s value for *flags*."""
+    """A flags channel's value for *flags*: :data:`HOOK_FLAGS_CHANNEL_ENV`'s
+    and :data:`SERVER_FLAGS_CHANNEL_ENV`'s."""
     return json.dumps(dict(flags), sort_keys=True)
 
 

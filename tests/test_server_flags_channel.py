@@ -151,9 +151,7 @@ def test_the_channel_stays_in_the_environment(registration_env, _restore_root_lo
 
 
 @pytest.mark.parametrize("form", list(_FORMS))
-def test_a_daemon_the_server_spawns_builds_the_hooks_configuration(
-    registration_env, form, tmp_path
-):
+def test_a_daemon_the_server_spawns_builds_the_hooks_configuration(registration_env, form):
     """The server spawns its daemon from a worker thread
     (``daemon_adapter``'s ``asyncio.to_thread``); the flags reach the child in
     ``MEMTOMEM_STM_HOOK_FLAGS``, and its fingerprint is the hook's daemon's."""
