@@ -156,6 +156,11 @@ def owned_handler(host_tag: str, handler: Any) -> OwnedHookCommand | None:
     * Claude Code and Codex: ``type`` is ``"command"`` and there is no
       ``args`` key. Install never writes ``args``; in Claude Code it also
       turns ``command`` into a single executable path.
+    * Claude Code also: no ``shell`` key, or ``"shell": "bash"``. Install
+      writes a POSIX line, and ``"shell": "powershell"`` has PowerShell read
+      it; any other value, ``null`` included, is not install's either. What
+      Codex does with a ``shell`` key is not established, so it is not read
+      there.
     * Kimi: ``event`` is ``"PostToolUse"``, the only event install registers.
     * Cursor: nothing beyond the text.
 
@@ -171,6 +176,8 @@ def owned_handler(host_tag: str, handler: Any) -> OwnedHookCommand | None:
         return None
     if host_tag in _NESTED_HOSTS:
         if handler.get("type") != "command" or "args" in handler:
+            return None
+        if host_tag == "claude" and handler.get("shell", "bash") != "bash":
             return None
     elif host_tag == "kimi" and handler.get("event") != _KIMI_EVENT:
         return None

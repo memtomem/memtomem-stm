@@ -2991,19 +2991,66 @@ def _render_cache_block(summary: dict[str, Any], *, collecting: bool) -> None:
     )
 
 
+def _progressive_coverage_lines(rollup: dict[str, Any]) -> list[str]:
+    """Coverage lines for the ``rollup`` of an all-time progressive summary.
+
+    Not :func:`_all_time_coverage_lines`: here the boundary is when the history
+    became complete, which after a repair of a damaged rollup is later than the
+    installation, so the loss is not described as "before the rollup was
+    installed".
+    """
+    earliest = rollup.get("earliest_created_at")
+    if earliest is not None:
+        since = _utc_text(float(earliest), "%Y-%m-%d")
+        lines = [f"  Window: all time — retained rows plus the rollup, since {since} UTC."]
+    else:
+        lines = ["  Window: all time — retained rows plus the rollup."]
+    incomplete = rollup.get("incomplete_before")
+    if incomplete is not None:
+        when = _utc_text(float(incomplete), "%Y-%m-%d %H:%M")
+        lost = rollup.get("lost_before_install")
+        if isinstance(lost, int):
+            lines.append(
+                f"  Incomplete before {when} UTC: {lost:,} reads were purged before the\n"
+                "    rollup was installed, so reads recorded before then may be missing."
+            )
+        else:
+            lines.append(
+                f"  Possibly incomplete before {when} UTC: an unknown number of reads\n"
+                "    recorded before then may be missing."
+            )
+    return lines
+
+
 def _render_progressive_block(
     summary: dict[str, Any], *, collecting: bool, retention_days: int
 ) -> None:
     """Progressive-delivery volume from :func:`read_progressive_summary`."""
-    click.echo(_hdr("Progressive delivery"))
+    raw_rollup = summary.get("rollup")
+    rollup: dict[str, Any] | None = raw_rollup if isinstance(raw_rollup, dict) else None
+    click.echo(
+        _hdr("Progressive delivery" if rollup is None else "Progressive delivery (all time)")
+    )
     click.echo("=" * 30)
     if summary.get("error"):
         click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
         return
     if not collecting:
         click.echo("  Collection disabled (proxy.progressive_reads.enabled = false).")
+    if rollup is not None and not rollup.get("installed"):
+        click.echo(
+            "  All-time totals unavailable: this feedback DB has no usable progressive rollup\n"
+            "    (none yet, or part of it is missing or damaged). It is installed or repaired\n"
+            "    the next time the MCP server of this STM version starts with progressive-read\n"
+            "    collection enabled; reads purged without a working rollup are not\n"
+            "    recoverable. Without --all-time this command reports the retained rows."
+        )
+        return
     if not summary.get("available") or not summary.get("total_responses"):
         click.echo("  No progressive responses recorded yet.")
+        if rollup is not None and summary.get("available"):
+            for line in _progressive_coverage_lines(rollup):
+                click.echo(line)
         return
     produced = int(summary["produced_chars"])
     delivered = int(summary["delivered_chars"])
@@ -3024,7 +3071,10 @@ def _render_progressive_block(
             "classification; they are included in both totals."
         )
     oldest = summary.get("oldest_at")
-    if oldest is not None:
+    if rollup is not None:
+        for line in _progressive_coverage_lines(rollup):
+            click.echo(line)
+    elif oldest is not None:
         since = datetime.fromtimestamp(float(oldest), tz=UTC).strftime("%Y-%m-%d")
         window = (
             f"rows older than {retention_days} days are purged when the server\n"
@@ -3141,7 +3191,8 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     help="Report compression over all rows ever recorded since the daily rollup was "
     "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only. "
     "The hook status counts include trimmed rows once the status rollup is installed; "
-    "before that they cover retained rows only.",
+    "before that they cover retained rows only. Progressive delivery likewise counts "
+    "purged reads since its rollup was installed; surfacing stays retained.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def stats(
@@ -3158,8 +3209,9 @@ def stats(
     creates or migrates them) and reports totals over the rows still retained
     (``proxy.metrics.max_history`` per source, ``retention_days`` for
     progressive reads and surfacing), not all-time totals. ``--all-time`` switches
-    the compression section alone to the never-pruned daily rollup plus retained
-    rows (#1316); progressive and surfacing stay retained-window. The cache block
+    the compression section to the never-pruned daily rollup plus retained rows
+    (#1316), and the progressive section to its per-response rollup plus retained
+    rows (#1328); surfacing stays retained-window. The cache block
     reads ``proxy_cache_daily``, which is never pruned and covers everything
     written since it was created (#1329). The live MCP server keeps additional
     in-memory counters that a separate CLI process cannot see, so the numbers
@@ -3279,7 +3331,9 @@ def stats(
         if source_filter != "hook"
         else None
     )
-    progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
+    progressive = read_progressive_summary(
+        proxy_cfg.progressive_reads.db_path, tool=tool_filter, all_time=all_time
+    )
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
     # These numbers come only from the on-disk stores; the live MCP server
@@ -3313,6 +3367,7 @@ def stats(
                     "hook_by_host": hook_by_host,
                     "hook_status": hook_status,
                     "cache": cache,
+                    "progressive_scope": progressive["scope"],
                     "progressive": progressive,
                     "surfacing": surfacing,
                 },
@@ -10486,20 +10541,6 @@ class _HookAdvice:
     command_deadlines: frozenset[str]
 
 
-def _overlay_value_wins(name: str, overlay: Mapping[str, str]) -> bool:
-    """Whether *name*'s overlay value is the one the build reads.
-
-    Mirrors ``config._overlaid_env_vars``: the overlay replaces the same
-    spelling in place or comes last, and names fold to lower case, so a later
-    case-equivalent spelling in the environment wins instead (#1503).
-    """
-    winner = None
-    for key in {**os.environ, **overlay}:
-        if key.lower() == name.lower():
-            winner = key
-    return winner == name
-
-
 def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _HookAdvice | None:
     """Doctor's advice inputs for a ``found`` view, else ``None``."""
     if view.state != "found":
@@ -10511,8 +10552,13 @@ def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _Ho
             _HOOK_DAEMON_TIMEOUT_ENV: float(built.hook.daemon_timeout_seconds),
         }
         for name, value in effective.items():
+            # Every flat spelling carries the overlay's value
+            # (``host_runtime.hook_flag_assignments``), so an equal value is the
+            # command's. A case variant of the field in the block's JSON, or a
+            # ``null`` block, can still set the build's deadline to the same
+            # number; that limit of #1503 is not checked here.
             raw = view.env.get(name)
-            if raw is None or not _overlay_value_wins(name, view.env):
+            if raw is None:
                 continue
             try:
                 if float(raw) == value:
@@ -10635,6 +10681,7 @@ def _env_overrides_found_row(
     not judged here: the ``ltm server`` row reports what its probe found (an
     unusable discovery key, surfacing off).
     """
+    from memtomem_stm.config import hook_flag_environ
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
     def classify(outcome: EnvSTMConfigLoad | Exception) -> tuple[str, Exception | None]:
@@ -10646,12 +10693,12 @@ def _env_overrides_found_row(
 
     hook_kind, hook_exc = classify(hook_outcome)
     bare_kind, bare_exc = classify(bare_outcome)
-    # Each build's hint reads the environment that build read: the overlay
-    # replaces in place or comes last, as ``config._overlaid_env_vars`` merges.
+    # Each build's hint reads the environment that build read, each variable
+    # the command sets named as it sets it (#1503).
     hook_hint = (
         ""
         if hook_exc is None
-        else env_var_hint_for_validation_error(hook_exc, {**os.environ, **view.env})
+        else env_var_hint_for_validation_error(hook_exc, hook_flag_environ(os.environ, view.env))
     )
     bare_hint = "" if bare_exc is None else env_var_hint_for_validation_error(bare_exc)
     hook_says = {

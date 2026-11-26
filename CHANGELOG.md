@@ -11,6 +11,26 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms stats --all-time` now covers the **Progressive delivery** block too
+  (issue #1328, part B of #1316). Reads removed by the
+  `proxy.progressive_reads.retention_days` purge at server start were lost,
+  so its produced and delivered chars covered only that window (90 days by
+  default). A database trigger now folds every deleted `progressive_reads`
+  row into a never-pruned `progressive_reads_rollup` table in
+  `stm_feedback.db`, one row per response and tool, so a response purged in
+  part is still counted once. It is installed when the MCP server of this
+  version starts with progressive-read collection enabled, before that
+  start's purge; reads purged earlier are counted as lost, not recovered.
+  Until then `--all-time` reports the progressive totals as unavailable.
+  `--json` adds `progressive_scope`, and a `rollup` coverage object under
+  `progressive` in all-time mode. Without `--all-time` the text output is
+  unchanged; the JSON gains `progressive_scope: "retained"` and a `scope` key
+  in `progressive`. To reset the history, delete from `progressive_reads` and
+  then from `progressive_reads_rollup` in one transaction; never `DROP` the
+  rollup table while its trigger exists.
+
 ### Fixed
 
 - `mms doctor`'s `env_overrides` row now says which daemon command its
@@ -25,6 +45,70 @@ changes inline only. See the deprecation policy in
   decided). The row does not judge whether that start would succeed; the
   `ltm server` row reports what its probe found, such as an unusable
   discovery key or surfacing off.
+- A runtime flag of the `mms hook` command (`--surfacing-timeout-seconds`,
+  `--daemon-timeout-seconds`, `--[no-]persist-query-text`, `--use-daemon` /
+  `--no-daemon`) is no longer outranked by another letter-case spelling of
+  its variable later in the environment (issue #1503), such as
+  `memtomem_stm_surfacing__persist_query_text=true` against
+  `--no-persist-query-text`. The hook now sets every spelling of the name to
+  the flag's value for the call and restores each in place afterwards; a
+  daemon it spawns inherits that environment, and `mms daemon …
+  --hook-command claude` and `mms doctor`'s build of the hook's configuration
+  read the same values. **Behavior change**: where such a spelling outranked
+  a flag, the hook, the daemon it spawns and doctor now use the flag's value,
+  and doctor's timeout advice names the command's flag instead of an export.
+  Not covered: a case variant of the field in the block's JSON
+  (`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`)
+  and a `null` block, which can still outrank a flag; when one of them sets
+  a deadline to the flag's own value, doctor's timeout advice still names
+  the flag.
+- The look-alike test of `mms hook install`, `mms hook uninstall`,
+  `mms doctor` and `mms daemon … --hook-command claude` now reads a hook
+  handler's words in time linear in the line's length (issue #1498). For a
+  line the cheaper candidate test does not name, it read the words of the
+  whole line with `shlex`, whose cost is quadratic in a word's length: a
+  handler `echo ` + 160,000 × `x` took about 0.34 s per scan (macOS,
+  CPython 3.14.7), and install and uninstall scan twice. The words are read
+  the way `shlex` reads them, so the same handlers are named as before.
+- Cleaning no longer removes markup as one element across two upstream text
+  blocks (#1538, issue #1531). When a response's text blocks carry no
+  metadata they are joined and cleaned as one string, so a tag or a
+  `<script>`/`<style>` element that opened in one block and closed in a
+  later one was removed together with the text of both blocks between them:
+  `Intro <style>Release notes` and `Rollback instructions</style> end` were
+  delivered as `Intro  end`. Line-ending normalization and markup removal now
+  read one block at a time; code-fence and generic protection, duplicate
+  paragraph removal, link-flood collapse and blank-line normalization still
+  read the joined text, so a fence split across blocks stays protected as
+  before. **Behavior change**: such a reply now keeps that text
+  (`Intro Release notes` / `Rollback instructions end`), and a block ending
+  in a lone `\r` now ends its own line instead of merging with the newline
+  that joins it to the next block; any other reply is unchanged. A cache hit
+  can still serve a reply stored earlier while that entry stays valid
+  (#1540).
+- `mms hook install` and `mms hook uninstall` no longer manage a Claude Code
+  handler whose `shell` field is present and anything but `"bash"` (issue
+  #1497). Install writes a POSIX line; with `"shell": "powershell"`
+  PowerShell reads it, yet install used to read settings from that line,
+  rewrite it and keep the `shell` field, and uninstall deleted it. Such a
+  handler (any other `shell` value, `null` included) is now left in place,
+  and named as a look-alike when its command looks like STM's hook, as
+  `mms doctor` already treated it. Codex
+  handlers are unchanged: what Codex does with a `shell` key is not
+  established. **Behavior change**: a Claude Code handler install wrote, to
+  which a `shell` other than `"bash"` was added by hand, is no longer
+  refreshed or removed; install refreshes the handler it does own, or adds
+  one beside it when it owns none.
+
+- The `max_upstream_chars` guard no longer reports an oversized payload when
+  no text was cut (#1536, issue #1530). A text block that exactly filled the cap
+  followed by an empty text block used to get the "response truncated …
+  upstream returned an oversized payload" notice appended to the joined
+  text, and a truncation warning in the log; the guard now fires only when
+  a block with text loses some or all of it. **Behavior change**: such a
+  reply is now delivered without that notice and no longer logs the
+  warning; a reply that really is cut is unchanged. A cache hit can still
+  serve a notice stored earlier while that entry stays valid.
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
   #1506). When doctor reads exactly one STM hook command `mms hook install`
@@ -42,6 +126,26 @@ changes inline only. See the deprecation policy in
   break (such as #1508's extreme deadline) now WARNs where the row passed.
   Without such a command (none, several, unreadable, Windows, or a settings
   error) the row is unchanged.
+
+- A proxied call whose upstream reply fails the MCP SDK's result checks is now
+  recorded with the `protocol` error category instead of `programming`
+  (issue #1131). The checks matched are a reply outside the negotiated schema
+  (for example a list `structuredContent`, or `resultType: "input_required"`
+  on a 2025-11-25 connection), an `InputRequiredResult` on a 2026-07-28
+  connection (valid there, but STM cannot relay it yet), a result that
+  breaks the tool's own `outputSchema` or omits the structured content it
+  declares, and an `outputSchema` the SDK cannot resolve. A failure these
+  checks do not match keeps the category it had before. Such a call is
+  still not retried, and it now resets the circuit breaker's failure count,
+  since a reply arrived. **Behavior change**: tool health counts
+  `programming` rows as calls but not as errors; these rows now count as
+  upstream errors too.
+  Health is evaluated at proxy startup, so once a tool that keeps sending
+  such replies crosses the health thresholds, the `strict` exposure profile
+  withholds it on a later startup and `review` gives it a risk penalty. Known
+  limit: a malformed `tools/list` reply to the SDK's output-schema refresh
+  during the call is still `programming`.
+
 - `mms doctor --measure-ltm` no longer advises `mms daemon start` when the
   daemon discovery key (`stm-discovery.key` under `data_dir`) cannot be used
   (#1520, issue #1519). `start` reads the same key and exits 1 on it. The

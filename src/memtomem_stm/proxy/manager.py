@@ -39,7 +39,7 @@ from mcp import ClientSession
 from mcp import types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.proxy import tool_name_budget
@@ -851,6 +851,52 @@ def _safe_error_text(exc: BaseException) -> str:
     """
     text = _stm_composed_text(exc) or exception_summary(exc)
     return text[:MAX_ERROR_MESSAGE_CHARS]
+
+
+# ``ClientSession.call_tool`` validates the ``tools/call`` reply twice: against
+# the negotiated version's wire schema (the error is titled after the result
+# model) and then through its result adapter (titled after the union it tries).
+# Request construction and the SDK's own ``tools/list`` refresh raise
+# ``ValidationError`` too, titled ``CallToolRequestParams`` / ``ListToolsResult``,
+# and are deliberately not matched: the first sent nothing, the second is not
+# the invoked tool's reply.
+_REJECTED_RESULT_TITLE = "CallToolResult"
+_REJECTED_RESULT_UNION_PREFIX = "union[CallToolResult,"
+
+# Messages the SDK raises as a bare ``RuntimeError`` for a reply it rejects:
+# an ``InputRequiredResult`` STM did not ask for (2026-07-28 connections), and a
+# result that breaks the tool's own declared ``outputSchema``.
+_REJECTED_RESULT_RUNTIME_PREFIXES = (
+    "Server returned InputRequiredResult",
+    "Invalid structured content returned by tool ",
+    "Invalid schema for tool ",
+)
+_REJECTED_RESULT_RUNTIME_SUFFIX = " has an output schema but did not return structured content"
+
+
+def _is_upstream_result_rejection(exc: BaseException) -> bool:
+    """Whether ``exc`` is the SDK refusing the upstream's ``tools/call`` reply.
+
+    Such a failure is not an STM bug, so it is recorded as ``protocol``: the
+    category for results the SDK rejects. Most break the protocol or the
+    tool's own ``outputSchema``; an ``InputRequiredResult`` is valid on a
+    2026-07-28 connection, and is rejected only because STM cannot relay it
+    and leaves ``allow_input_required`` off.
+
+    The match is on the SDK's own titles and messages, so an SDK release that
+    rewords them makes this return ``False`` and the call keeps the
+    ``programming`` category it had before; the tests built from the real SDK
+    then fail.
+    """
+    if isinstance(exc, ValidationError):
+        title = exc.title
+        return title == _REJECTED_RESULT_TITLE or title.startswith(_REJECTED_RESULT_UNION_PREFIX)
+    if type(exc) is RuntimeError:
+        message = str(exc)
+        return message.startswith(_REJECTED_RESULT_RUNTIME_PREFIXES) or (
+            message.startswith("Tool ") and message.endswith(_REJECTED_RESULT_RUNTIME_SUFFIX)
+        )
+    return False
 
 
 def _mark_cache_invalidated(exc: BaseException) -> None:
@@ -4331,6 +4377,19 @@ class ProxyManager:
             return text
         return DefaultContentCleaner(cleaning_cfg).clean(text)
 
+    def _clean_shaped_text(self, shaped: ShapedResponse, cleaning_cfg: CleaningConfig) -> str:
+        """Clean the normal path's joined text blocks into the string it compresses.
+
+        Disabled cleaning returns ``shaped.original_text`` itself. Enabled
+        cleaning keeps every removal match inside one block and runs the
+        whole-response rules on the join (``DefaultContentCleaner.clean_parts``).
+        """
+        if not cleaning_cfg.enabled:
+            return shaped.original_text
+        return DefaultContentCleaner(cleaning_cfg).clean_parts(
+            shaped.original_text, shaped.text_part_lengths
+        )
+
     async def _compress_maybe_offthread(
         self,
         compressor: Any,
@@ -6517,6 +6576,30 @@ class ProxyManager:
                     if breaker is not None:
                         breaker.record_success()
                     raise
+                if _is_upstream_result_rejection(exc):
+                    # The upstream replied with a result the SDK rejects for
+                    # this connection, which is not an STM bug (see
+                    # ``_is_upstream_result_rejection``). Replaying would
+                    # fetch the same reply, and the connection itself is
+                    # fine, so no retry and no reconnect.
+                    # The round trip completed, which closes the breaker as
+                    # the oversize branch above does.
+                    self.tracker.record_error(
+                        CallMetrics(
+                            server=server,
+                            tool=tool,
+                            original_chars=0,
+                            compressed_chars=0,
+                            is_error=True,
+                            error_category=ErrorCategory.PROTOCOL,
+                            error_message=_safe_error_text(exc),
+                            trace_id=trace_id,
+                        )
+                    )
+                    _mark_recorded(exc)
+                    if breaker is not None:
+                        breaker.record_success()
+                    raise
                 # Only retry transport/connection errors and MCP errors.
                 # Programming errors (TypeError, AttributeError, etc.)
                 # propagate immediately to avoid masking bugs.
@@ -6713,15 +6796,19 @@ class ProxyManager:
                     # non-text blocks keep their relative positions.
                     non_text_before_first_text = len(non_text_content)
                     first_text_content = content
-                remaining = max_upstream - total_chars
-                if remaining <= 0:
-                    oversize = True
-                    continue
                 # ``content.text or ""`` tolerates spec-noncompliant upstreams
                 # that return ``None`` for a TextContent's ``text`` field.
                 # MCP spec requires ``text: str`` but mirrors the same gap
                 # that PR #114 fixed for ``result.content`` itself.
                 text = content.text or ""
+                remaining = max_upstream - total_chars
+                if remaining <= 0:
+                    # A block that exactly filled the cap leaves no room, but
+                    # only a block with text loses anything; an empty one is
+                    # skipped without claiming an oversized payload.
+                    if text:
+                        oversize = True
+                    continue
                 if len(text) > remaining:
                     text_parts.append(text[:remaining])
                     total_chars += remaining
@@ -6747,11 +6834,13 @@ class ProxyManager:
         if not text_parts:
             return ShapedResponse(
                 original_text="",
+                text_part_lengths=(),
                 non_text_content=non_text_content,
                 passthrough=ShapePassthrough(has_non_text=bool(non_text_content)),
             )
         return ShapedResponse(
             original_text="\n".join(text_parts),
+            text_part_lengths=tuple(len(part) for part in text_parts),
             non_text_content=non_text_content,
             non_text_before_first_text=non_text_before_first_text,
             first_text_content=first_text_content,
@@ -8396,12 +8485,19 @@ class ProxyManager:
             return "[empty response]"
 
         # ── Stage 1: CLEAN ──
+        # The cleaner gets the block lengths with ``original_text``, so markup
+        # removal matches stay within one block: an element that opens in one
+        # block and closes in a later one is no longer removed as one match
+        # with the text of both blocks between its tags (#1531). Fence/generic protection,
+        # paragraph dedup, link-flood collapse and whitespace normalization
+        # still read the joined text — several text blocks reach this stage
+        # only when none carries metadata, and they leave as one merged block.
         with traced(
             "proxy_call_clean",
             metadata={"server": server, "tool": tool},
         ):
             _t0 = _time.monotonic()
-            cleaned = self._clean_content(original_text, tc.cleaning)
+            cleaned = self._clean_shaped_text(shaped, tc.cleaning)
             _clean_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stages 2+3: COMPRESS (or PROGRESSIVE) + SURFACE ──
