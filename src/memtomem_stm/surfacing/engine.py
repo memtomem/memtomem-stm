@@ -6,9 +6,11 @@ import asyncio
 import fnmatch
 import functools
 import hashlib
+import hmac
 import logging
 import math
 import random
+import secrets
 import time
 import uuid
 from concurrent.futures import Future
@@ -36,7 +38,7 @@ from memtomem_stm.surfacing.feedback_store import (
     OpportunityRow,
 )
 from memtomem_stm.surfacing.formatter import RenderManifest, SurfacingFormatter
-from memtomem_stm.surfacing.grams import eligible_source
+from memtomem_stm.surfacing.grams import KEY_BYTES, eligible_source
 from memtomem_stm.surfacing.mcp_client import (
     KNOWN_SCORE_SCALES,
     render_score_scale,
@@ -93,13 +95,55 @@ def _fifo_prune(d: dict[Any, Any], cap: int) -> None:
         del d[k]
 
 
-_QUERY_HASH_PREFIX = "sha256:"
-"""Marker prefixed to the truncated sha256 digest written to
-``surfacing_events.query`` when ``SurfacingConfig.persist_query_text`` is
-``False`` (#352 part 3). Lets the stats formatter recognize the
-hashed-form row without re-reading config and lets ad-hoc DB inspection
-tell user-derived text apart from a stable opaque ID. The full stored
-value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
+_QUERY_HASH_PREFIX = "hmac-sha256:"
+"""Marker prefixed to the query digest written to ``surfacing_events.query``
+when ``SurfacingConfig.persist_query_text`` is ``False`` (#352 part 3), to
+``surfacing_opportunities.query_digest``, and to the surface webhook's
+``query``. Lets the stats formatter recognize the hashed-form row without
+re-reading config and lets ad-hoc DB inspection tell user-derived text apart
+from an opaque ID. The full value is ``"hmac-sha256:" + 16 hex chars`` → 28
+chars total. Rows written before the digest was keyed carry ``"sha256:"`` +
+16 hex instead; the two are not comparable."""
+
+_QUERY_DIGEST_HEX = 16
+"""Hex chars kept from the query HMAC (8 bytes): enough to tell queries apart
+in a stats listing, and the same length the unkeyed form used."""
+
+_QUERY_DIGEST_LABEL = b"stm-query-digest-v1"
+"""Domain-separation label for the query-digest subkey. The feedback DB's key
+also hashes memory-path 4-grams (``grams.keyed_hash``); deriving a subkey under
+this label keeps a query digest from ever equalling a gram hash of the same
+text."""
+
+
+def _query_digest_key(feedback_tracker: Any | None) -> bytes:
+    """The subkey this engine digests queries under.
+
+    Derived from the feedback DB's committed HMAC key when a tracker is
+    attached, so the proxy and the hook daemon — which share that DB — write
+    the same digest for the same query. That key lives in the same DB file as
+    the digests, so keying protects copies that leave it (stats output, a
+    webhook payload, an exported row), not a reader of the file itself.
+
+    Without a tracker (the one-shot hook path) there is nothing to persist
+    into, and the parent key is random and lives as long as this engine: the
+    digest is stable only within it, and reaches at most a webhook an
+    embedder wired. A tracker whose store exposes no valid key falls back the
+    same way.
+    """
+    store_key = None
+    if feedback_tracker is not None:
+        store_key = getattr(feedback_tracker.store, "hmac_key", None)
+    if not isinstance(store_key, bytes) or len(store_key) != KEY_BYTES:
+        store_key = secrets.token_bytes(KEY_BYTES)
+    return hmac.new(store_key, _QUERY_DIGEST_LABEL, hashlib.sha256).digest()
+
+
+def query_digest(query: str, subkey: bytes) -> str:
+    """``hmac-sha256:`` + the first 16 hex chars of HMAC-SHA256(*subkey*, *query*)."""
+    mac = hmac.new(subkey, query.encode("utf-8", errors="surrogatepass"), hashlib.sha256)
+    return f"{_QUERY_HASH_PREFIX}{mac.hexdigest()[:_QUERY_DIGEST_HEX]}"
+
 
 _CIRCUIT_OPEN_KIND: frozenset[str] = frozenset({"circuit_open"})
 """Recovery scope for keys this engine's breaker turned away: the success that
@@ -431,6 +475,7 @@ class SurfacingEngine:
         self._webhook_manager = webhook_manager
         self._feedback_tracker = feedback_tracker
         self._token_tracker = token_tracker
+        self._query_digest_key = _query_digest_key(feedback_tracker)
         # Feedback-loop enablement, not event persistence. When a tracker is
         # attached, telemetry writes (``surfacing_events`` rows, ``seen_memories``
         # dedup, fault counters) gate on tracker presence alone — so paths like
@@ -1461,8 +1506,8 @@ class SurfacingEngine:
 
         When ``persist_query_text=True`` (default, backward-compatible)
         this is just ``query``. When ``False``, the engine substitutes a
-        truncated sha256 digest with a ``sha256:`` prefix so the persisted
-        value is a stable opaque ID rather than user-derived text. The
+        keyed digest with an ``hmac-sha256:`` prefix (``_hashed_query``) so
+        the persisted value is an opaque ID rather than user-derived text. The
         in-memory ``RelevanceGate.record_surfacing(query)`` cooldown
         signal (and the in-flight ``query`` argument used for similarity
         comparison, dedup, formatter rendering, etc.) intentionally keeps
@@ -1491,11 +1536,13 @@ class SurfacingEngine:
             return self._hashed_query(query)
         return query
 
-    @staticmethod
-    def _hashed_query(query: str) -> str:
-        """Return the stable ``sha256:`` + 16-hex-char digest form of *query*."""
-        digest = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
-        return f"{_QUERY_HASH_PREFIX}{digest}"
+    def _hashed_query(self, query: str) -> str:
+        """Return the keyed ``hmac-sha256:`` + 16-hex-char digest form of *query*.
+
+        Keyed so a stored or webhook-delivered digest of a short or guessable
+        query cannot be confirmed by hashing candidates offline (#1381).
+        """
+        return query_digest(query, self._query_digest_key)
 
     def _active_min_score(self, tool: str, score_ceiling: float | None = None) -> float:
         """Return the score floor currently used for surfacing decisions.

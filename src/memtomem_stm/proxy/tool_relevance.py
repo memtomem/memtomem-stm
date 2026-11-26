@@ -59,13 +59,12 @@ so adding them changes no ordering and no cohort stamp. Sanitization
 identifiers and policy-evidence paths out of the record.
 
 Privacy: the derived query is used in memory for scoring only — callers
-persist its sha256/length/source via ``build_candidate_features``, never the
+persist its length/source via ``build_candidate_features``, never the
 text, matching the selection log's structural-redaction contract.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -283,12 +282,13 @@ def build_candidate_features(
 ) -> dict[str, Any]:
     """Assemble the ``candidate_features`` object for the selection event.
 
-    Carries the query only as sha256 + char count + source tag — the raw
-    text never enters the telemetry record.
+    Carries the query only as a char count + source tag — the raw text never
+    enters the telemetry record, and neither does a digest of it: an unkeyed
+    hash of a short query lets anyone holding the log confirm a guess offline
+    (#1381, selection-log schema v2).
     """
     return {
         "query_source": query_source,
-        "query_sha256": hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest(),
         "query_chars": len(query),
         "ranked_candidates": ranked,
     }

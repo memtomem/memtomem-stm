@@ -653,7 +653,7 @@ class TestToolgraphConsultWiring:
         cache.initialize()
         try:
             cache.put(
-                GraphConsultCache.provider_fingerprint(cfg),
+                cache.provider_fingerprint(cfg),
                 cfg.agent_id,
                 cfg.query_profile,
                 GraphConsultCache.candidate_hash([bad_ref]),
@@ -673,7 +673,7 @@ class TestToolgraphConsultWiring:
             # a passing assertion below cannot be an accidental miss.
             assert (
                 seeded.get(
-                    GraphConsultCache.provider_fingerprint(cfg),
+                    seeded.provider_fingerprint(cfg),
                     cfg.agent_id,
                     cfg.query_profile,
                     GraphConsultCache.candidate_hash([bad_ref]),
@@ -1553,3 +1553,85 @@ class TestToolgraphHealthRendering:
         body = "\n".join(lines)
         assert "not consulted" in body
         assert "active" not in body
+
+
+def _consult_cache_log(mgr) -> str:
+    """What ``_open_consult_cache`` logs, as the server writes it: through
+    ``DisplayEscapingFormatter``, which withholds exception text and leaves a
+    message's own values to the call site."""
+    import io
+
+    from memtomem_stm.logging_setup import FILE_FORMAT, DisplayEscapingFormatter
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(DisplayEscapingFormatter(FILE_FORMAT))
+    manager_logger = logging.getLogger("memtomem_stm.proxy.manager")
+    manager_logger.addHandler(handler)
+    try:
+        assert mgr._open_consult_cache(mgr._config.toolgraph) is None
+    finally:
+        manager_logger.removeHandler(handler)
+    return stream.getvalue()
+
+
+_posix_names = pytest.mark.skipif(
+    sys.platform == "win32", reason="a newline is not a valid Windows file name character"
+)
+_HOSTILE_DIR = "x\nWARNING forged\u202e"
+_HOSTILE_DIR_ESCAPED = "x\\u000AWARNING forged\\u202E"
+
+
+def test_unusable_consult_key_file_is_named_in_the_production_log(tmp_path):
+    """The warning names ``<consult_cache_path>.key`` under the formatter the
+    server installs, which withholds exception text (#1416)."""
+    from memtomem_stm.utils.local_key import key_path_for
+
+    mgr, _ = _tg_manager(tmp_path)
+    key_file = key_path_for(mgr._config.toolgraph.consult_cache_path)
+    key_file.write_bytes(b"not a key\n")
+
+    output = _consult_cache_log(mgr)
+
+    assert "consult cache disabled" in output
+    assert str(key_file) in output
+
+
+@_posix_names
+def test_unusable_consult_key_warning_escapes_a_hostile_path(tmp_path):
+    """The key error's message quotes the configured cache path; a newline or
+    a bidi control in it must not reach the log as itself (#1422)."""
+    from memtomem_stm.utils.local_key import key_path_for
+
+    cache_dir = tmp_path / _HOSTILE_DIR
+    cache_dir.mkdir()
+    mgr, _ = _tg_manager(tmp_path, consult_cache_path=cache_dir / "tg_consult.db")
+    key_path_for(mgr._config.toolgraph.consult_cache_path).write_bytes(b"not a key\n")
+
+    output = _consult_cache_log(mgr)
+
+    assert "consult cache disabled" in output
+    assert len(output.splitlines()) == 1
+    assert _HOSTILE_DIR_ESCAPED in output
+
+
+def test_unopenable_consult_cache_warning_escapes_a_hostile_path(tmp_path, monkeypatch):
+    """The other way the cache fails to open names the configured path
+    directly. That record carries a traceback, so it is several lines by
+    design; what must hold is that none of them is the path's own (#1422)."""
+
+    def refuse(self) -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(GraphConsultCache, "initialize", refuse)
+    mgr, _ = _tg_manager(tmp_path, consult_cache_path=tmp_path / _HOSTILE_DIR / "tg_consult.db")
+
+    output = _consult_cache_log(mgr)
+    lines = output.splitlines()
+
+    assert "consult cache could not be opened" in lines[0]
+    assert _HOSTILE_DIR_ESCAPED in lines[0]
+    assert not any(line.startswith("WARNING forged") for line in lines)
+    assert "\u202e" not in output
+    # The traceback is still there, rendered by the formatter.
+    assert any("Traceback" in line for line in lines[1:])

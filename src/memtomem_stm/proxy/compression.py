@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, Self, cast
+from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, Self, TypeVar, cast
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.pending_store import PendingStore
@@ -44,6 +44,10 @@ from memtomem_stm.proxy.delivery import (
     fit_toc,
     metadata_format,
     plain_result_fits,
+    stored_text_block,
+    text_block_metadata,
+    text_block_overhead,
+    with_text_block,
 )
 from memtomem_stm.proxy.markdown_structure import (
     Heading,
@@ -55,7 +59,7 @@ from memtomem_stm.proxy.markdown_structure import (
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.utils.json_out import dumps as surrogate_safe_dumps
-from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
+from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer, scoring_source
 from memtomem_stm.utils.anyio_shutdown import (
     InFlightGate,
     drain_or_warn,
@@ -256,6 +260,32 @@ class NoopCompressor:
         return text
 
 
+_S = TypeVar("_S")
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _binds_scoring_source(
+    method: Callable[Concatenate[_S, _P], _R],
+) -> Callable[Concatenate[_S, _P], _R]:
+    """Bind a ``compress`` method's input text as the scoring source (#1382).
+
+    Sections are rebuilt from that text, and an embedding scorer screens it
+    before sending any of them off the machine: see
+    ``relevance.scoring_source`` for what the rebuild can hide. The text is
+    read as the method itself would receive it, positionally or as ``text=``,
+    so the decorator leaves the call signature as it was.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: _S, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        text = args[0] if args else kwargs.get("text")
+        with scoring_source(text if isinstance(text, str) else None):
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 def _scores_or_none(
     scorer: RelevanceScorer, query: str, sections: list[tuple[str, str]]
 ) -> list[float] | None:
@@ -331,6 +361,7 @@ class TruncateCompressor(_PlainTextRetention):
     # Comment-section boundaries (-- Section Header)
     _COMMENT_SECTION_RE = re.compile(r"(?:^|\n)(--\s+\S.+)")
 
+    @_binds_scoring_source
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         if not text or len(text) <= max_chars:
             return text
@@ -838,6 +869,8 @@ class TruncateCompressor(_PlainTextRetention):
                     alloc_left -= len(line) + 1
                 enriched[i] = "\n".join(kept)
 
+    _PREVIEW_SIGNATURE_CAP = 80
+
     def _code_aware_truncate(self, text: str, max_chars: int, boundaries: list[re.Match]) -> str:
         """Preserve signatures/names from ALL code blocks, not just the first ones.
 
@@ -845,13 +878,13 @@ class TruncateCompressor(_PlainTextRetention):
         For SQL: keeps first query full + signature of remaining queries.
         """
         # Parse blocks: each boundary starts a logical block
-        blocks: list[tuple[str, str]] = []  # (signature_line, full_body)
+        blocks: list[str] = []
+        labels: list[str] = []  # what each boundary pattern captured, stripped
         for i, m in enumerate(boundaries):
             start = m.start()
             end = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(text)
-            sig = m.group(1).strip()
-            body = text[start:end].rstrip()
-            blocks.append((sig, body))
+            blocks.append(text[start:end].rstrip())
+            labels.append(m.group(1).strip())
 
         # Preamble (imports, docstrings before first boundary)
         preamble = text[: boundaries[0].start()].rstrip() if boundaries[0].start() > 0 else ""
@@ -873,7 +906,7 @@ class TruncateCompressor(_PlainTextRetention):
             parts.append(preamble)
             used += len(preamble) + 1
 
-        for i, (sig, body) in enumerate(blocks):
+        for i, body in enumerate(blocks):
             if used + len(body) + 2 <= full_budget:
                 parts.append(body)
                 used += len(body) + 2
@@ -881,28 +914,58 @@ class TruncateCompressor(_PlainTextRetention):
             else:
                 break
 
-        # Phase 2: signatures of remaining blocks
-        remaining = [(sig, body) for i, (sig, body) in enumerate(blocks) if i >= full_count]
+        # Phase 2: the remaining blocks, signatures first. Each preview is the
+        # block's first non-blank line (its signature) plus up to 3 more
+        # non-blank lines. Every signature that fits goes in before any block
+        # gets a body line, and body lines are then added one round at a time,
+        # so a tight budget names more blocks rather than showing more of the
+        # first few. A signature line is first placed cut to
+        # _PREVIEW_SIGNATURE_CAP chars, so one long first line (a wide SELECT)
+        # cannot crowd out every block. A block whose cut signature does not
+        # fit either is marked `# <label>` (for SQL just the keyword) when that
+        # fits, so it is still counted in. Cut signatures then get their whole
+        # line back before any body line is added; a marked block gets neither.
+        # Separators are counted: 2 per preview, 1 per added line.
+        remaining = blocks[full_count:]
         if remaining:
             sig_budget = max_chars - used - 60
-            sig_parts: list[str] = []
+            cap = self._PREVIEW_SIGNATURE_CAP
+            previews = [[ln for ln in body.split("\n") if ln.strip()][:4] for body in remaining]
+            heads = [ln[0] if len(ln[0]) <= cap else ln[0][: cap - 1] + "…" for ln in previews]
+            shown: list[int] = []
             sig_used = 0
-            for sig, body in remaining:
-                # Show signature + first non-empty body line
-                body_lines = body.split("\n")
-                sig_lines = [body_lines[0]]
-                for line in body_lines[1:4]:  # up to 3 more lines
-                    stripped = line.strip()
-                    if stripped:
-                        sig_lines.append(line)
-                snippet = "\n".join(sig_lines)
-                if sig_used + len(snippet) + 2 > sig_budget:
-                    if sig_used + len(sig) + 4 <= sig_budget:
-                        sig_parts.append(f"# {sig}")
-                        sig_used += len(sig) + 4
+            for head in heads:
+                cost = len(head) + 2
+                if sig_used + cost <= sig_budget:
+                    shown.append(1)
+                    sig_used += cost
                 else:
-                    sig_parts.append(snippet)
-                    sig_used += len(snippet) + 2
+                    shown.append(0)
+            marked: set[int] = set()
+            for i, label in enumerate(labels[full_count:]):
+                if not shown[i] and sig_used + len(label) + 4 <= sig_budget:
+                    heads[i] = f"# {label}"
+                    shown[i] = 1
+                    marked.add(i)
+                    sig_used += len(label) + 4
+            for i, lines in enumerate(previews):
+                if shown[i] and i not in marked and heads[i] != lines[0]:
+                    cost = len(lines[0]) - len(heads[i])
+                    if sig_used + cost <= sig_budget:
+                        heads[i] = lines[0]
+                        sig_used += cost
+            for depth in range(1, 4):
+                for i, lines in enumerate(previews):
+                    if shown[i] == depth and i not in marked and depth < len(lines):
+                        cost = len(lines[depth]) + 1
+                        if sig_used + cost <= sig_budget:
+                            shown[i] += 1
+                            sig_used += cost
+            sig_parts = [
+                "\n".join([head, *lines[1:n]])
+                for head, lines, n in zip(heads, previews, shown, strict=True)
+                if n
+            ]
 
             if sig_parts:
                 parts.append(f"\n... ({len(remaining)} more blocks)\n")
@@ -987,6 +1050,34 @@ def payload_has_credentials(text: str) -> bool:
     return contains_sensitive_content(text, CREDENTIAL_PATTERNS)
 
 
+def text_block_has_credentials(block: dict[str, Any] | None) -> bool:
+    """Whether a text block's metadata (#1529) carries a credential.
+
+    The same real-bytes verdict as :func:`payload_has_credentials`, over the
+    metadata as the client receives it (serialized once) and over every key
+    and string value as it is. The store's own row scan sees only a
+    serialization, where a quote inside a key or value is escaped, so it
+    cannot see a credential written there.
+    """
+    if not block:
+        return False
+    if payload_has_credentials(surrogate_safe_dumps(block, ensure_ascii=False)):
+        return True
+    stack: list[Any] = [block]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(key, str) and payload_has_credentials(key):
+                    return True
+                stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(value)
+        elif isinstance(value, str) and payload_has_credentials(value):
+            return True
+    return False
+
+
 def _store_persists(store: object) -> bool:
     return bool(getattr(store, "persists_to_disk", False))
 
@@ -1005,6 +1096,22 @@ class PendingSelection:
     # (#1370). ``None``: a row written before that, which expires by the
     # caller's TTL. Progressive rows keep theirs in ``__meta__`` instead.
     ttl_seconds: float | None = None
+
+
+def _decoded_selection_metadata(metadata_json: str | None) -> dict[str, Any] | None:
+    """A selective row's ``metadata_json`` decoded once, or ``None``.
+
+    ``None`` also for a container that does not decode or is not an object:
+    a legacy read serves such rows without validating their presentation, so
+    they yield no text block metadata (#1529) and the text is served as
+    before. :func:`metadata_format` then decodes *metadata_json* itself and
+    refuses it wherever it did before.
+    """
+    try:
+        data = json.loads(metadata_json) if metadata_json else None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class ChunkMap(dict[str, str]):
@@ -1213,11 +1320,15 @@ class SelectiveCompressor:
         # installs on the event loop wait for; a retarget onto a persisting
         # store from a non-persisting one evaluates it under the lock instead.
         sources = (text,) if sensitivity_source is None else (text, sensitivity_source)
+        block = text_block_metadata()
         verdict: list[bool] = []
 
         def sensitive() -> bool:
             if not verdict:
-                verdict.append(any(payload_has_credentials(s) for s in sources))
+                verdict.append(
+                    any(payload_has_credentials(s) for s in sources)
+                    or text_block_has_credentials(block)
+                )
             return verdict[0]
 
         if _store_persists(self._store):
@@ -1240,7 +1351,8 @@ class SelectiveCompressor:
         # race the write barrier exists to close.
         items = list(chunks.items())
         if context_query and context_query.strip():
-            scores = _scores_or_none(self._scorer, context_query, items)
+            with scoring_source(*sources):
+                scores = _scores_or_none(self._scorer, context_query, items)
             if scores is not None:
                 order = sorted(range(len(items)), key=lambda i: -scores[i])
                 items = [items[i] for i in order]
@@ -1264,6 +1376,7 @@ class SelectiveCompressor:
             "source_offset": source_offset,
             "chunks": records,
             "metadata_complete": bool(getattr(chunks, "records", {})),
+            **({"text_block": block} if block else {}),
         }
         ttl = self._ttl
         # Once per entry, not per ``build``: a JSON chunk's type comes from
@@ -1401,7 +1514,10 @@ class SelectiveCompressor:
         if pending is None:
             return None
 
-        mode = metadata_format(pending.metadata_json, response_format)
+        data = _decoded_selection_metadata(pending.metadata_json)
+        mode = metadata_format(pending.metadata_json, response_format, decoded=data)
+        # Whatever the format: only a present, invalid value is refused.
+        block = stored_text_block(data) if data is not None else None
 
         selected_parts: list[str] = []
         for section in sections:
@@ -1417,11 +1533,7 @@ class SelectiveCompressor:
             available = list(pending.chunks.keys())
             return f"No matching sections found. Available: {available}"
 
-        raw = (
-            json.loads(pending.metadata_json)
-            if pending.metadata_json and mode == "structured"
-            else {}
-        )
+        raw = data if data is not None and mode == "structured" else {}
         records = raw.get("chunks", {})
         descriptor = envelope(
             "selection",
@@ -1437,14 +1549,14 @@ class SelectiveCompressor:
                 ],
             },
         )
-        if mode == "structured" and delivery_size(descriptor, owned=True) > raw.get(
-            "budget", 16000
-        ):
+        if mode == "structured" and delivery_size(descriptor, owned=True) + text_block_overhead(
+            block
+        ) > raw.get("budget", 16000):
             raise DeliveryBudgetExceeded("Select fewer sections or request legacy output.")
         self._store.touch(key)
         result = DeliveryText("\n\n".join(selected_parts), descriptor)
         result.response_format = mode
-        return result
+        return with_text_block(result, block)
 
     def begin_use(self) -> None:
         """Register an in-flight ``compress()`` before the manager lock drops.
@@ -2358,6 +2470,7 @@ class SchemaPruningCompressor(_PlainTextRetention):
         self._max_array = max_array_items
         self._scorer = scorer or BM25Scorer()
 
+    @_binds_scoring_source
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         if not text or len(text) <= max_chars:
             return text
@@ -2626,6 +2739,7 @@ class SkeletonCompressor(_PlainTextRetention):
         self._min_chars = min_chars
         self._scorer = scorer or BM25Scorer()
 
+    @_binds_scoring_source
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         """Keep all headings + first content line per section.
 

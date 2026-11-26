@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -11,8 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from memtomem_stm.proxy.metrics import (
+    CONTEXT_QUERY_AGENT,
+    HOOK_COMPRESSION_STATUSES,
     METADATA_BYPASS_STRATEGY,
     STRUCTURED_BYPASS_STRATEGY,
+    CacheDeltas,
     CallMetrics,
 )
 from memtomem_stm.utils.json_out import (
@@ -120,6 +124,18 @@ _MIGRATIONS: dict[str, str] = {
     # backfill default is ``'mcp'``; ``mms hook`` writes ``'hook'`` for
     # native built-in tools. NOT NULL + DEFAULT keeps old rows readable.
     "source": "ALTER TABLE proxy_metrics ADD COLUMN source TEXT NOT NULL DEFAULT 'mcp'",
+    # ``mms hook`` rows only (``CallMetrics.hook_compression_status``). NULL on
+    # MCP rows and on hook rows written before the column, which readers report
+    # as "not recorded" rather than guess.
+    "hook_compression_status": (
+        "ALTER TABLE proxy_metrics ADD COLUMN hook_compression_status TEXT DEFAULT NULL"
+    ),
+    # ``CallMetrics.context_query_source``. Nullable for the reason
+    # ``strategy_auto_selected`` is: a default of ``'none'`` would claim that
+    # calls recorded before the column carried no query.
+    "context_query_source": (
+        "ALTER TABLE proxy_metrics ADD COLUMN context_query_source TEXT DEFAULT NULL"
+    ),
 }
 
 # Schema bookkeeping in a table of our own rather than in ``PRAGMA
@@ -384,7 +400,170 @@ def _rollup_trigger_ddl() -> str:
 
 _ROLLUP_TRIGGER_DDL = _rollup_trigger_ddl()
 
-_ROLLUP_OBJECT_NAMES = (_DAILY_TABLE, _ROLLUP_TRIGGER)
+# ── Hook status rollup (#1442) ──────────────────────────────────────────────
+#
+# ``proxy_metrics_daily`` keeps no ``hook_compression_status``, so once a hook
+# row is trimmed its status would be gone while its call still counts toward
+# the all-time totals. A second, separately named table and trigger keep the
+# status of every trimmed ``source='hook'`` row, per ``(UTC day, server, tool,
+# kind, status)``. They sit beside the daily rollup rather than changing it:
+# a new ``_v1`` body would need a new trigger name, and an older binary
+# re-running its slow path recreates the old one beside it, counting each
+# delete twice. Everything the rollup notes above say applies here too —
+# rolled up on delete, so exact and fed by older binaries' deletes; ANY delete
+# from ``proxy_metrics`` is rolled up; the trigger must be unable to fail, so
+# the counters are nullable, every key has a non-NULL fallback, and sizes pass
+# through ``_finite``; and never ``DROP`` the table while its trigger exists.
+#
+# ``kind`` separates three things without a sentinel string (``''`` is a value
+# a writer can store, which the reader reports as ``other``):
+#
+# - ``_STATUS_KIND_VALUE``: a stored status, kept verbatim in ``status``.
+#   Folding unknown names into ``other`` happens on read, not here: the
+#   trigger body is fixed once installed, so folding here would turn a status
+#   name a later version adds into ``other`` for good.
+# - ``_STATUS_KIND_NULL``: a row that recorded no status (written before the
+#   column existed, or by an older writer); ``status`` is ``''``.
+# - ``_STATUS_KIND_NOT_KEPT``: hook calls already in ``proxy_metrics_daily``
+#   when this table was created, whose status was not kept anywhere;
+#   ``status`` is ``''``. Seeded once, in the transaction that creates the
+#   table, so the status counts add up to the hook calls of the daily rollup.
+#   If the table is ever recreated after a ``DROP``, the reseed also covers
+#   calls whose status this table had held — hence "not kept", not "before
+#   installation".
+#
+# The source match is ``COLLATE BINARY`` so the trigger takes exactly the rows
+# that ``proxy_metrics_daily`` files under ``'hook'`` (its key columns are
+# BINARY), whatever collation an outside schema gave ``source``.
+#
+# The status buckets are subordinate to the daily ones: a third trigger,
+# ``AFTER DELETE ON proxy_metrics_daily``, removes the status rows of a deleted
+# hook bucket. That keeps the reset documented before this table existed
+# (``DELETE FROM proxy_metrics``, then ``DELETE FROM proxy_metrics_daily``)
+# complete — without it, a reset by those instructions would leave status
+# counts for calls the totals no longer have. Nothing in STM deletes from the
+# daily table (the rollup trigger only upserts, which fires no delete
+# trigger), so this runs on manual resets only; it can fail only when the
+# status table is gone, which is the ``DROP`` hazard above.
+
+_STATUS_DAILY_TABLE = "proxy_metrics_hook_status_daily"
+_STATUS_ROLLUP_TRIGGER = "proxy_metrics_hook_status_rollup_on_delete_v1"
+_STATUS_RESET_TRIGGER = "proxy_metrics_hook_status_follow_daily_delete_v1"
+_STATUS_COLUMN = "hook_compression_status"
+_STATUS_KIND_VALUE = 0
+_STATUS_KIND_NULL = 1
+_STATUS_KIND_NOT_KEPT = 2
+
+_STATUS_DAILY_CREATE = (
+    f"CREATE TABLE IF NOT EXISTS {_STATUS_DAILY_TABLE} (\n"
+    "    day TEXT NOT NULL,\n"
+    "    server TEXT NOT NULL,\n"
+    "    tool TEXT NOT NULL,\n"
+    "    kind INTEGER NOT NULL,\n"
+    "    status TEXT NOT NULL,\n"
+    # Nullable on purpose — see the rollup notes above.
+    "    calls INTEGER DEFAULT 0,\n"
+    "    original_chars INTEGER DEFAULT 0,\n"
+    "    PRIMARY KEY (day, server, tool, kind, status)\n"
+    ") WITHOUT ROWID"
+)
+
+
+def _status_rollup_trigger_ddl() -> str:
+    day, _epoch = _created_at_terms("OLD.")
+    status = f"OLD.{_STATUS_COLUMN}"
+    kind = f"CASE WHEN {status} IS NULL THEN {_STATUS_KIND_NULL} ELSE {_STATUS_KIND_VALUE} END"
+    values = ", ".join(
+        (
+            day,
+            "COALESCE(OLD.server, '')",
+            "COALESCE(OLD.tool, '')",
+            kind,
+            f"COALESCE({status}, '')",
+            "1",
+            _finite("OLD.original_chars"),
+        )
+    )
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {_STATUS_ROLLUP_TRIGGER} "
+        "AFTER DELETE ON proxy_metrics FOR EACH ROW "
+        "WHEN OLD.source = 'hook' COLLATE BINARY BEGIN "
+        f"INSERT INTO {_STATUS_DAILY_TABLE} "
+        "(day, server, tool, kind, status, calls, original_chars) "
+        f"VALUES ({values}) "
+        "ON CONFLICT (day, server, tool, kind, status) DO UPDATE SET "
+        "calls = COALESCE(calls, 0) + excluded.calls, "
+        "original_chars = COALESCE(original_chars, 0) + excluded.original_chars; END"
+    )
+
+
+_STATUS_ROLLUP_TRIGGER_DDL = _status_rollup_trigger_ddl()
+
+_STATUS_RESET_TRIGGER_DDL = (
+    f"CREATE TRIGGER IF NOT EXISTS {_STATUS_RESET_TRIGGER} "
+    f"AFTER DELETE ON {_DAILY_TABLE} FOR EACH ROW "
+    "WHEN OLD.source = 'hook' COLLATE BINARY BEGIN "
+    f"DELETE FROM {_STATUS_DAILY_TABLE} "
+    "WHERE day = OLD.day AND server = OLD.server AND tool = OLD.tool; END"
+)
+
+# One copy per daily row: ``proxy_metrics_daily`` has exactly one row per
+# ``(day, 'hook', server, tool)``, so nothing is aggregated and nothing can
+# overflow into an error that would fail the installation. The ``WHERE`` also
+# keeps ``INSERT ... SELECT ... ON CONFLICT`` unambiguous to the parser.
+_STATUS_SEED = (
+    f"INSERT INTO {_STATUS_DAILY_TABLE} "
+    "(day, server, tool, kind, status, calls, original_chars) "
+    f"SELECT day, server, tool, {_STATUS_KIND_NOT_KEPT}, '', {_finite_total('calls')}, "
+    f"{_finite_total('legacy_original_chars')} + {_finite_total('structured_original_chars')} "
+    f"FROM {_DAILY_TABLE} WHERE source = 'hook' COLLATE BINARY "
+    "ON CONFLICT (day, server, tool, kind, status) DO NOTHING"
+)
+
+# ── Response-cache counts (#1329) ──────────────────────────────────────────
+#
+# Cache hits, misses and unstorable misses never become ``proxy_metrics`` rows
+# (a hit runs none of the pipeline, #558), so no trigger can roll them up. The
+# live tracker buffers them per ``(UTC day, server, tool)`` and writes them with
+# a direct UPSERT, inside the transaction of the next metrics row it records
+# (``MetricsStore.record(..., cache_deltas=)``), or on their own
+# (``record_cache_counts``) from the periodic flush and at shutdown. Never pruned. The UPSERT adds to what is there, so
+# several proxy processes sharing the file count correctly; an older binary
+# writes nothing here, which is why the coverage start is recorded.
+#
+# ``cache_rollup_installed_at`` in ``metrics_meta`` is written only in the
+# transaction that first creates the table. A table that already exists without
+# it (the marker was erased) keeps an unknown start: writing "now" would claim
+# its rows began later than they did.
+_CACHE_DAILY_TABLE = "proxy_cache_daily"
+_CACHE_INSTALLED_KEY = "cache_rollup_installed_at"
+_CACHE_COUNTERS = ("hits", "hit_chars", "misses", "unstorable")
+
+_CACHE_DAILY_CREATE = (
+    f"CREATE TABLE IF NOT EXISTS {_CACHE_DAILY_TABLE} (\n"
+    "    day TEXT NOT NULL,\n"
+    "    server TEXT NOT NULL,\n"
+    "    tool TEXT NOT NULL,\n"
+    + "".join(f"    {c} INTEGER DEFAULT 0,\n" for c in _CACHE_COUNTERS)
+    + "    PRIMARY KEY (day, server, tool)\n"
+    ") WITHOUT ROWID"
+)
+
+_CACHE_UPSERT = (
+    f"INSERT INTO {_CACHE_DAILY_TABLE} (day, server, tool, {', '.join(_CACHE_COUNTERS)}) "
+    f"VALUES (?, ?, ?, {', '.join('?' for _ in _CACHE_COUNTERS)}) "
+    "ON CONFLICT (day, server, tool) DO UPDATE SET "
+    + ", ".join(f"{c} = COALESCE({c}, 0) + excluded.{c}" for c in _CACHE_COUNTERS)
+)
+
+_ROLLUP_OBJECT_NAMES = (
+    _DAILY_TABLE,
+    _ROLLUP_TRIGGER,
+    _STATUS_DAILY_TABLE,
+    _STATUS_ROLLUP_TRIGGER,
+    _STATUS_RESET_TRIGGER,
+    _CACHE_DAILY_TABLE,
+)
 
 
 def _schema_fingerprint() -> str:
@@ -439,7 +618,11 @@ _MEASUREMENT_MIXED = (
 
 
 def read_compression_summary(
-    db_path: Path, tool: str | None = None, source: str | None = None
+    db_path: Path,
+    tool: str | None = None,
+    source: str | None = None,
+    *,
+    with_hook_status: bool = False,
 ) -> dict[str, object]:
     """Aggregate per-``(server, tool)`` compression stats read-only from disk.
 
@@ -462,12 +645,26 @@ def read_compression_summary(
     built-in tools). On a pre-``source`` DB the column is absent: a request for
     any source other than the legacy ``'mcp'`` default returns an empty (but
     ``available``) summary, since no row can carry that source.
+
+    ``with_hook_status`` adds a ``hook_status`` key: the retained
+    ``source='hook'`` rows grouped by ``(server, status)``, as
+    ``{"scope": "retained", "rows": [...]}`` — see
+    :func:`_read_hook_status` — read in the same snapshot as the totals, so
+    the two describe the same rows. Under ``source=None`` they are the hook
+    share of the totals. ``source='mcp'``, an unavailable summary or a failed
+    read leaves it ``None``.
     """
-    return _read_compression(db_path, tool=tool, source=source, all_time=False)
+    return _read_compression(
+        db_path, tool=tool, source=source, all_time=False, with_hook_status=with_hook_status
+    )
 
 
 def read_compression_all_time(
-    db_path: Path, tool: str | None = None, source: str | None = None
+    db_path: Path,
+    tool: str | None = None,
+    source: str | None = None,
+    *,
+    with_hook_status: bool = False,
 ) -> dict[str, object]:
     """All-time compression totals: retained rows plus the daily rollup (#1316).
 
@@ -489,8 +686,126 @@ def read_compression_all_time(
       installation and the counted rows reach back before it, else ``None``)
       and ``unknown_date_calls`` (rows whose ``created_at`` was not a
       convertible timestamp; counted, but undated).
+
+    ``with_hook_status`` behaves as in :func:`read_compression_summary`, and
+    once the hook status rollup (#1442) is installed it also counts the
+    trimmed hook rows, under ``"scope": "all_time"`` — including ``not_kept``
+    rows for trimmed calls whose status was not kept. A DB whose status
+    rollup is missing reports the retained rows, under ``"scope": "retained"``.
     """
-    return _read_compression(db_path, tool=tool, source=source, all_time=True)
+    return _read_compression(
+        db_path, tool=tool, source=source, all_time=True, with_hook_status=with_hook_status
+    )
+
+
+def _cache_cell(value: object) -> int:
+    """What one ``proxy_cache_daily`` cell adds to its counter.
+
+    The writer only adds non-negative int deltas, so a count is a whole number
+    of at least 0: an ``int``, or a ``float`` for a bucket the UPSERT pushed
+    past int64 (SQLite then stores REAL), which ``int()`` converts exactly.
+    Anything else only an outside write can store — ``NULL``, text, a blob,
+    ``±inf``, ``nan``, a fractional or negative number — adds 0.
+    """
+    if isinstance(value, int):
+        return value if value >= 0 else 0
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return 0
+
+
+def read_cache_summary(db_path: Path, *, tool: str | None = None) -> dict[str, object]:
+    """Response-cache counts persisted since ``proxy_cache_daily`` was created.
+
+    Read-only (``?mode=ro``); never creates or migrates anything. The totals
+    are all-time by construction (the table is never pruned) but cover only
+    STM processes with #1329, and only what they wrote: counts are buffered
+    until the next recorded call, the next periodic flush (every
+    ``CACHE_FLUSH_INTERVAL_SECONDS``) or shutdown. ``installed_at`` is ``None`` when
+    the coverage start is unknown (marker missing or unparseable), never a
+    made-up time. ``storable_hit_rate`` is the live ``stm_proxy_stats``
+    formula — ``hits / (hits + max(0, misses - unstorable))`` — or ``None``
+    when that denominator is 0. ``tool`` matches the raw tool name across
+    servers, like the compression reader's filter.
+
+    The stored values are added exactly, as Python ints, each cell by
+    :func:`_cache_cell`. That does not make a total exact when storage already
+    rounded it: a bucket the UPSERT pushed past int64 is kept as REAL (adding 2
+    to ``2**63 - 1`` stores ``2**63``).
+    """
+    resolved = db_path.expanduser().resolve()
+    summary: dict[str, object] = {
+        "path": str(resolved),
+        "available": False,
+        "installed_at": None,
+        "hits": 0,
+        "hit_chars": 0,
+        "misses": 0,
+        "unstorable": 0,
+        "storable_hit_rate": None,
+        "error": None,
+    }
+    if not resolved.exists():
+        return summary
+    try:
+        db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        summary["error"] = exception_summary(exc)
+        return summary
+    try:
+        db.execute("BEGIN")
+        present = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (_CACHE_DAILY_TABLE,),
+        ).fetchone()
+        if present is None:
+            return summary
+        summary["available"] = True
+        has_meta = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metrics_meta'"
+        ).fetchone()
+        if has_meta is not None:
+            # Read as bytes: a value that is not valid UTF-8 would otherwise
+            # fail the fetch and hide counters that are perfectly readable.
+            row = db.execute(
+                "SELECT CAST(value AS BLOB) FROM metrics_meta WHERE key = ?",
+                (_CACHE_INSTALLED_KEY,),
+            ).fetchone()
+            try:
+                installed_at = float(bytes(row[0]).decode("ascii")) if row is not None else None
+            except (TypeError, ValueError):
+                installed_at = None
+            if installed_at is not None and math.isfinite(installed_at):
+                summary["installed_at"] = installed_at
+        if tool is not None and has_lone_surrogate(tool):
+            return summary
+        # Summed here, not by SQL: ``SUM`` raises past int64 and ``TOTAL`` is a
+        # float that rounds past 2**53 or reaches inf, and either choice is made
+        # for every column at once. The CASE only keeps text and blobs (which
+        # may not even decode) from being fetched.
+        cells = ", ".join(
+            f"CASE WHEN typeof({c}) IN ('integer', 'real') THEN {c} ELSE 0 END"
+            for c in _CACHE_COUNTERS
+        )
+        sql = f"SELECT {cells} FROM {_CACHE_DAILY_TABLE}"
+        params: tuple[str, ...] = ()
+        if tool is not None:
+            sql += " WHERE tool = ?"
+            params = (tool,)
+        totals = [0] * len(_CACHE_COUNTERS)
+        for row in db.execute(sql, params):
+            for i, value in enumerate(row):
+                totals[i] += _cache_cell(value)
+        hits, hit_chars, misses, unstorable = totals
+        summary.update(hits=hits, hit_chars=hit_chars, misses=misses, unstorable=unstorable)
+        storable = hits + max(0, misses - unstorable)
+        summary["storable_hit_rate"] = hits / storable if storable else None
+    except sqlite3.Error as exc:
+        summary["available"] = False
+        summary["error"] = exception_summary(exc)
+    finally:
+        db.close()
+    return summary
 
 
 def _rollup_markers(db: sqlite3.Connection) -> tuple[float, int | None] | None:
@@ -528,8 +843,122 @@ def _rollup_markers(db: sqlite3.Connection) -> tuple[float, int | None] | None:
     return installed_at, lost
 
 
+def _status_rollup_installed(db: sqlite3.Connection) -> bool:
+    """Whether the hook status rollup (#1442) is wired: its table AND triggers.
+
+    A table with no trigger feeding it would under-count while looking
+    complete, as for ``_rollup_markers``; without the one that follows daily
+    deletes, a reset could leave counts the totals no longer have. No marker
+    is needed: the calls trimmed before the table existed are rows of the
+    table itself (``_STATUS_KIND_NOT_KEPT``), written in the transaction that
+    created it.
+    """
+    names = {
+        row[0]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE (type = 'table' AND name = ?) "
+            "OR (type = 'trigger' AND name IN (?, ?))",
+            (_STATUS_DAILY_TABLE, _STATUS_ROLLUP_TRIGGER, _STATUS_RESET_TRIGGER),
+        )
+    }
+    return names == {_STATUS_DAILY_TABLE, _STATUS_ROLLUP_TRIGGER, _STATUS_RESET_TRIGGER}
+
+
+def _fold_status(expr: str) -> str:
+    """SQL mapping a stored status to a known name, ``'other'`` or NULL."""
+    # The names are fixed identifiers, so interpolating them is safe.
+    known = ", ".join(f"'{name}'" for name in sorted(HOOK_COMPRESSION_STATUSES))
+    return (
+        f"CASE WHEN {expr} IS NULL THEN NULL "
+        # BINARY: an outside table may declare the column NOCASE, which
+        # would let ``COMPRESSED`` through and print its own spelling.
+        f"WHEN {expr} COLLATE BINARY IN ({known}) THEN {expr} "
+        "ELSE 'other' END"
+    )
+
+
+def _read_hook_status(
+    db: sqlite3.Connection, cols: Collection[str], tool: str | None, *, all_time: bool
+) -> dict[str, object]:
+    """``source='hook'`` rows grouped by ``(server, status)``.
+
+    Returns ``{"scope": ..., "rows": [...]}``. ``scope`` is ``"all_time"`` when
+    ``all_time`` is asked for and the status rollup is installed — the
+    retained rows plus ``proxy_metrics_hook_status_daily``, in one statement
+    as ``_read_compression`` reads the totals — and ``"retained"`` otherwise.
+
+    Each row has ``server``, ``status``, ``not_kept``, ``calls`` and
+    ``original_chars``. ``status`` is a name from ``HOOK_COMPRESSION_STATUSES``,
+    ``None`` for a row that recorded none (written before the column existed),
+    or ``"other"`` for any value outside the set — folded in SQL, before
+    anything is decoded, so no caller renders a stored value verbatim and an
+    undecodable one cannot fail the read. ``not_kept`` rows (all-time only)
+    count trimmed calls whose status was not kept; their ``status`` is
+    ``None``. Sizes pass through the same ``_finite`` guards and
+    ``SUM``→``TOTAL`` fallback as the totals they sit beside. A DB that
+    predates ``source`` has no hook rows.
+
+    The filters match as the totals reader's do — the column's own collation
+    on the retained half, the rollup table's BINARY keys on the other — so the
+    counts describe the rows of the figure they are printed under.
+    """
+    scope = "all_time" if all_time and _status_rollup_installed(db) else "retained"
+    result: dict[str, object] = {"scope": scope, "rows": []}
+    if "source" not in cols:
+        return result
+    status = _fold_status(_STATUS_COLUMN) if _STATUS_COLUMN in cols else "NULL"
+    where = "source = 'hook'"
+    params: list[object] = []
+    if tool is not None:
+        where += " AND tool = ?"
+        params.append(tool)
+    inner = (
+        f"SELECT server, {status} AS status, 0 AS not_kept, 1 AS calls, "
+        f"{_finite('original_chars')} AS original_chars FROM proxy_metrics WHERE {where}"
+    )
+    if scope == "all_time":
+        daily_where = " WHERE tool = ?" if tool is not None else ""
+        inner += (
+            " UNION ALL SELECT server, "
+            # Only the two kinds that store no status read as NULL; any other
+            # kind (none is written) is judged by its status like a value.
+            f"CASE WHEN kind IN ({_STATUS_KIND_NULL}, {_STATUS_KIND_NOT_KEPT}) THEN NULL "
+            f"ELSE {_fold_status('status')} END, "
+            f"CASE WHEN kind = {_STATUS_KIND_NOT_KEPT} THEN 1 ELSE 0 END, "
+            f"{_finite_total('calls')}, {_finite_total('original_chars')} "
+            f"FROM {_STATUS_DAILY_TABLE}{daily_where}"
+        )
+        params = [*params, *params]
+    statement = (
+        "SELECT server, status, not_kept, {agg}(calls), {agg}(original_chars) "
+        f"FROM ({inner}) GROUP BY server, status, not_kept"
+    )
+    try:
+        rows = db.execute(statement.replace("{agg}", "SUM"), params).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "integer overflow" not in str(exc):
+            raise
+        rows = db.execute(statement.replace("{agg}", "TOTAL"), params).fetchall()
+    result["rows"] = [
+        {
+            "server": str(server),
+            "status": None if not_kept else value,
+            "not_kept": bool(not_kept),
+            "calls": _count(calls),
+            "original_chars": _count(orig),
+        }
+        for server, value, not_kept, calls, orig in rows
+    ]
+    return result
+
+
 def _read_compression(
-    db_path: Path, *, tool: str | None, source: str | None, all_time: bool
+    db_path: Path,
+    *,
+    tool: str | None,
+    source: str | None,
+    all_time: bool,
+    with_hook_status: bool = False,
 ) -> dict[str, object]:
     resolved = db_path.expanduser().resolve()
     summary: dict[str, object] = {
@@ -553,6 +982,12 @@ def _read_compression(
             "serialized_base_chars": 0,
             "wire_bytes": 0,
         },
+        # ``{"observed": n, "agent": m}`` over the retained ``source='mcp'``
+        # rows among these totals: the rows that record whether the caller
+        # supplied ``_context_query``, and how many did. ``None`` where the
+        # figure does not exist — all time (it is not rolled up) and a hook
+        # summary — or was not read.
+        "context_query": None,
     }
     rollup: dict[str, object] = {
         "installed": False,
@@ -564,6 +999,12 @@ def _read_compression(
     }
     if all_time:
         summary["rollup"] = rollup
+    if with_hook_status:
+        summary["hook_status"] = None
+    # The hook rows among these totals: all of them under ``source='hook'``,
+    # the hook share under no filter. Under ``'mcp'`` there are none, so the
+    # value stays ``None`` rather than describing rows the totals exclude.
+    want_status = with_hook_status and source in (None, "hook")
     if not resolved.exists():
         return summary
 
@@ -574,6 +1015,10 @@ def _read_compression(
         return summary
 
     try:
+        if want_status:
+            # One read transaction, so the status groups below see the same
+            # rows as the totals even while a writer appends or trims.
+            db.execute("BEGIN")
         cols = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
         if "original_chars" not in cols:
             # Missing file would have returned above; an empty column set here
@@ -607,6 +1052,8 @@ def _read_compression(
             # ``mms stats`` refuses this at the CLI boundary; direct callers of
             # this reader still land here.
             summary["available"] = True
+            if want_status:
+                summary["hook_status"] = _read_hook_status(db, (), tool, all_time=all_time)
             return summary
 
         if source is not None and not has_source and source != "mcp":
@@ -614,6 +1061,8 @@ def _read_compression(
             # request for any other provenance matches nothing. Report an empty
             # but available summary rather than over-counting every legacy row.
             summary["available"] = True
+            if want_status:
+                summary["hook_status"] = _read_hook_status(db, (), tool, all_time=all_time)
             return summary
 
         conditions: list[str] = []
@@ -648,6 +1097,7 @@ def _read_compression(
             )
             inner_params = [*params, *params]
             extra = "0, MIN(min_created_at), {agg}(unknown_date_calls)"
+            context_query = "0, 0"
         else:
             # The calls the tuner's profiles count: every row but a
             # metadata/native bypass, which ``get_tool_profiles`` drops (#1122).
@@ -661,9 +1111,27 @@ def _read_compression(
                 inner_params = [METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY]
             else:
                 live.append("1 AS tuner_calls")
+            # Counted in the statement that counts the calls, so a line printed
+            # under a total cannot describe rows that total has not seen. Only
+            # MCP rows: ``mms hook`` never stamps the column, and a hook row
+            # carrying a value anyway is not a proxied call.
+            if "context_query_source" in cols:
+                proxied = "source = 'mcp' AND " if has_source else ""
+                live.append(
+                    f"CASE WHEN {proxied}context_query_source IS NOT NULL "
+                    "THEN 1 ELSE 0 END AS context_query_observed"
+                )
+                live.append(
+                    f"CASE WHEN {proxied}context_query_source = '{CONTEXT_QUERY_AGENT}' "
+                    "THEN 1 ELSE 0 END AS context_query_agent"
+                )
+            else:
+                live.append("0 AS context_query_observed")
+                live.append("0 AS context_query_agent")
             inner = f"SELECT server, tool, {', '.join(live)} FROM proxy_metrics{where}"
             inner_params = [*inner_params, *params]
             extra = "{agg}(tuner_calls), NULL, 0"
+            context_query = "{agg}(context_query_observed), {agg}(context_query_agent)"
         # One statement, so the provenance counts and size totals share a
         # snapshot while the server appends rows.
         statement = (
@@ -671,7 +1139,8 @@ def _read_compression(
             "{agg}(legacy_compressed_chars), {agg}(errors), {agg}(classified_calls), "
             f"{{agg}}(unclassified_calls), {extra}, {{agg}}(structured_calls), "
             "{agg}(structured_original_chars), {agg}(structured_base_chars), "
-            f"{{agg}}(structured_wire_bytes) FROM ({inner}) GROUP BY server, tool "
+            f"{{agg}}(structured_wire_bytes), {context_query} "
+            f"FROM ({inner}) GROUP BY server, tool "
             "ORDER BY {agg}(calls) DESC"
         )
         try:
@@ -685,6 +1154,7 @@ def _read_compression(
             if "integer overflow" not in str(exc):
                 raise
             rows = db.execute(statement.replace("{agg}", "TOTAL"), inner_params).fetchall()
+        hook_status = _read_hook_status(db, cols, tool, all_time=all_time) if want_status else None
     except sqlite3.Error as exc:
         summary["error"] = exception_summary(exc)
         return summary
@@ -694,6 +1164,7 @@ def _read_compression(
     by_tool: list[dict[str, object]] = []
     total_calls = total_error = total_orig = total_comp = 0
     classified = unclassified = unknown_dates = 0
+    query_observed = query_agent = 0
     earliest: float | None = None
     structured_totals = {
         "calls": 0,
@@ -717,6 +1188,8 @@ def _read_compression(
         structured_orig,
         structured_base,
         structured_wire,
+        group_query_observed,
+        group_query_agent,
     ) in rows:
         for k, v in zip(
             structured_totals, (structured_calls, structured_orig, structured_base, structured_wire)
@@ -724,6 +1197,8 @@ def _read_compression(
             structured_totals[k] += _count(v)
         classified += _count(known_calls)
         unclassified += _count(unknown_calls)
+        query_observed += _count(group_query_observed)
+        query_agent += _count(group_query_agent)
         unknown_dates += _count(group_unknown_dates)
         if group_earliest is not None and (earliest is None or group_earliest < earliest):
             earliest = float(group_earliest)
@@ -760,6 +1235,10 @@ def _read_compression(
     summary["saved_chars"] = total_orig - total_comp
     summary["saved_ratio"] = _saved_ratio(total_orig, total_comp)
     summary["by_tool"] = by_tool
+    if not all_time and source != "hook":
+        summary["context_query"] = {"observed": query_observed, "agent": query_agent}
+    if with_hook_status:
+        summary["hook_status"] = hook_status
     if all_time:
         rollup["earliest_created_at"] = earliest
         rollup["unknown_date_calls"] = unknown_dates
@@ -804,6 +1283,11 @@ class MetricsStore:
         # ``None`` keeps the long-lived-store default (5 s connect + 3000 ms busy).
         self._busy_timeout_ms = busy_timeout_ms
         self._db: sqlite3.Connection | None = None
+        # A second connection with a short lock budget, for the periodic cache
+        # flush (#1329): opened on first use, closed with the store, so the
+        # main connection's budget is never changed and never needs restoring.
+        self._fast_db: sqlite3.Connection | None = None
+        self._fast_db_budget_ms: int | None = None
         # Readers and writers share ``self._lock`` defensively. Current
         # callers are all asyncio single-thread, but the connection uses
         # ``check_same_thread=False`` so any future move to a thread-pool
@@ -944,6 +1428,8 @@ class MetricsStore:
             )
             db.execute(_DAILY_CREATE)
             db.execute(_ROLLUP_TRIGGER_DDL)
+            MetricsStore._install_status_rollup(db)
+            MetricsStore._install_cache_rollup(db)
             installed = db.execute(
                 "INSERT INTO metrics_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
                 (_ROLLUP_INSTALLED_KEY, str(time.time())),
@@ -970,6 +1456,58 @@ class MetricsStore:
         except BaseException:
             db.rollback()
             raise
+
+    @staticmethod
+    def _install_status_rollup(db: sqlite3.Connection) -> None:
+        """Create the hook status rollup (#1442) inside the caller's transaction.
+
+        The table is seeded only when it did not exist before this
+        transaction, and the trigger is created after the seed: under the
+        caller's ``BEGIN IMMEDIATE`` no trim can land between the two, so each
+        trimmed hook call is either in the seed or rolled up by the trigger,
+        never both. A later pass (an older binary's restamp sends the next
+        opener back here) finds the table and seeds nothing.
+
+        Nothing is created when ``proxy_metrics`` lacks the status column: a
+        trigger that reads a missing ``OLD`` column is accepted at creation and
+        then fails every delete. ``_migrate`` adds the column before this runs,
+        so that case is a guard, not a path.
+        """
+        has_column = any(
+            row[1] == _STATUS_COLUMN for row in db.execute("PRAGMA table_info(proxy_metrics)")
+        )
+        if not has_column:
+            return
+        first = (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (_STATUS_DAILY_TABLE,),
+            ).fetchone()
+            is None
+        )
+        db.execute(_STATUS_DAILY_CREATE)
+        if first:
+            db.execute(_STATUS_SEED)
+        db.execute(_STATUS_ROLLUP_TRIGGER_DDL)
+        db.execute(_STATUS_RESET_TRIGGER_DDL)
+
+    @staticmethod
+    def _install_cache_rollup(db: sqlite3.Connection) -> None:
+        """Create ``proxy_cache_daily`` (#1329) inside the caller's transaction,
+        and stamp its coverage start only when this transaction creates it."""
+        first = (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (_CACHE_DAILY_TABLE,),
+            ).fetchone()
+            is None
+        )
+        db.execute(_CACHE_DAILY_CREATE)
+        if first:
+            db.execute(
+                "INSERT INTO metrics_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                (_CACHE_INSTALLED_KEY, str(time.time())),
+            )
 
     def _schema_is_current(self, db: sqlite3.Connection) -> bool:
         """Whether this DB already carries the schema ``initialize`` would build.
@@ -1053,12 +1591,49 @@ class MetricsStore:
         return {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
 
     def close(self) -> None:
+        self._close_fast_db()
         if self._db:
             self._db.close()
             self._db = None
 
-    def record(self, metrics: CallMetrics) -> None:
-        """Persist one per-call metrics row.
+    def _fast_connection(self, busy_timeout_ms: int) -> sqlite3.Connection:
+        """The short-budget connection, (re)opened for this budget and tuned
+        like the main one (WAL, ``synchronous=NORMAL``), so a periodic commit
+        costs what a per-call one does."""
+        if self._fast_db is not None and self._fast_db_budget_ms != busy_timeout_ms:
+            self._close_fast_db()
+        if self._fast_db is None:
+            fast = sqlite3.connect(
+                str(self._db_path), check_same_thread=False, timeout=busy_timeout_ms / 1000.0
+            )
+            try:
+                tune_connection(fast, busy_timeout_ms=busy_timeout_ms)
+            except Exception:
+                fast.close()
+                raise
+            self._fast_db, self._fast_db_budget_ms = fast, busy_timeout_ms
+        return self._fast_db
+
+    def _close_fast_db(self) -> None:
+        fast, self._fast_db = self._fast_db, None
+        self._fast_db_budget_ms = None
+        if fast is not None:
+            try:
+                fast.close()
+            except sqlite3.Error:
+                logger.debug("Failed to close the metrics DB flush connection", exc_info=True)
+
+    def record(self, metrics: CallMetrics, *, cache_deltas: CacheDeltas | None = None) -> bool:
+        """Persist one per-call metrics row, plus any buffered cache counts.
+
+        ``cache_deltas`` (from ``TokenTracker``, #1329) are UPSERTed into
+        ``proxy_cache_daily`` in the same transaction, under a savepoint: a
+        failing cache write is normally rolled back alone and does not cost the
+        metrics row. If SQLite itself rolled the whole transaction back, the
+        error propagates: that metrics row is lost (as any failed metrics write
+        is) and ``TokenTracker`` keeps the cache counts for its next write.
+        Returns whether the cache counts were committed (``True`` when there
+        were none), so the caller can keep them for the next write.
 
         Synchronous sqlite write on the asyncio event loop: while it
         runs, every runnable coroutine stalls — other in-flight proxied
@@ -1072,72 +1647,85 @@ class MetricsStore:
         so this store is lock-ready for that move.
         """
         if self._db is None:
-            return
+            return False
         require_utf8_identifier(metrics.server, "server")
         require_utf8_identifier(metrics.tool, "tool")
         require_utf8_identifier(metrics.trace_id, "trace_id")
         require_utf8_identifier(metrics.compression_strategy, "compression_strategy")
         require_utf8_identifier(metrics.source, "source")
         require_utf8_identifier(metrics.compression_accounting, "compression_accounting")
+        require_utf8_identifier(metrics.hook_compression_status, "hook_compression_status")
+        require_utf8_identifier(metrics.context_query_source, "context_query_source")
         now = time.time()
         with self._lock:
-            cursor = self._db.execute(
-                "INSERT INTO proxy_metrics "
-                "(server, tool, original_chars, compressed_chars, cleaned_chars, "
-                "is_error, error_category, error_code, error_message, trace_id, "
-                "compression_strategy, strategy_auto_selected, "
-                "ratio_violation, scorer_fallback, "
-                "index_ok, index_error, chunks_indexed, "
-                "extract_ok, extract_error, "
-                "surfacing_on_progressive_ok, surface_error, source, created_at, "
-                "compression_accounting, delivery_format, wire_bytes) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    metrics.server,
-                    metrics.tool,
-                    metrics.original_chars,
-                    metrics.compressed_chars,
-                    metrics.cleaned_chars,
-                    int(metrics.is_error),
-                    metrics.error_category.value if metrics.error_category else None,
-                    metrics.error_code,
+            # The INSERT is under the rollback guard too: a statement-level
+            # failure (an AFTER INSERT trigger's RAISE(FAIL)) leaves the row
+            # pending in the open transaction, and the next commit, a cache
+            # flush included, would otherwise publish it.
+            try:
+                cursor = self._db.execute(
+                    "INSERT INTO proxy_metrics "
+                    "(server, tool, original_chars, compressed_chars, cleaned_chars, "
+                    "is_error, error_category, error_code, error_message, trace_id, "
+                    "compression_strategy, strategy_auto_selected, "
+                    "ratio_violation, scorer_fallback, "
+                    "index_ok, index_error, chunks_indexed, "
+                    "extract_ok, extract_error, "
+                    "surfacing_on_progressive_ok, surface_error, source, created_at, "
+                    "compression_accounting, delivery_format, wire_bytes, "
+                    "hook_compression_status, context_query_source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        escape_lone_surrogates(metrics.error_message)
-                        if metrics.error_message is not None
-                        else None
+                        metrics.server,
+                        metrics.tool,
+                        metrics.original_chars,
+                        metrics.compressed_chars,
+                        metrics.cleaned_chars,
+                        int(metrics.is_error),
+                        metrics.error_category.value if metrics.error_category else None,
+                        metrics.error_code,
+                        (
+                            escape_lone_surrogates(metrics.error_message)
+                            if metrics.error_message is not None
+                            else None
+                        ),
+                        metrics.trace_id,
+                        metrics.compression_strategy,
+                        _tristate(metrics.strategy_auto_selected),
+                        int(metrics.ratio_violation),
+                        int(metrics.scorer_fallback),
+                        _tristate(metrics.index_ok),
+                        (
+                            escape_lone_surrogates(metrics.index_error)
+                            if metrics.index_error is not None
+                            else None
+                        ),
+                        metrics.chunks_indexed,
+                        _tristate(metrics.extract_ok),
+                        (
+                            escape_lone_surrogates(metrics.extract_error)
+                            if metrics.extract_error is not None
+                            else None
+                        ),
+                        _tristate(metrics.surfacing_on_progressive_ok),
+                        (
+                            escape_lone_surrogates(metrics.surface_error)
+                            if metrics.surface_error is not None
+                            else None
+                        ),
+                        metrics.source,
+                        now,
+                        metrics.compression_accounting,
+                        metrics.delivery_format,
+                        metrics.wire_bytes,
+                        metrics.hook_compression_status,
+                        metrics.context_query_source,
                     ),
-                    metrics.trace_id,
-                    metrics.compression_strategy,
-                    _tristate(metrics.strategy_auto_selected),
-                    int(metrics.ratio_violation),
-                    int(metrics.scorer_fallback),
-                    _tristate(metrics.index_ok),
-                    (
-                        escape_lone_surrogates(metrics.index_error)
-                        if metrics.index_error is not None
-                        else None
-                    ),
-                    metrics.chunks_indexed,
-                    _tristate(metrics.extract_ok),
-                    (
-                        escape_lone_surrogates(metrics.extract_error)
-                        if metrics.extract_error is not None
-                        else None
-                    ),
-                    _tristate(metrics.surfacing_on_progressive_ok),
-                    (
-                        escape_lone_surrogates(metrics.surface_error)
-                        if metrics.surface_error is not None
-                        else None
-                    ),
-                    metrics.source,
-                    now,
-                    metrics.compression_accounting,
-                    metrics.delivery_format,
-                    metrics.wire_bytes,
-                ),
-            )
+                )
+            except Exception:
+                self._db.rollback()
+                raise
             # One transaction for the insert and the trim it may trigger. If the
             # DELETE fails, the crossing row goes with it: left committed it
             # would become the next row's predecessor, land in the same bucket
@@ -1145,11 +1733,69 @@ class MetricsStore:
             # indefinitely. Losing one best-effort metrics row is the cheaper
             # side of that trade. Also one commit instead of two.
             try:
+                cache_committed = True
+                if cache_deltas:
+                    cache_committed = self._upsert_cache_counts_guarded(self._db, cache_deltas)
                 if self._should_trim(metrics.source, cursor.lastrowid):
                     self._trim_statement(self._db, metrics.source)
                 self._db.commit()
             except Exception:
                 self._db.rollback()
+                raise
+        return cache_committed
+
+    def _upsert_cache_counts_guarded(self, db: sqlite3.Connection, deltas: CacheDeltas) -> bool:
+        """The cache UPSERTs under a savepoint of the open transaction.
+
+        A failure rolls back to the savepoint (the metrics row stays) and
+        returns ``False`` so the caller keeps the counts."""
+        db.execute("SAVEPOINT cache_counts")
+        try:
+            self._upsert_cache_counts(db, deltas)
+        except Exception:
+            if not db.in_transaction:
+                # SQLite already rolled the whole transaction back (e.g. a
+                # RAISE(ROLLBACK) trigger), savepoint and metrics row with it:
+                # re-raise the real error rather than "no such savepoint".
+                raise
+            db.execute("ROLLBACK TO cache_counts")
+            db.execute("RELEASE cache_counts")
+            logger.warning("Failed to persist cache counts; kept for the next write", exc_info=True)
+            return False
+        db.execute("RELEASE cache_counts")
+        return True
+
+    def _upsert_cache_counts(self, db: sqlite3.Connection, deltas: CacheDeltas) -> None:
+        db.executemany(_CACHE_UPSERT, [(*key, *counts) for key, counts in deltas.items()])
+
+    def record_cache_counts(
+        self, deltas: CacheDeltas, *, busy_timeout_ms: int | None = None
+    ) -> None:
+        """Write buffered cache counts in their own transaction.
+
+        Raises on failure, after rolling back, so the caller keeps them.
+        With ``busy_timeout_ms`` (the periodic flush) the write goes through a
+        second connection opened with that lock budget, so a DB another process
+        holds locked fails fast instead of stalling the event loop; that
+        connection is dropped after any failure and reopened on the next use."""
+        if not deltas:
+            return
+        if self._db is None:
+            raise sqlite3.ProgrammingError("metrics store is closed")
+        with self._lock:
+            if busy_timeout_ms is None:
+                db = self._db
+            else:
+                db = self._fast_connection(int(busy_timeout_ms))
+            try:
+                self._upsert_cache_counts(db, deltas)
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                finally:
+                    if db is self._fast_db:
+                        self._close_fast_db()
                 raise
 
     def _trim_interval(self) -> int:

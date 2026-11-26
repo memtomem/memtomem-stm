@@ -4,22 +4,23 @@ hashing of the persisted query column.
 Three layers exercised:
 
 1. **Engine boundary** — when the flag is off, both the cache-miss and
-   cache-hit ``record_surfacing`` call sites must pass
-   ``"sha256:" + sha256(query)[:16]`` rather than the raw text. The
-   default (``True``) preserves the legacy raw-text contract.
+   cache-hit ``record_surfacing`` call sites must pass the keyed
+   ``"hmac-sha256:" + HMAC(subkey, query)[:16 hex]`` digest (#1381) rather
+   than the raw text. The default (``True``) preserves the legacy raw-text
+   contract.
 2. **Store stats** — ``FeedbackStore.get_stats`` ``query_preview`` must
-   pass the 23-char hash form through verbatim (no 80-char clip) so
-   the digest tail survives, while keeping the legacy clip for raw
-   text.
+   pass the digest form (keyed, or the legacy unkeyed ``sha256:`` one)
+   through verbatim (no 80-char clip) so the digest tail survives, while
+   keeping the legacy clip for raw text.
 3. **Server formatter** — ``stm_surfacing_stats`` renders a one-line
-   legend when any recent row carries the ``sha256:`` prefix so
-   operators reading the output don't mistake the digest for a
-   malformed query.
+   legend when any recent row carries a digest so operators reading the
+   output don't mistake it for a malformed query.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -88,10 +89,22 @@ def _make_mcp_adapter(results: list[FakeSearchResult]):
     return adapter
 
 
-def _make_tracker():
+_STORE_KEY = bytes(range(32))
+"""Stand-in for the feedback DB's committed ``stm_meta`` HMAC key."""
+
+
+def _expected_digest(query: str, store_key: bytes = _STORE_KEY) -> str:
+    """The keyed digest, derived here independently of the engine's helpers."""
+    subkey = hmac.new(store_key, b"stm-query-digest-v1", hashlib.sha256).digest()
+    mac = hmac.new(subkey, query.encode("utf-8", errors="surrogatepass"), hashlib.sha256)
+    return "hmac-sha256:" + mac.hexdigest()[:16]
+
+
+def _make_tracker(store_key: bytes = _STORE_KEY):
     tracker = MagicMock()
     tracker.record_surfacing = MagicMock()
     tracker.store = MagicMock()
+    tracker.store.hmac_key = store_key
     tracker.store.mark_surfaced = MagicMock()
     tracker.store.get_seen_ids = MagicMock(return_value=set())
     tracker.store.cleanup_expired = MagicMock(return_value=0)
@@ -109,11 +122,13 @@ class TestEngineHashesPersistedQuery:
     def test_lone_surrogate_hashes_without_aliasing_literal(self):
         raw = "query\ud800"
         literal = r"query\ud800"
-        assert SurfacingEngine._hashed_query(raw) == (
-            _QUERY_HASH_PREFIX
-            + hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=_make_tracker(),
         )
-        assert SurfacingEngine._hashed_query(raw) != SurfacingEngine._hashed_query(literal)
+        assert engine._hashed_query(raw) == _expected_digest(raw)
+        assert engine._hashed_query(raw) != engine._hashed_query(literal)
 
     async def test_default_persists_raw_text(self):
         """``persist_query_text`` defaults to ``True`` — the legacy raw
@@ -131,9 +146,9 @@ class TestEngineHashesPersistedQuery:
         tracker.record_surfacing.assert_called_once()
         assert tracker.record_surfacing.call_args.kwargs["query"] == VALID_ARGS["_context_query"]
 
-    async def test_disabled_persists_sha256_prefix(self):
+    async def test_disabled_persists_keyed_digest(self):
         """With ``persist_query_text=False`` the engine substitutes
-        ``sha256:`` + 16-hex-char digest for the query argument."""
+        ``hmac-sha256:`` + 16-hex-char keyed digest for the query argument."""
         tracker = _make_tracker()
         engine = SurfacingEngine(
             config=_make_config(persist_query_text=False),
@@ -145,11 +160,7 @@ class TestEngineHashesPersistedQuery:
         tracker.record_surfacing.assert_called_once()
         persisted = tracker.record_surfacing.call_args.kwargs["query"]
         assert persisted.startswith(_QUERY_HASH_PREFIX)
-        expected = (
-            _QUERY_HASH_PREFIX
-            + hashlib.sha256(VALID_ARGS["_context_query"].encode("utf-8")).hexdigest()[:16]
-        )
-        assert persisted == expected
+        assert persisted == _expected_digest(VALID_ARGS["_context_query"])
         assert len(persisted) == len(_QUERY_HASH_PREFIX) + 16
         # And — critically — the raw query string never appears in the
         # persisted form, even as a substring.
@@ -244,8 +255,7 @@ class TestSecretGuard:
             mcp_adapter=_make_mcp_adapter([]),
             feedback_tracker=_make_tracker(),
         )
-        expected = _QUERY_HASH_PREFIX + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
-        assert engine._persistable_query(secret) == expected
+        assert engine._persistable_query(secret) == _expected_digest(secret)
 
     @pytest.mark.parametrize("clean", _CLEAN)
     async def test_clean_query_literal_when_persist_true(self, clean):
@@ -300,6 +310,100 @@ class TestSecretGuard:
         assert "bob.smith@example.com" not in out
 
 
+class TestKeyedDigest:
+    """#1381: the digest is an HMAC, so a stored or webhook-delivered value of
+    a short query cannot be confirmed by hashing candidates without the key."""
+
+    def _engine(self, tracker):
+        return SurfacingEngine(
+            config=_make_config(), mcp_adapter=_make_mcp_adapter([]), feedback_tracker=tracker
+        )
+
+    def test_shape_and_not_the_unkeyed_sha256(self):
+        query = "hunter2"
+        digest = self._engine(_make_tracker())._hashed_query(query)
+        assert digest.startswith("hmac-sha256:")
+        assert len(digest) == len("hmac-sha256:") + 16
+        assert digest[len("hmac-sha256:") :] != hashlib.sha256(query.encode()).hexdigest()[:16]
+
+    def test_stable_under_one_key_and_distinct_across_keys(self):
+        a1 = self._engine(_make_tracker(bytes(32)))
+        a2 = self._engine(_make_tracker(bytes(32)))
+        b = self._engine(_make_tracker(b"\x01" * 32))
+        assert a1._hashed_query("q") == a2._hashed_query("q")
+        assert a1._hashed_query("q") != b._hashed_query("q")
+
+    def test_domain_separated_from_gram_hashes(self):
+        """The store key also hashes memory-path 4-grams; the query digest is
+        taken under a derived subkey, so it never equals a gram hash of the
+        same text (truncated to the same length)."""
+        from memtomem_stm.surfacing.grams import keyed_hash
+
+        text = "flask routing uses blueprints"
+        digest = self._engine(_make_tracker())._hashed_query(text)
+        assert digest == _expected_digest(text)
+        assert digest[len("hmac-sha256:") :] != keyed_hash(text, _STORE_KEY)[:16]
+
+    def test_engines_on_one_feedback_db_agree(self, tmp_path: Path):
+        """Proxy and hook daemon share ``stm_feedback.db``; both derive the
+        subkey from its committed key, so their digests of a query match."""
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        db = tmp_path / "feedback.db"
+        first = FeedbackTracker(config=_make_config(), db_path=db)
+        second = FeedbackTracker(config=_make_config(), db_path=db)
+        try:
+            key = first.store.hmac_key
+            assert isinstance(key, bytes) and key == second.store.hmac_key
+            one, two = self._engine(first), self._engine(second)
+            assert one._hashed_query("q") == two._hashed_query("q") == _expected_digest("q", key)
+        finally:
+            first.close()
+            second.close()
+
+    def test_without_a_store_key_the_key_is_per_engine(self):
+        """No tracker (the one-shot hook path): a random key per engine. The
+        digest keeps its shape and is stable within the engine only."""
+        one, two = self._engine(None), self._engine(None)
+        assert one._hashed_query("q") == one._hashed_query("q")
+        assert one._hashed_query("q").startswith("hmac-sha256:")
+        assert one._hashed_query("q") != two._hashed_query("q")
+
+    async def test_event_row_and_opportunity_row_carry_the_same_digest(self, tmp_path: Path):
+        """Under ``persist_query_text=False`` the event's ``query`` and the
+        opportunity's ``query_digest`` are the same keyed value, so the two
+        tables still join on it."""
+        import sqlite3
+
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        cfg = _make_config(persist_query_text=False, min_query_tokens=1)
+        tracker = FeedbackTracker(config=cfg, db_path=tmp_path / "feedback.db")
+        engine = SurfacingEngine(
+            config=cfg,
+            mcp_adapter=_make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)]),
+            feedback_tracker=tracker,
+        )
+        try:
+            out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert out != LONG_RESPONSE
+            await engine.drain_store_writes()
+            db = sqlite3.connect(tracker.store.db_path)
+            try:
+                (event_query,) = db.execute("SELECT query FROM surfacing_events").fetchone()
+                (opp_digest,) = db.execute(
+                    "SELECT query_digest FROM surfacing_opportunities"
+                ).fetchone()
+            finally:
+                db.close()
+            key = tracker.store.hmac_key
+            assert isinstance(key, bytes)
+            assert event_query == opp_digest == _expected_digest(VALID_ARGS["_context_query"], key)
+        finally:
+            await engine.stop()
+            tracker.close()
+
+
 class TestPersistSitesRouteThroughGuard:
     """Both persistence sites must funnel through ``_persistable_query`` so
     the guard cannot be bypassed by one path. The cache-hit
@@ -317,13 +421,15 @@ class TestPersistSitesRouteThroughGuard:
 
 
 class TestStatsPreviewPreservesHash:
-    def test_hash_passes_through_verbatim(self, tmp_path: Path) -> None:
-        """The 23-char ``sha256:<16-hex>`` form must not be clipped — the
-        digest tail is the disambiguating bit and clipping it defeats
-        the opaque-ID purpose."""
+    @pytest.mark.parametrize("prefix", [_QUERY_HASH_PREFIX, "sha256:"])
+    def test_hash_passes_through_verbatim(self, tmp_path: Path, prefix: str) -> None:
+        """The digest form must not be clipped — the digest tail is the
+        disambiguating bit and clipping it defeats the opaque-ID purpose.
+        Covers the keyed ``hmac-sha256:`` form and the unkeyed ``sha256:`` one
+        rows written before #1381 still carry."""
         store = FeedbackStore(tmp_path / "fb.db")
         store.initialize()
-        hashed = _QUERY_HASH_PREFIX + "0123456789abcdef"
+        hashed = prefix + "0123456789abcdef"
         store.record_surfacing(
             surfacing_id="evt-hashed",
             server="s",
@@ -357,20 +463,22 @@ class TestStatsPreviewPreservesHash:
         assert len(preview) == 80
         store.close()
 
-    def test_raw_query_with_sha256_prefix_is_clipped(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("prefix", ["sha256:", "hmac-sha256:"])
+    def test_raw_query_with_sha256_prefix_is_clipped(self, tmp_path: Path, prefix: str) -> None:
         """Prefix-only matching would misclassify a legitimate raw query
         that happens to start with ``sha256:`` (e.g. an agent searching
         for a checksum, or a tool argument carrying a literal hash) and
         bypass the 80-char clip, leaking unbounded text under the default
         ``persist_query_text=True``. The bypass must require the exact
-        23-char ``sha256:<16-hex>`` shape, not the bare prefix."""
+        digest shape (``sha256:<16-hex>`` or ``hmac-sha256:<16-hex>``), not the
+        bare prefix."""
         store = FeedbackStore(tmp_path / "fb.db")
         store.initialize()
         # 200-char raw query that begins with the sentinel prefix. Could
         # easily come from an LLM agent searching for "sha256:abc... why
         # does that hash appear in two places" or similar.
-        adversarial = "sha256:" + ("user typed text with extra context " * 6)
-        assert adversarial.startswith("sha256:")
+        adversarial = prefix + ("user typed text with extra context " * 6)
+        assert adversarial.startswith(prefix)
         assert len(adversarial) > 80
         store.record_surfacing(
             surfacing_id="evt-prefix",
@@ -404,6 +512,10 @@ class TestStatsPreviewPreservesHash:
             "sha256:" + "0" * 15,
             "sha256:" + "0" * 17,
             "sha256:" + "g" * 16,
+            "hmac-sha256:" + "0" * 15,
+            "hmac-sha256:" + "0" * 17,
+            "hmac-sha256:" + "g" * 16,
+            "hmac-" + "0" * 16,
         ]
         for i, q in enumerate(cases):
             store.record_surfacing(
@@ -504,6 +616,20 @@ class TestStatsLegend:
 
         assert "persist_query_text=false" in result
         assert "sha256:0123456789abcdef" in result
+        # Plain row still renders alongside.
+        assert "plain text query" in result
+
+    async def test_legend_fires_for_a_keyed_digest_row(self, _stm_context):
+        from memtomem_stm.server import stm_surfacing_stats
+
+        tracker = MagicMock()
+        tracker.get_stats.return_value = _stats_payload_with_recent(
+            "hmac-sha256:0123456789abcdef", "plain text query"
+        )
+        result = await stm_surfacing_stats(ctx=_stm_context(tracker))
+
+        assert "persist_query_text=false" in result
+        assert "hmac-sha256:0123456789abcdef" in result
         # Plain row still renders alongside.
         assert "plain text query" in result
 

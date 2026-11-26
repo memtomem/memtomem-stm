@@ -13,13 +13,15 @@ Hardening matches the data-at-rest convention (``utils/fileio.py``,
 handler-level redaction hook: call sites render error text before logging it,
 e.g. ``proxy/manager.py:_safe_error_text`` for upstream failures (#1082).
 
-The one thing the handlers do render themselves is an attached traceback, and
-that text can quote operator input a call site never saw — a pydantic
-``ValidationError`` location carries the upstream key from a
-``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…`` variable name. So every
-handler STM installs formats through :class:`DisplayEscapingFormatter`, which
-escapes the exception and stack text line by line the way call sites escape
-values (#1173).
+What the handlers do render themselves is the message and an attached
+traceback, and either can carry a character the terminal must not get as
+itself. An upstream server key is named in many proxy log lines and config does
+not restrict its characters (#1425); a pydantic ``ValidationError`` location
+carries the same key from a
+``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…`` variable name, which no call
+site ever saw (#1173). So every handler STM installs formats through
+:class:`DisplayEscapingFormatter`, which escapes the rendered message whole and
+the exception and stack text line by line.
 
 Below ``WARNING``, the same handlers also refuse every record that does not
 come from STM's own ``memtomem_stm`` logger tree (:class:`DependencyRecordFilter`,
@@ -299,11 +301,24 @@ def _exception_type_label(cls: type[BaseException]) -> str:
 
 
 class DisplayEscapingFormatter(logging.Formatter):
-    """A ``Formatter`` whose exception and stack text cannot carry a
-    display-hostile character to the terminal or the log file (#1173).
+    """A ``Formatter`` whose message, exception text and stack text cannot
+    carry a display-hostile character to the terminal or the log file (#1173,
+    #1425).
 
-    The message itself is the call site's job (each renders its values through
-    ``utils/display._disp``), but the traceback is rendered here, and a
+    **The message.** The stdlib renders it — ``msg % args`` with whatever the
+    call site passed, then the format's own line around it (level, logger
+    name, time) — and that line is escaped whole through
+    ``utils/display._disp``: a member of the set ``_disp_escapes`` defines
+    becomes its ``\\uXXXX`` form. So a server key with a newline in it stays
+    on the line that names it, whichever way the call site put it there: as a
+    ``%s`` argument, under ``%r``, or formatted into the message beforehand.
+    Nothing about formatting is changed or re-implemented, and the record is
+    not touched; only the rendered text is. That makes the message one line by
+    construction: a line break or a tab a call site writes in the message text
+    itself is escaped like any other, so a call site that wants two lines logs
+    twice.
+
+    **Tracebacks.** The traceback is rendered here too, and a
     ``ValidationError`` location quotes the operator's own environment: the
     upstream key of ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…`` reaches
     the ``loc`` as ``upstream_servers.<key>``. A newline or a bidi control in
@@ -349,6 +364,14 @@ class DisplayEscapingFormatter(logging.Formatter):
 
     def formatStack(self, stack_info: str) -> str:
         return _escape_lines(super().formatStack(stack_info))
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        from memtomem_stm.utils.display import _disp
+
+        # ``str.__str__``: ``"%s" % value`` can hand back a ``str`` subclass
+        # as it is, and ``_disp`` must read the characters the handler will
+        # write, not what that subclass chooses to iterate as.
+        return _disp(str.__str__(super().formatMessage(record)))
 
     def format(self, record: logging.LogRecord) -> str:
         if not self._withhold_exception_text:

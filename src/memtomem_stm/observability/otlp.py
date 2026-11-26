@@ -582,9 +582,11 @@ def init_otlp(config: OtlpExportConfig, *, span_processor: Any = None) -> OtlpEm
     if not config.enabled:
         return None
 
-    # No ImportError guard: config validation already refuses to enable export
-    # without the packages, so a failure here means a broken or partial
-    # install. Degrading would leave explicitly-enabled telemetry inert, which
+    # No ImportError guard: config validation refuses to enable export unless
+    # the SDK, the HTTP exporter and requests can be found (``find_spec``: it
+    # locates the named modules without running them, though it imports their
+    # parent packages), so a failure here means a broken or partial install.
+    # Degrading would leave explicitly-enabled telemetry inert, which
     # is the failure this boundary's fail-fast contract exists to prevent.
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider

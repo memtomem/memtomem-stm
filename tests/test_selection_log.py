@@ -101,7 +101,6 @@ SELECTION_KEYS = {
     "reject_reasons",
     "candidate_features",
     "graph_generation",
-    "args_sha256",
     "args_chars",
 }
 
@@ -136,7 +135,7 @@ FEEDBACK_KEYS = {
 
 class TestSchemaStability:
     def test_selection_and_execution_key_sets_pinned(self, tmp_path):
-        """Replayability contract: the exact v1 key set per event type.
+        """Replayability contract: the exact v2 key set per event type.
 
         Adding/removing/renaming a field must fail here and force a
         ``SCHEMA_VERSION`` bump decision, not silently change the log.
@@ -150,7 +149,7 @@ class TestSchemaStability:
         assert set(execution) == EXECUTION_KEYS
         assert set(feedback) == FEEDBACK_KEYS
         for record in (selection, execution, feedback):
-            assert record["schema_version"] == SCHEMA_VERSION == 1
+            assert record["schema_version"] == SCHEMA_VERSION == 2
             assert record["ranker_version"] == RANKER_VERSION
 
     def test_pair_shares_selection_id_and_trace_id(self, tmp_path):
@@ -232,7 +231,6 @@ class TestSchemaStability:
         log = _make_log(tmp_path)
         feats = {
             "query_source": "args",
-            "query_sha256": "0" * 64,
             "query_chars": 4,
             "ranked_candidates": [],
         }
@@ -291,7 +289,10 @@ class TestRedaction:
 
         (selection,) = _read_events(log)
         canonical = _canonical_args(secret_args)
-        assert selection["args_sha256"] == hashlib.sha256(canonical.encode()).hexdigest()
+        # No digest of the arguments either (#1381): an unkeyed hash of a small
+        # argument set can be confirmed offline by hashing guesses.
+        assert "args_sha256" not in selection
+        assert hashlib.sha256(canonical.encode()).hexdigest() not in raw
         assert selection["args_chars"] == len(canonical)
         assert log.events_written == 1
         assert log.redaction_drops == 0
@@ -1794,6 +1795,36 @@ class TestRecordsFrameThemselves:
         assert reader.quality["malformed_lines"] == 1, "the fragment is the malformed line"
 
 
+class TestSchemaVersionAdmission:
+    """v2 (#1381) removed two digest fields and nothing else, so every reader
+    admits v1 and v2 alike — a log spanning the upgrade replays as one."""
+
+    def test_reader_admits_v1_and_v2_and_counts_the_rest(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [
+                _sel(selection_id="v1", schema_version=1),
+                _sel(selection_id="v2", schema_version=2),
+                _sel(selection_id="v3", schema_version=3),
+                # Hand-edited: an unhashable version must read as unsupported,
+                # not raise out of the reader.
+                _sel(selection_id="list", schema_version=[1]),
+                _sel(selection_id="missing", schema_version=None),
+            ],
+        )
+        reader = selection_log_module.TelemetryReader(log_path)
+        admitted = [record["selection_id"] for record in reader.records()]
+        assert admitted == ["v1", "v2"]
+        assert reader.quality["unsupported_schema_records"] == 3
+
+    def test_selection_defect_accepts_both_versions(self):
+        defect = selection_log_module.selection_defect
+        assert defect(_sel(selection_id="a", schema_version=1)) is None
+        assert defect(_sel(selection_id="a", schema_version=2)) is None
+        assert defect(_sel(selection_id="a", schema_version=3)) == "unsupported schema_version 3"
+
+
 class TestUnreadableSegmentIsNotAnAbsentOne:
     """"I could not look there" is not "no such selection".
 
@@ -2055,6 +2086,19 @@ class TestUnlabellableSelections:
         assert payload["error"] == "unusable_record"
         assert "schema_version" in payload["message"]
         assert _feedback_records(log_path) == []
+
+    def test_a_v1_selection_is_still_labellable(self, tmp_path):
+        """v2 only dropped ``args_sha256`` / ``query_sha256`` (#1381), so a v1
+        row from before the upgrade takes a label like a v2 one."""
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="old", schema_version=1, args_sha256="0" * 64)])
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "old", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 0, result.output
+        (label,) = _feedback_records(log_path)
+        assert label["selection_id"] == "old"
+        assert label["schema_version"] == SCHEMA_VERSION == 2
 
     def test_a_selection_with_no_cohort_stamp_is_refused(self, tmp_path):
         log_path = tmp_path / "log.jsonl"

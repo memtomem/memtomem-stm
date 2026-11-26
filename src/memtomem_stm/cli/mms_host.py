@@ -20,36 +20,47 @@ The four buckets:
 * ``changed`` — host scan finds the entry but the canonical hash
   differs (host config was edited externally since last
   ``mms import --apply``).
+
+  Both compare under the baseline's own hash version: an unkeyed version 1
+  baseline is still compared, so upgrading does not turn every entry into
+  ``no_baseline``. See :mod:`memtomem_stm.mms.drift`.
 * ``removed_at_host`` — registry has the entry, sidecar has the
   baseline, but no host scanner finds it. PR3 surfaced this as a
   footer count + neutral note only; PR4 added a main-table row while
   keeping the footer count as a backwards-compat anchor for downstream
   tooling that grepped PR3's output.
-* ``no_baseline`` — sidecar lacks a row for this entry, OR the
-  sidecar's ``drift_hash_version`` doesn't match the running mms's
-  :data:`HASH_VERSION`. Either way the comparison can't be made and
-  the user needs to re-stamp via ``mms import --apply``. This catches
-  three real paths that PR2's backfill alone doesn't cover:
+* ``no_baseline`` — sidecar lacks a row for this entry, OR the row is one
+  :func:`memtomem_stm.mms.drift.comparable` rejects. Either way the
+  comparison can't be made and the user needs to re-stamp. This catches
+  real paths that PR2's backfill alone doesn't cover:
 
   1. Manual sidecar edits (RFC §3 says the user can hand-edit any of
      these files; the sidecar isn't exempt).
   2. Pre-PR2 installs that upgrade to the wired mms but call
      ``mms host status`` before any ``mms import --apply``.
-  3. A future ``HASH_VERSION`` bump where v1 baselines coexist with a
-     v2 binary — comparing them silently would always read as
-     ``changed``, which is worse than asking for a re-stamp.
+  3. A row of a hash version this mms does not know.
+  4. A keyed row whose key file is gone or was replaced — comparing it
+     under another key would always read as ``changed``, which is worse
+     than asking for a re-stamp.
 
-A fifth state, ``not_inspected`` (#1271), splits off what used to read as
-``removed_at_host``: the entry's baseline source is one the scan skipped —
-STM could not tell which Claude Code config or project entry is in use, or
-the file was unreadable — so a missing candidate says nothing about the host.
-Rows carry a ``reason``; sync never removes them.
+  A baseline whose source the scan skipped is ``not_inspected`` instead,
+  whatever its version.
+
+A fifth state, ``not_inspected`` (#1271), covers every entry whose baseline
+source is one the scan skipped — STM could not tell which host config or
+project entry is in use, or the file was unreadable — so the scan says
+nothing about the entry's own host. It is checked before every other state:
+a baseline that cannot be compared, or a same-name entry at another host,
+does not decide the row (#1403). Rows carry a ``reason``; sync never removes,
+backfills or re-stamps them.
 
 When candidates with the same name appear in multiple host configs,
 the comparison candidate is chosen by ``baseline.source_label`` match
 first, falling back to first-seen across :data:`ALL_HOSTS`. This keeps
 ``unchanged``/``changed`` stable when the user later mirrors an entry
 into a second host — the import-time host stays the comparison axis.
+The fallback is never compared against a skipped baseline source; it only
+supplies that row's ``current_hash``.
 
 PR6 added ``mms host sync`` as the write-back counterpart to status's
 read-only inspection. Sync's JSON shape (``mode``/``aborted``/``plan``
@@ -71,8 +82,7 @@ from memtomem_stm.cli._display import _disp
 from memtomem_stm.cli._mms_errors import surface_mms_state_errors
 from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.cli.mms_import import _classify_against_registry, _format_env_summary
-from memtomem_stm.mms import state
-from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
+from memtomem_stm.mms import drift, state
 from memtomem_stm.mms.import_hosts import (
     ALL_HOSTS,
     ImportCandidate,
@@ -91,8 +101,12 @@ _NO_REGISTRY_MSG = "No registered MCP entries. Run `mms import --apply` to impor
 
 _FOOTER_REMOVED_AT_HOST_TEMPLATE = "{n} entr{ies_or_y} in registry not present in any host scan"
 
+# Names ``mms host sync --apply``, not ``mms import --apply``: import stamps
+# only an entry that has no sidecar row, so it leaves a row that exists but
+# cannot be compared (unknown hash version, lost drift-hash key) as it is.
+# Sync's BACKFILL stamps both, for any entry a host scan still finds.
 _FOOTER_NO_BASELINE_TEMPLATE = (
-    "{n} entr{ies_or_y} missing baseline hash — run `mms import --apply` to stamp"
+    "{n} entr{ies_or_y} missing baseline hash — run `mms host sync --apply` to stamp"
 )
 
 # `mms host scan --from` choices. Derived from canonical ``ALL_HOSTS`` plus
@@ -116,6 +130,12 @@ _SYNC_CHANGED_FOOTER_TEMPLATE = (
 )
 
 _SYNC_PLAN_CLOSING_TEMPLATE = "Run `{command}` to execute."
+
+# The plan's closing line when that ``--apply`` run would write nothing (#1402).
+# Not ``_SYNC_NO_OP_MSG``: with an in-place changed entry and no ``--force``,
+# "Already synchronized" would contradict the "differ in shape at host" footer
+# printed above it. It names the command so the claim is about that run only.
+_SYNC_PLAN_NOTHING_TEMPLATE = "Nothing for `{command}` to do."
 
 # Cross-host drift footer (Lock-down 6). Used in two contexts:
 #   - Sub-line under ``_SYNC_CHANGED_FOOTER_TEMPLATE`` when ``--force``
@@ -235,6 +255,8 @@ def _classify(
     import_state: state.ImportState,
     candidates: list[ImportCandidate],
     gaps: dict[str, str] | None = None,
+    *,
+    key: bytes | None = None,
 ) -> list[dict]:
     """Bucket every registry entry into one of five states.
 
@@ -245,10 +267,18 @@ def _classify(
 
     ``gaps`` maps source labels the scan could not inspect to a reason
     (:func:`~memtomem_stm.mms.import_hosts.discover_with_gaps`). A baselined
-    entry no scanner returned whose baseline source is one of them is
-    ``not_inspected`` — with a ``reason`` key — not ``removed_at_host``:
-    its host config was skipped, not found without it, so nothing may
-    remove it on that evidence (#1271).
+    entry whose baseline source is one of them is ``not_inspected`` — with a
+    ``reason`` key — whatever else the scan found: not ``removed_at_host``,
+    since its host config was skipped rather than read without it (#1271),
+    and not ``no_baseline``, ``unchanged`` or ``changed`` on the strength of
+    another hash version or of a same-name entry at another host (#1403).
+
+    ``key`` is the drift-hash key, ``None`` when no key file exists. Both
+    hash fields are keyed or ``None``: without a key ``current_hash`` is
+    ``None`` on every row and so is the ``baseline_hash`` of a version 1
+    row, while a keyed row still shows its stored hash
+    (:func:`~memtomem_stm.mms.drift.reportable_baseline`). ``state`` does
+    not depend on the key for a version 1 baseline.
     """
     gaps = gaps or {}
     cand_by_name = _select_candidate_by_name(candidates, import_state)
@@ -263,34 +293,44 @@ def _classify(
         # against the host config gets the same value back regardless
         # of whether the row is unchanged / changed / removed / has no
         # baseline.
-        current_hash = compute_drift_hash(cand.server) if cand is not None else None
+        current_hash = (
+            drift.compute_drift_hash(cand.server, key)
+            if cand is not None and key is not None
+            else None
+        )
+        baseline_hash = drift.reportable_baseline(baseline, key) if baseline else None
 
-        if baseline is None or baseline.drift_hash_version != HASH_VERSION:
-            # ``no_baseline`` covers both the missing-row case and the
-            # version-mismatch case — they both mean "the comparison
-            # can't be trusted; re-stamp". Surfacing them as one bucket
-            # keeps the user-facing fix the same single command.
-            rows.append(
-                {
-                    "name": name,
-                    "state": "no_baseline",
-                    "source_label": baseline.source_label if baseline else None,
-                    "baseline_hash": baseline.drift_hash if baseline else None,
-                    "current_hash": current_hash,
-                    "last_imported": baseline.last_imported if baseline else None,
-                }
-            )
-            continue
-        if cand is None and baseline.source_label in gaps:
+        # Checked first: while the baseline's own source is skipped, neither a
+        # same-name entry at another host nor a baseline of another hash
+        # version may decide the row — sync would re-stamp or compare it
+        # against a host that is not its own (#1403).
+        if baseline is not None and baseline.source_label in gaps:
             rows.append(
                 {
                     "name": name,
                     "state": "not_inspected",
                     "source_label": baseline.source_label,
-                    "baseline_hash": baseline.drift_hash,
-                    "current_hash": None,
+                    "baseline_hash": baseline_hash,
+                    "current_hash": current_hash,
                     "last_imported": baseline.last_imported,
                     "reason": gaps[baseline.source_label],
+                }
+            )
+            continue
+        if baseline is None or not drift.comparable(baseline, key):
+            # ``no_baseline`` covers both the missing-row case and the
+            # row-that-cannot-be-compared case (unknown hash version, or
+            # a keyed row without its key) — they both mean "the
+            # comparison can't be trusted; re-stamp". Surfacing them as one
+            # bucket keeps the user-facing fix the same single command.
+            rows.append(
+                {
+                    "name": name,
+                    "state": "no_baseline",
+                    "source_label": baseline.source_label if baseline else None,
+                    "baseline_hash": baseline_hash,
+                    "current_hash": current_hash,
+                    "last_imported": baseline.last_imported if baseline else None,
                 }
             )
             continue
@@ -300,7 +340,7 @@ def _classify(
                     "name": name,
                     "state": "removed_at_host",
                     "source_label": baseline.source_label,
-                    "baseline_hash": baseline.drift_hash,
+                    "baseline_hash": baseline_hash,
                     "current_hash": None,
                     "last_imported": baseline.last_imported,
                 }
@@ -309,9 +349,9 @@ def _classify(
         rows.append(
             {
                 "name": name,
-                "state": "unchanged" if current_hash == baseline.drift_hash else "changed",
+                "state": "unchanged" if drift.matches(baseline, cand.server, key) else "changed",
                 "source_label": baseline.source_label,
-                "baseline_hash": baseline.drift_hash,
+                "baseline_hash": baseline_hash,
                 "current_hash": current_hash,
                 "last_imported": baseline.last_imported,
             }
@@ -330,7 +370,7 @@ def _render_text(rows: list[dict]) -> None:
     Main table shows ``unchanged`` + ``changed`` + ``removed_at_host``
     rows — the three states that carry a baseline source attribution
     and benefit from name-level visibility. ``no_baseline`` stays
-    footer-only: the only meaningful response is ``mms import --apply``
+    footer-only: the only meaningful response is ``mms host sync --apply``
     to re-stamp, and the footer's hint conveys that more directly than
     a table row would. (The version-mismatch sub-case does carry a real
     ``source_label`` and ``baseline_hash``; the missing-sidecar
@@ -461,7 +501,7 @@ def status_cmd(json_output: bool) -> None:
         return
 
     candidates, gaps = discover_with_gaps("all", Path.cwd().resolve())
-    rows = _classify(registry, import_state, candidates, gaps)
+    rows = _classify(registry, import_state, candidates, gaps, key=drift.load_drift_key())
     if json_output:
         _render_json(rows)
     else:
@@ -645,6 +685,7 @@ def _empty_sync_summary() -> dict:
         "skipped_changed": 0,
         "orphan_no_baseline": 0,
         "restamped": 0,
+        "rekeyed": 0,
         "unchanged": 0,
         "conflicts": 0,
         "not_inspected": 0,
@@ -829,6 +870,7 @@ def _render_sync_text(
     apply_outcome: str | None = None,
     yes: bool = False,
     allow_project_configs: bool = False,
+    apply_writes: bool = True,
 ) -> None:
     """Default human-readable sync renderer.
 
@@ -848,6 +890,10 @@ def _render_sync_text(
     ``yes`` / ``allow_project_configs`` are the flags the user supplied;
     both ``mms host sync --apply`` hints (changed-entry footer, plan
     closing line) carry them (see ``_sync_apply_command``).
+
+    ``apply_writes`` (plan mode only) is whether the ``--apply`` run the
+    closing line names would write anything; when it would not, the line
+    says so instead of telling the user to run it (#1402).
     """
     add_rows = plan_payload["add"]
     remove_rows = plan_payload["remove"]
@@ -903,6 +949,9 @@ def _render_sync_text(
         for row in restamp_rows:
             for line in _format_server_diff_lines(row):
                 w(line)
+    if summary["rekeyed"]:
+        n = summary["rekeyed"]
+        w(f"  REKEY     {n} sidecar baseline{_s_suffix(n)} (same baseline, keyed hash)")
 
     w("")
     w(f"  {summary['unchanged']} unchanged")
@@ -956,8 +1005,9 @@ def _render_sync_text(
 
     if mode == "plan":
         w("")
+        template = _SYNC_PLAN_CLOSING_TEMPLATE if apply_writes else _SYNC_PLAN_NOTHING_TEMPLATE
         w(
-            _SYNC_PLAN_CLOSING_TEMPLATE.format(
+            template.format(
                 command=_sync_apply_command(
                     force=force_active, yes=yes, allow_project_configs=allow_project_configs
                 )
@@ -995,6 +1045,12 @@ def _render_sync_text(
                 f"Re-stamped {summary['restamped']} entr{_ies_or_y(summary['restamped'])} "
                 f"(registry + sidecar) — {_disp(str(state.registry_path()))}, "
                 f"{_disp(str(state.import_state_path()))}"
+            )
+        if summary["rekeyed"]:
+            w(
+                f"Re-keyed {summary['rekeyed']} sidecar "
+                f"baseline{_s_suffix(summary['rekeyed'])} "
+                f"in {_disp(str(state.import_state_path()))}"
             )
 
 
@@ -1078,6 +1134,13 @@ def sync_cmd(
         would silently relocate the entry's host-of-record. Excluded
         entries surface in the extended CHANGED footer for manual
         review (``mms host status``).
+      - a kept baseline with an unkeyed (version 1) hash → REKEY: the
+        sidecar row gets the keyed hash of the same baseline, so its
+        state does not change. Sidecar only; needs no confirmation.
+
+    The drift-hash key (``~/.mms/import_state.toml.key``) is created by
+    the first ``--apply`` that writes, after its gates have passed.
+    ``--plan`` never creates it.
 
     ``--force`` and ``--yes`` are orthogonal:
       - ``--force`` activates the ``changed`` bucket as a mutator
@@ -1117,14 +1180,18 @@ def sync_cmd(
 
     # Two orthogonal classifiers (see Action-bucket matrix in the plan).
     new, conflicts, _idempotent = _classify_against_registry(candidates, registry)
-    classified = _classify(registry, import_state, candidates, gaps)
+    # Read without creating: ``--plan`` writes nothing, and ``--apply`` creates
+    # the key only once its gates have passed.
+    key = drift.load_drift_key()
+    classified = _classify(registry, import_state, candidates, gaps, key=key)
     cand_by_name = _select_candidate_by_name(candidates, import_state)
 
     removed_at_host_rows = [r for r in classified if r["state"] == "removed_at_host"]
     changed_rows_classified = [r for r in classified if r["state"] == "changed"]
     no_baseline_rows = [r for r in classified if r["state"] == "no_baseline"]
-    # Never mutated: their host config was skipped, so a missing candidate
-    # says nothing about the host (#1271).
+    # Never mutated: their host config was skipped, so the scan says nothing
+    # about their host — neither a missing candidate (#1271) nor a same-name
+    # one at another host (#1403).
     not_inspected_rows = [r for r in classified if r["state"] == "not_inspected"]
     n_unchanged = sum(1 for r in classified if r["state"] == "unchanged")
 
@@ -1173,7 +1240,7 @@ def sync_cmd(
         "cleanup": [
             {
                 "name": name,
-                "baseline_hash": import_state.entries[name].drift_hash,
+                "baseline_hash": drift.reportable_baseline(import_state.entries[name], key),
                 "source_label": import_state.entries[name].source_label,
                 "last_imported": import_state.entries[name].last_imported,
             }
@@ -1218,6 +1285,18 @@ def sync_cmd(
             for r in not_inspected_rows
         ],
     }
+    # Version 1 baselines this run keeps: the sidecar write re-keys them (same
+    # baseline, keyed digest; see ``drift.promote``). Rows it removes or
+    # re-stamps are counted in their own bucket instead.
+    rekey_skip = {r["name"] for r in removed_at_host_rows}
+    if force:
+        rekey_skip |= {r["name"] for r in restamp_eligible_rows}
+    rekey_names = [
+        name
+        for name, entry in import_state.entries.items()
+        if drift.is_legacy(entry) and name in registry.servers and name not in rekey_skip
+    ]
+
     # ``restamped`` always present (default 0); incremented only on
     # ``--apply --force`` over baseline-source-matched entries.
     summary = {
@@ -1228,6 +1307,7 @@ def sync_cmd(
         "skipped_changed": len(plan_payload["skipped_changed"]),
         "orphan_no_baseline": len(plan_payload["orphan_no_baseline"]),
         "restamped": len(restamp_eligible_rows) if force else 0,
+        "rekeyed": len(rekey_names),
         "unchanged": n_unchanged,
         "conflicts": len(plan_payload["conflicts"]),
         "not_inspected": len(plan_payload["not_inspected"]),
@@ -1247,6 +1327,27 @@ def sync_cmd(
             row["_new_server"] = cand.server
             row["_new_source_label"] = cand.source_label
 
+    # ``--force`` activates the ``changed`` bucket as a mutator
+    # (Lock-down 3). The cross-host slice (Lock-down 6) is excluded —
+    # surfaced in the CHANGED footer for manual review only.
+    restamp_rows = restamp_eligible_rows if force else []
+
+    # Whether the ``--apply`` run with these flags writes anything, gates aside.
+    # One expression for both modes: the plan's closing line says whether that
+    # run has something to do (#1402), and the apply no-op gate below is the
+    # same test, so the two cannot disagree. ``cleanup_names`` counts: orphan
+    # sidecar entries are filtered on the next save, which is how
+    # ``sidecar.keys() ⊆ registry.servers.keys()`` self-heals; so does
+    # ``rekey_names``, a sidecar rewrite with nothing else pending.
+    apply_writes = bool(
+        new
+        or removed_at_host_rows
+        or no_baseline_with_cand
+        or restamp_rows
+        or cleanup_names
+        or rekey_names
+    )
+
     if is_plan:
         if json_output:
             _render_sync_json("plan", plan_payload, summary, aborted=False)
@@ -1256,22 +1357,18 @@ def sync_cmd(
                 plan_payload,
                 summary,
                 new=new,
-                restamp_rows=restamp_eligible_rows if force else [],
+                restamp_rows=restamp_rows,
                 cross_host_count=len(cross_host_changed_rows),
                 force_active=force,
                 yes=yes,
                 allow_project_configs=allow_project_configs,
+                apply_writes=apply_writes,
             )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
             _render_not_inspected_footer(not_inspected_rows, indent="  ")
         return
 
     # ----- --apply -----
-
-    # ``--force`` activates the ``changed`` bucket as a mutator
-    # (Lock-down 3). The cross-host slice (Lock-down 6) is excluded —
-    # surfaced in the CHANGED footer for manual review only.
-    restamp_rows = restamp_eligible_rows if force else []
 
     # Project-config gate. Both registry-writing buckets — ADD (``new``) and,
     # under --force, RESTAMP — can adopt candidates read from project-local
@@ -1323,14 +1420,8 @@ def sync_cmd(
             click.echo(_SYNC_DECLINE_MSG, err=True)
             sys.exit(2)
 
-    # No-op gate. ``cleanup_names`` non-empty counts as a mutation
-    # (orphan sidecar entries get filtered on the next save). Without
-    # this, orphans would never be cleaned up by a "boring" sync and
-    # the post-condition ``sidecar.keys() ⊆ registry.servers.keys()``
-    # would not self-heal.
-    no_mutations = not (new or removed_at_host_rows or no_baseline_with_cand or restamp_rows)
-    no_orphans = not cleanup_names
-    if no_mutations and no_orphans:
+    # No-op gate: the predicate the plan's closing line reads (see ``apply_writes``).
+    if not apply_writes:
         if json_output:
             _render_sync_json("apply", plan_payload, summary, aborted=False)
         else:
@@ -1349,6 +1440,11 @@ def sync_cmd(
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
             _render_not_inspected_footer(not_inspected_rows, indent="  ")
         return
+
+    # Every gate has passed and something will be written: from here the key
+    # may be created. Before the registry write, so an unusable key file stops
+    # the run with nothing changed.
+    key = drift.load_or_create_drift_key()
 
     # Step 1: registry write (ADD inserts + REMOVE deletes + RESTAMP
     # replacements). Sequential passes, single ``save_registry`` —
@@ -1384,33 +1480,23 @@ def sync_cmd(
     new_state_entries: dict[str, state.ImportStateEntry] = {}
     for name, entry in import_state.entries.items():
         if name in new_servers:
-            new_state_entries[name] = entry
+            # Re-keys a version 1 row; leaves every other row as it is.
+            new_state_entries[name] = drift.promote(entry, key)
     for cand in new:
-        new_state_entries[cand.name] = state.ImportStateEntry(
-            drift_hash=compute_drift_hash(cand.server),
-            drift_hash_version=HASH_VERSION,
-            last_imported=now,
-            source_label=cand.source_label,
+        new_state_entries[cand.name] = drift.stamp(
+            cand.server, key, last_imported=now, source_label=cand.source_label
         )
     for row in no_baseline_with_cand:
         cand_for_row = cand_by_name[row["name"]]
-        new_state_entries[row["name"]] = state.ImportStateEntry(
-            drift_hash=compute_drift_hash(cand_for_row.server),
-            drift_hash_version=HASH_VERSION,
-            last_imported=now,
-            source_label=cand_for_row.source_label,
+        new_state_entries[row["name"]] = drift.stamp(
+            cand_for_row.server, key, last_imported=now, source_label=cand_for_row.source_label
         )
     for row in restamp_rows:
         cand_for_row = cand_by_name[row["name"]]
-        new_state_entries[row["name"]] = state.ImportStateEntry(
-            drift_hash=compute_drift_hash(cand_for_row.server),
-            drift_hash_version=HASH_VERSION,
-            last_imported=now,
-            source_label=cand_for_row.source_label,
+        new_state_entries[row["name"]] = drift.stamp(
+            cand_for_row.server, key, last_imported=now, source_label=cand_for_row.source_label
         )
-    new_import_state = state.ImportState(
-        schema_version=import_state.schema_version, entries=new_state_entries
-    )
+    new_import_state = state.ImportState(entries=new_state_entries)
     try:
         state.save_import_state(new_import_state)
     except state.StateWriteFailed as exc:

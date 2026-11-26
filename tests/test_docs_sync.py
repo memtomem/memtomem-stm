@@ -1287,6 +1287,39 @@ def test_cli_md_stats_documents_source_filter() -> None:
         )
 
 
+def test_cli_md_stats_documents_the_hook_status_scope() -> None:
+    """The hook status breakdown covers trimmed rows under ``--all-time`` once
+    the status rollup exists (#1442), and retained rows otherwise. Pin the JSON
+    keys, both scopes, every status name the hook can write, the status table
+    and the reset that must clear it, so the prose cannot drift back to
+    retained-only or omit the table a reset has to empty."""
+    from memtomem_stm.proxy.metrics import HOOK_COMPRESSION_STATUSES
+
+    cli_md = _read("docs/cli.md")
+    section_match = re.search(r"### `stats`\n(.*?)(?=\n### |\n## |\Z)", cli_md, re.DOTALL)
+    if not section_match:
+        pytest.fail("docs/cli.md must have a ### `stats` section")
+    section = section_match.group(1)
+    assert "`hook_status`" in section
+    assert '"scope": "retained"' in section
+    assert "`scope` is `all_time` when the trimmed rows are counted too" in section
+    assert '"status_not_kept_calls"' in section
+    assert "`status not kept N`" in section
+    assert (
+        "BEGIN IMMEDIATE; DELETE FROM proxy_metrics; DELETE FROM proxy_metrics_daily; COMMIT;"
+    ) in section
+    # The two-statement reset is complete only because deleting daily rows
+    # clears their status rows; the docs must say so, and the trigger must exist.
+    from memtomem_stm.proxy import metrics_store
+
+    assert f"reset `{metrics_store._STATUS_DAILY_TABLE}` too" in section
+    assert f"DELETE FROM {metrics_store._STATUS_DAILY_TABLE}" in (
+        metrics_store._STATUS_RESET_TRIGGER_DDL
+    )
+    missing = sorted(name for name in HOOK_COMPRESSION_STATUSES if f"`{name}`" not in section)
+    assert not missing, f"docs/cli.md `stats` must name every hook status: {missing}"
+
+
 def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
     """The hook guide, CLI reference, and live help must agree with host specs."""
     from click.testing import CliRunner
@@ -1325,6 +1358,54 @@ def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
     assert "not explicitly guaranteed" not in native_hooks
     assert "명확히 보장되지" not in guide
     assert "updatedMCPToolOutput" in native_hooks
+
+
+def test_hook_compression_docs_require_explicit_claude_host() -> None:
+    """Enabling the env var alone does not compress: replacement needs a
+    registration with ``--host claude`` (#1437). Every surface that tells an
+    operator how to turn compression on must say so, and the one hand-written
+    registration example must carry the flag."""
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli import hook_cmd
+    from memtomem_stm.cli.hook_cmd import hook_command
+
+    import re
+
+    def flat(relative: str) -> str:
+        # Join wrapped lines (and `#`-comment continuations in shell blocks)
+        # so a sentence is matched whole wherever the doc wraps it.
+        lines = (re.sub(r"^\s*#\s?", "", line) for line in _read(relative).splitlines())
+        return " ".join(" ".join(lines).split())
+
+    # One sentence per surface, each new in #1437: a bare `--host claude`
+    # substring would also match the install commands these docs already had.
+    requirement = {
+        "README.md": "guarded Bash compression, which needs the hook registered with "
+        "`--host claude`",
+        "docs/cli.md": "It runs only when the registration passes `--host claude`",
+        "docs/configuration.md": "It also needs a registration that passes `--host claude`",
+        "docs/guides/native-hooks.md": "Replacement also requires the hook command to pass "
+        "`--host claude`",
+        "docs/guides/vibe-coding-getting-started-ko.md": "hook 명령에 `--host claude`가 "
+        "있어야 합니다",
+        "docs/reference/cli-hooks.md": "It also requires a registration with `--host claude`",
+    }
+    for relative, sentence in requirement.items():
+        assert sentence in flat(relative), f"{relative} lost the --host claude requirement"
+    env_row = next(
+        line
+        for line in _read("docs/reference/environment-variables.md").splitlines()
+        if line.startswith("| `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` |")
+    )
+    assert "--host claude" in env_row
+
+    module_doc = hook_cmd.__doc__ or ""
+    assert '"command": "mms hook --host claude"' in module_doc
+    assert '"command": "mms hook"}' not in module_doc
+    result = CliRunner().invoke(hook_command, ["--help"], terminal_width=200)
+    assert result.exit_code == 0
+    assert "--host claude" in result.output
 
 
 def test_vibe_coding_guide_pins_client_registration_and_hook_boundaries() -> None:

@@ -156,6 +156,28 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+_POLICY_FLAT = (
+    "MEMTOMEM_STM_SURFACING__USE_DAEMON",
+    "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+    "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
+)
+
+
+def _assert_registration_channel(env: dict[str, str]) -> None:
+    """The registration as written carries ``MEMTOMEM_STM_SERVER_FLAGS``, and
+    it decodes to the flat policy values beside it (#1544)."""
+    from memtomem_stm.cli.host_runtime import decode_server_flags_channel
+
+    assert "MEMTOMEM_STM_SERVER_FLAGS" in env, sorted(env)
+    channel = decode_server_flags_channel(env["MEMTOMEM_STM_SERVER_FLAGS"])
+    assert channel == {name: env[name] for name in _POLICY_FLAT}
+
+
+def _cli_env(args: list[str], flag: str) -> dict[str, str]:
+    """``KEY=VALUE`` pairs that follow *flag* in a host CLI command."""
+    return dict(args[i + 1].split("=", 1) for i, word in enumerate(args) if word == flag)
+
+
 def _cfg_args(config: Path) -> list[str]:
     """Shared ``--config`` flag for sub-tests."""
     return ["--config", str(config)]
@@ -5842,9 +5864,10 @@ class TestInitMcpRegistration:
 
 
 class TestDetectInstallType:
-    """``_detect_install_type`` returns ``(server_cmd, server_args)`` for the
-    current install location. Covers the three relevant shapes: STM source
-    checkout, user project that ``uv add``'d memtomem-stm, and global install."""
+    """``_detect_install_type`` returns ``(server_cmd, server_args)``, the
+    launcher ``mms hook install`` writes into a host's user-scope hook. Covers
+    the three relevant shapes: STM source checkout, user project that ``uv
+    add``'d memtomem-stm, and global install."""
 
     def test_detects_stm_source_checkout(self, tmp_path, monkeypatch):
         (tmp_path / "pyproject.toml").write_text(
@@ -5856,12 +5879,7 @@ class TestDetectInstallType:
 
         cmd, args = _detect_install_type()
         assert cmd == "uv"
-        assert args[:2] == ["run", "--directory"]
-        # The entrypoint must be the ``memtomem-stm`` console script, not the
-        # ``mms`` click group — ``mms`` with no subcommand prints help and
-        # exits 0, which closes the MCP stdio pipe and the client reports
-        # "Failed to reconnect".
-        assert args[-1] == "memtomem-stm"
+        assert args == ["run", "--directory", str(tmp_path), "memtomem-stm"]
 
     def test_detects_user_project_with_stm_dep(self, tmp_path, monkeypatch):
         (tmp_path / "pyproject.toml").write_text(
@@ -5995,18 +6013,12 @@ class TestDetectInstallType:
         assert cmd == "memtomem-stm"
         assert args == []
 
-    def test_never_emits_click_group_as_mcp_entrypoint(self, tmp_path, monkeypatch):
-        """Regression guard: neither branch may return ``mms`` as the command
-        the MCP client will spawn.
-
-        ``mms`` is the click CLI group (entrypoint
-        ``memtomem_stm.cli.proxy:cli``) — calling it with no subcommand
-        prints help and exits 0, the stdio pipe closes before ``initialize``,
-        and the client reports "Failed to reconnect". The actual server is
-        ``memtomem-stm`` (entrypoint ``memtomem_stm.server:main``). Pinning
-        the non-inclusion here because the three branch-specific tests above
-        could all flip together in a refactor and silently reintroduce the
-        regression."""
+    def test_launcher_names_the_memtomem_stm_entry_point(self, tmp_path, monkeypatch):
+        """The checkout launcher runs the ``memtomem-stm`` entry point, the
+        name the hook-registration readers (``hook_hosts``, ``mms doctor``)
+        recognize next to ``uv run --directory``. All three console scripts
+        share one Click group (``pyproject.toml`` ``[project.scripts]``), so
+        this pins the spelling, not a dispatch difference."""
         from memtomem_stm.cli.proxy import _detect_install_type
 
         # Dev-checkout branch.
@@ -6016,10 +6028,132 @@ class TestDetectInstallType:
         )
         monkeypatch.chdir(tmp_path)
         cmd, args = _detect_install_type()
-        assert "mms" not in [cmd, *args], (
-            "regression: _detect_install_type emits the click group — "
-            "MCP stdio will close on initialize"
+        assert [cmd, *args][-1] == "memtomem-stm"
+        assert "mms" not in [cmd, *args]
+
+
+class TestHookProjectBinding:
+    """``_hook_project_binding`` names the project a user-scope hook launcher
+    would be tied to (#1379): ``mms hook install`` run inside a project that
+    depends on memtomem-stm writes ``uv run --directory <project>``, so every
+    hook call, in every project, runs from that project's environment. The
+    install output says so. STM's own source checkout is the intended
+    developer binding and gets no notice."""
+
+    @staticmethod
+    def _source_checkout(root: Path) -> Path:
+        (root / "src" / "memtomem_stm").mkdir(parents=True)
+        (root / "src" / "memtomem_stm" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "pyproject.toml").write_text(
+            '[project]\nname = "memtomem-stm"\nversion = "0.0.0"\n', encoding="utf-8"
         )
+        return root
+
+    @staticmethod
+    def _dependent(root: Path, deps: str = 'dependencies = ["memtomem-stm>=0.1"]') -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "pyproject.toml").write_text(
+            f'[project]\nname = "my-app"\n{deps}\n', encoding="utf-8"
+        )
+        return root
+
+    def test_dependent_project_is_named(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _detect_install_type, _hook_project_binding
+
+        project = self._dependent(tmp_path / "app")
+        monkeypatch.chdir(project)
+        assert _detect_install_type() == (
+            "uv",
+            ["run", "--directory", str(project), "memtomem-stm"],
+        )
+        assert _hook_project_binding() == project
+
+    def test_optional_dependency_project_is_named(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _hook_project_binding
+
+        project = self._dependent(
+            tmp_path / "app",
+            'dependencies = []\n[project.optional-dependencies]\nstm = ["memtomem-stm"]',
+        )
+        monkeypatch.chdir(project)
+        assert _hook_project_binding() == project
+
+    def test_dependent_project_two_levels_up_is_named(self, tmp_path, monkeypatch):
+        """The issue's measured shape: install run from a subdirectory."""
+        from memtomem_stm.cli.proxy import _hook_project_binding
+
+        project = self._dependent(tmp_path / "app")
+        nested = project / "pkg" / "sub"
+        nested.mkdir(parents=True)
+        monkeypatch.chdir(nested)
+        assert _hook_project_binding() == project
+
+    def test_source_checkout_and_its_subdirectory_are_not_named(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _detect_install_type, _hook_project_binding
+
+        root = self._source_checkout(tmp_path / "memtomem-stm")
+        for cwd in (root, root / "src" / "memtomem_stm"):
+            monkeypatch.chdir(cwd)
+            assert _detect_install_type() == (
+                "uv",
+                ["run", "--directory", str(root), "memtomem-stm"],
+            )
+            assert _hook_project_binding() is None
+
+    def test_name_only_project_without_the_package_is_named(self, tmp_path, monkeypatch):
+        """A pyproject that only declares the name is not shaped like STM's
+        checkout, so the binding is reported rather than assumed intended."""
+        from memtomem_stm.cli.proxy import _hook_project_binding
+
+        root = tmp_path / "lookalike"
+        root.mkdir()
+        (root / "pyproject.toml").write_text('[project]\nname = "memtomem-stm"\n', encoding="utf-8")
+        monkeypatch.chdir(root)
+        assert _hook_project_binding() == root
+
+    def test_unreadable_source_marker_counts_as_unconfirmed(self, tmp_path, monkeypatch):
+        """Before Python 3.14 ``Path.is_file`` raises ``PermissionError`` for
+        an unreadable ``src/``. That must not abort install: the checkout is
+        unconfirmed, so the binding is reported."""
+        from memtomem_stm.cli.proxy import _hook_project_binding
+
+        root = self._source_checkout(tmp_path / "memtomem-stm")
+        real_is_file = Path.is_file
+
+        def is_file(self):
+            if self.name == "__init__.py":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", is_file)
+        monkeypatch.chdir(root)
+        assert _hook_project_binding() == root
+
+    def test_plain_directory_is_not_named(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _detect_install_type, _hook_project_binding
+
+        monkeypatch.chdir(tmp_path)
+        assert _detect_install_type() == ("memtomem-stm", [])
+        assert _hook_project_binding() is None
+
+    @pytest.mark.parametrize(
+        "inner",
+        ['[project]\nname = "unrelated"\ndependencies = ["requests"]\n', "not [[ toml\n"],
+        ids=["unrelated", "malformed"],
+    )
+    def test_nearest_pyproject_wins_inside_a_source_checkout(self, tmp_path, monkeypatch, inner):
+        """The walk stops at the first pyproject.toml: an unrelated or broken
+        one nested inside STM's checkout yields the bare launcher, not the
+        checkout above it."""
+        from memtomem_stm.cli.proxy import _detect_install_type, _hook_project_binding
+
+        root = self._source_checkout(tmp_path / "memtomem-stm")
+        inner_dir = root / "examples" / "demo"
+        inner_dir.mkdir(parents=True)
+        (inner_dir / "pyproject.toml").write_text(inner, encoding="utf-8")
+        monkeypatch.chdir(inner_dir)
+        assert _detect_install_type() == ("memtomem-stm", [])
+        assert _hook_project_binding() is None
 
 
 class TestClaudeDesktopConfigHint:
@@ -6262,6 +6396,7 @@ class TestRegisterCommand:
         assert "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=false" in add_cmd
         assert "MEMTOMEM_STM_SURFACING__USE_DAEMON=true" in add_cmd
         assert "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=3" in add_cmd
+        _assert_registration_channel(_cli_env(add_cmd[: add_cmd.index("--")], "-e"))
 
     def test_register_client_codex_uses_official_cli(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -6281,6 +6416,7 @@ class TestRegisterCommand:
         assert calls[0][:4] == ["codex", "mcp", "get", "memtomem-stm"]
         assert calls[1][:4] == ["codex", "mcp", "add", "memtomem-stm"]
         assert "--env" in calls[1]
+        _assert_registration_channel(_cli_env(calls[1][: calls[1].index("--")], "--env"))
 
     def test_register_json_keeps_existing_until_explicit_replace(
         self, runner, config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -6322,6 +6458,7 @@ class TestRegisterCommand:
         assert entry["hostExtension"] is True
         assert entry["env"]["OPERATOR_FLAG"] == "keep"
         assert entry["env"]["MEMTOMEM_STM_SURFACING__USE_DAEMON"] == "true"
+        _assert_registration_channel(entry["env"])
 
     def test_register_client_codex_add_failure_is_nonzero(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -13286,6 +13423,28 @@ class TestEjectCommand:
         assert fake_claude_host["calls"] == []
         assert "demo" in self._stm_servers(config)
 
+    @pytest.mark.parametrize(
+        ("section", "block", "flagged"),
+        [
+            ("env", {"DATABASE_URL": "postgresql://app:pw@db/prod"}, "env.DATABASE_URL"),
+            ("headers", {"Cookie": "sid=abc"}, "headers.Cookie"),
+        ],
+    )
+    def test_secret_gate_sees_neutral_key_credentials(
+        self, runner, config, fake_claude_host, section, block, flagged
+    ):
+        """#1345: a credentialed URL under ``DATABASE_URL`` and a ``Cookie``
+        header would land on the ``claude mcp add-json`` argv too."""
+        original = {"command": "npx", section: block}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert f"payload carries secret-classified values ({flagged})" in result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
     def test_secret_gate_allow_flag_proceeds(self, runner, config, fake_claude_host):
         original = {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_secret"}}
         self._seed_config(config, {"demo": _eject_entry(original=original)})
@@ -17039,7 +17198,61 @@ class TestDoctor:
         assert env_check is not None, result.output
         assert env_check["status"] == "WARN"
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND" in env_check["detail"]
+        # Proxy-only (#847): the hook and the daemon run with proxy defaults,
+        # so the row says that rather than "cannot start".
+        assert "proxy settings at defaults" in env_check["detail"]
+        assert "hook metrics are not recorded" in env_check["detail"]
+        assert "cannot start" not in env_check["detail"]
         assert result.exit_code == 0, result.output  # WARN-only never exits 1
+
+    def test_env_overrides_check_keeps_the_failure_text_for_a_non_proxy_break(
+        self, runner, config, monkeypatch
+    ):
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS", "nope")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        env_check = self._check_by_id(result, "env_overrides")
+        assert env_check is not None, result.output
+        assert env_check["status"] == "WARN"
+        assert "the daemon cannot start" in env_check["detail"]
+        assert "proxy settings at defaults" not in env_check["detail"]
+
+    @pytest.mark.parametrize(
+        ("var", "recovered"),
+        [
+            pytest.param("MEMTOMEM_STM_PROXY", True, id="proxy_payload"),
+            pytest.param("MEMTOMEM_STM_HOOK", False, id="non_proxy_payload"),
+        ],
+    )
+    def test_env_overrides_blank_hint_still_names_a_target(
+        self, runner, config, monkeypatch, var, recovered
+    ):
+        """An undecodable payload is a ``SettingsError``, whose hint is blank
+        by design, so "the variable(s) named above" would point at nothing.
+        The recovered branch names the proxy variables; the other one stays
+        generic, since a blank hint also comes from a non-proxy payload."""
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        monkeypatch.setenv(var, "{")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        env_check = self._check_by_id(result, "env_overrides")
+        assert env_check is not None, result.output
+        assert env_check["status"] == "WARN"
+        action = env_check["next_action"]
+        assert "named above" not in action
+        assert "{" not in env_check["detail"] + action  # never the value
+        if recovered:
+            assert "MEMTOMEM_STM_PROXY" in action
+            assert "proxy settings at defaults" in env_check["detail"]
+        else:
+            assert "MEMTOMEM_STM_PROXY" not in action
+            assert "MEMTOMEM_STM_*" in action
 
     def test_env_overrides_check_passes_on_a_healthy_env(self, runner, config, monkeypatch):
         self._stub_probe(monkeypatch)

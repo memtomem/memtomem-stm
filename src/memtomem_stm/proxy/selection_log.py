@@ -8,7 +8,7 @@ the substrate for offline replay/eval (#468) and every later learning stage
 hard filter's rejects (#465) plus registration's declines (#908), so replay
 sees the tools that were withheld, not just the ones advertised.
 
-Schema v1 — three event types, every record self-describing via
+Schema v2 — three event types, every record self-describing via
 ``schema_version`` + ``ranker_version``; one JSON object per line, keys
 sorted, so a replay harness can stream-parse and diff runs. Each record is
 preceded by a blank line — the newline ships in the same append as the record
@@ -29,8 +29,11 @@ ones, because it numbers records for ordering:
     rejected or the filter never ran — reason vocabulary in
     ``proxy/tool_eligibility.py``), ``candidate_features``
     (#466 ranking output) / ``graph_generation`` (reserved ``null`` until
-    toolgraph#13/#15), ``args_sha256`` + ``args_chars`` (canonical-JSON
-    hash — see redaction below), ``ts``.
+    toolgraph#13/#15), ``args_chars`` (length of the canonical-JSON
+    arguments — see redaction below), ``ts``. v1 also carried
+    ``args_sha256`` and ``candidate_features.query_sha256``, unkeyed digests
+    of the arguments and of the ranking query derived from them; v2 dropped
+    both (#1381) and is otherwise identical, so readers accept both.
 
 ``execution``
     ``selection_id`` / ``trace_id`` / ``server`` / ``selected_tool``
@@ -57,8 +60,10 @@ ones, because it numbers records for ordering:
 
 Redaction policy is structural, not filter-based: no field ever carries
 raw arguments, results, prompts, resource URIs, or error message strings —
-argument payloads appear only as a sha256 over their canonical JSON plus a
-char count. As a belt-and-suspenders backstop (the storage-gating rule from
+argument payloads appear only as the char count of their canonical JSON. (v1
+also wrote unkeyed sha256 digests of the arguments and the ranking query, which
+let anyone holding the log confirm a guessed value offline; v2 writes no
+digest of either.) As a belt-and-suspenders backstop (the storage-gating rule from
 ``privacy.py``), every serialized line is screened with
 ``contains_sensitive_content`` before persisting and dropped (counted) on a
 match, mirroring the never-persist-secrets rule from #460/#462. Files are
@@ -108,7 +113,16 @@ from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+"""The version this writer stamps on every record."""
+
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
+"""The versions every reader admits. v2 only removed ``args_sha256`` and
+``candidate_features.query_sha256``, which no reader consults, so a v1 record
+joins, replays and takes a label exactly like a v2 one. A tuple, not a set:
+membership then compares with ``==`` like the single-version check did, and an
+unhashable value in a hand-edited line is "unsupported" rather than a
+``TypeError``."""
 
 # Longest line the log's readers will parse. Defined here rather than in the
 # replay harness that first needed it, because the labelling command has to
@@ -238,14 +252,12 @@ def _still_reachable(fd: int) -> bool | None:
 
 
 def _canonical_args(arguments: dict[str, Any] | None) -> str:
-    """Serialize call arguments deterministically for hashing.
+    """Serialize call arguments deterministically, for ``args_chars``.
 
     ``default=str`` keeps non-JSON-native values (e.g. Path) from raising —
-    the output is only ever hashed, never persisted, so a lossy fallback
-    rendering is fine as long as it is stable. Surrogate-safe because that
-    hash encodes it (#757): "only hashed" is not the same as "never
-    encoded", and an upstream tool argument is exactly the kind of value
-    that carries one.
+    only the length is persisted, never the text, so a lossy fallback
+    rendering is fine as long as it is stable. Surrogate-safe (#757): an
+    upstream tool argument is exactly the kind of value that carries one.
     """
     return json_out.dumps(
         arguments or {},
@@ -386,7 +398,6 @@ class SelectionTelemetryLog:
                 "reject_reasons": dict(reject_reasons) if reject_reasons else {},
                 "candidate_features": candidate_features,
                 "graph_generation": graph_generation,
-                "args_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
                 "args_chars": len(canonical),
             }
         )
@@ -852,7 +863,7 @@ def selection_defect(record: dict[str, Any]) -> str | None:
 
     Reason codes, not prose, so the CLI can render one and a test can pin it.
     """
-    if record.get("schema_version") != SCHEMA_VERSION:
+    if record.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
         return f"unsupported schema_version {record.get('schema_version')!r}"
     selection_id = record.get("selection_id")
     if not isinstance(selection_id, str) or not selection_id:
@@ -1094,7 +1105,7 @@ class TelemetryReader:
         if not isinstance(record, dict):
             self.quality["malformed_lines"] += 1
             return None
-        if record.get("schema_version") != SCHEMA_VERSION:
+        if record.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
             self.quality["unsupported_schema_records"] += 1
             if not self.keep_unsupported:
                 return None
@@ -1124,7 +1135,7 @@ def _supported(record: dict[str, Any]) -> bool:
     else looks at the record, so a row of some future schema is not a copy that
     can conflict with anything — the duplicate fold must not see it either.
     """
-    return record.get("schema_version") == SCHEMA_VERSION
+    return record.get("schema_version") in SUPPORTED_SCHEMA_VERSIONS
 
 
 def _fold_ids(

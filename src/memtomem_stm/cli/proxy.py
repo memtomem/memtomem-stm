@@ -19,7 +19,7 @@ import subprocess
 import sys
 import textwrap
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -27,7 +27,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import wraps
-from typing import TYPE_CHECKING, Any, NoReturn, TextIO, TypeGuard
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TextIO, TypeGuard
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import click
@@ -36,6 +36,7 @@ from click.core import ParameterSource
 if TYPE_CHECKING:
     import httpx
 
+    from memtomem_stm.config import EnvSTMConfigLoad
     from memtomem_stm.proxy.config import ProxyConfig
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
@@ -54,7 +55,7 @@ from memtomem_stm.cli._display import _disp, _disp_escapes
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import has_lone_surrogate, unencodable_field
 from memtomem_stm.cli._write_lock import ConfigWriteError, with_config_write_lock
-from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
+from memtomem_stm.cli.host_runtime import hook_launcher, resolve_host_runtime_policy
 from memtomem_stm.mms.claude_config import (
     CLAUDE_CONFIG_UNKNOWN_REASONS,
     ClaudeConfigUnknown,
@@ -348,6 +349,12 @@ def _setup_json_result(action: str):  # noqa: ANN201
             # this wrapper sits inside ``with_config_write_lock``, so it sees
             # the exception first.
             write_failure: ConfigWriteError | None = None
+            # The redirect swaps the process-wide ``sys.stdout``/``sys.stderr``.
+            # Two ``--json`` setup commands running at the same time in one
+            # process can restore each other's sink, and even one capture takes
+            # in what other threads write to the process streams meanwhile. The
+            # CLI runs one setup command per process; overlapping in-process
+            # calls are not supported (#1511).
             with redirect_stdout(out), redirect_stderr(err):
                 try:
                     fn(*args, **kwargs)
@@ -877,15 +884,19 @@ def _dep_name(spec: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _pyproject_references_stm(pyp: Path) -> bool:
-    """True if ``pyp`` is STM's own pyproject.toml, or lists memtomem-stm as
-    a dep. Parses the TOML via ``tomllib`` so comments, descriptions, and
-    adjacent-name packages (``memtomem-stm-extension``) can't false-positive.
-    """
+def _load_pyproject(pyp: Path) -> dict[str, Any] | None:
+    """``pyp`` parsed, or ``None`` when it cannot be read or parsed."""
     try:
-        data = tomllib.loads(pyp.read_text(encoding="utf-8"))
+        return tomllib.loads(pyp.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-        return False
+        return None
+
+
+def _project_table_references_stm(data: dict[str, Any]) -> bool:
+    """True if parsed pyproject ``data`` is STM's own (``[project].name``), or
+    lists memtomem-stm as a dependency or optional dependency. ``tomllib``
+    parsing means comments, descriptions and adjacent-name packages
+    (``memtomem-stm-extension``) can't false-positive."""
     project = data.get("project")
     if not isinstance(project, dict):
         return False
@@ -905,43 +916,110 @@ def _pyproject_references_stm(pyp: Path) -> bool:
     return False
 
 
-def _detect_install_type() -> tuple[str, list[str]]:
-    """Return ``(server_cmd, server_args)`` to register with an MCP client.
+class _StmProject(NamedTuple):
+    """The project a user-scope hook launcher binds to.
 
-    Branches:
+    ``source_checkout`` is True when the directory is shaped like STM's own
+    source checkout: ``[project].name = "memtomem-stm"`` and the package at
+    ``src/memtomem_stm/__init__.py`` (the name alone could be any project's).
+    Both fields come from one read of the same ``pyproject.toml``, so the
+    written command and the binding notice cannot describe different
+    versions of the file (#1379)."""
 
-    * Inside a ``pyproject.toml`` that is STM's own source checkout OR a
-      user project that lists ``memtomem-stm`` in ``[project].dependencies``
-      / ``[project].optional-dependencies`` → ``uv run --directory <root>
-      memtomem-stm``.
-    * Default (global install via ``uv tool install`` / ``pipx``, or a cwd
-      with no relevant pyproject) → bare ``memtomem-stm`` console script.
+    root: Path
+    source_checkout: bool
 
-    Both branches spawn the ``memtomem-stm`` console script, not ``mms``:
-    ``mms`` is the click CLI group and exits 0 on no-subcommand, which closes
-    the stdio pipe immediately and the MCP client reports "Failed to
-    reconnect". ``memtomem-stm`` is the actual server entrypoint
-    (``memtomem_stm.server:main``).
 
-    Parent ``mm init`` keeps source/project as separate branches because
-    the parent is a monorepo (``packages/`` subdir is the discriminator).
-    STM has a flat layout so the two collapse into one.
-
-    PEP 735 ``dependency-groups`` and tool-specific dev-dep tables (``[tool.uv
-    .dev-dependencies]``, ``[tool.poetry.group.*.dependencies]``) are
-    intentionally **not** matched — a dev-only dep usually means the user
-    wants `uv run --group <name>` which the registration command can't pick.
-    Bare ``memtomem-stm`` is the safer default; users can override manually.
-    """
+def _stm_project() -> _StmProject | None:
+    """The nearest ``pyproject.toml`` (cwd and up to four parents) that
+    references STM, read once; ``None`` when the nearest one does not (the
+    walk stops at the first ``pyproject.toml``, so an unrelated project
+    nested inside an STM checkout yields ``None``) or there is none."""
     check = Path.cwd()
     for _ in range(5):
         pyp = check / "pyproject.toml"
         if pyp.exists():
-            if _pyproject_references_stm(pyp):
-                return ("uv", ["run", "--directory", str(check), "memtomem-stm"])
-            break
+            data = _load_pyproject(pyp)
+            if data is None or not _project_table_references_stm(data):
+                return None
+            return _StmProject(check, _is_stm_source_checkout(check, data))
         check = check.parent
-    return ("memtomem-stm", [])
+    return None
+
+
+def _is_stm_source_checkout(root: Path, data: dict[str, Any]) -> bool:
+    """Whether ``root`` (whose parsed pyproject is ``data``) is shaped like
+    STM's own source checkout. An unreadable package marker counts as not
+    confirmed, so install goes on and reports the binding: ``Path.is_file``
+    raises ``PermissionError`` before Python 3.14 for an unreadable ``src/``."""
+    project = data.get("project")
+    if not isinstance(project, dict) or project.get("name") != "memtomem-stm":
+        return False
+    try:
+        return (root / "src" / "memtomem_stm" / "__init__.py").is_file()
+    except OSError:
+        return False
+
+
+def _detect_install_type() -> tuple[str, list[str]]:
+    """Return ``(cmd, args)``, the launcher ``mms hook install`` writes into a
+    host's **user-scope** hook (its only caller: MCP registration uses
+    ``sys.executable -P -m memtomem_stm``, :func:`_registration_command`).
+
+    Branches, decided by the nearest ``pyproject.toml`` in the cwd or one of
+    its four parents (:func:`_stm_project`):
+
+    * It declares ``[project].name = "memtomem-stm"`` (STM's own checkout, or
+      any project with that name) or lists ``memtomem-stm`` in
+      ``[project].dependencies`` / ``[project].optional-dependencies`` →
+      ``uv run --directory <its directory> memtomem-stm``. Unless the
+      directory is shaped like STM's source checkout, the hook is then bound
+      to that project's environment for every project, which
+      :func:`_hook_project_binding` names so install can say so (#1379).
+    * Otherwise (global install via ``uv tool install`` / ``pipx``, or no
+      such pyproject) → bare ``memtomem-stm`` console script.
+
+    Both branches name the ``memtomem-stm`` entry point, the spelling the
+    hook-registration readers recognize after ``uv run --directory``.
+
+    PEP 735 ``dependency-groups`` and tool-specific dev-dep tables (``[tool.uv
+    .dev-dependencies]``, ``[tool.poetry.group.*.dependencies]``) are
+    intentionally **not** matched — a dev-only dep usually means the user
+    wants `uv run --group <name>` which the written command can't pick.
+    Bare ``memtomem-stm`` is the safer default; users can override manually.
+    """
+    return _launcher_for(_stm_project())
+
+
+def _launcher_for(project: _StmProject | None) -> tuple[str, list[str]]:
+    """The launcher for a :func:`_stm_project` result. Split out so ``mms hook
+    install`` derives the written command and its binding notice from one
+    lookup."""
+    # The words come from ``host_runtime.hook_launcher``, which the reader
+    # of installed hook commands (``owned_hook_command``) shares.
+    words = hook_launcher(str(project.root) if project is not None else None)
+    return (words[0], words[1:])
+
+
+def _hook_project_binding() -> Path | None:
+    """The project a user-scope hook launcher from :func:`_detect_install_type`
+    is tied to, or ``None`` when it is not tied to one.
+
+    ``None`` for the bare console script and for STM's own source checkout
+    (the developer binding, intended). A dependent project's directory
+    otherwise: every hook call, in every project, would run from that
+    project's environment, which install reports instead of changing (#1379).
+    The written command is left alone because the install shell's PATH is not
+    the host app's, so switching to a bare command could break a working hook.
+    """
+    return _binding_for(_stm_project())
+
+
+def _binding_for(project: _StmProject | None) -> Path | None:
+    """:func:`_hook_project_binding` for an already looked-up project."""
+    if project is None or project.source_checkout:
+        return None
+    return project.root
 
 
 def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, str]]:
@@ -2601,11 +2679,199 @@ def _all_time_coverage_lines(rollup: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _hook_by_host(hook_summary: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Per-host totals of a ``source='hook'`` compression summary.
+
+    A host that cannot replace tool output only ever adds to the denominator of
+    the hook ratio, so the hosts are reported apart. Grouped from ``by_tool``
+    by the host tag in each row's ``server``; rows written before the host was
+    recorded form one entry whose ``host`` is ``None``. ``can_replace_output``
+    is what the adapter in THIS version can do, not what happened when the row
+    was written, and is ``None`` for an unrecorded or unknown host. ``None``
+    when there is no hook summary to split.
+    """
+    if not hook_summary or not hook_summary.get("available"):
+        return None
+    from memtomem_stm.cli.hook_adapter import host_can_replace_output
+    from memtomem_stm.proxy.metrics import hook_host_of
+
+    totals: dict[str | None, dict[str, int]] = {}
+    for row in hook_summary.get("by_tool") or []:
+        entry = totals.setdefault(
+            hook_host_of(str(row["server"])),
+            {"calls": 0, "original_chars": 0, "compressed_chars": 0},
+        )
+        for key in entry:
+            entry[key] += row[key]
+    hosts: list[dict[str, Any]] = []
+    # Recorded hosts by volume, the unrecorded remainder last.
+    for host, entry in sorted(
+        totals.items(), key=lambda item: (item[0] is None, -item[1]["original_chars"])
+    ):
+        orig, comp = entry["original_chars"], entry["compressed_chars"]
+        hosts.append(
+            {
+                "host": host,
+                **entry,
+                "saved_ratio": round(1.0 - comp / orig, 4) if orig > 0 else 0.0,
+                "can_replace_output": host_can_replace_output(host) if host else None,
+            }
+        )
+    return hosts
+
+
+def _hook_status(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The ``hook_status`` JSON value: hook rows by host, then status.
+
+    ``value`` is a summary's ``hook_status`` (``None`` when it was not read or
+    could not be): ``{"scope", "rows"}`` from ``_read_hook_status``. Hosts are
+    grouped with :func:`hook_host_of`, as in :func:`_hook_by_host`; ``host``
+    and ``status`` are ``None`` where the row recorded none. ``scope`` is
+    ``all_time`` once the status rollup counts the trimmed rows too; each
+    host's ``status_not_kept_calls`` then counts its trimmed calls whose
+    status was not kept, and is ``None`` under ``retained``.
+    """
+    if value is None:
+        return None
+    from memtomem_stm.proxy.metrics import hook_host_of
+
+    all_time = value["scope"] == "all_time"
+    grouped: dict[str | None, dict[str | None, dict[str, int]]] = {}
+    not_kept: dict[str | None, int] = {}
+    for row in value["rows"]:
+        host = hook_host_of(str(row["server"]))
+        statuses = grouped.setdefault(host, {})
+        not_kept.setdefault(host, 0)
+        if row["not_kept"]:
+            not_kept[host] += row["calls"]
+            continue
+        entry = statuses.setdefault(row["status"], {"calls": 0, "original_chars": 0})
+        entry["calls"] += row["calls"]
+        entry["original_chars"] += row["original_chars"]
+    by_host = []
+    # Recorded hosts by calls, ties by name; the unrecorded remainder last.
+    for host, statuses in sorted(
+        grouped.items(),
+        key=lambda item: (
+            item[0] is None,
+            -(sum(e["calls"] for e in item[1].values()) + not_kept[item[0]]),
+            item[0] or "",
+        ),
+    ):
+        ordered = sorted(
+            statuses.items(), key=lambda item: (item[0] is None, -item[1]["calls"], item[0] or "")
+        )
+        by_host.append(
+            {
+                "host": host,
+                "statuses": [{"status": name, **entry} for name, entry in ordered],
+                "status_not_kept_calls": not_kept[host] if all_time else None,
+            }
+        )
+    return {"scope": value["scope"], "by_host": by_host}
+
+
+def _hook_status_line(
+    hook_status: dict[str, Any] | None, host: str | None, indent: str, all_time: bool
+) -> list[str]:
+    """``status:`` counts for one host's rows, or nothing to add.
+
+    Nothing to add: no status was read, the host has no rows in scope, or the
+    host itself was not recorded and neither was any status nor a trimmed
+    call without one — those rows predate both and the line would only repeat
+    ``(host not recorded)``. A known host whose rows all predate the status
+    still gets ``not recorded N``, which is the answer for it. Status names
+    come from :data:`HOOK_COMPRESSION_STATUSES` or are ``other`` (the reader
+    folds anything else), so they print as they are. Counts are in descending
+    order with ``not recorded`` last, then ``status not kept`` (trimmed calls
+    whose status was not kept). Under ``--all-time`` a DB without the status
+    rollup counts the retained rows only, and the line says so.
+    """
+    if not hook_status:
+        return []
+    for entry in hook_status["by_host"]:
+        if entry["host"] == host:
+            statuses = entry["statuses"]
+            not_kept = entry["status_not_kept_calls"] or 0
+            break
+    else:
+        return []
+    if host is None and not not_kept and all(item["status"] is None for item in statuses):
+        return []
+    parts = [f"{item['status'] or 'not recorded'} {item['calls']:,}" for item in statuses]
+    if not_kept:
+        parts.append(f"status not kept {not_kept:,}")
+    if not parts:
+        return []
+    scope = "  (retained rows)" if all_time and hook_status["scope"] == "retained" else ""
+    return [f"{indent}status: {', '.join(parts)}{scope}"]
+
+
+def _hook_host_lines(
+    hosts: list[dict[str, Any]] | None,
+    indent: str,
+    hook_status: dict[str, Any] | None = None,
+    all_time: bool = False,
+    lone_status: dict[str, Any] | None = None,
+) -> list[str]:
+    """One line per host, or none when a split would add nothing.
+
+    Nothing to split: a single host that can replace output (its ratio is the
+    hook ratio already) or only rows with no recorded host. Each host that can
+    replace output also gets its ``status:`` line (under the hook line itself
+    when the host lines are left out — then from ``lone_status`` when given,
+    the read behind the line it hangs under); for a host that cannot, the
+    "measured only" note already says why nothing was compressed.
+    """
+    if not hosts:
+        return []
+    if len(hosts) == 1 and hosts[0]["can_replace_output"] is not False:
+        lone = lone_status if lone_status is not None else hook_status
+        return _hook_status_line(lone, hosts[0]["host"], indent, all_time)
+    lines = []
+    for entry in hosts:
+        name = _disp(entry["host"]) if entry["host"] else "(host not recorded)"
+        head = f"{indent}{name:<6} calls: {entry['calls']}  chars: {entry['original_chars']:,}"
+        if entry["can_replace_output"] is False:
+            lines.append(f"{head}  (measured only: host cannot replace output)")
+        else:
+            saved = f"saved {float(entry['saved_ratio']) * 100:.1f}%"
+            lines.append(f"{head} -> {entry['compressed_chars']:,}  ({saved})")
+            lines.extend(_hook_status_line(hook_status, entry["host"], indent + "  ", all_time))
+    return lines
+
+
+def _context_query_line(summary: dict[str, Any], indent: str) -> str | None:
+    """How many of *summary*'s MCP responses carried ``_context_query``.
+
+    The counts were read in the statement that read *summary*'s totals, so the
+    caller passes the summary whose line this one hangs under. ``None`` when
+    the summary has no such figure or observed no call.
+    """
+    counts = summary.get("context_query")
+    if not isinstance(counts, dict):
+        return None
+    observed = counts.get("observed") or 0
+    agent = counts.get("agent") or 0
+    if not observed:
+        return None
+    return (
+        f"{indent}Context query supplied on {agent} of {observed} observed live MCP "
+        f"responses ({agent / observed * 100:.1f}%)"
+    )
+
+
 def _render_compression_block(
     summary: dict[str, Any],
     by_source: dict[str, dict[str, Any]] | None = None,
     max_history: int | None = None,
+    hook_by_host: list[dict[str, Any]] | None = None,
+    hook_status: dict[str, Any] | None = None,
+    total_hook_status: dict[str, Any] | None = None,
 ) -> None:
+    """``hook_status`` is read with the hook summary, ``total_hook_status`` with
+    ``summary``: a line printed under a figure has to come from that figure's
+    snapshot, or a write between the reads shows more statuses than calls."""
     raw_rollup = summary.get("rollup")
     rollup: dict[str, Any] | None = raw_rollup if isinstance(raw_rollup, dict) else None
     click.echo(_hdr("Proxy / Compression" if rollup is None else "Proxy / Compression (all time)"))
@@ -2656,6 +2922,22 @@ def _render_compression_block(
             if src_structured:
                 line += f"  [{src_structured} structured, separate accounting]"
             click.echo(line)
+            if src == "hook":
+                for host_line in _hook_host_lines(
+                    hook_by_host, "      ", hook_status, rollup is not None
+                ):
+                    click.echo(host_line)
+            elif query_line := _context_query_line(s, "      "):
+                click.echo(query_line)
+    else:
+        # No per-source lines (``--source hook``, or the hook is the only
+        # source with rows), so the hosts hang off the total.
+        for host_line in _hook_host_lines(
+            hook_by_host, "    ", hook_status, rollup is not None, lone_status=total_hook_status
+        ):
+            click.echo(host_line)
+        if query_line := _context_query_line(summary, "    "):
+            click.echo(query_line)
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
     if rollup is not None:
         for line in _all_time_coverage_lines(rollup):
@@ -2677,7 +2959,7 @@ def _render_compression_block(
     if by_tool:
         click.echo("")
         header = (
-            f"  {'SERVER':<12} {'TOOL':<28} {'CALLS':>6} {'ORIG':>10} {'COMP':>10} {'SAVED%':>7}"
+            f"  {'SERVER':<14} {'TOOL':<28} {'CALLS':>6} {'ORIG':>10} {'COMP':>10} {'SAVED%':>7}"
         )
         click.echo(_hdr(header))
         for row in by_tool:
@@ -2685,27 +2967,114 @@ def _render_compression_block(
             # Truncate first, then escape: the slice keeps its existing
             # meaning (28 characters of the recorded name) and an escaped
             # cell overflows like an over-long one, rather than being cut
-            # mid-escape into an ambiguous ``\u00`` (#755).
+            # mid-escape into an ambiguous ``\u00`` (#755). 14 for the server
+            # so the longest hook label (``builtin:claude``) shows whole.
             click.echo(
-                f"  {_disp(str(row['server'])[:12]):<12} {_disp(str(row['tool'])[:28]):<28} "
+                f"  {_disp(str(row['server'])[:14]):<14} {_disp(str(row['tool'])[:28]):<28} "
                 f"{row['calls']:>6} {row['original_chars']:>10,} "
                 f"{row['compressed_chars']:>10,} {saved_pct:>6.1f}%"
             )
+
+
+def _render_cache_block(summary: dict[str, Any], *, collecting: bool) -> None:
+    """Response-cache counts from :func:`read_cache_summary` (#1329)."""
+    click.echo(_hdr("Proxy / Cache"))
+    click.echo("=" * 30)
+    if summary.get("error"):
+        click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
+        return
+    if not collecting:
+        click.echo(
+            "  Not collecting (proxy.enabled, proxy.cache.enabled or proxy.metrics.enabled "
+            "is false)."
+        )
+    if not summary.get("available"):
+        click.echo("  No cache lookups recorded yet.")
+        return
+    hits, misses = int(summary.get("hits") or 0), int(summary.get("misses") or 0)
+    unstorable = int(summary.get("unstorable") or 0)
+    if hits or misses or unstorable:
+        click.echo(f"  lookups: {hits:,} hits, {misses:,} misses ({unstorable:,} unstorable)")
+        rate = summary.get("storable_hit_rate")
+        rate_text = f"{float(rate) * 100:.1f}%" if rate is not None else "n/a (no storable lookups)"
+        click.echo(f"  hit rate: {rate_text} of storable lookups")
+        click.echo(f"  served from cache: {int(summary.get('hit_chars') or 0):,} chars")
+    else:
+        click.echo("  No cache lookups recorded yet.")
+    since = "an unknown start"
+    installed_at = summary.get("installed_at")
+    if installed_at is not None:
+        try:
+            since = datetime.fromtimestamp(float(installed_at), tz=UTC).strftime("%Y-%m-%d UTC")
+        except (OverflowError, OSError, ValueError):
+            pass
+    click.echo(
+        f"  Coverage: since {since}, from STM processes that persist cache counts;\n"
+        "    each tries to write them with its next metrics row, every 30 s while some\n"
+        "    are waiting, and at MCP server stop."
+    )
+
+
+def _progressive_coverage_lines(rollup: dict[str, Any]) -> list[str]:
+    """Coverage lines for the ``rollup`` of an all-time progressive summary.
+
+    Not :func:`_all_time_coverage_lines`: here the boundary is when the history
+    became complete, which after a repair of a damaged rollup is later than the
+    installation, so the loss is not described as "before the rollup was
+    installed".
+    """
+    earliest = rollup.get("earliest_created_at")
+    if earliest is not None:
+        since = _utc_text(float(earliest), "%Y-%m-%d")
+        lines = [f"  Window: all time — retained rows plus the rollup, since {since} UTC."]
+    else:
+        lines = ["  Window: all time — retained rows plus the rollup."]
+    incomplete = rollup.get("incomplete_before")
+    if incomplete is not None:
+        when = _utc_text(float(incomplete), "%Y-%m-%d %H:%M")
+        lost = rollup.get("lost_before_install")
+        if isinstance(lost, int):
+            lines.append(
+                f"  Incomplete before {when} UTC: {lost:,} reads were purged before the\n"
+                "    rollup was installed, so reads recorded before then may be missing."
+            )
+        else:
+            lines.append(
+                f"  Possibly incomplete before {when} UTC: an unknown number of reads\n"
+                "    recorded before then may be missing."
+            )
+    return lines
 
 
 def _render_progressive_block(
     summary: dict[str, Any], *, collecting: bool, retention_days: int
 ) -> None:
     """Progressive-delivery volume from :func:`read_progressive_summary`."""
-    click.echo(_hdr("Progressive delivery"))
+    raw_rollup = summary.get("rollup")
+    rollup: dict[str, Any] | None = raw_rollup if isinstance(raw_rollup, dict) else None
+    click.echo(
+        _hdr("Progressive delivery" if rollup is None else "Progressive delivery (all time)")
+    )
     click.echo("=" * 30)
     if summary.get("error"):
         click.echo(f"  {_warn('unreadable')}: {_disp(str(summary['error']))}")
         return
     if not collecting:
         click.echo("  Collection disabled (proxy.progressive_reads.enabled = false).")
+    if rollup is not None and not rollup.get("installed"):
+        click.echo(
+            "  All-time totals unavailable: this feedback DB has no usable progressive rollup\n"
+            "    (none yet, or part of it is missing or damaged). It is installed or repaired\n"
+            "    the next time the MCP server of this STM version starts with progressive-read\n"
+            "    collection enabled; reads purged without a working rollup are not\n"
+            "    recoverable. Without --all-time this command reports the retained rows."
+        )
+        return
     if not summary.get("available") or not summary.get("total_responses"):
         click.echo("  No progressive responses recorded yet.")
+        if rollup is not None and summary.get("available"):
+            for line in _progressive_coverage_lines(rollup):
+                click.echo(line)
         return
     produced = int(summary["produced_chars"])
     delivered = int(summary["delivered_chars"])
@@ -2726,7 +3095,10 @@ def _render_progressive_block(
             "classification; they are included in both totals."
         )
     oldest = summary.get("oldest_at")
-    if oldest is not None:
+    if rollup is not None:
+        for line in _progressive_coverage_lines(rollup):
+            click.echo(line)
+    elif oldest is not None:
         since = datetime.fromtimestamp(float(oldest), tz=UTC).strftime("%Y-%m-%d")
         window = (
             f"rows older than {retention_days} days are purged when the server\n"
@@ -2833,14 +3205,18 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     type=click.Choice(["mcp", "hook"]),
     default=None,
     help="Filter compression rows by provenance: 'mcp' (proxied upstream tools) "
-    "or 'hook' (native built-in tools recorded by 'mms hook').",
+    "or 'hook' (native built-in tools recorded by 'mms hook'). 'hook' also omits the "
+    "cache block, since only proxied tools are cached.",
 )
 @click.option(
     "--all-time",
     "all_time",
     is_flag=True,
     help="Report compression over all rows ever recorded since the daily rollup was "
-    "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only.",
+    "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only. "
+    "The hook status counts include trimmed rows once the status rollup is installed; "
+    "before that they cover retained rows only. Progressive delivery likewise counts "
+    "purged reads since its rollup was installed; surfacing stays retained.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def stats(
@@ -2857,16 +3233,20 @@ def stats(
     creates or migrates them) and reports totals over the rows still retained
     (``proxy.metrics.max_history`` per source, ``retention_days`` for
     progressive reads and surfacing), not all-time totals. ``--all-time`` switches
-    the compression section alone to the never-pruned daily rollup plus retained
-    rows (#1316); progressive and surfacing stay retained-window. The live MCP server
-    keeps additional in-memory counters that a separate CLI process cannot see,
-    so the numbers here reflect only what has been written to disk. An explicit
+    the compression section to the never-pruned daily rollup plus retained rows
+    (#1316), and the progressive section to its per-response rollup plus retained
+    rows (#1328); surfacing stays retained-window. The cache block
+    reads ``proxy_cache_daily``, which is never pruned and covers everything
+    written since it was created (#1329). The live MCP server keeps additional
+    in-memory counters that a separate CLI process cannot see, so the numbers
+    here reflect only what has been written to disk. An explicit
     ``--config`` also steers the STMConfig-backed feedback-DB location (#839).
     """
     config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.config import STMConfig, stm_config_for_cli
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
     from memtomem_stm.proxy.metrics_store import (
+        read_cache_summary,
         read_compression_all_time,
         read_compression_summary,
     )
@@ -2931,29 +3311,66 @@ def stats(
 
     read_compression = read_compression_all_time if all_time else read_compression_summary
     compression = read_compression(
-        proxy_cfg.metrics.db_path, tool=tool_filter, source=source_filter
+        proxy_cfg.metrics.db_path,
+        tool=tool_filter,
+        source=source_filter,
+        # Also unfiltered: a lone host's status line hangs under this total,
+        # so it has to come from the same snapshot.
+        with_hook_status=source_filter in (None, "hook"),
     )
     # ``--source`` scopes the compression rows only; unset, report each source
     # beside the aggregate so one high-volume source cannot hide another's ratio.
     compression_by_source = (
         {
-            src: read_compression(proxy_cfg.metrics.db_path, tool=tool_filter, source=src)
+            src: read_compression(
+                proxy_cfg.metrics.db_path,
+                tool=tool_filter,
+                source=src,
+                with_hook_status=src == "hook",
+            )
             for src in ("mcp", "hook")
         }
         if source_filter is None
         else None
     )
-    progressive = read_progressive_summary(proxy_cfg.progressive_reads.db_path, tool=tool_filter)
+    # The hook summary to split by host: its own line when every source is
+    # reported, the whole block under ``--source hook``, nothing under ``mcp``.
+    # The status groups were read in the same snapshot as that summary; they
+    # leave it here so ``--json`` reports them once, under ``hook_status``.
+    hook_summary = (
+        compression_by_source["hook"]
+        if compression_by_source is not None
+        else compression
+        if source_filter == "hook"
+        else None
+    )
+    hook_by_host = _hook_by_host(hook_summary)
+    status_rows: Any = hook_summary.pop("hook_status", None) if hook_summary else None
+    hook_status = _hook_status(status_rows)
+    total_rows: Any = compression.pop("hook_status", None)
+    total_hook_status = hook_status if compression is hook_summary else _hook_status(total_rows)
+    # Only proxied tools are cached, so ``--source hook`` has no cache block.
+    cache = (
+        read_cache_summary(proxy_cfg.metrics.db_path, tool=tool_filter)
+        if source_filter != "hook"
+        else None
+    )
+    progressive = read_progressive_summary(
+        proxy_cfg.progressive_reads.db_path, tool=tool_filter, all_time=all_time
+    )
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
     # These numbers come only from the on-disk stores; the live MCP server
-    # keeps additional in-memory-only counters (cache hits, latency, reconnects,
-    # …) that a separate CLI process cannot see. Name the source and point at
-    # the live tool so a user comparing the two doesn't read the gap as a bug.
-    # Wording is generic (not the default filenames) because metrics.db_path and
-    # surfacing.feedback_db_path are both configurable.
+    # keeps additional in-memory-only counters (latency, reconnects, cache counts
+    # not yet written, …) that a separate CLI process cannot see. Name the
+    # source and point at the live tool so a user comparing the two doesn't
+    # read the gap as a bug. Wording is generic (not the default filenames)
+    # because metrics.db_path and surfacing.feedback_db_path are both
+    # configurable.
     data_source = (
-        "on-disk stores only (metrics DB + surfacing-feedback DB); "
+        "on-disk stores only (metrics DB + surfacing-feedback DB; each proxy tries to "
+        "write its pending cache counts with its next metrics write, every 30 s, and "
+        "during an orderly MCP server stop); "
         "live in-memory counters via the stm_admin MCP tool (action proxy_stats)"
     )
 
@@ -2971,6 +3388,10 @@ def stats(
                     "compression_scope": "all_time" if all_time else "retained",
                     "compression": compression,
                     "compression_by_source": compression_by_source,
+                    "hook_by_host": hook_by_host,
+                    "hook_status": hook_status,
+                    "cache": cache,
+                    "progressive_scope": progressive["scope"],
                     "progressive": progressive,
                     "surfacing": surfacing,
                 },
@@ -2990,8 +3411,19 @@ def stats(
     click.echo(f"Data   : {data_source}")
     click.echo("")
     _render_compression_block(
-        compression, compression_by_source, max_history=proxy_cfg.metrics.max_history
+        compression,
+        compression_by_source,
+        max_history=proxy_cfg.metrics.max_history,
+        hook_by_host=hook_by_host,
+        hook_status=hook_status,
+        total_hook_status=total_hook_status,
     )
+    if cache is not None:
+        click.echo("")
+        _render_cache_block(
+            cache,
+            collecting=proxy_cfg.enabled and proxy_cfg.cache.enabled and proxy_cfg.metrics.enabled,
+        )
     click.echo("")
     _render_progressive_block(
         progressive,
@@ -9690,12 +10122,75 @@ def _known_ltm_state(value: object) -> str:
     return value if isinstance(value, str) and value in _KNOWN_LTM_STATES else "unknown"
 
 
-def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False) -> dict[str, Any]:
-    """Shared-daemon readiness and telemetry; active only with ``measure_ltm``."""
-    from memtomem_stm.daemon import client as daemon_client
+# Fixed text, not the exception's message: that one quotes ``data_dir`` and
+# the OS error, and this report carries no config-derived values (#1079).
+# ``mms daemon status`` is where the file is named.
+def _discovery_key_error(*, hook_command: bool = False) -> str:
+    return (
+        "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
+        f"(LocalKeyError); run `{_daemon_command('status', hook_command=hook_command)}`"
+    )
 
+
+_HOOK_COMMAND_OPTION = "--hook-command claude"
+
+
+def _daemon_command(sub: str, *, hook_command: bool) -> str:
+    """``mms daemon <sub>``, with ``--hook-command claude`` for the hook's daemon.
+
+    *hook_command* is set when doctor built the hook's configuration from the
+    one STM hook command it read (route the hook's, view ``found``): that
+    option builds as the command does (#1515), and the bare command, from the
+    shell's environment alone, can address another daemon.
+    """
+    command = f"mms daemon {sub}"
+    return f"{command} {_HOOK_COMMAND_OPTION}" if hook_command else command
+
+
+def _names_hook_command(surfacing_status: Mapping[str, Any]) -> bool:
+    """Whether doctor's daemon advice should carry ``--hook-command claude``.
+
+    Read from the ``hook_view`` summary the bootstrap records before its probe,
+    so every row agrees with the probe's own error text; the advice inputs are
+    best-effort and may be missing when the probe ran.
+    """
+    view = surfacing_status.get("hook_view")
+    return (
+        isinstance(view, dict) and view.get("state") == "found" and view.get("hook_route") is True
+    )
+
+
+_DISCOVERY_KEY_ERROR = _discovery_key_error()
+
+
+def _ltm_daemon_status(
+    config: Any, timeout: float, *, measure_ltm: bool = False, hook_command: bool = False
+) -> dict[str, Any]:
+    """Shared-daemon readiness and telemetry; active only with ``measure_ltm``.
+
+    An unusable discovery key reads as an unreachable daemon with its own
+    error text, wherever in the probe or the measurement it surfaces, and
+    ``discovery_key_unusable`` set: doctor's ``ltm measurement`` row keys on
+    that field, not the text, so it does not advise ``mms daemon start``,
+    which exits on the same key. The texts that name a daemon command name it as
+    :func:`_daemon_command` does.
+    """
+    from memtomem_stm.utils.local_key import LocalKeyError
+
+    try:
+        return _ltm_daemon_probe(
+            config, timeout, measure_ltm=measure_ltm, hook_command=hook_command
+        )
+    except LocalKeyError:
+        status = _ltm_daemon_status_base(config)
+        status["error"] = _discovery_key_error(hook_command=hook_command)
+        status["discovery_key_unusable"] = True
+        return status
+
+
+def _ltm_daemon_status_base(config: Any) -> dict[str, Any]:
     surfacing = config.surfacing
-    status: dict[str, Any] = {
+    return {
         "route": "daemon",
         "transport": surfacing.ltm_mcp_transport,
         "command": surfacing.ltm_mcp_command,
@@ -9707,16 +10202,29 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
         "runtime_profile": None,
         "error": None,
         "daemon_reachable": False,
+        "discovery_key_unusable": False,
         "ltm_state": None,
         "latency": None,
         "measurement": None,
     }
+
+
+def _ltm_daemon_probe(
+    config: Any, timeout: float, *, measure_ltm: bool, hook_command: bool = False
+) -> dict[str, Any]:
+    from memtomem_stm.daemon import client as daemon_client
+
+    surfacing = config.surfacing
+    status = _ltm_daemon_status_base(config)
     if not surfacing.enabled:
         status["skipped"] = "surfacing_disabled"
         return status
     hs = asyncio.run(daemon_client.ping(config, timeout=max(0.1, float(timeout))))
     if hs is None:
-        status["error"] = "shared daemon is not reachable; run `mms daemon status`"
+        status["error"] = (
+            "shared daemon is not reachable; run "
+            f"`{_daemon_command('status', hook_command=hook_command)}`"
+        )
         return status
     # A missing field keeps the old "cold" default; a present value outside
     # the known set is "unknown", whatever it is.
@@ -9761,13 +10269,19 @@ def _ltm_status(
     timeout: float,
     *,
     measure_ltm: bool = False,
-    prefer_hook_daemon: bool = False,
+    hook_route: bool = False,
+    hook_command: bool = False,
 ) -> dict[str, Any]:
     # Standalone proxy surfacing and native hooks have independent routing
-    # knobs. Health keeps describing the standalone route; doctor opts into
-    # the hook daemon because its timeout advice governs hook→daemon traffic.
-    if config.surfacing.use_daemon or (prefer_hook_daemon and config.hook.use_daemon):
-        return _ltm_daemon_status(config, timeout, measure_ltm=measure_ltm)
+    # knobs. *hook_route* is the caller's decision that the row describes the
+    # hook's daemon (see ``_surfacing_bootstrap_status``), and *config* is then
+    # the hook's own build; otherwise this is the standalone route.
+    # *hook_command*: that build came from one STM hook command
+    # (:func:`_daemon_command`).
+    if hook_route or config.surfacing.use_daemon:
+        return _ltm_daemon_status(
+            config, timeout, measure_ltm=measure_ltm, hook_command=hook_route and hook_command
+        )
     return _ltm_mcp_status(config.surfacing, timeout)
 
 
@@ -9891,6 +10405,358 @@ def _all_config_secret_values(data: dict[str, Any]) -> list[str]:
     return values
 
 
+@dataclass(frozen=True)
+class _HookCommandView:
+    """What doctor read of the STM hook command in Claude Code's user settings (#1494).
+
+    ``state`` is ``found`` (exactly one handler ``mms hook install`` owns, and
+    nothing else that may run the hook), ``none``, ``several``, ``unreadable``
+    (a handler install does not own that may still run the hook, so what it
+    would build is unknown), ``windows`` (shell form there may run under Git
+    Bash or PowerShell, which this reader does not model; the ``hook
+    registration`` row does not read it either) or ``settings_error``.
+    ``locations`` name the handlers (``hooks.PostToolUse[i].hooks[j]``), never
+    their command text, which can hold credentials. ``env`` and ``use_daemon``
+    are only set for ``found``: the flags the hook applies from that command
+    (``host_runtime.hook_flags_scope``), and its ``--use-daemon``/``--no-daemon`` (``None`` for
+    neither), which the hook routes on directly (#1501).
+    """
+
+    state: Literal["found", "none", "several", "unreadable", "windows", "settings_error"]
+    path: Path | None = None
+    locations: tuple[str, ...] = ()
+    env: dict[str, str] = dataclass_field(default_factory=dict)
+    use_daemon: bool | None = None
+    settings_error: str | None = None
+
+    @property
+    def gate_from_command(self) -> bool:
+        """Whether the found command carries a daemon flag, which decides the route."""
+        return self.use_daemon is not None
+
+
+def _hook_command_view() -> _HookCommandView:
+    """Read the STM hook command doctor's hook view should be built with.
+
+    Reads the file ``mms hook install --host claude`` writes, as the ``hook
+    registration`` row does. A handler is recognized when install owns it
+    (``hook_hosts.owned_handler``: install's own words, ``"type": "command"``,
+    no ``args``) and it has no ``shell`` other than Bash. The flags the hook
+    applies are then known exactly, computed from the flag words as the hook
+    computes them. Any other ``command`` handler that may
+    run STM's hook (install's look-alike test, ``unmanaged_stm_like``) makes
+    the view ``unreadable``: it runs too, and what it would build is unknown.
+    A handler ``mms hook`` would not run as the bridge (``--help``, a
+    subcommand), and one that is not a ``command`` handler, run nothing and
+    are ignored.
+    """
+    from memtomem_stm.cli import hook_hosts
+    from memtomem_stm.cli.hook_registration import (
+        inspect_hook_registration,
+        is_candidate,
+        running_on_windows,
+    )
+
+    try:
+        path, handlers = hook_hosts.claude_post_tool_handlers()
+    except Exception as exc:
+        detail, _action = _hook_settings_read_failure(exc)
+        return _HookCommandView("settings_error", settings_error=detail)
+    windows = running_on_windows()
+
+    def cannot_run_the_bridge(handler: dict[str, Any]) -> bool:
+        # The ``hook registration`` row's reader, which also reads exec form:
+        # ``{"command": "mms", "args": ["hook", "--help"]}`` only prints help.
+        registration = inspect_hook_registration(handler, windows=windows)
+        return registration.not_checked is None and not registration.runs_bridge
+
+    recognized: list[tuple[str, dict[str, str], bool | None]] = []
+    unreadable: list[str] = []
+    for location, handler in handlers or []:
+        if not isinstance(handler, dict) or handler.get("type") != "command":
+            continue
+        command = handler.get("command")
+        if not isinstance(command, str):
+            continue
+        owned = hook_hosts.owned_handler("claude", handler)
+        if owned is not None and handler.get("shell", "bash") == "bash":
+            # The overlay of the command's own words, as the hook computes it
+            # (#1508): rebuilt from the parsed settings, a deadline the hook's
+            # build rejects is dropped and a rounded one moves.
+            recognized.append((location, owned.env_overrides(), owned.settings.use_daemon))
+        elif owned is not None or is_candidate(handler) or hook_hosts._words_name_the_hook(command):
+            if not cannot_run_the_bridge(handler):
+                unreadable.append(location)
+    every = tuple(loc for loc, _env, _flag in recognized) + tuple(unreadable)
+    if every and windows:
+        return _HookCommandView("windows", path, every)
+    if unreadable:
+        return _HookCommandView("unreadable", path, tuple(unreadable))
+    if len(recognized) > 1:
+        return _HookCommandView("several", path, every)
+    if recognized:
+        location, env, use_daemon = recognized[0]
+        return _HookCommandView("found", path, (location,), env, use_daemon)
+    return _HookCommandView("none", path)
+
+
+def _hook_view_summary(view: _HookCommandView, *, hook_route: bool) -> dict[str, Any]:
+    """The JSON form of what doctor read: locations and the path, no values."""
+    return {
+        "state": view.state,
+        "path": None if view.path is None else str(view.path),
+        "locations": list(view.locations),
+        "hook_route": hook_route,
+        "gate_from_command": view.gate_from_command,
+        "settings_error": view.settings_error,
+    }
+
+
+_SURFACING_TIMEOUT_ENV = "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS"
+_HOOK_DAEMON_TIMEOUT_ENV = "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"
+
+# The key under which ``_surfacing_bootstrap_status`` hands doctor its advice
+# inputs. Doctor pops it before anything renders the result, so it never
+# reaches ``doctor --json``; ``mms health`` never sets it.
+_HOOK_ADVICE_KEY = "_hook_advice"
+# Likewise for the hook view and the build of the hook's configuration doctor
+# routed with, which the ``env_overrides`` row reports (#1506).
+_HOOK_BUILD_KEY = "_hook_build"
+
+
+@dataclass(frozen=True)
+class _HookBuild:
+    """The hook view doctor read, and its build of the hook's configuration.
+
+    ``outcome`` is the ``EnvSTMConfigLoad`` of ``load_env_stm_config(view.env)``
+    or the exception it raised; ``None`` when no build was made from this view
+    yet. Never rendered: the ``env_overrides`` row names the handler's location
+    and the variables an error implicates, never the command or its values.
+    """
+
+    view: _HookCommandView
+    outcome: EnvSTMConfigLoad | Exception | None = None
+
+
+@dataclass(frozen=True)
+class _HookAdvice:
+    """What doctor's advice needs to know about a ``found`` hook command (#1505).
+
+    Never rendered as a whole: the advice names ``location`` and flag names,
+    never the command's values.
+
+    ``hook_route`` is doctor's route decision. ``built`` is whether doctor's
+    build of the hook's configuration succeeded. ``use_daemon`` is the
+    command's ``--use-daemon``/``--no-daemon`` (``None`` for neither).
+    ``command_deadlines``: the deadline variables whose value in doctor's
+    build of the hook's configuration is the command's, so editing the flag
+    changes it and exporting that variable in doctor's shell does not.
+
+    The ``mms daemon start`` / ``status`` / ``restart`` advice for the hook's
+    daemon does not read these: it carries ``--hook-command claude`` from the
+    ``hook_view`` summary (:func:`_names_hook_command`, #1515), which is
+    recorded before the probe while these inputs are best-effort.
+    """
+
+    location: str
+    hook_route: bool
+    built: bool
+    use_daemon: bool | None
+    command_deadlines: frozenset[str]
+
+
+def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _HookAdvice | None:
+    """Doctor's advice inputs for a ``found`` view, else ``None``."""
+    if view.state != "found":
+        return None
+    deadlines: set[str] = set()
+    if built is not None and hook_route:
+        for name in (_SURFACING_TIMEOUT_ENV, _HOOK_DAEMON_TIMEOUT_ENV):
+            # The command's flags are laid over everything the environment
+            # gives the field (#1537), so in a build that succeeded, a deadline
+            # the command sets is the one in effect.
+            if name in view.env:
+                deadlines.add(name)
+    return _HookAdvice(
+        location=view.locations[0],
+        hook_route=hook_route,
+        built=built is not None,
+        use_daemon=view.use_daemon,
+        command_deadlines=frozenset(deadlines),
+    )
+
+
+def _hook_deadline_advice(advice: Any, name: str, flag: str, seconds: float) -> str | None:
+    """Edit-the-handler advice when the command's *flag* sets the deadline in effect."""
+    if not (isinstance(advice, _HookAdvice) and advice.hook_route):
+        return None
+    if name not in advice.command_deadlines:
+        return None
+    return (
+        f"set {flag} to {seconds:g} in the STM hook command at {advice.location} "
+        f"(Claude Code user settings); its timeout options override an exported {name}"
+    )
+
+
+def _hook_view_note(summary: Any, ltm: Any) -> str | None:
+    """The ``ltm server`` row's account of the route it took and what it chose it from (#1494).
+
+    Only what doctor did: the route, whether a probe ran, and the inputs of
+    its build of the hook's configuration. Not why the hook behaves as it
+    does: doctor builds from its own environment, not the host's, so what the
+    registered hook builds is not known here. The ``env_overrides`` row
+    reports whether that build and doctor's environment-only build succeed,
+    naming the variables when the error identifies them (#1506).
+    """
+    if not isinstance(summary, dict):
+        return None
+    # Raw, like every other ``check()`` detail: the terminal renderer escapes it,
+    # and ``--json`` consumers decode the value themselves (#755).
+    path = str(summary.get("path"))
+    locations = ", ".join(str(loc) for loc in summary.get("locations") or [])
+    state = summary.get("state")
+    if summary.get("hook_route"):
+        route = "the hook's daemon"
+    elif not isinstance(ltm, dict):
+        # A build that failed before the standalone route could be told apart.
+        route = "the standalone route"
+    elif ltm.get("route") == "daemon":
+        route = "the standalone daemon route"
+    else:
+        route = "the direct LTM route"
+    if isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled":
+        route = f"{route} (not probed: surfacing is disabled)"
+    if state == "found":
+        inputs = (
+            f"doctor's environment with the options of the STM hook command at {locations} "
+            f"in {path}"
+        )
+    elif state == "several":
+        inputs = (
+            f"doctor's environment only: {len(summary['locations'])} STM hook commands "
+            f"({locations}) in {path}"
+        )
+    elif state == "unreadable":
+        inputs = (
+            "doctor's environment only: a command that may run STM's hook could not be read "
+            f"({locations}) in {path}"
+        )
+    elif state == "windows":
+        inputs = (
+            f"doctor's environment only: hook commands are not read on Windows ({locations}) "
+            f"in {path}"
+        )
+    elif state == "settings_error":
+        inputs = f"doctor's environment only: {summary.get('settings_error')}"
+    else:
+        inputs = f"doctor's environment only: no STM hook command recognized in {path}"
+    return f"route: {route}, chosen from {inputs} (Claude Code user settings only)"
+
+
+_ENV_FIX_NAMED = "unset or fix the MEMTOMEM_STM_* variable(s) named above"
+_ENV_FIX_IN_BARE_CLAUSE = (
+    "unset or fix the MEMTOMEM_STM_* variable(s) named for doctor's environment alone"
+)
+_ENV_FIX_UNDECODABLE = "check the MEMTOMEM_STM_* variables for a value settings cannot decode"
+_ENV_FIX_PROXY_UNDECODABLE = (
+    "check MEMTOMEM_STM_PROXY and its MEMTOMEM_STM_PROXY__* overrides "
+    "for a value settings cannot decode"
+)
+
+
+def _env_overrides_found_row(
+    view: _HookCommandView,
+    hook_outcome: EnvSTMConfigLoad | Exception,
+    bare_outcome: EnvSTMConfigLoad | Exception,
+    *,
+    hook_daemon: bool = False,
+) -> tuple[str, str, str | None]:
+    """The ``env_overrides`` row when doctor read one STM hook command (#1506).
+
+    Two builds, each reported in its own clause with its own consequence and
+    the variables its own error implicates: ``load_env_stm_config(view.env)``,
+    the command's options over doctor's environment, as the hook builds; and
+    doctor's environment alone, as ``mms daemon start`` from it builds. Each
+    outcome is an ``EnvSTMConfigLoad`` or the exception the build raised.
+
+    The next action does not attribute a failure to a variable or to the
+    command: the hints name every variable under the failing field, a valid
+    one included, and an undecodable payload hides any later error. It says
+    which clause to act on and, for the hook's build, to rerun doctor. Names
+    the handler by location and path, never its command text or values.
+
+    *hook_daemon*: doctor took the hook's daemon route for this command
+    (:func:`_names_hook_command`). When only the bare build fails, its
+    clause then says it describes plain ``mms daemon start``, and the next
+    action also names ``mms daemon start --hook-command claude``, which builds
+    as the hook's command does (#1524). Whether that start would succeed is
+    not judged here: the ``ltm server`` row reports what its probe found (an
+    unusable discovery key, surfacing off).
+    """
+    from memtomem_stm.config import hook_flags_hint
+    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+
+    def classify(outcome: EnvSTMConfigLoad | Exception) -> tuple[str, Exception | None]:
+        if isinstance(outcome, Exception):
+            return "fail", outcome
+        if outcome.proxy_error is not None:
+            return "proxy", outcome.proxy_error
+        return "ok", None
+
+    hook_kind, hook_exc = classify(hook_outcome)
+    bare_kind, bare_exc = classify(bare_outcome)
+    # Each build's hint reads the environment that build read, each flag the
+    # command sets named as it sets it (#1503, #1537).
+    hook_hint = "" if hook_exc is None else hook_flags_hint(hook_exc, view.env)
+    bare_hint = "" if bare_exc is None else env_var_hint_for_validation_error(bare_exc)
+    hook_says = {
+        "ok": "STMConfig() constructs",
+        "fail": "STMConfig() fails — a hook run with doctor's environment and these options "
+        "passes surfacing/compression through (logged per call that reaches its configuration)",
+        "proxy": "MEMTOMEM_STM_PROXY* is invalid — a hook run with doctor's environment and "
+        "these options ignores it and runs with proxy settings at defaults; hook metrics are "
+        "not recorded",
+    }
+    bare_says = {
+        "ok": "STMConfig() constructs",
+        # ``plain`` only beside a hook build that constructs: that is the case
+        # where the hook's daemon builds and plain start does not.
+        "fail": "STMConfig() fails — "
+        f"{'plain ' if hook_daemon and hook_kind == 'ok' else ''}mms daemon start "
+        "from it exits 1",
+        "proxy": "MEMTOMEM_STM_PROXY* is invalid — mms daemon start from it ignores it and "
+        "runs with proxy settings at defaults",
+    }
+    location = view.locations[0]
+    detail = (
+        f"with the options of the STM hook command at {location} in {view.path} "
+        f"(Claude Code user settings): {hook_says[hook_kind]}{hook_hint}; "
+        f"doctor's environment alone: {bare_says[bare_kind]}{bare_hint}"
+    )
+    actions: list[str] = []
+    if bare_kind != "ok":
+        if bare_hint:
+            actions.append(_ENV_FIX_IN_BARE_CLAUSE)
+        else:
+            actions.append(
+                _ENV_FIX_PROXY_UNDECODABLE if bare_kind == "proxy" else _ENV_FIX_UNDECODABLE
+            )
+        # Only a bare build that fails outright: an invalid proxy variable
+        # reaches the hook's build too, so it never leaves that one ``ok``.
+        if bare_kind == "fail" and hook_kind == "ok" and hook_daemon:
+            actions.append(
+                "or start the hook's daemon as its command builds it: "
+                f"{_daemon_command('start', hook_command=True)}"
+            )
+    if hook_kind != "ok":
+        actions.append(
+            f"fix the options of the STM hook command at {location} (Claude Code user "
+            "settings) or the variables its build reads, then rerun mms doctor"
+        )
+    status = "PASS" if hook_kind == bare_kind == "ok" else "WARN"
+    return status, detail, "; ".join(actions) if actions else None
+
+
 def _surfacing_bootstrap_status(
     timeout: float,
     *,
@@ -9901,28 +10767,115 @@ def _surfacing_bootstrap_status(
     """Return surfacing bootstrap readiness without starting the proxy.
 
     *timeout* is the ``mms health --timeout`` value, forwarded into the LTM
-    probe so the documented per-server bound covers it too. *config_path* is
-    the command's explicit ``--config``, threaded so the ``STMConfig`` here
-    reads the same file as the command's own proxy checks (#839).
+    probe so the documented per-server bound covers it too.
+
+    The route is chosen first, then the configuration to look its daemon up
+    with, because a daemon is found by the fingerprint of the build that
+    started it (#1485):
+
+    - *prefer_hook_daemon* (doctor) and the hook's daemon setting on: the
+      section describes the hook. The hook builds with
+      ``load_env_stm_config``: environment only, never doctor's ``--config``,
+      and tolerant of a proxy-only break. It routes on that build's
+      ``hook.use_daemon`` (#1495), unless its command carries
+      ``--use-daemon``/``--no-daemon``, which then decides (#1501; doctor
+      reads it from the command, below). A daemon it
+      spawns reloads the same way, so that build is the daemon's identity.
+      Doctor's proxy checks still report a broken proxy variable.
+    - When that build fails to decode or validate a setting
+      (``ValidationError``/``SettingsError``), the hook passes every call
+      through and its route is moot: the section is built in the command's
+      own view below, so the error reported is that view's. Any other
+      exception reaches the handler at the end as it is.
+    - Otherwise (health, or the hook off): the standalone route, in the
+      command's own view: built from *config_path*, the command's explicit
+      ``--config``, so the ``STMConfig`` here reads the same file as the
+      command's own proxy checks (#839). That view gives a registered
+      server's fingerprint when the server's own build also succeeds and its
+      environment matches this one in the fingerprinted settings; doctor
+      cannot see the server's environment. A standalone server snapshots its
+      daemon identity before it applies the file's proxy settings; the file
+      reaches that build only through upstream completion, which decides
+      whether the build succeeds, not what it fingerprints.
+
+    Doctor also reads the STM hook command in Claude Code's user settings
+    (:func:`_hook_command_view`, #1494). When it finds exactly one that
+    ``mms hook install`` owns, and nothing else that may run the hook, the
+    hook's build applies that command's flags over doctor's environment, as
+    the hook applies them (a settings layer over every form the environment
+    gives the same field, #1537), and the command's daemon flag decides the
+    route directly, as in the hook: ``--no-daemon`` sends doctor to the
+    standalone route, and the fingerprint takes the query-text persistence
+    and surfacing deadline that build resolves. The flags are scoped to that
+    build, never set in ``os.environ``: the probe and the standalone build
+    read the environment as it is. Otherwise the hook view is built
+    from doctor's environment alone. The result's ``hook_view`` says which.
     """
+    hook_view: dict[str, Any] | None = None
+    hook_advice: _HookAdvice | None = None
+    hook_build: _HookBuild | None = None
     try:
+        from pydantic import ValidationError
+        from pydantic_settings import SettingsError
+
         from memtomem_stm.cli.rrf_diagnostics import rrf_boundary_doctor_checks
-        from memtomem_stm.config import stm_config_for_cli
+        from memtomem_stm.config import STMConfig, load_env_stm_config, stm_config_for_cli
         from memtomem_stm.surfacing.feedback_store import (
             inspect_feedback_db,
             read_surfacing_summary,
         )
         from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
 
-        config = stm_config_for_cli(config_path)
+        ltm_status: dict[str, Any] | None = None
+        if prefer_hook_daemon:
+            view = _hook_command_view()
+            hook_view = _hook_view_summary(view, hook_route=False)
+            try:
+                hook_load = load_env_stm_config(view.env)
+            except (ValidationError, SettingsError) as exc:
+                hook_build = _HookBuild(view, exc)
+                built: STMConfig | None = None
+            except Exception as exc:
+                # The section reports it as its error; the ``env_overrides``
+                # row still reports this view's build, not a second one.
+                hook_build = _HookBuild(view, exc)
+                raise
+            else:
+                hook_build = _HookBuild(view, hook_load)
+                built = hook_load.config
+            # As the hook routes (#1501): its command's daemon flag decides
+            # directly, else the build's ``hook.use_daemon``. A build that fails
+            # passes every call through, so its route is moot.
+            if built is not None and (
+                view.use_daemon if view.use_daemon is not None else built.hook.use_daemon
+            ):
+                hook_view["hook_route"] = True
+                config = built
+                # Before the probe, as on the standalone route: a feedback DB
+                # path that cannot be inspected ends the section unprobed.
+                db_status = inspect_feedback_db(config.surfacing.feedback_db_path)
+                # The probe reads the flags' variables only through *config*;
+                # the fingerprint's direct read of the environment is
+                # ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``, which no flag sets.
+                ltm_status = _ltm_status(
+                    config,
+                    timeout,
+                    measure_ltm=measure_ltm,
+                    hook_route=True,
+                    hook_command=_names_hook_command({"hook_view": hook_view}),
+                )
+            try:
+                hook_advice = _hook_advice(view, built, hook_route=bool(hook_view["hook_route"]))
+            except Exception as exc:
+                # Advice only: a failure here must not turn a probe that
+                # already ran into the section's error. The type alone: a
+                # message or traceback can quote configured values (#1075).
+                logger.debug("hook command advice inputs unavailable (%s)", type(exc).__name__)
+        if ltm_status is None:
+            config = stm_config_for_cli(config_path)
+            db_status = inspect_feedback_db(config.surfacing.feedback_db_path)
+            ltm_status = _ltm_status(config, timeout, measure_ltm=measure_ltm, hook_route=False)
         surfacing = config.surfacing
-        db_status = inspect_feedback_db(surfacing.feedback_db_path)
-        ltm_status = _ltm_status(
-            config,
-            timeout,
-            measure_ltm=measure_ltm,
-            prefer_hook_daemon=prefer_hook_daemon,
-        )
         # Judge Core's profile as it was sent, then render only its projection
         # (#1082): the checks below read the raw snapshot, so a value the
         # projection cannot represent never changes a verdict.
@@ -9938,7 +10891,7 @@ def _surfacing_bootstrap_status(
         )
         ltm_status["runtime_profile"] = project_runtime_profile(profile)
         fields = ("id", "label", "status", "detail", "next_action")
-        return {
+        status: dict[str, Any] = {
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
@@ -9959,13 +10912,20 @@ def _surfacing_bootstrap_status(
         # which can carry configured values (#1075) or anything the failing
         # code quoted (#1079).
         logger.debug("Surfacing bootstrap status inspection failed: %s", _disp(error))
-        return {
+        status = {
             "enabled": None,
             "feedback_enabled": None,
             "feedback_db": None,
             "ltm_server": None,
             "error": error,
         }
+    if hook_view is not None:
+        status["hook_view"] = hook_view
+    if hook_advice is not None:
+        status[_HOOK_ADVICE_KEY] = hook_advice
+    if hook_build is not None:
+        status[_HOOK_BUILD_KEY] = hook_build
+    return status
 
 
 def _surfacing_bootstrap_error(exc: Exception) -> str:
@@ -10792,6 +11752,190 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
     return checks
 
 
+# What the row can miss, stated at the end of each detail that reports on
+# commands (the settings-read failure has none to report). Recognition is a
+# search of the command text (``hook_registration.is_candidate``), and what it
+# misses cannot be listed from that text, so the limit is said instead (#1457).
+_HOOK_REGISTRATION_SCOPE = (
+    "STM hooks are recognized from the command text by a heuristic, so one behind a wrapper "
+    "script or spelled with shell syntax can be missed; project, local and managed Claude "
+    "Code settings are not read"
+)
+
+
+def _doctor_hook_registration_check(check: Callable[..., None]) -> None:
+    """``hook_registration``: Claude Code hook commands that keep hook
+    compression from replacing output (#1437, #1443).
+
+    ``mms hook`` replaces Bash output only when its ``--host`` is ``claude``.
+    This reads the PostToolUse handlers in the file ``mms hook install --host
+    claude`` writes and reports, by location, the STM hook commands that lack
+    it, that do not run the hook, or that it cannot read safely
+    (:mod:`memtomem_stm.cli.hook_registration`). Command text is never shown:
+    inline assignments can carry credentials.
+
+    Not gated on compression being enabled: the hook process's environment
+    cannot be established from here, and ``--host claude`` is the right
+    registration for Claude Code either way. WARN only, like the other hook
+    checks; no row when the file holds no command recognized as STM's hook.
+
+    A PASS covers the recognized commands only. Recognition is a heuristic, and
+    a hook it does not find (a wrapper script, some shell spellings) is not counted,
+    so a detail that reports on commands ends with that limit (#1457).
+    """
+    from memtomem_stm.cli import hook_hosts
+    from memtomem_stm.cli.hook_cmd import host_authorizes_replacement
+    from memtomem_stm.cli.hook_registration import (
+        NOT_PLAIN,
+        WINDOWS_SHELL,
+        inspect_hook_registration,
+        is_candidate,
+        running_on_windows,
+    )
+
+    label = "hook registration"
+    try:
+        path, handlers = hook_hosts.claude_post_tool_handlers()
+    except Exception as exc:
+        detail, action = _hook_settings_read_failure(exc)
+        check(
+            "hook_registration",
+            label,
+            "WARN",
+            f"{detail}; STM hook registrations were not checked",
+            action,
+        )
+        return
+    if not handlers:
+        return
+    windows = running_on_windows()
+    readings = [
+        (location, inspect_hook_registration(handler, windows=windows))
+        for location, handler in handlers
+        if is_candidate(handler)
+    ]
+    if not readings:
+        return
+    checked = [(loc, r) for loc, r in readings if not r.not_checked]
+    stopped = [loc for loc, r in checked if not r.runs_bridge]
+    lacking = [
+        loc for loc, r in checked if r.host is not None and not host_authorizes_replacement(r.host)
+    ]
+    lacking_set = set(lacking)
+    passing = [loc for loc, r in checked if r.runs_bridge and loc not in lacking_set]
+    shell_syntax = [loc for loc, r in readings if r.not_checked == NOT_PLAIN]
+    # Shell form on Windows is never read, so even install's own output lands
+    # here. It still WARNs, because nothing was verified, but with advice that
+    # fits: rewriting it as plain words would not make it checkable.
+    windows_shell = [loc for loc, r in readings if r.not_checked == WINDOWS_SHELL]
+    other = [
+        f"{loc} ({r.not_checked})"
+        for loc, r in readings
+        if r.not_checked and r.not_checked not in (NOT_PLAIN, WINDOWS_SHELL)
+    ]
+    where = f"in {path}; {_HOOK_REGISTRATION_SCOPE}"
+    if not (stopped or lacking or shell_syntax or windows_shell or other):
+        check(
+            "hook_registration",
+            label,
+            "PASS",
+            f"STM hook commands: {len(passing)} recognized, all passing --host claude to "
+            f"mms hook — {where}",
+        )
+        return
+    problems = []
+    steps = []
+    if stopped:
+        problems.append(
+            f"{len(stopped)} not running the hook (--help, a usage error or a subcommand): "
+            + ", ".join(stopped)
+        )
+        steps.append("fix the arguments of the commands that do not run the hook")
+    if lacking:
+        problems.append(
+            f"{len(lacking)} without --host claude, so hook compression, if enabled, "
+            "never replaces their output: " + ", ".join(lacking)
+        )
+        steps.append(
+            "add --host claude where Claude Code routing is intended (or make the last "
+            "--host claude), before any standalone --, keeping each command's other settings"
+        )
+    if shell_syntax:
+        problems.append(
+            f"{len(shell_syntax)} not checked because of shell syntax (quotes, $, ~, # or "
+            "operators): " + ", ".join(shell_syntax)
+        )
+        steps.append(
+            "check the commands with shell syntax by hand, or spell them as plain words "
+            "where that keeps their behavior (e.g. an absolute path instead of $HOME or ~)"
+        )
+    if windows_shell:
+        problems.append(
+            f"{len(windows_shell)} in shell form, which is not checked on Windows (Claude "
+            "Code may run it under Git Bash or PowerShell): " + ", ".join(windows_shell)
+        )
+        steps.append(
+            "check by hand that each Windows shell-form command runs mms hook with --host claude"
+        )
+    if other:
+        problems.append(
+            f"{len(other)} not checked (an unknown launcher or an unsupported handler "
+            "field): " + ", ".join(other)
+        )
+        steps.append("check the other not-checked commands by hand")
+    check(
+        "hook_registration",
+        label,
+        "WARN",
+        f"STM hook commands: {'; '.join(problems)} — {where}",
+        "; then ".join(steps),
+    )
+
+
+def _hook_settings_read_failure(exc: Exception) -> tuple[str, str]:
+    """``(detail, next action)`` for a Claude Code settings file doctor could not
+    read. Messages are never shown: they can quote the path's directory."""
+    from memtomem_stm.cli import hook_hosts
+
+    if isinstance(exc, hook_hosts.HookConfigLocationUnknown):
+        return (
+            "CLAUDE_CONFIG_DIR does not name a usable directory",
+            "set CLAUDE_CONFIG_DIR to an absolute directory, or unset it",
+        )
+    if isinstance(exc, hook_hosts.HookConfigNotRegularFile):
+        return (
+            "the Claude Code user settings path is not a regular file",
+            "replace it with the settings JSON file, then rerun mms doctor",
+        )
+    if isinstance(exc, hook_hosts.HookConfigNotAnObject):
+        return (
+            "the Claude Code user settings are valid JSON but not an object",
+            "make the settings file's top level a JSON object, then rerun mms doctor",
+        )
+    kind = type(exc.__cause__ or exc).__name__
+    return (
+        f"the Claude Code user settings could not be read ({kind})",
+        "make the Claude Code settings file readable and valid JSON, then rerun mms doctor",
+    )
+
+
+def _without_hook_flags(fn: Callable[..., None]) -> Callable[..., None]:
+    """Run *fn* with no hook runtime flags in effect (#1537).
+
+    Doctor's builds of its own environment must not pick up the flags of a
+    hook call it runs inside (an embedder); its build of the hook's
+    configuration applies the command's flags itself. The caller's scope is
+    back in effect when *fn* returns."""
+    from memtomem_stm.cli.host_runtime import hook_flags_scope
+
+    @wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> None:
+        with hook_flags_scope({}):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 @cli.command()
 @click.option(
     "--config",
@@ -10820,6 +11964,7 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
         "to refresh warm-LTM latency advice. Never starts a missing daemon."
     ),
 )
+@_without_hook_flags
 def doctor(
     config_path: str | None,
     *,
@@ -10830,7 +11975,8 @@ def doctor(
     """Diagnose the proxy setup end-to-end (passive unless measuring LTM).
 
     Runs the existing status/health/config checks as one PASS/WARN/FAIL
-    report with a copy-paste next action per failing check. Exit code is 1
+    report with a next action per failing check: a command to copy and run,
+    or an edit to make by hand. Exit code is 1
     when any check FAILs; WARN-only runs exit 0 — `mms doctor` passing is
     the quickstart success gate, so it must be scriptable. `health` stays
     the always-exit-0 inspection command; strict config linting stays in
@@ -10838,7 +11984,13 @@ def doctor(
     ``--measure-ltm`` explicitly authorizes read-only synthetic searches against
     an already running daemon; it still never edits configuration or LTM data.
     An explicit ``--config`` also steers the STMConfig-backed checks (LTM /
-    surfacing), not just the proxy-file checks (#839).
+    surfacing), not just the proxy-file checks (#839), unless doctor's build
+    of the hook's configuration selects the hook's daemon: those checks then
+    use that build, made from doctor's environment (not the host's), which
+    ``--config`` does not reach (#1485), with the options of the STM hook
+    command in Claude Code's user settings applied when they hold exactly one
+    that ``mms hook install`` owns, no other handler that may run the hook,
+    and doctor is not on Windows (#1494).
     """
     resolved_cfg = resolve_cli_config_path(config_path)
     config_path = resolved_cfg.path
@@ -10868,6 +12020,7 @@ def doctor(
 
     servers_payload: dict[str, Any] | None = None
     surfacing_status: dict[str, Any] | None = None
+    hook_build: _HookBuild | None = None
 
     # 1. config file exists — every later check reads it, so FAIL
     # short-circuits the report instead of cascading noise. The detail names
@@ -11413,12 +12566,18 @@ def doctor(
                 prefer_hook_daemon=True,
                 config_path=_explicit_config_path(config_path),
             )
+            # Before anything renders the status: never part of ``--json``.
+            hook_advice = surfacing_status.pop(_HOOK_ADVICE_KEY, None)
+            hook_build = surfacing_status.pop(_HOOK_BUILD_KEY, None)
+            hook_command = _names_hook_command(surfacing_status)
             ltm = surfacing_status.get("ltm_server")
+            view_note = _hook_view_note(surfacing_status.get("hook_view"), ltm)
+            view_suffix = f"; {view_note}" if view_note else ""
             if isinstance(ltm, dict) and ltm.get("connected"):
                 detail = str(ltm.get("display") or ltm.get("command") or "")
                 if ltm.get("version"):
                     detail = f"{detail}, version {ltm['version']}"
-                check("ltm", "ltm server", "PASS", f"connectable ({detail})")
+                check("ltm", "ltm server", "PASS", f"connectable ({detail}){view_suffix}")
                 for runtime_check in surfacing_status.get("runtime_profile_checks", []):
                     check(
                         runtime_check["id"],
@@ -11492,9 +12651,9 @@ def doctor(
                     "ltm server",
                     "WARN",
                     f"{cause} — only LTM-dependent features (memory surfacing) are "
-                    "disabled; the proxy core is unaffected",
+                    f"disabled; the proxy core is unaffected{view_suffix}",
                     (
-                        "mms daemon status"
+                        _daemon_command("status", hook_command=hook_command)
                         if isinstance(ltm, dict) and ltm.get("route") == "daemon"
                         else "export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=<memtomem-server>"
                         "  # see docs/surfacing.md"
@@ -11522,17 +12681,86 @@ def doctor(
             # optional measurement above is the only path that executes a
             # synthetic search.  These are WARN-only operational checks: an
             # undersized budget degrades surfacing but never breaks proxying.
-            if measure_ltm and (
-                not isinstance(ltm, dict)
-                or ltm.get("route") != "daemon"
-                or ltm.get("daemon_reachable") is False
-            ):
+            if measure_ltm and not isinstance(ltm, dict):
+                # The bootstrap raised (while loading the configuration or
+                # later, even after measuring); the ``ltm`` row above already
+                # renders its sanitized error, and no result survives.
                 check(
                     "ltm_measurement",
                     "ltm measurement",
                     "WARN",
-                    "--measure-ltm requires surfacing.use_daemon=true and a running daemon",
-                    "export MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                    "--measure-ltm result unavailable: the surfacing status could not be "
+                    "read (see the ltm server row)",
+                    "see the ltm server row",
+                )
+            elif (
+                measure_ltm and isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled"
+            ):
+                # Either route: the probe never pinged, so whether a daemon runs
+                # is unknown.
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm did not run: surfacing is disabled",
+                    "enable surfacing (surfacing.enabled, default true), then rerun",
+                )
+            elif (
+                measure_ltm
+                and isinstance(ltm, dict)
+                and ltm.get("route") != "daemon"
+                and isinstance(hook_advice, _HookAdvice)
+                and hook_advice.built
+                and hook_advice.use_daemon is False
+            ):
+                # The command's ``--no-daemon`` decided the hook's route (#1501),
+                # so no form of ``hook.use_daemon`` turns it back on (#1505).
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm needs a daemon route and a running daemon: the STM hook "
+                    f"command at {hook_advice.location} sets --no-daemon, which decides "
+                    "the hook's route, and surfacing.use_daemon is off",
+                    "replace --no-daemon with --use-daemon in the STM hook command at "
+                    f"{hook_advice.location} (Claude Code user settings), or export "
+                    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                )
+            elif measure_ltm and isinstance(ltm, dict) and ltm.get("route") != "daemon":
+                # The daemon route is the hook's when its ``hook.use_daemon``
+                # is on (#1485, #1495), else the standalone
+                # ``surfacing.use_daemon`` one.
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm needs a daemon route (the hook's, with hook.use_daemon "
+                    "true, the default, or surfacing.use_daemon=true) and a running daemon",
+                    "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
+                    "use_daemon in MEMTOMEM_STM_HOOK) or export "
+                    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                )
+            elif (
+                measure_ltm and isinstance(ltm, dict) and ltm.get("discovery_key_unusable") is True
+            ):
+                # Not "did not run": the key can fail at the refresh ping
+                # after every sample completed, and that result is discarded.
+                # ``mms daemon start`` exits on the same key (#1519).
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm result unavailable: the daemon discovery key cannot be "
+                    "used (see the ltm server row)",
+                    _daemon_command("status", hook_command=hook_command),
+                )
+            elif measure_ltm and isinstance(ltm, dict) and ltm.get("daemon_reachable") is False:
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm requires a running daemon for the probed configuration",
+                    _daemon_command("start", hook_command=hook_command),
                 )
             elif isinstance(ltm, dict) and ltm.get("route") == "daemon":
                 measurement = ltm.get("measurement")
@@ -11648,7 +12876,13 @@ def doctor(
                             "WARN",
                             f"configured {surfacing_current:g}s; warm-daemon telemetry "
                             f"recommends {recommended:g}s ({recommendation_status})",
-                            f"export MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS={recommended:g}",
+                            _hook_deadline_advice(
+                                hook_advice,
+                                _SURFACING_TIMEOUT_ENV,
+                                "--surfacing-timeout-seconds",
+                                recommended,
+                            )
+                            or f"export MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS={recommended:g}",
                         )
                     else:
                         check(
@@ -11696,7 +12930,7 @@ def doctor(
                             "the running daemon predates the surfacing outcome counters; "
                             "its failures are unreported and its timeout recommendation is "
                             "derived from durations that include failed searches",
-                            "mms daemon restart",
+                            _daemon_command("restart", hook_command=hook_command),
                         )
                     elif failures:
                         # Neutral about the cause on purpose: this population
@@ -11713,7 +12947,7 @@ def doctor(
                             f"warm LTM search ({breakdown['timeout_samples']} timed out, "
                             f"{breakdown['error_samples']} faulted after issuing one, "
                             f"{breakdown['pre_rpc_faults']} never issued one)",
-                            "mms daemon status",
+                            _daemon_command("status", hook_command=hook_command),
                         )
                     elif isinstance(surface_summary, dict) and surface_summary.get("samples"):
                         # No count on this side: ``samples`` is windowed, so
@@ -11743,7 +12977,13 @@ def doctor(
                             "WARN",
                             f"configured {hook_current:g}s; outer hook deadline truncates the "
                             f"inner surfacing budget (need >= {hook_recommended:g}s)",
-                            "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS="
+                            _hook_deadline_advice(
+                                hook_advice,
+                                _HOOK_DAEMON_TIMEOUT_ENV,
+                                "--daemon-timeout-seconds",
+                                hook_recommended,
+                            )
+                            or "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS="
                             f"{hook_recommended:g}",
                         )
                     else:
@@ -11756,26 +12996,82 @@ def doctor(
 
     # Last check: bare env construction — what `mms hook` and the daemon see.
     # Those paths have no --config flag, so this deliberately ignores the
-    # flag: a broken MEMTOMEM_STM_* env silently degrades hook surfacing/
-    # compression to pass-through and stops the daemon from starting (#847).
-    # WARN, never FAIL: the flag-driven checks above may be fully healthy,
-    # and doctor's exit code must not flip for a degradation the proxy
-    # itself does not share. Runs outside the config_file short-circuit —
-    # it does not read the file.
-    from memtomem_stm.config import STMConfig
+    # flag. A proxy-only break leaves them running with proxy defaults; any
+    # other break degrades hook surfacing/compression to pass-through and
+    # stops the daemon from starting (#847). WARN, never FAIL: the
+    # flag-driven checks above may be fully healthy, and doctor's exit code
+    # must not flip for a degradation the proxy itself does not share. Runs
+    # outside the config_file short-circuit — it does not read the file.
+    #
+    # When doctor read exactly one STM hook command (the ``found`` view the
+    # ``ltm`` row routed with), the hook builds with that command's options
+    # over its environment, not the bare environment: the row then reports
+    # that build and the bare one separately (#1506). It reuses the view and
+    # the build the surfacing section made, so both rows describe one build;
+    # only when that section did not reach it does the row read the view.
+    from memtomem_stm.config import load_env_stm_config
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
+    env_view: _HookCommandView | None = None
+    hook_outcome: EnvSTMConfigLoad | Exception | None = None
+    if hook_build is not None:
+        env_view, hook_outcome = hook_build.view, hook_build.outcome
+    else:
+        try:
+            env_view = _hook_command_view()
+        except Exception as exc:
+            # The type alone: a message can quote the settings (#1075).
+            logger.debug("hook command view unavailable (%s)", type(exc).__name__)
+    found_view = env_view if env_view is not None and env_view.state == "found" else None
+    found_outcome: EnvSTMConfigLoad | Exception | None = None
+    if found_view is not None:
+        found_outcome = hook_outcome
+        if found_outcome is None:
+            try:
+                found_outcome = load_env_stm_config(found_view.env)
+            except Exception as exc:
+                found_outcome = exc
+
+    bare_outcome: EnvSTMConfigLoad | Exception
     try:
-        STMConfig()
+        bare_outcome = load_env_stm_config()
     except Exception as exc:
+        bare_outcome = exc
+    if found_view is not None and found_outcome is not None:
+        # The route the surfacing section decided, as the other rows read it;
+        # ``None`` when that section did not run (a missing config file).
+        decided = surfacing_status if hook_build is not None else None
+        check(
+            "env_overrides",
+            "env overrides",
+            *_env_overrides_found_row(
+                found_view,
+                found_outcome,
+                bare_outcome,
+                hook_daemon=decided is not None and _names_hook_command(decided),
+            ),
+        )
+    elif isinstance(bare_outcome, Exception):
+        hint = env_var_hint_for_validation_error(bare_outcome)
         check(
             "env_overrides",
             "env overrides",
             "WARN",
             "bare STMConfig() fails — hook surfacing/compression degrade "
-            "to pass-through (logged per call) and the daemon cannot start"
-            + env_var_hint_for_validation_error(exc),
-            "unset or fix the MEMTOMEM_STM_* variable(s) named above",
+            "to pass-through (logged per call) and the daemon cannot start" + hint,
+            # A SettingsError (an undecodable payload) has no hint by design.
+            _ENV_FIX_NAMED if hint else _ENV_FIX_UNDECODABLE,
+        )
+    elif bare_outcome.proxy_error is not None:
+        hint = env_var_hint_for_validation_error(bare_outcome.proxy_error)
+        check(
+            "env_overrides",
+            "env overrides",
+            "WARN",
+            "MEMTOMEM_STM_PROXY* is invalid — mms hook and the daemon ignore it "
+            "and run with proxy settings at defaults; hook metrics are not "
+            "recorded" + hint,
+            _ENV_FIX_NAMED if hint else _ENV_FIX_PROXY_UNDECODABLE,
         )
     else:
         check(
@@ -11784,6 +13080,8 @@ def doctor(
             "PASS",
             "bare STMConfig() constructs — hook/daemon env path healthy",
         )
+
+    _doctor_hook_registration_check(check)
 
     counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}
     overall = "fail" if counts["FAIL"] else ("warn" if counts["WARN"] else "pass")

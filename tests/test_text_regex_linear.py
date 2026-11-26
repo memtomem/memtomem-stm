@@ -219,13 +219,13 @@ class TestCodeBoundaryAfterBlankLines:
         assert starts == [text.index("\n    def")]
         assert [m.start() for m in OLD_CODE_BOUNDARY_RE.finditer(text)] == [text.index("\n")]
 
-    def test_signature_snippets_survive_leading_blank_lines(self):
-        # The snippet is the body's first line plus up to 3 more non-empty
-        # ones; blank lines opening the body used to fill that window, which
-        # left the later blocks with no signature at all.
+    def test_signatures_survive_leading_blank_lines(self):
+        # Blank lines opening a block used to fill its preview window, which
+        # left a later block with an empty preview; a preview now starts at
+        # the block's first non-blank line, its signature.
         out = TruncateCompressor().compress(_code_blocks(3), max_chars=300)
         assert "... (9 more blocks)" in out
-        assert "def f3(x):\n    a = 3" in out
+        assert all(f"def f{i}(x):" in out for i in range(3, 8))
 
 
 # A consumer given an input that took tens of seconds before the fix; each

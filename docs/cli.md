@@ -170,7 +170,7 @@ mms init --resume --client codex  # continue an existing setup
 
 Claude Code keeps its user-scope servers, its per-project (`local`) servers and its `/mcp` disables in one global config file, and STM reads that file the way Claude Code 2.1.316 picks it (read from its executable and measured on macOS; Linux and Windows follow the same code, with the home directory taken from `HOME`, or `USERPROFILE` on Windows, and were not measured): `$CLAUDE_CONFIG_DIR/.claude.json` when `CLAUDE_CONFIG_DIR` is set to an absolute path, `~/.claude.json` otherwise. Within it, the project entry is the one Claude Code uses for the current directory: the root of the repository the directory is in (the nearest `.git` directory), so a subdirectory finds the servers registered at the repository root, or the directory itself, with symlinks resolved, outside any repository. `claude mcp add` and `claude mcp remove`, which `prune` and `eject` run, inherit the same environment, so they act on the entry STM read. Both check again right before each of those calls and refuse when STM can no longer tell which file is in use (a legacy `.config.json` appearing mid-run: a `prune` row becomes manual if this happens before planning and failed after, and `eject --force` says when its pre-remove already ran); a config edited or replaced while they run is not detected.
 
-STM reads nothing from Claude Code's global config, and says so, when it cannot tell which file Claude Code uses: `CLAUDE_CODE_CUSTOM_OAUTH_URL` is set (Claude Code then reads a differently named file); `CLAUDE_CONFIG_DIR` is set but empty (Claude Code then uses a `.config.json` in its own working directory when there is one), relative, or has a `.` or `..` component (Claude Code joins paths lexically, while macOS and Linux resolve `..` through symlinks); the home directory is unset, relative or has such a component; or a legacy `.config.json` exists in Claude Code's config directory (`$CLAUDE_CONFIG_DIR`, or `~/.claude`), which Claude Code may use instead. The same holds when the file exists but is not a readable JSON object. `init`, `add --from-clients` and `prune` then print `Note: Claude Code user and project servers were not read: <reason>.` and work with the other sources; when STM cannot tell which file is in use, [`eject`](#eject) to a Claude Code target refuses before touching any host config; `mms host status` and `sync` report the entries those sources hold as `not_inspected` and keep them (see [`mms host`](#mms-host--host-config-drift-inspection-and-sync)). In a linked worktree, a submodule or behind a symlinked `.git`, the project entry is not read either — the same commands print `Note: Claude Code project servers were not read: <reason>.` when the config has project entries — because Claude Code files a worktree under its main checkout only after path checks STM does not reproduce.
+STM reads nothing from Claude Code's global config, and says so, when it cannot tell which file Claude Code uses: `CLAUDE_CODE_CUSTOM_OAUTH_URL` is set (Claude Code then reads a differently named file); `CLAUDE_CONFIG_DIR` is set but empty (Claude Code then uses a `.config.json` in its own working directory when there is one), relative, or has a `.` or `..` component (Claude Code joins paths lexically, while macOS and Linux resolve `..` through symlinks); the home directory is unset, relative or has such a component; or a legacy `.config.json` exists in Claude Code's config directory (`$CLAUDE_CONFIG_DIR`, or `~/.claude`), which Claude Code may use instead. The same holds when the file exists but is not a readable JSON object. `init`, `add --from-clients` and `prune` then print `Note: Claude Code user and project servers were not read: <reason>.` and work with the other sources; when STM cannot tell which file is in use, [`eject`](#eject) to a Claude Code target refuses before touching any host config; `mms host status` and `sync` report the entries those sources hold as `not_inspected` and keep them (see [`mms host`](#mms-host--host-config-drift-inspection-and-sync)). In a linked worktree, a submodule or behind a symlinked `.git`, the project entry is not read either — the same commands print `Note: Claude Code project servers were not read: <reason>.` when the config has project entries — because Claude Code files a worktree under its main checkout only after path checks STM does not reproduce. [`mms import`](#mms-import--populate-the-registry-from-host-configs) names each skipped source on its own stderr line instead — `Note: Claude Code (user) not inspected: <reason>.`, and the same for `Claude Code (project)` and `.mcp.json (project)`. When STM cannot name the project entry (the worktree, submodule and symlink cases above), `mms import` reports `Claude Code (project)` as skipped whenever the config is a non-empty object, with or without project entries; an empty `{}` gives no note.
 
 ### `register`
 
@@ -548,7 +548,7 @@ Key semantics:
 - **Targets.** Entries restore to their recorded origin. Claude Code scopes go through `claude mcp add-json` (the project scope runs at the recorded project path); `.mcp.json` and Claude Desktop are direct atomic JSON edits. A `cursor-*` origin is not a target — nothing here writes a Cursor config — so those entries need an explicit `--to` naming one of the four writable kinds, and `--to cursor-user` / `--to cursor-project` are rejected outright. Entries without a usable origin (manual `mms add`, imports predating provenance capture, a vanished project directory) need an explicit `--to`. Choosing a target does not change the payload: a captured `origin.original` is still restored verbatim, whatever the destination. Only an entry with no captured original is reconstructed, with warnings for what import-time normalization lost (filtered env keys, HTTP headers).
 - **No-clobber.** A same-name entry already at the target is compared by the same identity rule [`prune`](#prune) uses — command/URL, args and `env`/`headers`: identical → idempotent skip; different or not comparable → that entry fails with a hint unless `--force` (which replaces it). An unreadable or malformed target config fails the pre-check before any host write, even with `--force`; only a genuinely missing file or entry is treated as absent. Fix the target config and retry. A `claude-user`/`claude-project` target is the [config Claude Code uses](#which-claude-code-config-stm-reads) — under an absolute `CLAUDE_CONFIG_DIR`, `$CLAUDE_CONFIG_DIR/.claude.json` — and the project entry is the one Claude Code picks for the recorded directory; when STM cannot tell either, eject refuses before reading a host config or invoking Claude: restore manually in the active Claude configuration. Explicit `.mcp.json` and Claude Desktop targets are unaffected. Identity is the gate on *overwriting* someone else's entry; the release of the STM entry is gated separately and more strictly, by the deep-equality check below.
 - **Verified release.** The STM entry is only removed once the host entry deep-equals the restore payload. The claude CLI re-serializes through its own schema and silently drops fields it doesn't know, so a clean `add-json` exit isn't proof; on mismatch the entry stays in STM (dual registration) unless you pass `--accept-schema-loss`.
-- **Secret gate.** Payloads with secret-classified `env`/`headers` values would appear on the `claude` argv (visible in the process list). On a TTY you get an explicit per-entry confirmation; non-TTY callers must pass `--allow-argv-secrets`. `--yes` never bypasses this gate.
+- **Secret gate.** Payloads with secret-classified `env`/`headers` values (the same classifier as [`mms import`](#secret-classification)) would appear on the `claude` argv (visible in the process list). The gate applies only to entries written back through `claude mcp add-json` — the `claude-user` and `claude-project` targets; `.mcp.json` and Claude Desktop writes and idempotent skips never reach it. On a TTY you get an explicit per-entry confirmation; non-TTY callers must pass `--allow-argv-secrets`. `--yes` never bypasses this gate.
 - **Failures are per-entry and non-fatal.** Each failed entry keeps its STM registration. Write-time failures print an exact manual restore command; plan-time refusals explain the failed precondition without printing the payload; the run exits 1 if anything failed. When an entry has no origin, the [prune backup log](#prune) (`~/.memtomem/pruned_upstreams.json`) is suggested as a starting point for `--to` — verify it's current first; eject never auto-adopts it.
 - **`--json`.** stdout carries a single result document: `{"action": "eject", "ok": ..., "dry_run": ..., "keep": ..., "config_path": ..., "plan": [...], "restored": [...], "removed_from_stm": [...], "failed": [{"name", "error", "hint"}]}`, mirroring the human plan display per entry (`target`, `write`, `verbatim`, `warnings`, `pruned_duplicates`, `error`). The captured host original itself is never serialized into `plan` rows; each `failed` row's `hint` is the same manual restore command the terminal prints — like that stderr hint, it embeds the restore payload (secrets included), so treat failed-eject `--json` output like the config file itself. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`, and the secret gate fails the entry at plan time instead of confirming (pass `--allow-argv-secrets` to proceed).
 
@@ -679,7 +679,7 @@ Options:
                            daemon may receive one additional prime search.
 ```
 
-One read-only diagnostic pass over the whole setup, designed for "I just installed this — why isn't it working?". Every check prints `PASS` / `WARN` / `FAIL`, a short cause, and — for anything that isn't a `PASS` — a `next:` line you can run as-is. **Exit code is 1 when any check FAILs; WARN-only runs exit 0.** That makes `mms doctor` the scriptable success gate for a fresh install: [`health`](#health) stays the always-exit-0 connectivity inspection, [`config validate`](#config-validate) stays the strict schema lint.
+One read-only diagnostic pass over the whole setup, designed for "I just installed this — why isn't it working?". Every check prints `PASS` / `WARN` / `FAIL`, a short cause, and — for anything that isn't a `PASS` — a `next:` line when there is an action to take: a command you can run as-is, or the edit to make by hand. **Exit code is 1 when any check FAILs; WARN-only runs exit 0.** That makes `mms doctor` the scriptable success gate for a fresh install: [`health`](#health) stays the always-exit-0 connectivity inspection, [`config validate`](#config-validate) stays the strict schema lint.
 
 The server-shaped checks (`proxy enabled`, `server transports`, `prefixes`, `upstream: <name>`, and the `upstreams` warning) read an **env-overlaid** config rather than the file alone, so `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<NAME>__<FIELD>` servers are counted, validated and probed like file-declared ones, and an env override of a file-declared field is what gets probed. Only a config that fails the `config schema` check falls back to the raw file, since no effective snapshot exists to trust. JSON-valued vars are read the way the server reads them, so the aggregate `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS='{…}'` and JSON leaves like `…__ARGS='["--one"]'` are decoded rather than reported as schema failures (#834). The remaining config checks (`cache policy`, `compression tuning`) still read the file as written.
 
@@ -702,13 +702,15 @@ Checks, in order:
 | `host registration` | Codex, Claude Code, and project `.mcp.json` discovery | WARN: STM registration not detected |
 | `cache policy` | the `config validate` advisory predicate | WARN: cache enabled but `tool_annotation_policy` unset (conservative default caches unclassified tools) |
 | `compression tuning` | proxy metrics sample inventory | PASS with readiness or collection status; never writes tuning |
-| `ltm server` | the `health` LTM probe | WARN: LTM unconfigured/unreachable — **never FAIL**; only LTM-dependent features are disabled |
+| `ltm server` | the `health` LTM probe, except when doctor's build of the hook's configuration (below) selects the hook's daemon: then that daemon, looked up under that build's fingerprint. Doctor first reads Claude Code's user settings (the file `mms hook install --host claude` writes). When they hold exactly one handler `mms hook install` owns (its own command words, `"type": "command"`, no `args`, no `shell` other than Bash) and nothing else that may run STM's hook, that command's flags (`--use-daemon`/`--no-daemon`, `--surfacing-timeout-seconds`, `--daemon-timeout-seconds`, `--[no-]persist-query-text`) are applied over doctor's environment for the build, as the hook applies them: over every form that environment gives the same setting. Otherwise (no owned handler, several, a handler install does not own that may still run the hook, such as a hand-written `mms hook --host claude` or an `env MEMTOMEM_STM_…` prefix, an unreadable file, or any handler on Windows) the build reads doctor's environment alone. As in the hook, the command's `--use-daemon`/`--no-daemon`, when doctor read one, decides the route; without one, `hook.use_daemon` in that build does (true, the default — however it is set: `MEMTOMEM_STM_HOOK__USE_DAEMON`, `use_daemon` in `MEMTOMEM_STM_HOOK`, any letter case). Handlers that may run the hook are found with the look-alike test `mms hook install` uses, leaving out those `mms hook` would not run as the bridge (`--help`, a subcommand): one behind a wrapper script or spelled with shell syntax can be missed, and some that cannot run the hook (a comment, an exec-form `--help` with a quoted argument) are counted, which only falls back to doctor's environment. The build ignores `--config` and is not stopped by an invalid `MEMTOMEM_STM_PROXY*` variable, which the `env_overrides` row reports instead; the surfacing checks below read the same build. When that build rejects any other variable (a setting that does not decode or validate), this section reports the error of the build doctor makes with `--config`, which carries none of the hook command's flags. Doctor makes that build of the hook's configuration from its own environment (with the registered command's flags when it read them), not the host's, so it can fail where the hook's does not, or the reverse. With the hook's daemon off, the standalone route is probed with the `--config` view, without the hook command's settings. The detail ends with the route chosen, whether a probe ran, and what doctor chose it from (the command's options over its environment, or its environment alone and why the command was not used), naming the handler by location, never its text; it does not say why the registered hook behaves as it does. Not read: project, local and managed Claude Code settings, other hosts' hook configurations, and the host's own environment | WARN: LTM unconfigured/unreachable — **never FAIL**; only LTM-dependent features are disabled |
 | `ltm runtime profile` / `dependencies` | Core runtime-profile schema 1 | FAIL when active dense/rerank dependencies are missing or Core cannot read effective config; older Core is WARN |
 | `ltm retrieval mode` | Core configured/effective search mode | FAIL on disabled or unexpected dense-to-BM25 degradation; intentional BM25-only is WARN |
 | `ltm RRF boundary` | Core fusion settings and configured STM floors | PASS when the configured floor lies inside both theoretical RRF intervals; otherwise WARN with a conditional pin suggestion or a reason no pin is available. See [RRF boundary diagnostics](surfacing.md#rrf-boundary-diagnostics) for the Core requirement and assumptions |
 | `ltm score scale` | feedback diagnostics | FAIL while a recent score-scale mismatch episode remains unrecovered |
 | `ltm measurement` / timeout checks | daemon latency telemetry | WARN when measurement cannot run or configured surfacing/hook deadlines are too small |
 | `surfacing outcomes` | daemon `latency.surface` counters | WARN when the surface series records a request that timed out, faulted after issuing a search, or never issued one, with that breakdown; healthy skips (allowlist, gate, cache) and requests refused before admission (`expired`, `busy`) are not in this population, and raw/synthetic `retrieval` traffic is not counted here — see `ltm measurement`. A daemon predating the counters WARNs asking for a restart rather than reading their absence as zero. Independent of whether there is enough data to size a timeout |
+| `env overrides` | `load_env_stm_config()`: the settings sources `mms daemon start` reads, never doctor's `--config` argument, as `mms daemon start` builds and as `mms hook` builds after applying its command's options | WARN — **never FAIL** — when a build fails or only `MEMTOMEM_STM_PROXY*` breaks it (that build then drops every `MEMTOMEM_STM_PROXY*` variable and runs with proxy settings at defaults). Without the hook command below, the row reports one build, doctor's environment alone: when it fails, hook surfacing/compression pass through and the daemon cannot start. When doctor reads exactly one STM hook command `mms hook install` owns and nothing else that may run the hook (the conditions of the `ltm server` row above), it reports two builds, each with its own consequence and the variables its error implicates: that command's options over doctor's environment, as the hook builds (when it fails, a hook run with doctor's environment and those options passes surfacing/compression through; when the `ltm server` check runs, this is the build doctor decides the hook-daemon route with), and doctor's environment alone (when it fails, `mms daemon start` from that environment exits 1). The variables an error implicates are named when the error identifies them; they can include a valid variable under the failing setting, and an undecodable payload hides any later error. So the next action does not pick a culprit. When doctor's environment alone warns, it points to the variables named for that build, or, when none is named, to a value settings cannot decode. When doctor took the hook's daemon route for the command (as the `ltm server` row says) and the command's build constructs, a failing clause for doctor's environment alone names plain `mms daemon start`; and the next action names `mms daemon start --hook-command claude` too, which builds the daemon's configuration as the hook's command does. This row does not judge whether that start would succeed; the `ltm server` row reports what its probe found (an unusable discovery key, surfacing off), and a lock or a `data_dir` it cannot use still stops it. When the hook command's build warns (it fails, or ignores an invalid `MEMTOMEM_STM_PROXY*`), it points to that command's options (named by location) or the variables its build reads, then a rerun of doctor. Names the handler by location and path, never its text or values. Like the `ltm server` row, it reads doctor's environment, not the host's |
+| `hook registration` | the PostToolUse handlers in Claude Code's user settings (`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`), read with `mms hook`'s own options | WARN when an STM hook command lacks `--host claude` (hook compression, if enabled, then never replaces its output), does not run the hook (`--help`, a usage error, a subcommand or another leftover word; a `--host` after a leftover word is never parsed, so its host is not judged), or is not checked. Only plain words are read: in shell form every word must be one (no quotes or expansions such as `$HOME` or `~`); in exec form (`args`) every argument must be, and the executable may be any path whose last component, as written, is an STM entry point (no `=`, control characters or trailing `/`). Before the executable only `MEMTOMEM_STM_*=` assignments (shell form) or `env` with them are allowed, and `uv run --directory <dir> <entry point>` (a bare entry-point name) is the only other launcher; `python -m memtomem_stm hook` is reported as not checked. Anything else, a `shell` field other than `bash` (or any `shell` next to `args`), and the `env` launcher on Windows (Git's MSYS `env.exe`) are reported as not checked rather than guessed. On Windows, shell form is never read, even with `shell: "bash"` (Git Bash may convert path-like arguments, and without it PowerShell runs the line); those commands WARN with advice to check them by hand (install writes that form, so a correct Windows install WARNs too; exec form is still read). Elsewhere, a line with shell syntax becomes checkable when spelled as plain words, where that keeps its behavior, e.g. `/Users/me/.local/bin/mms hook --host claude` instead of `$HOME/.local/bin/mms hook --host claude`. A settings file that cannot be used is a WARN that names the reason (an unusable `CLAUDE_CONFIG_DIR`, a path that is not a regular file, valid JSON that is not an object, or otherwise only the exception type). Names locations (`hooks.PostToolUse[i].hooks[j]`), never command text. Not gated on compression being enabled, since the hook process's environment is not visible here. The `next:` line is a hand edit, not `mms hook install --host claude --apply`: install replaces only a handler in the form it writes (`memtomem-stm hook --host claude`, bare or after `uv run --directory <dir>`, with its own setting flags or none) and leaves every other STM hook line, such as `mms hook` or `NAME=value mms hook`, in place beside the handler it adds. An STM hook is recognized from the command text (in exec form, the command and its `args`) by a heuristic: it looks for an STM name (`mms`, `memtomem-stm`, `memtomem-stm-proxy`, or the module `memtomem_stm`) and a later `hook`: as whole words when the line is plain words, and anywhere in the raw text for any other line. A shell line of only plain words and quotes (up to 4,096 characters, balanced) is also matched as whole words after quote removal. A PASS (`N recognized, all passing --host claude to mms hook`) covers the recognized commands only, and a detail that reports on commands ends by saying a hook can be missed: a wrapper script whose command names neither is not counted, and neither are spellings such as `m"m"s hook # note`, `sh -c 'm"m"s hook'` and `python -mmemtomem_stm hook` (while `m"m"s hook` and `sh -c "mms hook"` are). In the other direction, a command that only mentions both words (`mms version hook`) is counted and reported as not checked. Project, local and managed settings are not read. No row when the file is absent or holds no command recognized as STM's hook |
 
 `--json` emits a single document: `{"config_path", "status": "pass"|"warn"|"fail", "checks": [{"id", "label", "status", "detail", "next_action"}, ...]}` plus, once probing ran, the staged `servers` map (same shape as `health --json`) and the `surfacing` bootstrap payload. Active Ollama dependencies add one grouped `ollama_endpoint:<digest>` check per unique base URL (the digest covers the URL without its userinfo, query string or fragment; an endpoint that has any of those appends a digest of its own use sites, so credential-only twins stay distinct and IDs never depend on a secret); duplicate models and use sites share its single inventory request. Short-circuited runs contain only the checks that executed. Probe entries keep the shape documented above: the `description budget` check reports counts and lengths, and no advertised description text enters the document. Configuration values that commonly carry credentials are not printed: `args` values (probe validation errors name locations and error types only, and the LTM server's arguments are hidden as in [`health`](#health)), `env` and `headers` values, and URL userinfo. Probe errors cannot quote them back, since they carry no exception message (see [`health`](#health)). Identifiers you act on are shown deliberately — server names, prefixes (the `prefixes` check names each colliding prefix, since that is the value to change), commands, transports, file paths, model names, and URLs as scheme, host and path: userinfo shows as `***@`, and the query string and fragment are dropped. A URL the parser may have split wrongly — any `@` outside its authority, such as a `?`, `#` or `/` inside the userinfo, or an encoded `@` — is shown as `<unparseable url>`. That includes a legitimate `@` in a path or query (`/users/@me`), since no rule on the URL's shape can tell the two apart.
 
@@ -771,19 +773,32 @@ Options:
   --tool TEXT                Filter to one upstream tool name.
   --source [mcp|hook]        Filter compression rows by provenance: 'mcp'
                              (proxied upstream tools) or 'hook' (native
-                             built-in tools recorded by 'mms hook').
+                             built-in tools recorded by 'mms hook'). 'hook'
+                             also omits the cache block, since only proxied
+                             tools are cached.
   --all-time                 Report compression over all rows ever recorded
                              since the daily rollup was installed (retained
                              rows plus rolled-up trimmed rows), instead of
-                             retained rows only.
+                             retained rows only. The hook status counts
+                             include trimmed rows once the status rollup is
+                             installed; before that they cover retained rows
+                             only. Progressive delivery likewise counts
+                             purged reads since its rollup was installed;
+                             surfacing stays retained.
   --json                     Output as JSON for scripting.
 ```
 
 Shows proxy compression and surfacing statistics from the persistent databases (`proxy_metrics.db` and `stm_feedback.db`). `--source mcp` limits the compression rows to proxied upstream tools, `--source hook` to native built-in tools recorded by `mms hook`; omit it to include both. 
 
-It reads these files read-only (without creating or migrating them). The totals cover only the rows still retained, not all time: `proxy_metrics` is capped at `proxy.metrics.max_history` rows per source (default 10000; the oldest are trimmed in batches, so a source can briefly exceed it, and `mms hook` takes the cap only from `MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY`), progressive reads older than `proxy.progressive_reads.retention_days` (default 90) are purged when the server starts with progressive-read collection enabled, and surfacing rows age out after `surfacing.stats_retention_days` (default 90; checked at server start and then opportunistically, at most hourly). When both sources are present, the compression block prints the `mcp` and `hook` ratios separately under the aggregate; a source whose rows are all structured deliveries shows no text ratio. The **Progressive delivery** block compares the chars produced for paged responses with the chars delivered to the agent, counting every recorded read (rereads count again), and is filtered by `--tool` but not by `--source`. Because the live MCP server keeps additional in-memory counters that a separate CLI process cannot see, the numbers here reflect only what has been successfully flushed/written to disk.
+It reads these files read-only (without creating or migrating them). The totals cover only the rows still retained, not all time: `proxy_metrics` is capped at `proxy.metrics.max_history` rows per source (default 10000; the oldest are trimmed in batches, so a source can briefly exceed it, and `mms hook` takes the cap only from `MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY`), progressive reads older than `proxy.progressive_reads.retention_days` (default 90) are purged when the server starts with progressive-read collection enabled, and surfacing rows age out after `surfacing.stats_retention_days` (default 90; checked at server start and then opportunistically, at most hourly). When both sources are present, the compression block prints the `mcp` and `hook` ratios separately under the aggregate; a source whose rows are all structured deliveries shows no text ratio. The `hook` rows are further split by host, because a host whose hook cannot replace tool output (Codex, Cursor, Kimi) only ever adds to the denominator of the `hook` ratio: each host gets a line with its own ratio, a host that cannot replace output is marked `measured only` with no ratio, and rows that carry no host (written by 0.7.9 or earlier, or by an older `mms hook` sharing the file) are grouped as `(host not recorded)`. When the rows form a single group the lines are omitted, unless that group is a host that cannot replace output. `mms hook` records the host in the row's `server`, as `builtin:<host>` (`builtin:claude`, `builtin:codex`, …), which is what the per-tool table shows; since the daily rollup is keyed by server, the split holds under `--all-time` too. `--json` carries the split as `hook_by_host` (`null` under `--source mcp` or when the compression summary is unavailable: the metrics DB cannot be read, or `--all-time` runs before the daily rollup is installed), a list of `host`, `calls`, `original_chars`, `compressed_chars`, `saved_ratio` and `can_replace_output`. `can_replace_output` is what the host's adapter in the running version can do (`null` for an unrecorded or unknown host), not a record of whether output was replaced when the row was written: a Claude Code row from a registration without `--host claude`, or from one with hook compression off, is still labelled `claude`. Each `hook` row also records what the hook's output-compression stage decided, and under each host that can replace output a `status:` line counts its rows by that decision: `compressed`; left alone by the gate (`below_threshold`, `already_compressed`, `retention_guard` when the result would keep less than `hook.compression.min_retention`, `budget_too_small`, `unsafe_result` for a failed, interrupted or image result); not a candidate (`disabled`, `ineligible_event`, `ineligible_tool`, `unsupported_shape`); refused because the host cannot replace output (`unsupported_host`) or because the hook was registered without `--host claude` (`replacement_not_requested`); and `error`. Rows written before the status was recorded count as `not recorded`, and a stored value outside this list as `other`. A host that cannot replace output gets no `status:` line, since its `measured only` line already says why, and neither does the `(host not recorded)` group when none of its rows recorded a status, unless some of its calls were trimmed with no status kept (`status not kept`, below). Counts are listed largest first, with `not recorded` last. Without `--all-time` these counts cover the retained rows. Under `--all-time` they also cover the trimmed rows: the status of every trimmed `hook` row is kept in a second never-pruned table, `proxy_metrics_hook_status_daily` (one row per UTC day, server, tool and status), fed by its own database trigger like the daily rollup below. Hook calls that were already in the daily rollup when this version first opened the metrics DB were trimmed with no status kept; they are counted once, at that point, and the line ends with `status not kept N` for them, so the counts under `--all-time` add up to the host's calls. When the status rollup is not available — a metrics DB this version has not opened for writing yet (`mms stats` only reads), or one whose status table or either of its triggers is missing — the counts cover the retained rows only, also under `--all-time`, where the line says `(retained rows)`. `--json` carries them as `hook_status`: `{"scope": "retained", "by_host": [{"host", "statuses": [{"status", "calls", "original_chars"}], "status_not_kept_calls"}]}`, with `null` for an unrecorded host or status, an empty `by_host` when no hook row is counted, and `null` for the whole value whenever `hook_by_host` is `null`. `scope` is `all_time` when the trimmed rows are counted too, and then `status_not_kept_calls` is the number of that host's trimmed calls whose status was not kept; under `retained` it is `null`. In the per-tool table and in `by_tool` of the unfiltered `compression`, rows are grouped by server and tool across both sources, so an upstream MCP server named like a hook label shares a row with it; `--source` separates them. The **Progressive delivery** block compares the chars produced for paged responses with the chars delivered to the agent, counting every recorded read (rereads count again), and is filtered by `--tool` but not by `--source`. Because the live MCP server keeps additional in-memory counters that a separate CLI process cannot see, the numbers here reflect only what has been successfully flushed/written to disk.
 
-`--all-time` switches the compression block alone to all-time totals; the progressive and surfacing blocks keep their retained windows. Every row deleted from `proxy_metrics`, by the per-source trim or by anything else, is folded into a never-pruned `proxy_metrics_daily` table (one row per UTC day, source, server and tool) by a database trigger, and all-time totals are those daily rows plus the rows still retained. Because the trigger lives in the database file, rows trimmed by an older STM version that shares the file are counted too. The rollup is installed the first time this version opens the metrics DB (the MCP server, `mms tune` or `mms hook`); until then `--all-time` reports the totals as unavailable rather than falling back to the retained rows. Rows trimmed before installation cannot be recovered: when some were, and the counted rows reach back before the installation time, an **Incomplete before** line gives that time and the number of rows already lost. When that number is not recorded — including after the installation markers in `metrics_meta` were erased and re-created on a rollup that was already running — the line reads **Possibly incomplete before** and says the number is unknown (`lost_before_install` is `null`). To make the next open rebuild the schema (for example after an index was dropped), delete only the stamp (`DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'`); the rollup markers beside it cannot be reconstructed once erased. `--json` names the scope in `compression_scope` (`retained` or `all_time`); in all-time mode `compression` carries a `rollup` object (`installed`, `installed_at`, `lost_before_install`, `earliest_created_at`, `incomplete_before`, `unknown_date_calls`) and its `by_tool` rows have no `tuner_calls`. To reset the history, delete the rows of both tables in this order, `DELETE FROM proxy_metrics` and then `DELETE FROM proxy_metrics_daily` (the other order refills the daily table from the rows being deleted); do not `DROP` the daily table while its trigger exists: every trim then fails with `no such table`, rolling back the write that triggered it (and, because the next write retries that trim, nearly every write after it), and startup reconciliation fails too.
+Under the MCP figures, a `Context query supplied on N of M observed live MCP responses` line counts the retained proxied responses that record whether the call carried `_context_query`, and how many did; it is omitted when no such row is retained, under `--source hook` and under `--all-time`. `--json` carries it as `context_query` inside `compression` and inside the `mcp` and `hook` entries of `compression_by_source` (which is itself `null` when `--source` is given): `{"observed", "agent"}`, both 0 when the figure was read and no such row is retained, and `null` where the figure does not exist (a hook summary, `--all-time`) or was not read (for one, when the metrics DB cannot be opened). What counts as observed is in [Measuring whether queries arrive](compression.md#measuring-whether-queries-arrive).
+
+`--all-time` switches the compression block, and the progressive block (see the next paragraph), to all-time totals; the surfacing block keeps its retained window. Every row deleted from `proxy_metrics`, by the per-source trim or by anything else, is folded into a never-pruned `proxy_metrics_daily` table (one row per UTC day, source, server and tool) by a database trigger, and all-time totals are those daily rows plus the rows still retained. Because the trigger lives in the database file, rows trimmed by an older STM version that shares the file are counted too. The rollup is installed the first time this version opens the metrics DB (the MCP server, `mms tune` or `mms hook`); until then `--all-time` reports the totals as unavailable rather than falling back to the retained rows. Rows trimmed before installation cannot be recovered: when some were, and the counted rows reach back before the installation time, an **Incomplete before** line gives that time and the number of rows already lost. When that number is not recorded — including after the installation markers in `metrics_meta` were erased and re-created on a rollup that was already running — the line reads **Possibly incomplete before** and says the number is unknown (`lost_before_install` is `null`). To make the next open rebuild the schema (for example after an index was dropped), delete only the stamp (`DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'`); the rollup markers beside it cannot be reconstructed once erased. `--json` names the scope in `compression_scope` (`retained` or `all_time`); in all-time mode `compression` carries a `rollup` object (`installed`, `installed_at`, `lost_before_install`, `earliest_created_at`, `incomplete_before`, `unknown_date_calls`) and its `by_tool` rows have no `tuner_calls`. To reset the history, delete the rows of both tables in one transaction, `proxy_metrics` first: `BEGIN IMMEDIATE; DELETE FROM proxy_metrics; DELETE FROM proxy_metrics_daily; COMMIT;` (the other order refills the daily table from the rows being deleted; the transaction keeps another process from writing between the two statements, where a row it records and trims would be rolled up and then deleted again, missing from both tables). Deleting a row of `proxy_metrics_daily` also deletes the hook status rows of the same day, server and tool, by a third trigger, so the same two statements reset `proxy_metrics_hook_status_daily` too, on a DB that has it and on one that does not yet — as long as that trigger is in place; when the status rollup is incomplete, `mms stats` already reports the status counts as `(retained rows)`; do not `DROP` either daily table while a trigger that writes to it exists: every trim then fails with `no such table`, rolling back the write that triggered it (and, because the next write retries that trim, nearly every write after it), and startup reconciliation fails too.
+
+Under `--all-time` the **Progressive delivery** block counts reads that the `proxy.progressive_reads.retention_days` purge removed too. Every row deleted from `progressive_reads`, by the purge or by anything else and by any STM version sharing the file, is folded by a database trigger into a never-pruned `progressive_reads_rollup` table in the same `stm_feedback.db`, one row per response and tool, and the all-time figures merge those rows with the retained ones per response. Every figure the block prints is per response (responses, responses with follow-up reads, the chars produced for each response), so the rollup keeps its rows per response rather than per day: a response whose reads were purged in part is still counted once. That table grows by one row per purged response and tool. It is installed the first time the MCP server of this version starts with progressive-read collection enabled, before that start's purge; until then `--all-time` reports the progressive totals as unavailable. Reads purged before installation cannot be recovered: when some were, an **Incomplete before** line gives the installation time and how many reads were lost. When the count is unknown the line reads **Possibly incomplete before**. That happens when part of the rollup — its table, its trigger or a marker in `progressive_reads_meta` — was removed, renamed or changed from outside (the table and the trigger are compared with what this version creates, and the markers with each other): the next such server start re-creates it, records the loss as unknown, and moves the boundary to the time of that repair. A rollup table that was altered is renamed aside to `progressive_reads_rollup_replaced_<milliseconds>`, keeping its rows but no longer counting them. Edits that leave all of that intact — to the rollup's rows, or to markers rewritten consistently — are not detected. Neither is a change to the definition of `progressive_reads_meta` itself: if its `key` or `value` column no longer exists, reading the markers fails, and the server starts with progressive-read collection disabled (it logs `Progressive reads tracker init failed`) and `--all-time` prints the progressive block as `unreadable`, until the table's definition is restored. A size that is not a number within ±9.2e18, or a timestamp that is not a finite number, is treated the same before and after its row is purged: a delivered size adds 0, a produced size is left out of the response's maximum, and a timestamp is left out of the earliest time. `--json` names the scope in `progressive_scope` (`retained` or `all_time`), and in all-time mode `progressive` carries a `rollup` object (`installed`, `installed_at`, `lost_before_install`, `earliest_created_at`, `incomplete_before`). To reset the history, delete the rows of both tables in one transaction, `progressive_reads` first: `BEGIN IMMEDIATE; DELETE FROM progressive_reads; DELETE FROM progressive_reads_rollup; COMMIT;`. Do not `DROP` `progressive_reads_rollup` while its trigger exists: until this version's next server start with progressive-read collection enabled re-creates the table (recording the loss as unknown), every delete from `progressive_reads` fails with `no such table`; an older STM version cannot re-create it, so while its startup purge is enabled (`retention_days` above 0) that purge fails on every start and the server runs with progressive-read collection disabled (it logs `Progressive reads tracker init failed`).
+
+The cache block is the exception to the retained windows above: it reads `proxy_cache_daily` in the metrics DB, which is never pruned, so its totals cover everything written since that table was created (the **Coverage** line gives the date, or says the start is unknown when its marker in `metrics_meta` is missing or unreadable). Each proxy process keeps its response-cache hits, misses, unstorable misses and the characters served from cache per UTC day, server and tool in memory, and tries to write them with its next metrics row, every 30 seconds while some are waiting, and during an orderly MCP server stop; all three are best-effort, and a killed process loses the counts buffered since its last successful write (the timer runs every 30 seconds, later when the event loop is busy). The 30-second write uses a 50 ms SQLite busy timeout instead of the full one, so when another process holds the database locked it fails quickly and tries again on the next tick rather than stalling the proxy's calls while it waits. At most 1,024 day/server/tool buckets wait in memory per process: while that many are waiting, events for a new bucket are not persisted (the live `proxy_stats` counters still count them), and no later write or stop recovers them; events for a bucket already waiting still add to it. Only STM versions that persist these counts write them, so a DB shared with an older version under-counts. `hits` and `hit_chars` are what the cache served instead of calling upstream; `storable_hit_rate` is hits over hits plus misses that were storable (misses minus unstorable, never below zero), as `stm_admin` `proxy_stats` computes it, and `null` (text `n/a`) when there were none. A miss is counted when it happens and its unstorable outcome when the call completes, so the two can land on adjacent UTC days, and while a call is still running its miss can already be on disk without its unstorable outcome; the unstorable count is queued before the call's own metrics write, which tries to persist everything pending. `--tool` filters the cache block like the others; `--source hook` omits it (`cache` is `null` in `--json`), since only proxied tools are cached. To clear these counts too, stop the running proxies first (a running one would write its buffered counts back), then, if the table exists, `DELETE FROM proxy_cache_daily;`.
 
 The surfacing block reports degraded-LTM faults separately from score-scale
 diagnostics. After five consecutive non-empty searches for one upstream tool
@@ -1008,7 +1023,10 @@ for read-like built-ins (`Read`/`Grep`/`Glob`/`Bash` and their per-host
 equivalents). Bash stdout compression is separate, Claude-only, requires Claude
 Code 2.1.121+, and is opt-in via
 `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning `updatedToolOutput` while
-preserving stderr, exit status, interruption state, and image markers.
+preserving stderr, exit status, interruption state, and image markers. It runs
+only when the registration passes `--host claude`: under `auto` the hook never
+replaces output, and on a call routed to the Claude adapter that compression
+would have attempted it reports that through `systemMessage` and stderr instead.
 
 Runtime `--host TEXT` selects the adapter; `auto` (the default) recognizes
 Cursor and Kimi shapes and a non-empty Codex `turn_id`. A payload that remains
@@ -1019,16 +1037,43 @@ block. The operator-facing install/uninstall subcommands keep the strict
 `[claude|codex|cursor|kimi]` choice. Per-host registration writes an explicit
 host. The hook always exits `0` and emits `{}` (or empty stdout) on malformed
 input, timeout, disabled surfacing, or internal errors. By default it uses the
-local daemon path; set `MEMTOMEM_STM_HOOK__USE_DAEMON=0` for the legacy cold
-in-process path. The daemon choice, both deadlines and query-text persistence
+local daemon path; pass `--no-daemon` for the legacy cold in-process path. A
+command with neither `--use-daemon` nor `--no-daemon` follows `hook.use_daemon`
+instead, in any form the settings read (`MEMTOMEM_STM_HOOK__USE_DAEMON=0`, or
+`use_daemon` in `MEMTOMEM_STM_HOOK`). The daemon choice, both deadlines and query-text persistence
 can also arrive as the runtime flags `install` writes into the host command;
 see [the hook CLI reference](reference/cli-hooks.md#mms-hook) for the list.
+The hook applies the flags while it builds its settings, over everything the
+environment gives the same field, and leaves its environment as it is. So
+neither another spelling of the variable
+(`memtomem_stm_surfacing__timeout_seconds`), nor the field repeated under
+another letter case in the block's JSON
+(`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`),
+nor a `null` block (`MEMTOMEM_STM_SURFACING=null`) outranks a flag; a block
+that is not a JSON object (`MEMTOMEM_STM_SURFACING=[]`) still fails the
+build. A daemon the hook spawns receives the flags in its own environment,
+as `MEMTOMEM_STM_HOOK_FLAGS`, which only `mms daemon run --detached` reads.
+A value that is not a JSON object of the flags' variables with string values
+ends that run with exit 1 and a stderr line naming the variable; a daemon the
+hook spawns has its stderr discarded, so the line shows only in a run started
+by hand. An MCP server
+registration that `mms register` or `mms init` writes carries its policy the
+same way: as `MEMTOMEM_STM_SERVER_FLAGS`, a JSON object of its three
+variables, which the server applies over another spelling of the variable,
+a case variant of the field in the block's JSON and a `null` block, so the
+server and the hook with the same policy read the same values for it. The
+registration also keeps the three as plain variables for older releases;
+they are outranked, so editing one of them alone changes nothing. A
+registration written before this carries only the plain variables, which
+those environment forms can still outrank. The route is not affected either
+way: an explicit `--use-daemon` or `--no-daemon` decides it directly.
 
 ### `install` / `uninstall` — per-host registration
 
 `mms hook install --host <name>` writes STM's `PostToolUse` hook block into the
-host's own config so the host fires `mms hook --host <name>` after each built-in
-tool call. `uninstall` removes it.
+host's own config so the host fires `memtomem-stm hook --host <name>` (behind
+`uv run --directory <dir>` in a project that uses STM) after each built-in tool
+call. `uninstall` removes it.
 
 | host     | config file               | format |
 | -------- | ------------------------- | ------ |
@@ -1057,18 +1102,105 @@ Options:
   --apply                         Write the change (default: dry-run preview).
                                   Backs up any prior file to <path>.bak
                                   (.bak.1, … if one already exists).
-  --surfacing-timeout SECONDS     Pin the LTM search deadline. [x>0.0]
+  --surfacing-timeout SECONDS     Pin the LTM search deadline in the installed
+                                  hook command. A positive, finite number that
+                                  stays finite when written there.  [x>0.0]
   --daemon                        Install an explicit shared-daemon route.
   --no-daemon                     Install an explicit cold/in-process route.
   --inherit-runtime-env           Do not serialize daemon, timeout, or query-
                                   persistence settings.
 ```
 
-The merge is idempotent — an existing STM block (recognized by command shape,
-so a global or `uv run …` registration with any `--host` is matched) is updated
-in place, never duplicated — and `uninstall` is symmetric: it removes exactly
-what `install` adds, prunes the emptied containers, and leaves hand-written
-hooks untouched. Both **default to a dry-run preview**; pass `--apply` to write,
+Install and uninstall manage the handlers `mms hook install` writes, and no
+others. A handler is install's own when all three hold:
+
+- **Place.** It is where install writes for that host:
+  `hooks.PostToolUse[i].hooks[j]` (Claude Code, Codex), `hooks.postToolUse[i]`
+  (Cursor), or a `[[hooks]]` entry whose `event` is `PostToolUse` (Kimi). A
+  Kimi entry on another event is not install's.
+- **Fields.** For Claude Code and Codex, `type` is `command` and there is no
+  `args` key. For Claude Code, there is also no `shell` key, or it is exactly
+  `"bash"`: install writes a POSIX line, and `"shell": "powershell"` has
+  PowerShell read it. A handler with any other `shell` value, `null`
+  included, is left in place, and named as a look-alike when its command
+  looks like STM's hook. Codex's `shell` key is not read. Other
+  fields, such as a timeout or a status message, do not matter and are kept
+  when the handler is updated.
+- **Text.** The `command` is `memtomem-stm hook --host <that host>`, alone or
+  after `uv run --directory <absolute dir>`, followed by nothing or by the six
+  runtime-setting words in the order install writes them. It is spelled as
+  install spells it: single spaces, and the directory quoted only where and
+  how Python's `shlex.join` quotes it.
+
+Every command a release of `mms hook install` has written has this form.
+Nothing else does: `mms hook --host claude` (another entry-point name; this is
+the manual registration), a path to the executable, an `env` or `NAME=value`
+prefix, a quoted name (`"memtomem-stm" hook …`) or a directory quoted another way
+(`--directory "/a b"`), flags added, left out or in
+another order, another host's `--host`, a relative `--directory`, a trailing
+`# comment`. Whether such a line would run STM's hook is not asked. No shell
+is modelled, so the answer is the same on every platform.
+
+The merge is idempotent: the handler install owns is updated in place instead
+of adding another. Install keeps the daemon, timeout and query-text settings
+of the handler it updates. They are read from its setting words the way
+`mms hook` applies them: a deadline that is not a positive finite number is
+not kept, and the daemon deadline is at least one second above a usable
+surfacing deadline. No setting is read from an environment prefix, or from a
+handler install does not own. Claude Code and Codex also fold any further
+handlers install owns into the one it updates; Cursor and Kimi update the
+first one and leave the rest as they are.
+
+Before Claude Code or Codex folds two or more owned handlers, install reads
+the settings of each, the same way, and compares them, before the new
+command is built. When they differ in a setting install would carry over
+from the first one, install refuses: it exits non-zero, with or without
+`--apply`, and leaves the config as it was with no backup (an `--apply` can
+still create the hook-host lock file). The error names the handlers'
+locations and the settings they differ in, never their values. A setting an
+option sets is not carried over, so `--daemon` / `--no-daemon` and
+`--surfacing-timeout` resolve a difference in that setting; the daemon
+deadline and query-text settings have no such option. Because the daemon
+deadline is read as at least one second above the surfacing deadline, two
+handlers that differ only in surfacing deadline can differ in daemon
+deadline too. A handler without setting words, which 0.1.29–0.1.38 and
+`--inherit-runtime-env` write, inherits every setting, so it differs from
+any handler with them even when the values in effect would match.
+`--inherit-runtime-env` carries nothing over: it folds them into one handler
+without setting words. Otherwise, remove all but one handler by hand and
+re-run.
+
+Install writes a deadline only when the hook will keep it: written the way
+install writes it, it must read back as a positive finite number. A
+`--surfacing-timeout` that does not (`inf`, `nan`, or a value so large that
+its 15-digit spelling reads back as infinity, such as
+`1.7976931348623157e308`) is a usage error. A deadline resolved from STM's
+configuration that does not (`MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=inf`,
+or such a large `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS`) stops install the
+same way a conflict does: non-zero exit, config left as it was, no backup.
+The error names the setting and its variable, never the value, and offers
+`--surfacing-timeout` (for the surfacing deadline) or `--inherit-runtime-env`.
+A handler releases wrote with such a deadline is still install's own; its
+deadline is not carried over, so re-installing replaces it.
+
+`uninstall` removes every handler install owns, prunes the emptied
+containers, and leaves other hooks untouched.
+
+A handler that looks like STM's hook but is not install's, such as
+`mms hook --host claude` or `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms
+hook`, is left in place by both commands. They print its location (in the
+written file after an `--apply` that writes, otherwise in the current file),
+never its text. Install adds its own handler beside it, and its preview names
+the location above the block it would write, so the second registration is
+not silent; remove the old handler by hand if it should not stay registered.
+Both commands look where install itself writes in that host's config file
+(`PostToolUse` for Claude Code and Codex, `postToolUse` for Cursor) and at
+every entry for Kimi. "Looks like" is the test `mms doctor` uses for its
+`hook registration` row, plus the line's own words for a name spelled so that
+test misses it (`m"m"s hook`). An uninstall that only prunes empty hook containers (an
+empty matcher group, event list or `hooks` section) says so instead of
+reporting a removal.
+Both **default to a dry-run preview**; pass `--apply` to write,
 which first backs up any existing file to `<path>.bak` (or `<path>.bak.1`, `.bak.2`,
 … if one already exists, so a second apply never clobbers the first backup). A
 config that exists but does not parse is refused, never overwritten. TOML hosts
@@ -1147,6 +1279,32 @@ to be free before it starts a replacement, and exits 1 without starting one if
 the lock is still held ("previous daemon still shutting down") or could not be
 checked ("could not check the previous daemon's lock").
 
+`start`, `stop`, `status` and `restart` accept `--hook-command claude`, which
+builds the daemon's configuration the way the STM hook command that
+`mms hook install --host claude` wrote in Claude Code's user settings does.
+The hook applies its options (`--surfacing-timeout-seconds`,
+`--[no-]persist-query-text`, …) while it builds its settings, and a daemon
+it spawns receives them at launch. Two of them enter the daemon's
+fingerprint, so a bare command run from a shell can address a daemon other
+than the hook's (a default install writes `--no-persist-query-text`). With
+the option, the command applies the same options the same way for its run,
+and a daemon `start` launches receives them too. So when `mms doctor`
+takes the hook's daemon route for that command, the option acts on the daemon
+doctor probed, and doctor names it in its advice for that daemon. `status` then
+reports whether the hook uses the daemon from the command's
+`--use-daemon`/`--no-daemon` when it has one, since the hook routes on that
+flag. No message of such a run suggests `stop --all`, which targets every
+accepting daemon under `data_dir`, the hook's own included: `status` lists
+daemons under other configurations without the cleanup hint, and `stop` names
+no `stop --all` way out of an unusable discovery key. The command
+exits 1 without acting when the settings hold no STM hook command that install
+owns, more than one, or one that may run the hook but could not be read, when
+the settings cannot be read, and on Windows, where hook commands are not read.
+Everything else still comes from the shell's environment: when Claude Code
+runs the hook with a different environment or working directory, or a
+`uv run --directory` launcher selects another STM version, the hook can use a
+different daemon.
+
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. `mms daemon status` lists every live
 daemon under a different config fingerprint, and a different fingerprint does
@@ -1168,8 +1326,30 @@ anything uses it now:
 A daemon whose endpoint no longer accepts but whose lifetime lock is held is
 listed too, labelled `not accepting; lock held — starting or shutting down`
 (or `handshake unreadable; …` with `pid=?` when its record cannot be parsed,
-and `lock could not be checked` when the lock file cannot be opened). Such a
-list is never headed "running", and never answered with "nothing to stop".
+and `lock could not be checked` when the lock file cannot be opened). So is
+one with no handshake at all: a daemon holds its lock from before it publishes
+its handshake until after its teardown has removed it, and for those two
+stretches it is listed as `pid=?` with `no handshake; lock held — starting or
+shutting down`. It is found by its lock file (`stm-daemon-<fingerprint>.lock`).
+Lock files are never removed, so most of them belong to daemons long gone; one
+is listed only when its lock is held, or could not be checked. Testing a lock
+means taking it for an instant, which another `status` or a hook deciding
+whether to spawn a daemon does to the same file. So for a fingerprint with no
+handshake, a lock found held is looked at again in up to three more rounds,
+each after a 20 ms pause shared by every such lock, and it is listed as held
+only if it is still held on the last of them; one found free on the way is
+dropped, and one that turns out not to be checkable is listed as that. With no
+such lock found held there is no pause. A fingerprint that has a handshake is
+looked at once. Such a list is never headed "running", and never answered with
+"nothing to stop".
+
+Looking at another fingerprint's lock creates nothing: `status` and
+`stop --all` open only a lock file that is already there. A lock file that has
+been deleted counts as free; one that is a link to nothing, or sits under a
+directory that no longer resolves, counts as `lock could not be checked`, and so
+does every lock file on a filesystem that does not support file locking. (On
+Windows, opening an existing lock file that is empty tries to write one byte
+to it, and leaves it empty when another process has that byte locked.)
 
 Only `never exits when idle`, `idle timeout unknown` and those entries get the
 warning and the cleanup hint: if no running STM
@@ -1190,7 +1370,12 @@ it is unknown), `exits_when_idle` (`true`, `false`, or `null` when unknown),
 `listening` (`true` when its endpoint accepts), and `lock` (`"held"` or
 `"unknown"` for one that does not accept, `null` when not checked); an entry
 whose record is unreadable also has `handshake_unreadable: true` and `null`
-pid, host and port.
+pid, host and port, and one with no handshake has `handshake_absent: true` and
+the same `null` fields.
+A fingerprint in these listings is read from a file name in `data_dir`. Text
+output shows it escaped for display — a control or bidirectional-formatting
+character, or a byte that is not valid UTF-8, appears as `\uXXXX` — and
+`--json` carries it as found, encoded by JSON.
 When `data_dir` exists but cannot be listed (no read permission, say), the
 daemons under other configs are unknown rather than absent: `status` prints a
 warning naming the error class instead of a list, `status --json` reports
@@ -1201,12 +1386,84 @@ Foreign daemon detection combines process liveness with a protocol-neutral TCP
 connect-probe, so older protocol generations are reported on supported POSIX
 and Windows hosts without sending them an incompatible frame.
 
+### The discovery key
+
+A daemon is found through its config fingerprint, which names its handshake
+and lock files (`stm-daemon-<fingerprint>.json` / `.lock` under `data_dir`).
+The fingerprint covers the LTM command line and `ltm_mcp_headers`, so it is an
+HMAC under a random key, `<data_dir>/stm-discovery.key` (mode `0600`), rather
+than a hash anyone could recompute from a guess. Every STM process that shares
+the `data_dir` reads the same key.
+
+The key is created by whatever first needs a daemon to exist — `mms daemon
+start`, a hook's spawn request, the standalone proxy when it starts with
+`surfacing.use_daemon` on (before it has asked for any daemon), the daemon
+itself.
+`status` and `stop` only look: they never create the key and never change its
+mode. For a key left readable by group or other, the next command that creates
+or starts a daemon tries to tighten it to `0600` (on macOS and Linux, and only
+if the file can be chmod-ed); these two do not. With no key there is
+no fingerprint to look under, so `status` reports `stopped` and `stop` reports
+"no running daemon" for this config; on a `data_dir` that holds no daemon
+files — or does not exist — they create nothing at all. A daemon can still be
+running there: one an earlier build started, or one whose key was removed
+while it ran. `status` lists those as daemons under a different config —
+through the handshakes they published, or through a held lock when one has
+none yet or none any more — and still reports `stopped` for this config, which
+has no fingerprint to claim any of them with. Both commands still check
+that the directory could be walked; if it could not (a dangling symlink above
+it), `status` reports `unknown` (`--json`: an `error` field) and `stop` exits
+1. `restart` with no key skips the lock wait and goes straight to `start`.
+
+`status` and `stop` each read the key once, when they start, and use that one
+fingerprint for the whole run. A key removed or damaged while one of them is
+running does not change which daemon that run reports or stops as this
+config's; the next command is the one that sees the change.
+
+A key that exists but cannot be read, or does not hold a key, is an error:
+
+- `start`, `stop`, `status` and `restart` exit 1 with one line naming the file.
+  `status --json` reports `"state": "unknown"` with an `error` field, and
+  still lists as `foreign` every daemon it finds under `data_dir` — through a
+  handshake, or through a lock file with no handshake whose lock is held or
+  could not be checked.
+- `stop --all` treats every daemon found that way as foreign — this config's own
+  included — and acts on them before it reports the key and exits 1: the way
+  to stop daemons started under a key that has since been damaged. On macOS
+  and Linux it signals them as described above; on Windows it cannot signal by
+  pid, so end those processes from Task Manager. One that holds its lock
+  without a handshake (starting, or finishing its teardown) is listed and
+  waited on like any daemon that is not accepting, never signalled.
+- `mms hook` takes its configured `hook.fallback`. Standalone surfacing reads
+  the key when it starts and again whenever it asks for a daemon to be
+  spawned; from the first of those that fails it logs one warning naming the
+  file and reports the daemon as unavailable until STM restarts. A key damaged
+  while its daemon keeps answering changes nothing until that daemon is gone.
+  `mms health` and `mms doctor` report an unreachable daemon, with their usual
+  exit codes, and point to `mms daemon status`.
+
+Moving the file aside lets the next `start` create a new one. A new key means
+new fingerprints: daemons still running under the old one are listed as
+running under a different config, to be stopped with `stop --all` (on Windows,
+from Task Manager), and a standalone
+proxy that was already running keeps looking for the old fingerprint until it
+restarts — so replace the key only with STM stopped. The key is created with a
+hard link (two processes creating it at once must end up with one key), so a
+`data_dir` on a filesystem without hard links cannot use the daemon.
+
+Files from a build before the fingerprint was keyed are not cleaned up, and
+the lock files keep the old, recomputable fingerprint in their names. After
+`mms daemon stop --all`, and with no STM process running under any environment
+that uses this `data_dir`, every `stm-daemon-*.json` and `stm-daemon-*.lock`
+in it can be deleted; they are recreated on demand. Keep `stm-discovery.key`.
+
 ## `mms project` — project-scoped MCP management
 
 `mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap).
 
 The group ships six subcommands. State lives in three TOML files, a
-drift-detection sidecar and a lock file, plus the explicit route target:
+drift-detection sidecar with its key file and a lock file, plus the explicit
+route target:
 
 | Path | Purpose | Commit? |
 |------|---------|---------|
@@ -1214,6 +1471,7 @@ drift-detection sidecar and a lock file, plus the explicit route target:
 | `~/.mms/projects.toml` | Auto-managed projects index (path + last_seen) | **No** — gitignore |
 | `<project>/.mms/project.toml` | Per-project enabled MCP names | **Yes** |
 | `~/.mms/import_state.toml` | Drift-detection sidecar: the per-server baseline `mms import` records and `mms host` compares against; one per machine, with its own schema version | **No** — gitignore |
+| `~/.mms/import_state.toml.key` | Random key the sidecar's drift hashes are computed under (mode `0600`); created by the first `mms import --apply` or `mms host sync --apply` that writes. Not a credential for anything else, but keep it out of bug reports along with the sidecar | **No** — gitignore |
 | `~/.mms/.lock` | Advisory cross-process lock taken while the registry or the sidecar is written | **No** |
 
 ```
@@ -1359,19 +1617,20 @@ Where each host config lives:
 |------|---------|
 | `claude-code` | Claude Code's [global config](#which-claude-code-config-stm-reads) (user + the project entry Claude Code uses for cwd, `projects.<repository root>.mcpServers`) and `<cwd>/.mcp.json` |
 | `cursor` | `~/.cursor/mcp.json` (user) and `<cwd>/.cursor/mcp.json` (project) |
-| `codex` | `$CODEX_HOME/config.toml` plus trusted `<cwd>/.codex/config.toml` (an empty `CODEX_HOME` means `~/.codex`; one that is relative or has a `.` or `..` component skips both, and `mms host status`/`sync` report their entries as `not_inspected`) |
+| `codex` | `$CODEX_HOME/config.toml` plus trusted `<cwd>/.codex/config.toml` (an empty `CODEX_HOME` means `~/.codex`; one that is relative or has a `.` or `..` component skips both: `mms import` names them on stderr, and `mms host status`/`sync` report their entries as `not_inspected`) |
 | `claude-desktop` | macOS `~/Library/Application Support/Claude/...`; Windows `%APPDATA%\Claude\...`; Linux `~/.config/Claude/...` |
 
-Missing configs are silently treated as "no candidates" so `--from all` works across native Windows, macOS, Linux, and WSL2.
+Missing configs are silently treated as "no candidates" so `--from all` works across native Windows, macOS, Linux, and WSL2. A source STM skips for one of the reasons below is different — it may hold servers STM did not see — so `mms import` prints one `Note: <source> not inspected: <reason>.` line on stderr for each such source, ahead of any skipped-entry notes and the result, and when nothing was found it says `No MCP definitions found from --from=<host>; 1 source was not inspected.` (or `<n> sources were`) rather than asking whether the host config is in place. The reasons are the Claude Code ones listed under [Which Claude Code config STM reads](#which-claude-code-config-stm-reads) (a legacy `.config.json` counts there when it exists and also when STM cannot check whether it does, for example after a permission error), the `CODEX_HOME` case in the `codex` row above, and a `.mcp.json` that exists but is not a readable JSON object. Other skipped files get no note: Cursor, Claude Desktop and Codex configs that cannot be read are treated as missing, and an untrusted `<cwd>/.codex/config.toml` is not read.
 
 ### Secret classification
 
-The env block of each entry runs through a two-signal classifier:
+The env block of each entry runs through a three-signal classifier; the first signal that matches names the reason:
 
-1. **Key pattern** (case-insensitive substring): `*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`, `*PASS*`, `*AUTH*`, `*CREDENTIAL*`, `*API_KEY*`. Hits even if the value is short (`API_KEY=test` is still classified — pattern beats value).
-2. **Value heuristic**: length ≥ 32 AND the value is mostly base64- or hex-charset (catches opaque tokens stored under unusual key names).
+1. **Key pattern** (case-insensitive substring): `*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`, `*PASS*`, `*AUTH*`, `*CREDENTIAL*`, `*API_KEY*`, `*COOKIE*`, `*BEARER*`, `*DSN*`. Hits even if the value is short (`API_KEY=test` is still classified — pattern beats value).
+2. **Value pattern**: the whole value parses as a URL with a password (`DATABASE_URL=postgresql://user:pw@host/db` → `URI with password`), or it carries a credential the proxy's privacy scanner recognizes — a JWT, a provider token (`ghp_…`, `sk-…`, also behind a `Bearer ` prefix), a PEM private-key header, or a `password=` / `api_key=` label (→ `credential format`). A URL with a user and no password (`git+ssh://git@github.com/…`, a Sentry DSN — the `*DSN*` key pattern covers that one) is not a password. A URL inside a longer value (`--db=postgresql://user:pw@host`) is not parsed as a URL. The label rule is conservative: `--password=false` is classified as a secret.
+3. **Value heuristic**: length ≥ 32 AND the value is mostly base64- or hex-charset (catches opaque tokens stored under unusual key names).
 
-`--plan` prints `<REDACTED>` for any value matching either signal, with the classification reason next to it (e.g. `GITHUB_TOKEN=<REDACTED> ← secret (matches *TOKEN*)`). `--show-imported` reveals the actual values for the user who wants to verify before `--apply`.
+`--plan` prints `<REDACTED>` for any value matching any of the three signals, with the classification reason next to it (e.g. `GITHUB_TOKEN=<REDACTED> ← secret (matches *TOKEN*)`). `--show-imported` reveals the actual values for the user who wants to verify before `--apply`.
 
 ### Conflict resolution
 
@@ -1402,11 +1661,17 @@ Commands:
 
 `scan` is host-anchored and read-only; it can be limited with
 `--from claude-code|cursor|codex|claude-desktop|all` and supports `--json`.
-`status` is registry-anchored, read-only, and always exits `0`; drift is an
-observation rather than a CI failure signal. `sync` is the ongoing
+`status` is registry-anchored and read-only, and exits `0` whatever it finds;
+drift is an observation rather than a CI failure signal. (A `~/.mms` state
+file it cannot read is exit `1`.) `sync` is the ongoing
 reconciliation path: `--plan` previews, `--apply` writes, `--apply --force`
 adopts entries marked changed (under `--plan`, `--force` only previews that),
-and `--yes` bypasses confirmation prompts for scripts.
+and `--yes` bypasses confirmation prompts for scripts. The text preview shows
+the `mms host sync --apply` command to run when that run has changes to make,
+and says ``Nothing for `<command>` to do.`` when it has none: no entry to add,
+remove, backfill or re-stamp, no sidecar row to re-key or clean up. Entries
+that command skips, such as a changed entry without `--force` or one that
+moved to another host, do not count as changes.
 
 `sync --apply` shares the same project-local config gate as `mms import`: new
 (ADD-bucket) entries, and — only under `--force` — RESTAMP-bucket entries,
@@ -1414,19 +1679,43 @@ discovered in project-local config files under the current directory are
 refused unless `--allow-project-configs` is passed. REMOVE and sidecar
 BACKFILL are not gated, since neither adopts a new registry command.
 
+The baseline is a drift hash of each entry's `command`, `args` and `env`,
+values included. Because `env` values are often credentials, the hash is an
+HMAC under a random per-installation key (`~/.mms/import_state.toml.key`):
+`baseline_hash` and `current_hash` in `--json` output are
+`hmac-sha256:<16 hex>`, differ from one installation to the next, and cannot
+be recomputed from a host config, so a pasted report does not let a reader
+check a guessed value. Compare entries by `state`, not by these fields: while
+no key file exists `current_hash` is `null`, and so is the `baseline_hash` of
+a row written by a release that stored unkeyed hashes.
+
+A sidecar written by a release that stored unkeyed hashes keeps working: its
+rows are compared as before, so every entry keeps its state across the
+upgrade. `sync --apply` re-keys those rows in place — the `REKEY` line in the
+plan, `summary.rekeyed` in `--json` — without re-stamping them, so an entry
+that was `changed` stays `changed`; an `mms import --apply` that finds at
+least one host definition does the same. If the key file is lost or replaced,
+the rows it stamped read `no_baseline` (a comparison under another key would
+call every one of them `changed`), and `sync --apply` stamps them again from
+the host's current config. A key file that exists but cannot be read, or does
+not hold a key, is an error naming the file; it is never overwritten.
+
 A source the scan could not inspect is not read as empty. When STM cannot tell
 which [Claude Code config](#which-claude-code-config-stm-reads) or project
 entry is in use, or that file or `<cwd>/.mcp.json` exists but is not a readable
-JSON object, a registry entry whose baseline came from that source and that no
-scanner found is `not_inspected` rather than `removed_at_host`, and `sync
---apply` never removes it. `status` shows the state with a footer naming the
+JSON object, or when `CODEX_HOME` cannot be placed, a registry entry whose
+baseline came from that source is `not_inspected`. That holds even when another
+host has an entry with the same name, or the baseline cannot be compared (an
+unknown hash version, or a drift-hash key that was lost): the entry is not
+compared with the other host, and `sync --apply`, with or without `--force`,
+neither removes it nor re-stamps its baseline. `status` shows the state with a footer naming the
 reason (`--json`: the row's `reason`, and a `not_inspected` count in
 `summary`); `scan --json` lists the skipped sources as `not_inspected:
 [{"source", "reason"}]`; `sync --json` carries the rows in `plan.not_inspected`
 and their count in `summary.not_inspected`. `reason` is one of `custom_oauth`,
-`config_dir`, `home`, `legacy_config`, `unreadable`, `no_key`,
-`mcp_json_unreadable`. Other hosts' scanners still read an unreadable file as
-an empty one.
+`config_dir`, `home`, `legacy_config`, `unreadable`, `codex_home`, `no_key`,
+`mcp_json_unreadable`. Other scanners still read an unreadable file as an empty
+one, as the Codex scanner does an unreadable `config.toml`.
 
 ## MCP Tools (5 default + 2 opt-in + proxied)
 
@@ -1556,14 +1845,17 @@ export MEMTOMEM_STM_LOG_EXCEPTION_TEXT=true   # server and daemon logs
 load always withhold.
 
 Every handler STM installs (stderr, the file, the daemon's log, `mms hook`'s
-stderr) escapes an attached traceback line by line: a bidi control, an escape
-sequence or another C0/C1 character inside it renders as `\uXXXX`, the same
-way log lines render config- and environment-derived values, so a hostile
-upstream key in a `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…` variable
-cannot reorder the lines around a validation traceback or drive the terminal
-(#1173). A newline in such a key still splits the traceback's location line in
-two; the escaping keeps line structure, so that second line is not marked as
-injected.
+stderr) escapes the message of each record it writes, and an attached
+traceback: a bidi control, an escape sequence or another control character
+renders as `\uXXXX`. A message is escaped whole, line breaks and tabs
+included, so it is always one line: an upstream key or `prefix` with a
+newline in it — config does not restrict their characters — stays on the line
+that names it instead of starting what looks like a record of its own
+(#1425). A traceback is escaped line by line, so a hostile upstream key in a
+`MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…` variable cannot reorder the
+lines around a validation traceback or drive the terminal (#1173). A newline
+in such a key still splits the traceback's location line in two; the escaping
+keeps line structure, so that second line is not marked as injected.
 
 See [Configuration → General](configuration.md#general) for details.
 

@@ -351,7 +351,7 @@ class TestRecordFeedbackEventsFlag:
         assert row[0] == "gh"
         assert row[1] == "read_file"
         # ... with the query digest-substituted, never raw text.
-        assert re.fullmatch(r"sha256:[0-9a-f]{16}", row[2])
+        assert re.fullmatch(r"hmac-sha256:[0-9a-f]{16}", row[2])
         # But no rating prompt leaked: the event ID is not advertised.
         assert "stm_surfacing_feedback" not in output
         assert "surfacing_id" not in output

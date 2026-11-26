@@ -6,9 +6,11 @@ import asyncio
 import contextlib
 import re
 import sqlite3
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import pytest
 
 from memtomem_stm.proxy.config import ConfigLoadResult, ProxyConfig, UpstreamServerConfig
@@ -2409,6 +2411,12 @@ class TestTuningRecommendations:
 # ── app_lifespan ──────────────────────────────────────────────────────────
 
 
+class _HostScope:
+    """The cancel scope of the task group hosting a lifespan under test."""
+
+    scope: anyio.CancelScope | None = None
+
+
 class TestLifespan:
     async def test_proxy_disabled(self):
         """When proxy is disabled, ProxyManager.start() should not be called."""
@@ -2553,7 +2561,14 @@ class TestLifespan:
                 assert captured_engine_kwargs.get("feedback_tracker") is None
 
     async def _run_minimal_lifespan(
-        self, *, pm_stop=None, parent_liveness_poll=0.0, parent_liveness_grace=900.0, settle=False
+        self,
+        *,
+        pm_stop=None,
+        parent_liveness_poll=0.0,
+        parent_liveness_grace=900.0,
+        settle=False,
+        host_scope=None,
+        watchdog_seconds=None,
     ):
         """Drive app_lifespan with everything optional off — enough config for
         startup, so a teardown-only assertion is all the test carries.
@@ -2561,7 +2576,26 @@ class TestLifespan:
 
         *parent_liveness_poll* is spelled out rather than left to the MagicMock
         because ``MagicMock() > 0`` is truthy, which would silently turn the
-        #914 backstop on in every one of these."""
+        #914 backstop on in every one of these.
+
+        *host_scope* (a ``_HostScope``) runs the lifespan inside an AnyIO task
+        group, the way the MCP SDK's ``stdio_server`` hosts it, and publishes
+        that group's cancel scope for *pm_stop* to cancel. The group absorbs its
+        own scope's cancellation on exit, so nothing escapes the helper.
+        *watchdog_seconds* gives the config a real number, for a test that puts
+        the real ``TeardownWatchdog`` back."""
+        if host_scope is not None:
+            async with anyio.create_task_group() as tg:
+                host_scope.scope = tg.cancel_scope
+                await self._run_minimal_lifespan(
+                    pm_stop=pm_stop,
+                    parent_liveness_poll=parent_liveness_poll,
+                    parent_liveness_grace=parent_liveness_grace,
+                    settle=settle,
+                    watchdog_seconds=watchdog_seconds,
+                )
+            return
+
         from memtomem_stm.server import app_lifespan, mcp
 
         mock_pm_instance = MagicMock()
@@ -2585,6 +2619,8 @@ class TestLifespan:
             mock_cfg.otlp.enabled = False
             mock_cfg.parent_liveness_poll_seconds = parent_liveness_poll
             mock_cfg.parent_liveness_grace_seconds = parent_liveness_grace
+            if watchdog_seconds is not None:
+                mock_cfg.teardown_watchdog_seconds = watchdog_seconds
 
             async with app_lifespan(mcp) as _ctx:
                 if settle:
@@ -2755,6 +2791,191 @@ class TestLifespan:
 
         assert killed == [{4242}]
 
+    @staticmethod
+    def _record_completion(monkeypatch):
+        completed = []
+        monkeypatch.setattr("memtomem_stm.server.teardown_completed", lambda: completed.append(1))
+        return completed
+
+    async def test_a_teardown_cut_short_is_not_reported_as_completed(self, monkeypatch):
+        """The exit status after a signal says whether the close sequence ran
+        to the end. A CancelledError out of a step skips every later close, so
+        reporting completion there would be a false success (#1459)."""
+        completed = self._record_completion(monkeypatch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_minimal_lifespan(pm_stop=asyncio.CancelledError())
+
+        assert completed == []
+
+    async def test_a_sweep_cut_short_is_not_reported_as_completed(self, monkeypatch):
+        """Completion covers the sweep too: the close sequence reaching its end
+        is not enough if the sweep after it is interrupted. The watchdog is
+        still stood down."""
+        completed = self._record_completion(monkeypatch)
+        disarmed = []
+
+        class _RecordingWatchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                pass
+
+            def arm(self):
+                pass
+
+            def disarm(self):
+                disarmed.append(1)
+
+        def _sweep_cancelled(**_kwargs):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _RecordingWatchdog)
+        monkeypatch.setattr(
+            "memtomem_stm.server.child_reaper.sweep_leaked_children", _sweep_cancelled
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_minimal_lifespan()
+
+        assert completed == []
+        assert disarmed == [1]
+
+    @pytest.mark.parametrize(
+        "pm_stop", [None, RuntimeError("stop failed")], ids=["clean", "handled-failure"]
+    )
+    async def test_a_teardown_that_ran_to_the_end_is_reported_as_completed(
+        self, monkeypatch, pm_stop
+    ):
+        # A step that failed inside its own guard did not cut the sequence
+        # short: every later close still ran, so the sequence is complete.
+        completed = self._record_completion(monkeypatch)
+        await self._run_minimal_lifespan(pm_stop=pm_stop)
+        assert completed == [1]
+
+    @staticmethod
+    def _deliberate_shutdown(monkeypatch, *, signalled):
+        """Set whether a deliberate shutdown started this teardown, and keep
+        its exit from ending pytest: conftest's inert ShutdownSignals leaves
+        ``exit_after_signal_shutdown`` real, and that calls ``os._exit``."""
+        exits = []
+        monkeypatch.setattr("memtomem_stm.server.shutdown_was_signalled", lambda: signalled)
+        monkeypatch.setattr(
+            "memtomem_stm.server.exit_after_signal_shutdown", lambda: exits.append(1)
+        )
+        return exits
+
+    @pytest.mark.parametrize(
+        ("armed", "signalled", "shielded"),
+        [(True, True, True), (True, False, False), (False, True, False)],
+        ids=["signalled-and-armed", "not-signalled", "watchdog-not-armed"],
+    )
+    async def test_a_deliberate_shutdown_with_an_armed_watchdog_is_shielded_from_the_host(
+        self, monkeypatch, armed, signalled, shielded
+    ):
+        """The MCP SDK hosts the lifespan in ``stdio_server``'s task group. When
+        that group's scope is cancelled during teardown, AnyIO delivers the
+        cancellation at the next await and cuts the close sequence short —
+        measured after a SIGINT right after the handshake (#1468). A signalled
+        shutdown with the watchdog armed is shielded from it. Not when no such
+        shutdown started the teardown: cancelling an embedded lifespan is its
+        host's call. Not when the watchdog is not armed: then nothing outside
+        the loop guarantees the exit."""
+        completed = self._record_completion(monkeypatch)
+        self._deliberate_shutdown(monkeypatch, signalled=signalled)
+
+        class _Watchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                pass
+
+            def arm(self):
+                return armed
+
+            def disarm(self):
+                pass
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _Watchdog)
+        host = _HostScope()
+        markers = []
+
+        async def _stop_while_the_host_is_cancelled():
+            host.scope.cancel()
+            await asyncio.sleep(0.01)
+            markers.append("stop-returned")
+
+        await self._run_minimal_lifespan(pm_stop=_stop_while_the_host_is_cancelled, host_scope=host)
+
+        assert host.scope is not None and host.scope.cancel_called
+        if shielded:
+            assert markers == ["stop-returned"]
+            assert completed == [1]
+        else:
+            assert markers == []
+            assert completed == []
+
+    async def test_the_watchdog_deadline_still_runs_under_the_shield(self, monkeypatch):
+        """The shield blocks cancellation from enclosing AnyIO scopes, so for a
+        shielded teardown that wedges, the hard deadline is the watchdog, which
+        counts down on its own thread: it reaches its exit while the teardown is
+        still parked in the shielded step. Separately, a direct
+        ``Task.cancel()`` still reaches that step."""
+        from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
+
+        self._deliberate_shutdown(monkeypatch, signalled=True)
+        loop = asyncio.get_running_loop()
+        fired = asyncio.Event()
+        built = []
+
+        class _NoExitWatchdog(TeardownWatchdog):
+            # A subclass, not a patched method: a countdown thread that reaches
+            # its exit after the test has ended must still find no os._exit.
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                built.append(self)
+
+            def _fire(self):
+                loop.call_soon_threadsafe(fired.set)
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _NoExitWatchdog)
+        # Above the watchdog ceiling, so the watchdog is what ends the wait.
+        monkeypatch.setattr("memtomem_stm.server._PROXY_STOP_BUDGET_SECONDS", 30.0)
+        host = _HostScope()
+        markers = []
+        release = asyncio.Event()
+
+        async def _wedged_stop():
+            host.scope.cancel()
+            markers.append("stop-entered")
+            try:
+                await release.wait()
+            finally:
+                markers.append("stop-left")
+
+        task = asyncio.create_task(
+            self._run_minimal_lifespan(pm_stop=_wedged_stop, host_scope=host, watchdog_seconds=0.3)
+        )
+        try:
+            try:
+                await asyncio.wait_for(fired.wait(), timeout=5.0)
+                assert markers == ["stop-entered"]
+                assert not task.done()
+
+                # ``asyncio.wait``, not ``wait_for``: a shield that held back
+                # this cancellation must fail the test, not hang it.
+                task.cancel()
+                done, _ = await asyncio.wait({task}, timeout=5.0)
+                assert done == {task}
+                assert task.cancelled()
+                assert markers == ["stop-entered", "stop-left"]
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                    await asyncio.wait({task}, timeout=5.0)
+        finally:
+            for watchdog in built:
+                watchdog.disarm()
+                if watchdog._thread is not None:
+                    watchdog._thread.join(timeout=5.0)
+
     async def test_a_wedged_stop_does_not_park_the_rest_of_teardown(self, monkeypatch, caplog):
         """Teardown is on the critical path of process exit, so one stop() that
         never returns used to take the whole shutdown with it. The step is
@@ -2778,6 +2999,63 @@ class TestLifespan:
         messages = [r.getMessage() for r in caplog.records]
         assert any("Proxy manager stop did not finish" in m for m in messages)
         assert killed == [{4242}]  # the abandoned step's child still swept
+
+    async def test_a_wedged_stop_under_the_shield_still_hits_its_ceiling(self, monkeypatch, caplog):
+        """The shield of a deliberate shutdown (#1468) blocks the host scope's
+        cancellation, not the per-step ceiling: ``await_or_warn`` cancels its
+        wait directly. So a stop() that never returns is still abandoned, the
+        rest of the teardown runs to its end, and the sweep collects what the
+        step left."""
+        completed = self._record_completion(monkeypatch)
+        self._deliberate_shutdown(monkeypatch, signalled=True)
+
+        class _Watchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                pass
+
+            def arm(self):
+                return True
+
+            def disarm(self):
+                pass
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _Watchdog)
+        killed = []
+        probes = iter([set(), {4242}])
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+        monkeypatch.setattr("memtomem_stm.server._PROXY_STOP_BUDGET_SECONDS", 0.05)
+        host = _HostScope()
+
+        async def _never_returns_while_the_host_is_cancelled():
+            host.scope.cancel()
+            await asyncio.sleep(30)
+
+        task = asyncio.create_task(
+            self._run_minimal_lifespan(
+                pm_stop=_never_returns_while_the_host_is_cancelled, host_scope=host
+            )
+        )
+        try:
+            with caplog.at_level("WARNING"):
+                # ``asyncio.wait``: a ceiling that no longer fired must fail
+                # this test, not hang it.
+                done, _ = await asyncio.wait({task}, timeout=10.0)
+            assert done == {task}
+            task.result()  # ``asyncio.wait`` does not raise what the task raised
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.wait({task}, timeout=5.0)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Proxy manager stop did not finish" in m for m in messages)
+        assert killed == [{4242}]
+        assert completed == [1]
 
     async def test_the_watchdog_would_reap_the_children_a_wedged_teardown_left(self, monkeypatch):
         """The watchdog exits with os._exit, which runs no finally blocks — so
@@ -3084,6 +3362,92 @@ class TestLifespan:
             async with app_lifespan(mcp) as _ctx:
                 assert captured_pm_kwargs.get("cache") is None
                 mock_pm_instance.start.assert_awaited_once()
+
+    async def _log_of_an_unusable_cache_key(self, cache_dir: Path) -> tuple[str, Path]:
+        """Run the lifespan with a cache whose key file is not a key; return
+        what the production formatter wrote, and the key file."""
+        import io
+        import logging
+
+        from memtomem_stm.logging_setup import FILE_FORMAT, DisplayEscapingFormatter
+        from memtomem_stm.server import app_lifespan, mcp
+        from memtomem_stm.utils.local_key import key_path_for
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        db_path = cache_dir / "proxy_cache.db"
+        key_file = key_path_for(db_path)
+        key_file.write_bytes(b"not a key\n")
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = []
+        captured_pm_kwargs: dict = {}
+
+        def _capture_pm(*_args, **kwargs):
+            captured_pm_kwargs.update(kwargs)
+            return mock_pm_instance
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(DisplayEscapingFormatter(FILE_FORMAT))
+        server_logger = logging.getLogger("memtomem_stm.server")
+        server_logger.addHandler(handler)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", side_effect=_capture_pm),
+            ):
+                mock_cfg = MockConfig.return_value
+                mock_cfg.proxy = MagicMock()
+                mock_cfg.proxy.enabled = True
+                mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+                mock_cfg.proxy.metrics.enabled = False
+                mock_cfg.proxy.compression_feedback.enabled = False
+                mock_cfg.proxy.progressive_reads.enabled = False
+                mock_cfg.proxy.selection_telemetry.enabled = False
+                mock_cfg.proxy.cache.enabled = True
+                mock_cfg.proxy.cache.db_path = db_path
+                mock_cfg.proxy.cache.max_entries = 10
+                mock_cfg.surfacing = MagicMock()
+                mock_cfg.surfacing.enabled = False
+                mock_cfg.langfuse = MagicMock()
+                mock_cfg.langfuse.enabled = False
+                mock_cfg.otlp = MagicMock()
+                mock_cfg.otlp.enabled = False
+                mock_cfg.parent_liveness_poll_seconds = 0.0
+                mock_cfg.parent_liveness_grace_seconds = 900.0
+
+                async with app_lifespan(mcp) as _ctx:
+                    assert captured_pm_kwargs.get("cache") is None
+        finally:
+            server_logger.removeHandler(handler)
+        assert key_file.read_bytes() == b"not a key\n"
+        return stream.getvalue(), key_file
+
+    async def test_unusable_cache_key_file_is_named_in_the_production_log(self, tmp_path):
+        """The warning names the key file under the formatter the server
+        installs, which withholds exception text — so the name must be in the
+        message itself, not only in the traceback (#1416)."""
+        output, key_file = await self._log_of_an_unusable_cache_key(tmp_path)
+
+        assert "Response cache disabled" in output
+        assert str(key_file) in output
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="a newline is not a valid Windows file name character"
+    )
+    async def test_unusable_cache_key_warning_escapes_a_hostile_path(self, tmp_path):
+        """The message quotes the configured cache path, and the formatter
+        escapes only exception text: a newline or a bidi control in that path
+        must not reach the log as itself (#1422)."""
+        output, _ = await self._log_of_an_unusable_cache_key(
+            tmp_path / "x\nWARNING forged\u202e"
+        )
+
+        assert "Response cache disabled" in output
+        assert len(output.splitlines()) == 1
+        assert "x\\u000AWARNING forged\\u202E" in output
 
     async def test_init_failure_after_mcp_adapter_runs_cleanup(self):
         """If a post-mcp_adapter init step raises (e.g. proxy_manager.start()),

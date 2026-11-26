@@ -9,8 +9,9 @@ evidence lanes:
 - the packaged, sanitized 30-case labelled corpus replays the current
   eligibility filter and BM25 ranker and evaluates candidate risk weights.
 
-Production telemetry contains hashes instead of raw prompts and does not store
-candidate descriptions or schemas. It therefore cannot reproduce lexical
+Production telemetry records only the length and source of the ranking query,
+never the raw prompt (schema v1 rows also carried a digest of it), and does not
+store candidate descriptions or schemas. It therefore cannot reproduce lexical
 scores or establish that one ranker caused a task outcome. In particular,
 execution success is not task success, and ranker-version cohorts are not
 randomized A/B groups.

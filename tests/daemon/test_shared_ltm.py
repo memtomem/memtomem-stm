@@ -660,7 +660,7 @@ async def test_daemon_adapter_accepts_selected_schema_and_forwards_scope(
             "trace_id": "trace-1",
         },
         timeout=adapter._timeout,
-        fingerprint=config_fingerprint(adapter._daemon_config),
+        fingerprint=config_fingerprint(adapter._daemon_config, create_key=True),
     )
 
     request.return_value = ("ok", {"ok": True, "pinned": [], "retrieved": []})
@@ -787,7 +787,7 @@ async def test_daemon_adapter_end_to_end_over_loopback(tmp_path: Path) -> None:
         server._handle_conn, config.daemon.host, 0, limit=MAX_MESSAGE_BYTES
     )
     server._port = tcp.sockets[0].getsockname()[1]
-    fingerprint = config_fingerprint(config)
+    fingerprint = config_fingerprint(config, create_key=True)
     write_handshake(
         handshake_path(config.data_dir, fingerprint),
         pid=123,
@@ -1305,4 +1305,6 @@ async def test_daemon_adapter_passes_its_cached_fingerprint(
     else:
         await adapter.scratch_list(trace_id="trace-1")
 
-    assert request.await_args.kwargs["fingerprint"] == config_fingerprint(adapter._daemon_config)
+    assert request.await_args.kwargs["fingerprint"] == config_fingerprint(
+        adapter._daemon_config, create_key=True
+    )

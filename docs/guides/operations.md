@@ -191,6 +191,17 @@ build started.
    before any of them starts again, then run `mms version` and `mms doctor`.
 5. Start the hosts again.
 
+0.7.9 also changes the fingerprint itself — it is keyed with
+`<data_dir>/stm-discovery.key` — so the same steps apply to it even
+though the protocol does not change: a daemon the earlier build started is
+under a fingerprint the new build no longer derives. If one is still running
+after the upgrade, `mms daemon status` lists it as running under a different
+config, and step 3 applies to it: `mms daemon stop --all` on macOS and Linux,
+Task Manager on Windows. The earlier build's
+`stm-daemon-*.lock` files stay behind with the old fingerprint in their
+names; [The discovery key](../cli.md#the-discovery-key) says when they can be
+deleted.
+
 Each check covers the data directory of the config and `MEMTOMEM_STM_*`
 environment it runs under; repeat it for any other you use. Do not count on
 idle shutdown instead: a daemon exits after `daemon.idle_timeout_seconds`
@@ -211,7 +222,10 @@ mms daemon stop --all
 ```
 
 1. **Hooks** — `mms hook uninstall --host <host> --apply` removes the
-   PostToolUse hook after backing up the host settings file. Every install
+   PostToolUse hook install wrote, after backing up the host settings file.
+   A handler install did not write, such as a manual
+   `mms hook --host claude`, stays; uninstall names its location, so remove
+   it by hand too. Every install
    and uninstall leaves that backup **next to the host's own config**, not
    under STM's directories — `~/.claude/settings.json.bak`,
    `~/.codex/config.toml.bak`, and so on (`.bak.1`, `.bak.2`, … for later

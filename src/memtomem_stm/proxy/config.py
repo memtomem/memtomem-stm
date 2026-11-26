@@ -1025,6 +1025,25 @@ def env_var_hint_for_validation_error(
 ) -> str:
     """Name the ``MEMTOMEM_STM_*`` var(s) implicated in an ``STMConfig`` error.
 
+    The rendered form of :func:`implicated_env_vars`, ``""`` when none is."""
+    implicated = implicated_env_vars(exc, environ)
+    if not implicated:
+        return ""
+    return " (env var(s) implicated: " + ", ".join(sorted(implicated)) + ")"
+
+
+def implicated_env_vars(
+    exc: Exception,
+    environ: Mapping[str, str] | None = None,
+    *,
+    skip_locs: frozenset[tuple[str, ...]] = frozenset(),
+) -> set[str]:
+    """The ``MEMTOMEM_STM_*`` var(s) implicated in an ``STMConfig`` error.
+
+    *skip_locs*: error locations another source supplied the value for (the
+    hook's runtime flags, ``config.hook_flags_hint``); no variable is
+    attributed for an error there.
+
     The sibling of ``_env_override_hint`` for the OTHER failure point: that one
     explains a merged-config failure inside the load path, which owns an env
     overlay to attribute against; this one explains ``STMConfig()`` itself
@@ -1056,7 +1075,7 @@ def env_var_hint_for_validation_error(
     names, never values, are rendered (cf. ``hide_input_in_errors``).
     """
     if not isinstance(exc, ValidationError):
-        return ""
+        return set()
     env = os.environ if environ is None else environ
     prefix = "memtomem_stm_"
     var_paths: dict[tuple[str, ...], str] = {}
@@ -1147,7 +1166,7 @@ def env_var_hint_for_validation_error(
     implicated: set[str] = set()
     for err in exc.errors():
         loc = tuple(str(part) for part in err.get("loc", ()))
-        if not loc:
+        if not loc or loc in skip_locs:
             continue  # no path to attribute; naming every var would be noise
         for name, path in live:
             if err.get("type") == "missing":
@@ -1162,9 +1181,7 @@ def env_var_hint_for_validation_error(
                     implicated.add(name)
             elif _starts_with(loc, path) or _starts_with(path, loc):
                 implicated.add(name)
-    if not implicated:
-        return ""
-    return " (env var(s) implicated: " + ", ".join(sorted(implicated)) + ")"
+    return implicated
 
 
 class CompressionStrategy(StrEnum):
@@ -2066,6 +2083,32 @@ class RelevanceScorerConfig(BaseModel):
     caches the scorer it was built with, and that compressor is keyed on
     ``selective``, so a scorer-only edit reaches them at the next selective
     rebuild. Only used when scorer="embedding"."""
+    privacy_scan_enabled: bool = True
+    """Screen what the embedding scorer would send — the context query, each
+    section's title and first 500 body characters, and the response they came
+    from — for API keys, passwords, provider tokens, JWTs and private keys. On
+    a match the pass is scored with BM25 and nothing is sent (#1382), the same
+    rule ``LLMCompressorConfig.privacy_scan_enabled`` applies to LLM
+    summaries. Set to false only for an endpoint you trust with that text;
+    for a non-loopback ``embedding_base_url`` the proxy then logs a WARNING
+    when it builds its shared scorer — at startup and on a config edit that
+    rebuilds it. Only used when scorer="embedding"."""
+
+    def is_external_destination(self) -> bool:
+        """True when ``embedding_base_url`` is not a loopback host.
+
+        Judged by host alone, unlike ``LLMCompressorConfig``: an
+        OpenAI-compatible embedding server on localhost keeps the text on the
+        machine whatever ``embedding_provider`` says. A URL that does not parse
+        counts as external: the answer only decides whether to warn, and the
+        manager asks it while building the scorer, where raising would turn a
+        bad URL — today a BM25 fallback per call — into a startup failure.
+        """
+        try:
+            host = urlparse(self.embedding_base_url or "").hostname or ""
+        except ValueError:
+            return True
+        return host not in _LOCAL_LLM_HOSTS
 
     @model_validator(mode="after")
     def _apply_provider_default_url(self) -> "RelevanceScorerConfig":

@@ -68,6 +68,7 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_BASE_URL` | URL or `null` | — | Optional embedding-provider base URL. | Bundled |
 | `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_TIMEOUT` | positive float | `10.0` | Embedding request timeout in seconds. | Bundled |
 | `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_CACHE_SIZE` | non-negative integer | `256` | Embeddings held per scorer instance, keyed on provider, model and text; `0` disables the cache. | Bundled |
+| `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__PRIVACY_SCAN_ENABLED` | boolean | `true` | Score a pass with BM25 instead of sending it to the embedding endpoint when its text matches a credential pattern. | Bundled |
 | `MEMTOMEM_STM_PROXY__MAX_DESCRIPTION_CHARS` | integer `>= 32` | `4000` | Exact cap on the advertised tool-description length, `[proxied] ` prefix included. | Bundled |
 | `MEMTOMEM_STM_PROXY__HOST_DESCRIPTION_CAP` | integer `>= 32` or null | — | Declared host tool-description limit, including prefix and hints; unset means unknown. | Bundled |
 | `MEMTOMEM_STM_PROXY__STRIP_SCHEMA_DESCRIPTIONS` | boolean | `false` | Remove nested schema descriptions from proxied tools. | Bundled |
@@ -212,12 +213,12 @@ Status meanings:
 | `MEMTOMEM_STM_OTLP__MAX_EXPORT_BATCH_SIZE` | positive integer | `512` | Spans per request; no greater than queue size. | Startup |
 | `MEMTOMEM_STM_OTLP__SCHEDULE_DELAY_MS` | positive integer | `5000` | Batch flush interval. | Startup |
 | `MEMTOMEM_STM_OTLP__FLUSH_TIMEOUT_SECONDS` | positive float | `5.0` | Whole OTLP shutdown budget. | Startup |
-| `MEMTOMEM_STM_HOOK__USE_DAEMON` | boolean | `true` | Use the shared warm surfacing daemon. | Bundled |
+| `MEMTOMEM_STM_HOOK__USE_DAEMON` | boolean | `true` | Use the shared warm surfacing daemon. A hook command's `--use-daemon` / `--no-daemon` overrides it. | Bundled |
 | `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS` | positive float | `2.5` | Outer hook-to-daemon deadline. | Bundled |
 | `MEMTOMEM_STM_HOOK__FALLBACK` | `skip / cold` | `skip` | Behavior when the daemon is unavailable; a daemon that answers busy or out of time skips either way. | Bundled |
 | `MEMTOMEM_STM_HOOK__AUTO_SPAWN` | boolean | `true` | Start a missing daemon. | Bundled |
 | `MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS` | boolean | `false` | Enable rating prompts, durable-demotion reads, and auto-tune feedback processing. Surfacing telemetry rows still persist when false. | Bundled |
-| `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` | boolean | `false` | Enable guarded Claude Bash output replacement. | Bundled |
+| `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` | boolean | `false` | Enable guarded Claude Bash output replacement; applies only to a hook registered with `--host claude`. | Bundled |
 | `MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS` | positive integer | `16000` | Hook compression target size. | Bundled |
 | `MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION` | float `0..1` | `0.65` | Minimum allowed native-output retained fraction. | Bundled |
 | `MEMTOMEM_STM_HOOK__METRICS_ENABLED` | boolean | `true` | Record size/timing-only native-hook metrics. | Bundled |
@@ -267,6 +268,7 @@ provider, host, or standard SDK. They do not change `STMConfig` completeness.
 | Variable | Purpose |
 |---|---|
 | `MEMTOMEM_STM_HOOK_SURFACE_TOOLS` | Legacy comma-separated canonical native-tool allowlist (`read,grep,glob,shell,web_fetch`); mutating `write`/`edit` tokens are refused. |
+| `MEMTOMEM_STM_SERVER_FLAGS` | Written by `mms register` / `mms init` into an MCP server registration: a JSON object of exactly `MEMTOMEM_STM_SURFACING__USE_DAEMON`, `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` and `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT`, each once, with string values. The server applies them over another spelling of the variable, a case variant of the field in the parent block's JSON and a `null` parent block, the way the hook applies its flags (a block that is not a JSON object still fails); the registration's flat variables of those names carry the same values for older releases and are outranked, so editing one of them alone changes nothing. Any other value stops the server with exit 1 and a line naming the variable. |
 | `MMS_CLIENT_SERVER_NAME` | Client-visible STM registration name used only for composed tool-name budget checks. |
 | `MMS_NO_TUI` | Disable the interactive server-discovery TUI. |
 | `NO_COLOR` | Disable ANSI color in CLI output. |

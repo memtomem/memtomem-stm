@@ -13,7 +13,7 @@ Isolating those two means adding a host (B2: Cursor/Kimi/Codex) is one adapter,
 leaving the shared core untouched. B1 ships only :class:`ClaudeHookAdapter`; its
 parse/render delegate to the existing helpers in :mod:`hook_cmd` (imported
 lazily to avoid an import cycle, since ``hook_cmd`` imports this module), so
-behavior is byte-identical to the pre-adapter code.
+parse and render behave as the pre-adapter code did.
 
 Tool-name normalization (B2). Every host names the same built-in differently
 (``Bash`` / ``Shell``; ``Read`` / ``ReadFile``), so :meth:`parse` maps each
@@ -213,18 +213,18 @@ class HostHookAdapter(ABC):
 
         The default is the JSON every Claude-shaped host reads — both the nested
         ``hookSpecificOutput`` envelope (Claude/Codex) and Cursor's flat top-level
-        keys are JSON — so those hosts inherit it unchanged and byte-identical to
-        the pre-seam ``json.dumps`` emit. A host whose surfacing channel is *not*
-        JSON overrides this: Kimi prints the surfaced block as **raw stdout** on
-        exit 0 (no JSON envelope, no key). The caller appends the trailing newline
-        (via ``click.echo``), so this returns the content without one.
+        keys are JSON — so those hosts inherit it unchanged. A host whose
+        surfacing channel is *not* JSON overrides this: Kimi prints the surfaced
+        block as **raw stdout** on exit 0 (no JSON envelope, no key). The caller
+        appends the trailing newline (via ``click.echo``), so this returns the
+        content without one.
 
-        Uses the surrogate-safe writer (#757): the tool output being echoed
-        back is host-supplied and read with ``json.loads``, where ``"\\udcff"``
-        is a legal escape, and an unencodable payload here would break the
-        hook's always-exit-0 pass-through contract at the very last step.
+        The JSON is **ASCII-only** (``ensure_ascii=True``), so it encodes on any
+        ASCII-compatible stdout, not only UTF-8 (#1444); the host's JSON parser
+        decodes the ``\\uXXXX`` escapes back to the same values. Lone surrogates
+        in host-supplied tool output (#757) are escaped the same way.
         """
-        return _json_dumps(rendered, ensure_ascii=False)
+        return _json_dumps(rendered, ensure_ascii=True)
 
 
 class ClaudeHookAdapter(HostHookAdapter):
@@ -584,6 +584,16 @@ def known_hosts() -> tuple[str, ...]:
     The set of values ``mms hook --host`` accepts (plus ``auto``); derived from
     the registry so the CLI choice and the adapters never drift apart."""
     return tuple(_ADAPTERS)
+
+
+def host_can_replace_output(host_tag: str) -> bool | None:
+    """Whether ``host_tag``'s adapter can replace tool output; ``None`` if unknown.
+
+    No Claude fallback, unlike :func:`get_adapter`: a reader labelling recorded
+    rows must not claim a capability for a tag this version does not know.
+    """
+    adapter = _ADAPTERS.get(host_tag)
+    return adapter.can_replace_output if adapter is not None else None
 
 
 def detect_host(payload: Any) -> str:

@@ -28,12 +28,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _child_env() -> dict[str, str]:
+    """This process's environment, with the hook's runtime flags as the child
+    reads them (#1537).
+
+    Under a ``host_runtime.hook_flags_scope`` with flags, the child gets them
+    in ``HOOK_FLAGS_CHANNEL_ENV``, which ``mms daemon run --detached`` reads;
+    without one, an inherited copy is removed, so a spawn without flags never
+    passes another process's on. The MCP server's flags (from
+    ``SERVER_FLAGS_CHANNEL_ENV``) reach the child the same way, and that
+    variable itself is left out: only the server reads it (#1544)."""
+    from memtomem_stm.cli.host_runtime import (
+        HOOK_FLAGS_CHANNEL_ENV,
+        SERVER_FLAGS_CHANNEL_ENV,
+        active_hook_flags,
+        encode_hook_flags_channel,
+    )
+
+    dropped = {HOOK_FLAGS_CHANNEL_ENV, SERVER_FLAGS_CHANNEL_ENV}
+    env = {name: value for name, value in os.environ.items() if name not in dropped}
+    flags = active_hook_flags()
+    if flags:
+        env[HOOK_FLAGS_CHANNEL_ENV] = encode_hook_flags_channel(flags)
+    return env
+
+
 def _spawn_detached() -> None:
     """Launch ``mms daemon run --detached`` as a background process.
 
     The child inherits this process's working directory, which under the hook
     is the user's project; ``safe_module_argv`` keeps that directory off the
-    child's import path.
+    child's import path. Its environment is this one's, with the hook's flags
+    (:func:`_child_env`).
     """
     cmd = safe_module_argv("memtomem_stm", "daemon", "run", "--detached")
     kwargs: dict[str, Any] = {
@@ -41,6 +67,7 @@ def _spawn_detached() -> None:
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "close_fds": True,
+        "env": _child_env(),
     }
     if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
         flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
@@ -93,9 +120,16 @@ def request_spawn(config: STMConfig, *, propagate_errors: bool = False) -> bool:
     ``False`` covers three different things, and no caller can tell them apart:
     a same-config daemon already owns the lifetime lock (alive or mid-startup)
     so we deferred, the lock file couldn't be opened, or the spawn itself failed
-    (no thread, no fork). Never blocks on readiness, and never raises — the hot
-    path (``mms hook``, the daemon LTM adapter) only ever degrades to cold
-    surfacing, so an exception there buys nothing.
+    (no thread, no fork). Never blocks on readiness, and raises for one thing
+    only: a discovery key that cannot be read or created
+    (:class:`~memtomem_stm.utils.local_key.LocalKeyError`). That one is not
+    folded into ``False`` because no later attempt can succeed, and
+    ``mms daemon start`` would otherwise poll for ten seconds and blame the
+    daemon log. The hot-path callers (``mms hook``, the daemon LTM adapter)
+    catch it and degrade as they do for an unreachable daemon.
+
+    This is where the key is created when no daemon has run under
+    ``data_dir`` yet: the child it launches has to find the same one.
 
     *propagate_errors* re-raises that third case for callers that do more than
     degrade: ``mms daemon start`` retries on a schedule and reports at the end,
@@ -109,7 +143,8 @@ def request_spawn(config: STMConfig, *, propagate_errors: bool = False) -> bool:
     from memtomem_stm.daemon.locking import lock_path, single_owner_lock
 
     try:
-        with single_owner_lock(lock_path(config.data_dir, config_fingerprint(config))) as acquired:
+        fingerprint = config_fingerprint(config, create_key=True)
+        with single_owner_lock(lock_path(config.data_dir, fingerprint)) as acquired:
             alive = not acquired  # held by a live/starting daemon → don't pile on
     except OSError:
         logger.debug("request_spawn: could not open lock file", exc_info=True)

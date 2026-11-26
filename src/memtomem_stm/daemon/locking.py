@@ -19,12 +19,16 @@ blocks a config-B hook from spawning the daemon it actually needs (config-drift
 coexistence). "Single owner" is therefore per-config — exactly one daemon *per
 distinct config*.
 
-Three access shapes:
+Four access shapes:
 - :func:`single_owner_lock` — a context manager for the *probe* (acquire,
   yield, release). Used by ``request_spawn`` and ``mms daemon start``.
 - :func:`probe_lifetime_lock` — the same probe for callers that must not read
   "could not open the lock file" as "free": ``mms daemon stop``/``status``
   judge whether a daemon is still running by it (#1245).
+- :func:`probe_existing_lifetime_lock` — one look at a lock file that is
+  already there, creating nothing. ``mms daemon status`` and ``stop --all``
+  ask it about every *other* fingerprint's lock, which they have no business
+  bringing into existence (#1421).
 - :func:`open_lock_fd` / :func:`try_lock` / :func:`release_lock` — the daemon
   holds an fd across its whole asyncio run, retrying ``try_lock`` with
   ``await asyncio.sleep`` and releasing on teardown.
@@ -46,6 +50,7 @@ from memtomem_stm.utils.locking import (
     open_lock_fd as _open_lock_fd,
     release_lock as _release_lock,
     try_lock as _try_lock,
+    try_lock_strict as _try_lock_strict,
     unlock as _unlock,
 )
 
@@ -60,7 +65,9 @@ def lock_path(data_dir: Path, fingerprint: str) -> Path:
     Keyed by the config fingerprint so daemons under different configs hold
     different locks and coexist (see the module docstring). Callers pass
     :func:`~memtomem_stm.daemon.discovery.config_fingerprint` of their own
-    effective config — the same value used to derive the handshake path.
+    effective config — the same value used to derive the handshake path. A
+    caller that only looks for a daemon and got no fingerprint (no discovery
+    key) has no lock path to build: probing one would create the file.
     """
     return (data_dir / f"{LOCK_PREFIX}-{fingerprint}.lock").expanduser()
 
@@ -143,6 +150,47 @@ def probe_lifetime_lock(path: Path) -> Iterator[LockProbe]:
     try:
         acquired = _try_lock(fd)
         yield LockProbe.FREE if acquired else LockProbe.HELD
+    finally:
+        if acquired:
+            _unlock(fd)
+        os.close(fd)
+
+
+def probe_existing_lifetime_lock(path: Path) -> LockProbe | None:
+    """One non-blocking look at the lock file at ``path``, creating nothing.
+
+    Opens without creating the file, its directory, or the target of a link
+    that does not resolve, and returns after releasing whatever it took:
+
+    - ``None`` — nothing could be opened at ``path`` (``FileNotFoundError``).
+      That covers a file that is not there, a link whose target is not, and a
+      path whose directory cannot be walked; they are different answers to
+      "is a daemon running", so telling them apart is left to the caller.
+    - :attr:`LockProbe.UNKNOWN` — the file is there and could not be opened
+      or prepared for locking (any other ``OSError``), or the lock attempt
+      failed for a reason other than someone holding it: a filesystem with no
+      lock support would otherwise make every lock file look held.
+    - :attr:`LockProbe.FREE` / :attr:`LockProbe.HELD` — it opened, and the
+      lock was or was not available. Unlike :func:`probe_lifetime_lock`,
+      ``FREE`` is not held on return: there is no block to do work in.
+
+    ``HELD`` means held at that instant. The attempt itself takes the lock for
+    a moment, so two processes probing the same file can each be the other's
+    holder. A caller with nothing else to go by — no published record for the
+    fingerprint — looks more than once before it reports a daemon.
+    """
+    try:
+        fd = _open_lock_fd(path, create=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return LockProbe.UNKNOWN
+    acquired = False
+    try:
+        acquired = _try_lock_strict(fd)
+        return LockProbe.FREE if acquired else LockProbe.HELD
+    except OSError:
+        return LockProbe.UNKNOWN
     finally:
         if acquired:
             _unlock(fd)

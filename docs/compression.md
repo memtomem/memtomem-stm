@@ -415,7 +415,8 @@ When an agent provides `_context_query` in tool arguments, compression allocates
     "embedding_model": "nomic-embed-text",
     "embedding_base_url": "http://localhost:11434",
     "embedding_timeout": 10.0,
-    "embedding_cache_size": 256
+    "embedding_cache_size": 256,
+    "privacy_scan_enabled": true
   }
 }
 ```
@@ -424,6 +425,25 @@ When an agent provides `_context_query` in tool arguments, compression allocates
 |--------|---------|----------------|--------------|
 | `bm25` (default) | <1ms | No | None |
 | `embedding` | 5-50ms | Yes | Ollama / OpenAI |
+
+**What leaves the machine under `embedding`.** Each scoring pass sends the context query and, for every section, its title and the first 500 characters of its body to `embedding_base_url` — the provider's endpoint, or whatever host you point it at. `bm25` sends nothing. With `privacy_scan_enabled` on (the default), a pass is scored with BM25 instead, and nothing is sent, when the query, a section as sent, a whole section, or the response the sections were taken from matches a credential pattern (API keys, passwords, provider tokens, JWTs, private keys — the set the LLM compressor uses; email addresses alone do not count). The whole pass falls back, not only the matching section, because BM25 and embedding scores are on different scales. The response is screened as well as the sections because SELECTIVE and SCHEMA_PRUNING score a JSON key and its value as separate pieces, which can hide a `"password": "…"` pair from a per-section check; the response is read with its JSON string escapes decoded, so a label written as `\u0070assword` counts too. These passes do not count as a `scorer_fallback`: that metric records an endpoint that failed.
+
+> **Disabling the scan (`privacy_scan_enabled: false`) sends that text to the endpoint unscanned.** Turn it off only for an endpoint you trust with it, such as a local Ollama. When `scorer` is `embedding`, the scan is off and `embedding_base_url` is not a loopback host, the proxy logs a **WARNING** naming the destination — at startup and again whenever a config edit rebuilds the scorer into that state. A local endpoint stays silent, whatever `embedding_provider` says.
+
+### Measuring whether queries arrive
+
+Query-aware compression does nothing for a call that carries no query, so the proxy records whether one arrived. A live proxied call that the proxy records as successful, and whose upstream result has at least one text block (an empty block counts), stores `agent` or `none` in the `context_query_source` column of `proxy_metrics`: `agent` when the call's `_context_query` was a string with something other than whitespace in it, `none` otherwise. The row stores only that fact, not the query's text. `mms stats` reports it under the MCP figures:
+
+```text
+Context query supplied on 3 of 120 observed live MCP responses (2.5%)
+```
+
+- **Observed** means a retained MCP row that carries the value. A response delivered as a structured delivery frame and one whose text blocks bypassed compression carry it. A call recorded as an error (whether the upstream failed or the proxy did while handling the result), an upstream result with no text block (an empty, image-only or `structuredContent`-only result) and a row written by a version before the column do not, and `mms hook` rows never do. The number can therefore be lower than the block's `calls`.
+- **Only live responses count.** A cache hit writes no row. `_context_query` is part of the cache key, so the same arguments under a different query are a different cache entry.
+- **It says a query arrived, not that it was used.** Whether a scorer ran depends on the path the response took; a response within its budget, for one, runs none.
+- **It is not in `--all-time`.** The figure covers the retained rows only (`proxy.metrics.max_history`).
+
+The line counts the observed rows of every client that writes to this metrics DB (`--tool` narrows it to a tool name, across servers), including calls made before a client received a tool list that advertises the argument (`advertise_context_query`). It is not a rate for one client or for the period since a setting changed.
 
 `RelevanceScorer` protocol (`proxy/relevance.py`) enables custom scorer implementations. `EmbeddingScorer` uses sync httpx to call embedding APIs with automatic BM25 fallback on error.
 
@@ -573,15 +593,22 @@ serverInfo metadata and resultType, and legacy clients' field filtering.
 can be shortened to fit. A TOC that cannot fit without dropping keys falls back
 to progressive delivery. A budget too small for one progressing envelope returns
 `budget_exceeded`. A non-final progressive key is published only when its owned
-continuation can also fit a progressing response. Initial upstream metadata uses
-the initial budget only; continuations retain the full derived tool budget.
+continuation can also fit a progressing response. Result-level upstream metadata
+uses the initial budget only. The text block's `annotations` and `_meta` are
+repeated on each continuation that serves upstream text (not on a read at or
+past the end), so such a structured continuation reserves their serialized size
+from the full derived tool budget it retains. Metadata over about 64 KiB of UTF-8
+JSON is not kept for continuations: the first response carries it, the rest do
+not. The bound is approximate near the limit, since it is counted before the SDK
+serializes the metadata.
 With `max_result_tokens` and `token_estimation_mode: "unicode"`, the cleaned
 response's estimated token density derives one character cap before any retention
 floor. Structured frames use the smaller of that cap and the configured static
 character conversion, both for compression and serialized-result fitting. Initial
 upstream metadata is reserved from that cap; the full cap is stored for owned
-continuations. Lossless TOC/progressive delivery does not widen this limit to
-meet a lossy-content retention floor. This is an estimated token budget, not a
+continuations, which reserve the repeated text block metadata from it. Lossless
+TOC/progressive delivery does not widen this limit to meet a lossy-content
+retention floor. This is an estimated token budget, not a
 model-specific tokenizer guarantee.
 Selective and hybrid (`tail_mode: "toc"`) responses short enough to return
 unchanged do so only when that serialized result also fits; JSON escaping can

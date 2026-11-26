@@ -81,7 +81,7 @@ def test_arming_never_raises_at_the_cost_of_the_shutdown(
     monkeypatch.setattr(threading.Thread, "start", _cannot_start)
     watchdog = TeardownWatchdog(0.05)
     with caplog.at_level("WARNING", logger=teardown_watchdog.__name__):
-        watchdog.arm()
+        assert watchdog.arm() is False  # no backstop, and the caller is told
     assert watchdog._thread is None
     assert any("without a backstop" in r.getMessage() for r in caplog.records)
 
@@ -102,6 +102,33 @@ def test_arming_twice_starts_one_countdown(no_real_exit: _Exits) -> None:
     watchdog.arm()
     assert watchdog._thread is first
     watchdog.disarm()
+
+
+class _NoExitWatchdog(TeardownWatchdog):
+    """A watchdog whose countdown can never reach ``os._exit``, even one that
+    outlives the fixture catching the exit."""
+
+    def _fire(self) -> None:
+        pass
+
+
+def test_arm_says_whether_the_backstop_is_in_place() -> None:
+    # The lifespan shields a deliberate shutdown's close sequence only while
+    # something outside the loop guarantees the exit (#1468), and reads that
+    # from here.
+    armed = _NoExitWatchdog(5.0)
+    disabled = _NoExitWatchdog(0.0)
+    try:
+        assert armed.arm() is True
+        assert armed.arm() is True  # already counting down
+        armed.disarm()
+        assert armed.arm() is False  # stood down: no countdown left
+        assert disabled.arm() is False
+    finally:
+        for watchdog in (armed, disabled):
+            watchdog.disarm()
+            if watchdog._thread is not None:
+                watchdog._thread.join(timeout=5.0)
 
 
 def test_children_are_reaped_before_the_hard_exit(no_real_exit: _Exits) -> None:
@@ -174,7 +201,7 @@ def test_arming_survives_a_thread_constructor_failure(
 
     monkeypatch.setattr(teardown_watchdog.threading, "Thread", _cannot_construct)
     watchdog = TeardownWatchdog(0.05)
-    watchdog.arm()  # must not raise
+    assert watchdog.arm() is False  # must not raise
     assert watchdog._thread is None
 
 

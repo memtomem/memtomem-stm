@@ -1161,3 +1161,273 @@ class TestHotReloadedOverrides:
 
         assert session.call_tool.await_count == 1
         detect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestPersistedCacheCounts:
+    """#1329: the counts above also reach ``proxy_cache_daily``, attributed to
+    the dispatched server and tool, through the production call sites — a hit,
+    an eligible miss, an unstorable response refused by the store and one
+    passed through — and nothing for a call that attempted no lookup."""
+
+    async def test_dispatch_persists_attributed_counts(self, build, tmp_path, monkeypatch):
+        import sqlite3
+
+        from memtomem_stm.proxy import metrics as metrics_module
+
+        # One day for every event: rows are keyed by tool below, so a run
+        # crossing UTC midnight would otherwise split a tool across two rows.
+        monkeypatch.setattr(metrics_module, "_utc_day", lambda: "2026-11-21")
+        mgr, _, _ = build(
+            tools=[
+                _tool("reader", _ann(read_only=True)),
+                _tool("mixed", _ann(read_only=True)),
+                _tool("empty", _ann(read_only=True)),
+                _tool("writer", _ann(read_only=False)),
+            ]
+        )
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # eligible miss
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # hit
+        session.call_tool.return_value = _mixed_result()
+        await mgr.call_tool("srv", "mixed", {"q": "a"})  # miss + unstorable
+        session.call_tool.return_value = _empty_result()
+        await mgr.call_tool("srv", "empty", {})  # miss + unstorable
+        session.call_tool.return_value = _text_result("done")
+        await mgr.call_tool("srv", "writer", {"x": 1})  # no lookup, nothing
+        mgr.tracker.flush_cache_counts()
+
+        db = sqlite3.connect(tmp_path / "m.db")
+        try:
+            rows = {
+                row[0]: row[1:]
+                for row in db.execute(
+                    "SELECT tool, server, hits, hit_chars > 0, misses, unstorable "
+                    "FROM proxy_cache_daily"
+                )
+            }
+        finally:
+            db.close()
+        assert rows == {
+            "reader": ("srv", 1, 1, 1, 0),
+            "mixed": ("srv", 0, 0, 1, 1),
+            "empty": ("srv", 0, 0, 1, 1),
+        }
+
+
+@pytest.mark.asyncio
+class TestUnstorableRidesItsCallsMetricsWrite:
+    """#1329: once a call completes, its own metrics write carries both its
+    miss and its unstorable outcome, on each path that counts one — the main
+    pipeline (``_store_cache``), the empty-response passthrough and the
+    metadata bypass. Read after each dispatch, with no flush in between."""
+
+    @staticmethod
+    def _counts(path, tool):
+        import sqlite3
+
+        db = sqlite3.connect(path)
+        try:
+            return db.execute(
+                "SELECT misses, unstorable FROM proxy_cache_daily WHERE tool = ?", (tool,)
+            ).fetchall()
+        finally:
+            db.close()
+
+    async def test_each_path_writes_miss_and_unstorable_together(
+        self, build, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        from mcp import types as mcp_types
+
+        from memtomem_stm.proxy import metrics as metrics_module
+        from memtomem_stm.proxy.metrics import METADATA_BYPASS_STRATEGY
+
+        monkeypatch.setattr(metrics_module, "_utc_day", lambda: "2026-11-21")
+        mgr, _, _ = build(
+            tools=[
+                _tool("mixed", _ann(read_only=True)),
+                _tool("empty", _ann(read_only=True)),
+                _tool("meta", _ann(read_only=True)),
+            ]
+        )
+        session = mgr._connections["srv"].session
+        db_path = tmp_path / "m.db"
+
+        session.call_tool.return_value = _mixed_result()
+        await mgr.call_tool("srv", "mixed", {"q": "a"})
+        assert self._counts(db_path, "mixed") == [(1, 1)]
+
+        session.call_tool.return_value = _empty_result()
+        await mgr.call_tool("srv", "empty", {})
+        assert self._counts(db_path, "empty") == [(1, 1)]
+
+        # Two text blocks, one with block-level metadata: the metadata bypass
+        # (a result-level _meta alone does not take it).
+        session.call_tool.return_value = SimpleNamespace(
+            content=[
+                mcp_types.TextContent(type="text", text="first", _meta={"audience": "a"}),
+                mcp_types.TextContent(type="text", text="second"),
+            ],
+            is_error=False,
+        )
+        await mgr.call_tool("srv", "meta", {"q": "a"})
+        assert self._counts(db_path, "meta") == [(1, 1)]
+        db = sqlite3.connect(db_path)
+        try:
+            strategy = db.execute(
+                "SELECT compression_strategy FROM proxy_metrics WHERE tool = 'meta'"
+            ).fetchall()
+        finally:
+            db.close()
+        assert strategy == [(METADATA_BYPASS_STRATEGY,)]
+
+
+def _metadata_result():
+    """Two text blocks, one with block-level metadata: the metadata bypass."""
+    from mcp import types as mcp_types
+
+    return SimpleNamespace(
+        content=[
+            mcp_types.TextContent(type="text", text="first", _meta={"audience": "a"}),
+            mcp_types.TextContent(type="text", text="second"),
+        ],
+        is_error=False,
+    )
+
+
+# A body, then a progressive footer and its continuation call, as another STM
+# proxy upstream would send them. The body comes first: CLEAN strips a leading
+# newline, and the footer marker starts with one.
+_TRANSIENT_KEY_TEXT = (
+    'payload\n---\n[progressive: chars=7/14, remaining=7]\nstm_proxy_read_more(key="k1")'
+)
+
+
+def _response_text(result) -> str:
+    if isinstance(result, str):
+        return result
+    blocks = result.content if hasattr(result, "content") else result
+    return "".join(getattr(block, "text", "") for block in blocks)
+
+
+@pytest.mark.asyncio
+class TestUnstorableNeedsThisCallsMiss:
+    """#1473: an unstorable outcome is counted only against the miss the same
+    call recorded at lookup. Here the tool's annotations change while the
+    upstream call is in flight, as a ``tools/list_changed`` refresh or a
+    reconnect changes them, so eligibility read again at completion differs
+    from the lookup's; the counts must follow the lookup, live and persisted."""
+
+    @staticmethod
+    def _flip_annotations_during_call(mgr, tool, result, ann):
+        def _call(*_args, **_kwargs):
+            mgr._connections["srv"].tools = [_tool(tool, ann)]
+            return result
+
+        mgr._connections["srv"].session.call_tool.side_effect = _call
+
+    @pytest.fixture(autouse=True)
+    def _one_utc_day(self, monkeypatch):
+        # A call crossing UTC midnight would put its miss and its unstorable
+        # outcome on two rows; the assertions below read one.
+        from memtomem_stm.proxy import metrics as metrics_module
+
+        monkeypatch.setattr(metrics_module, "_utc_day", lambda: "2026-11-22")
+
+    @staticmethod
+    def _persisted(mgr, path):
+        import sqlite3
+
+        mgr.tracker.flush_cache_counts()
+        db = sqlite3.connect(path)
+        try:
+            return db.execute("SELECT misses, unstorable FROM proxy_cache_daily").fetchall()
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize(
+        "make_result",
+        [_mixed_result, _empty_result, _metadata_result, lambda: _text_result(_TRANSIENT_KEY_TEXT)],
+        ids=["mixed", "empty", "metadata-bypass", "transient-key"],
+    )
+    async def test_no_lookup_means_no_unstorable(self, build, tmp_path, make_result):
+        mgr, _, _ = build(tools=[_tool("t", _ann(read_only=False))])
+        self._flip_annotations_during_call(mgr, "t", make_result(), _ann(read_only=True))
+
+        await mgr.call_tool("srv", "t", {"q": "a"})
+
+        assert mgr._connections["srv"].session.call_tool.await_count == 1
+        summary = mgr.tracker.get_summary()
+        assert (summary["cache_misses"], summary["cache_unstorable"]) == (0, 0)
+        assert self._persisted(mgr, tmp_path / "m.db") == []
+
+    async def test_transient_key_case_reaches_the_store_decision(self, build):
+        """The markers survive CLEAN and COMPRESS, so the transient-key case
+        above is decided by ``_store_cache``'s transient-key branch rather than
+        by being stored: an eligible tool returning it records 1 miss and 1
+        unstorable and stores nothing."""
+        mgr, _, cache = build(tools=[_tool("t", _ann(read_only=True))])
+        mgr._connections["srv"].session.call_tool.return_value = _text_result(_TRANSIENT_KEY_TEXT)
+
+        result = await mgr.call_tool("srv", "t", {"q": "a"})
+
+        text = _response_text(result)
+        assert "\n---\n[progressive: chars=" in text
+        assert 'stm_proxy_read_more(key="' in text
+        summary = mgr.tracker.get_summary()
+        assert (summary["cache_misses"], summary["cache_unstorable"]) == (1, 1)
+        assert _get(mgr, cache, "t", {"q": "a"}) is None
+
+    async def test_never_storable_shape_keeps_its_unstorable(self, build, tmp_path):
+        """Eligible at lookup (miss recorded), a writer by completion: a mixed
+        response is never storable either way, so its miss gets its outcome."""
+        mgr, _, _ = build(tools=[_tool("t", _ann(read_only=True))])
+        self._flip_annotations_during_call(mgr, "t", _mixed_result(), _ann(read_only=False))
+
+        await mgr.call_tool("srv", "t", {"q": "a"})
+
+        summary = mgr.tracker.get_summary()
+        assert (summary["cache_misses"], summary["cache_unstorable"]) == (1, 1)
+        assert self._persisted(mgr, tmp_path / "m.db") == [(1, 1)]
+
+    async def test_text_skipped_by_the_completion_gate_is_not_unstorable(self, build, tmp_path):
+        """Eligible at lookup, a writer by completion: a plain text response is
+        not stored, but it is not a never-cacheable shape, so the miss stays
+        without an unstorable outcome (unchanged by #1473)."""
+        mgr, _, cache = build(tools=[_tool("t", _ann(read_only=True))])
+        self._flip_annotations_during_call(mgr, "t", _text_result("payload"), _ann(read_only=False))
+
+        await mgr.call_tool("srv", "t", {"q": "a"})
+
+        summary = mgr.tracker.get_summary()
+        assert (summary["cache_misses"], summary["cache_unstorable"]) == (1, 0)
+        assert self._persisted(mgr, tmp_path / "m.db") == [(1, 0)]
+        assert _get(mgr, cache, "t", {"q": "a"}) is None
+
+
+@pytest.mark.asyncio
+class TestCacheWriteFollowsTheMetricsWrite:
+    """The store decision runs before the metrics write (so an unstorable
+    count rides it), but the cache entry itself is written after it, so its
+    TTL starts when the response is complete, not before a slow metrics
+    write (#1329)."""
+
+    async def test_entry_is_written_after_the_metrics_row(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+        seen_at_record: list[object] = []
+        real_record = mgr.tracker.record
+
+        def spy(metrics):
+            seen_at_record.append(_get(mgr, cache, "reader", {"q": "a"}))
+            real_record(metrics)
+
+        mgr.tracker.record = spy
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert seen_at_record == [None]
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None

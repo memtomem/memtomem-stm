@@ -5,6 +5,10 @@ Host applications do not consistently inherit the shell environment in which
 that define the shared-daemon contract in the registration itself so an MCP
 server and a native hook discover the same warm daemon generation.
 
+The words of the hook command ``mms hook install`` writes are defined here
+too (:func:`hook_command_words`), next to the reader that decides whether an
+existing command has that form (:func:`owned_hook_command`).
+
 This module is intentionally internal to the CLI.  It does not add another
 public configuration model: the existing ``STMConfig`` fields and environment
 variables remain the source of truth at runtime.
@@ -12,10 +16,16 @@ variables remain the source of truth at runtime.
 
 from __future__ import annotations
 
+import json
 import math
+import re
 import shlex
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _DAEMON_GRACE_SECONDS = 1.0
 
@@ -28,16 +38,259 @@ _PERSIST_QUERY_TEXT_ENV = "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT"
 _TRUE = frozenset({"1", "true", "t", "yes", "y", "on"})
 _FALSE = frozenset({"0", "false", "f", "no", "n", "off"})
 
+HOOK_ENTRY_POINT = "memtomem-stm"
+"""The entry-point name ``mms hook install`` writes, bare or after ``uv run``."""
 
-def _shell_tokens(command: str) -> list[str]:
-    """Split a shell command while exposing unquoted compound operators."""
+_UV_LAUNCHER_HEAD = ("uv", "run", "--directory")
+_DAEMON_FLAGS = {True: "--use-daemon", False: "--no-daemon"}
+_PERSIST_FLAGS = {True: "--persist-query-text", False: "--no-persist-query-text"}
+
+
+def hook_launcher(directory: str | None = None) -> list[str]:
+    """The launcher words of an installed hook command: the bare console
+    script, or ``uv run --directory <directory>`` in front of it."""
+    if directory is None:
+        return [HOOK_ENTRY_POINT]
+    return [*_UV_LAUNCHER_HEAD, directory, HOOK_ENTRY_POINT]
+
+
+def hook_command_words(
+    launcher: Sequence[str], host: str, policy_words: Sequence[str]
+) -> list[str]:
+    """The words of an installed hook command. ``mms hook install`` joins them
+    with ``shlex.join``, and :func:`owned_hook_command` reads a command back
+    through this same function, so the two cannot drift apart."""
+    return [*launcher, "hook", "--host", host, *policy_words]
+
+
+def _policy_words(daemon_flag: str, surfacing: str, daemon: str, persist_flag: str) -> list[str]:
+    """The runtime-setting words of an installed hook command, in the order
+    every release since 0.1.40 has written them. A new written form is added
+    beside this one, never by editing it: commands written by older releases
+    must stay recognizable."""
+    return [
+        daemon_flag,
+        "--surfacing-timeout-seconds",
+        surfacing,
+        "--daemon-timeout-seconds",
+        daemon,
+        persist_flag,
+    ]
+
+
+_SHELL_SPACE = frozenset(" \t\r\n")
+_SHELL_PUNCTUATION = "|&;<>"
+_PLAIN_RUN = re.compile(r"[^ \t\r\n|&;<>'\"\\]+")
+_PUNCTUATION_RUN = re.compile(r"[|&;<>]+")
+_DOUBLE_QUOTED_RUN = re.compile(r'[^"\\]+')
+
+
+def _lenient_shell_tokens(command: str) -> list[str]:
+    """The words ``shlex.shlex(command, posix=True, punctuation_chars="|&;<>")``
+    reads with ``whitespace_split`` on and no comment characters; on a parse
+    error (an unbalanced quote, a trailing ``\\``), the words read before it,
+    an empty word, then the ``str.split()`` words of the whole line, so
+    neither reading is lost. An approximation of the shell, used only to
+    decide whether a handler that ``mms hook install`` does not own still
+    looks like STM's hook, never to act on it or read settings from it.
+
+    Read here in time linear in the line's length: ``shlex`` builds each word
+    one character at a time by concatenation, which is quadratic in a word's
+    length (#1498). The reading is ``shlex``'s:
+
+    * a word ends at a space, tab, CR or LF, or where a run of ``|&;<>``
+      starts, and such a run is a word of its own;
+    * ``'…'`` is literal, and ``"…"`` is literal except that ``\\`` before
+      ``"`` or ``\\`` stands for that character (before any other, both are
+      kept);
+    * outside quotes, ``\\`` stands for the character after it;
+    * a quote pair makes a word even when it is empty (``''``).
+    """
+    words: list[str] = []
+    end = len(command)
+    i = 0
+    while True:
+        while i < end and command[i] in _SHELL_SPACE:
+            i += 1
+        if i == end:
+            return words
+        punctuation = _PUNCTUATION_RUN.match(command, i)
+        if punctuation is not None:
+            words.append(punctuation.group())
+            i = punctuation.end()
+            continue
+        parts: list[str] = []
+        while i < end:
+            char = command[i]
+            if char in _SHELL_SPACE or char in _SHELL_PUNCTUATION:
+                break
+            if char == "'":
+                close = command.find("'", i + 1)
+                if close < 0:
+                    return _unparsed(words, command)
+                parts.append(command[i + 1 : close])
+                i = close + 1
+            elif char == '"':
+                i += 1
+                while True:
+                    run = _DOUBLE_QUOTED_RUN.match(command, i)
+                    if run is not None:
+                        parts.append(run.group())
+                        i = run.end()
+                    if i == end:
+                        return _unparsed(words, command)
+                    if command[i] == '"':
+                        i += 1
+                        break
+                    # A ``\`` inside double quotes.
+                    if i + 1 == end:
+                        return _unparsed(words, command)
+                    escaped = command[i + 1]
+                    parts.append(escaped if escaped in '"\\' else "\\" + escaped)
+                    i += 2
+            elif char == "\\":
+                if i + 1 == end:
+                    return _unparsed(words, command)
+                parts.append(command[i + 1])
+                i += 2
+            else:
+                plain = _PLAIN_RUN.match(command, i)
+                assert plain is not None  # ``char`` is none of the above
+                parts.append(plain.group())
+                i = plain.end()
+        words.append("".join(parts))
+
+
+def _unparsed(words: list[str], command: str) -> list[str]:
+    # The empty word keeps a pair from forming across the two readings: it
+    # is neither an executable name nor ``hook``.
+    return [*words, "", *command.split()]
+
+
+HOOK_FLAG_NAMES = frozenset(
+    {_USE_DAEMON_ENV, _SURFACING_TIMEOUT_ENV, _DAEMON_TIMEOUT_ENV, _PERSIST_QUERY_TEXT_ENV}
+)
+"""The variables :func:`runtime_env_overrides` names, spelled as it spells them."""
+
+MCP_FLAG_NAMES = frozenset(
+    {_SURFACING_USE_DAEMON_ENV, _SURFACING_TIMEOUT_ENV, _PERSIST_QUERY_TEXT_ENV}
+)
+"""The variables :meth:`HostRuntimePolicy.mcp_env` names, spelled as it spells
+them: the keys of :data:`SERVER_FLAGS_CHANNEL_ENV`."""
+
+RUNTIME_FLAG_NAMES = HOOK_FLAG_NAMES | MCP_FLAG_NAMES
+"""Every variable a :func:`hook_flags_scope` carries: the hook's flags, or the
+MCP server's registration policy (#1544)."""
+
+HOOK_FLAGS_CHANNEL_ENV = "MEMTOMEM_STM_HOOK_FLAGS"
+"""How a detached daemon receives the flags of the process that spawned it.
+
+``daemon.spawn`` writes it into the child's environment only, and only
+``mms daemon run --detached`` reads it: no settings build reads it, so an
+inherited copy changes nothing anywhere else. It is not a settings field (it
+has no ``__``), like ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``. Its keys are
+:data:`RUNTIME_FLAG_NAMES`: a daemon the MCP server spawns is handed the
+server's flags the same way."""
+
+SERVER_FLAGS_CHANNEL_ENV = "MEMTOMEM_STM_SERVER_FLAGS"
+"""How the MCP server receives its registration's runtime policy (#1544).
+
+:meth:`HostRuntimePolicy.mcp_env` writes it beside the flat variables, with
+the same values, and only ``server.main`` reads it: it applies the policy
+through :func:`hook_flags_scope`, so neither a ``null`` parent block nor a
+case variant of the field in the block's JSON outranks it. Not a settings
+field (no ``__``). ``daemon.spawn`` leaves it out of a daemon's environment,
+and the SDK starts upstream servers with an allowlist environment."""
+
+_HOOK_FLAGS: ContextVar[Mapping[str, str] | None] = ContextVar("_HOOK_FLAGS", default=None)
+
+
+@contextmanager
+def hook_flags_scope(flags: Mapping[str, str]) -> Iterator[None]:
+    """Apply *flags* to every ``STMConfig`` built in this context (#1537).
+
+    *flags* maps :data:`HOOK_FLAG_NAMES` to the strings
+    :func:`runtime_env_overrides` returns, or :data:`MCP_FLAG_NAMES` to the
+    strings :meth:`HostRuntimePolicy.mcp_env` writes (the MCP server,
+    #1544); ``{}`` means no flags, also over an
+    enclosing scope. ``STMConfig`` lays them over what the environment source
+    read, so no spelling of a variable, no case variant of the field in the
+    block's JSON and no ``null`` block outranks them. A context variable, not
+    the environment: a build in another context (a thread started without a
+    copy of this one) does not see it, and calls that overlap in one process
+    do not change each other's builds. The scope resets on every exit.
+
+    Here, not in ``config``, because the hook enters it before it reads its
+    payload, and a call that never builds its settings must not import them.
+    """
+    token = _HOOK_FLAGS.set(dict(flags))
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        return list(lexer)
-    except ValueError:
-        return command.split()
+        yield
+    finally:
+        _HOOK_FLAGS.reset(token)
+
+
+def active_hook_flags() -> dict[str, str]:
+    """The flags of the innermost :func:`hook_flags_scope`, or ``{}``."""
+    return dict(_HOOK_FLAGS.get() or {})
+
+
+def encode_hook_flags_channel(flags: Mapping[str, str]) -> str:
+    """A flags channel's value for *flags*: :data:`HOOK_FLAGS_CHANNEL_ENV`'s
+    and :data:`SERVER_FLAGS_CHANNEL_ENV`'s."""
+    return json.dumps(dict(flags), sort_keys=True)
+
+
+class HookFlagsChannelError(ValueError):
+    """A flags channel (:data:`HOOK_FLAGS_CHANNEL_ENV`,
+    :data:`SERVER_FLAGS_CHANNEL_ENV`) is not what its writer writes. The
+    message names the variable, never its value."""
+
+
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads``'s ``object_pairs_hook`` that refuses a repeated member,
+    which would otherwise let the later one win."""
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("repeated member")
+    return members
+
+
+def _decode_flags_channel(
+    raw: str, *, variable: str, names: frozenset[str], exact: bool
+) -> dict[str, str]:
+    try:
+        flags = json.loads(raw, object_pairs_hook=_unique_members)
+    except (ValueError, RecursionError):  # deep nesting exhausts the decoder's stack
+        flags = None
+    if (
+        not isinstance(flags, dict)
+        or not (set(flags) == names if exact else set(flags) <= names)
+        or not all(isinstance(value, str) for value in flags.values())
+    ):
+        what = "exactly the MCP registration's" if exact else "the runtime"
+        raise HookFlagsChannelError(f"{variable} is not a JSON object of {what} flag variables")
+    return flags
+
+
+def decode_hook_flags_channel(raw: str) -> dict[str, str]:
+    """Read :data:`HOOK_FLAGS_CHANNEL_ENV` back: a JSON object whose keys are
+    some of :data:`RUNTIME_FLAG_NAMES`, each once, and whose values are
+    strings, or :class:`HookFlagsChannelError`."""
+    return _decode_flags_channel(
+        raw, variable=HOOK_FLAGS_CHANNEL_ENV, names=RUNTIME_FLAG_NAMES, exact=False
+    )
+
+
+def decode_server_flags_channel(raw: str) -> dict[str, str]:
+    """Read :data:`SERVER_FLAGS_CHANNEL_ENV` back: a JSON object whose keys are
+    exactly :data:`MCP_FLAG_NAMES`, each once, and whose values are strings,
+    or :class:`HookFlagsChannelError`. Exactly, because a key left out would
+    leave its field to the environment — for ``persist_query_text``, the raw
+    query text the registration asked to hash."""
+    return _decode_flags_channel(
+        raw, variable=SERVER_FLAGS_CHANNEL_ENV, names=MCP_FLAG_NAMES, exact=True
+    )
 
 
 def _parse_bool(raw: str | None) -> bool | None:
@@ -66,6 +319,25 @@ def _parse_positive_float(raw: str | None) -> float | None:
 def format_seconds(value: float) -> str:
     """Stable, compact rendering for argv/environment serialization."""
     return format(value, ".15g")
+
+
+def writable_seconds(value: float) -> bool:
+    """Whether ``value``, written by :func:`format_seconds`, reads back as a
+    deadline the hook keeps: a positive finite number. ``inf``, ``nan`` and
+    ``1.7976931348623157e308`` (written ``1.79769313486232e+308``, which reads
+    back as infinity) do not. Defined by the hook's own reader, so the writer
+    cannot accept what the reader drops."""
+    return _parse_positive_float(format_seconds(value)) is not None
+
+
+class UnwritableDeadlineError(ValueError):
+    """A resolved deadline :func:`writable_seconds` refuses: the hook would
+    ignore it in the command."""
+
+    def __init__(self, field: str) -> None:
+        super().__init__(field)
+        self.field = field
+        """The ``STMConfig`` field the deadline is resolved from, dotted."""
 
 
 @dataclass(frozen=True)
@@ -107,108 +379,179 @@ class HostRuntimePolicy:
         )
 
     def mcp_env(self) -> dict[str, str]:
-        """Environment values managed for a newly-created MCP registration."""
-        return {
+        """Environment values managed for a newly-created MCP registration.
+
+        The policy twice: as flat variables, which an older release run from
+        the same registration still reads, and in
+        :data:`SERVER_FLAGS_CHANNEL_ENV`, which the server applies over a
+        ``null`` parent block and a case variant of the field in its JSON
+        (#1544). The channel wins, so a flat variable edited alone changes
+        nothing."""
+        flat = {
             _SURFACING_USE_DAEMON_ENV: "true" if self.use_daemon else "false",
             _SURFACING_TIMEOUT_ENV: format_seconds(self.surfacing_timeout_seconds),
             _PERSIST_QUERY_TEXT_ENV: "true" if self.persist_query_text else "false",
         }
+        return {**flat, SERVER_FLAGS_CHANNEL_ENV: encode_hook_flags_channel(flat)}
 
     def hook_args(self) -> list[str]:
-        """Cross-platform flags managed in a native hook command."""
+        """Cross-platform flags managed in a native hook command.
+
+        Raises :class:`UnwritableDeadlineError` for a deadline the hook would
+        drop. The surfacing deadline is checked first: a writable one keeps
+        ``surfacing + 1`` writable, so a daemon deadline that fails comes from
+        the daemon setting itself."""
         normalized = self.normalized()
-        return [
-            "--use-daemon" if normalized.use_daemon else "--no-daemon",
-            "--surfacing-timeout-seconds",
+        if not writable_seconds(normalized.surfacing_timeout_seconds):
+            raise UnwritableDeadlineError("surfacing.timeout_seconds")
+        if not writable_seconds(normalized.daemon_timeout_seconds):
+            raise UnwritableDeadlineError("hook.daemon_timeout_seconds")
+        return _policy_words(
+            _DAEMON_FLAGS[normalized.use_daemon],
             format_seconds(normalized.surfacing_timeout_seconds),
-            "--daemon-timeout-seconds",
             format_seconds(normalized.daemon_timeout_seconds),
-            (
-                "--persist-query-text"
-                if normalized.persist_query_text
-                else "--no-persist-query-text"
-            ),
-        ]
-
-
-def parse_managed_hook_runtime(command: str) -> PartialHostRuntimePolicy:
-    """Recover managed flags or the pre-flag inline-``env`` representation.
-
-    Invalid values are ignored.  The install command is operator-facing and
-    will fall back to the current effective ``STMConfig`` for any missing
-    field; the runtime bridge independently stays fail-open for hand edits.
-    """
-    tokens = _shell_tokens(command)
-    env_values: dict[str, str] = {}
-    for token in tokens:
-        if "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        if key.startswith("MEMTOMEM_STM_"):
-            env_values[key] = value
-
-    option_values: dict[str, str] = {}
-    flags: set[str] = set()
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        if token in {
-            "--use-daemon",
-            "--no-daemon",
-            "--persist-query-text",
-            "--no-persist-query-text",
-        }:
-            flags.add(token)
-        elif token in {"--surfacing-timeout-seconds", "--daemon-timeout-seconds"}:
-            if i + 1 < len(tokens):
-                option_values[token] = tokens[i + 1]
-                i += 1
-        elif token.startswith("--surfacing-timeout-seconds="):
-            option_values["--surfacing-timeout-seconds"] = token.split("=", 1)[1]
-        elif token.startswith("--daemon-timeout-seconds="):
-            option_values["--daemon-timeout-seconds"] = token.split("=", 1)[1]
-        i += 1
-
-    use_daemon: bool | None
-    if "--use-daemon" in flags:
-        use_daemon = True
-    elif "--no-daemon" in flags:
-        use_daemon = False
-    else:
-        use_daemon = _parse_bool(
-            env_values.get(_USE_DAEMON_ENV) or env_values.get(_SURFACING_USE_DAEMON_ENV)
+            _PERSIST_FLAGS[normalized.persist_query_text],
         )
 
-    persist_query_text: bool | None
-    if "--persist-query-text" in flags:
-        persist_query_text = True
-    elif "--no-persist-query-text" in flags:
-        persist_query_text = False
-    else:
-        persist_query_text = _parse_bool(env_values.get(_PERSIST_QUERY_TEXT_ENV))
 
+@dataclass(frozen=True)
+class OwnedHookCommand:
+    """A hook command in the form ``mms hook install`` writes."""
+
+    launcher: tuple[str, ...]
+    """:func:`hook_launcher`'s words for the command."""
+    settings: PartialHostRuntimePolicy
+    """The command's flags parsed into a policy, which install carries over on
+    refresh; every field ``None`` for a command without them. Not the hook's
+    input: a deadline the hook keeps but its build rejects (one
+    ``format_seconds`` writes as ``1.79769313486232e+308``) is dropped here.
+    The hook's input from the flags is :meth:`env_overrides`."""
+    policy_words: tuple[str, ...] = ()
+    """The command's six setting words as written, or none."""
+
+    def env_overrides(self) -> dict[str, str]:
+        """The flags ``mms hook`` applies from the command
+        (:func:`hook_flags_scope`), before its build validates them."""
+        return _hook_overlay(self.policy_words)
+
+
+# What ``format_seconds`` can write for a deadline, read as text: digits, an
+# optional fraction and an optional exponent, or ``inf`` / ``nan``. Text and
+# not a parsed number, because releases wrote ``inf``, ``nan`` and
+# ``1.79769313486232e+308`` (which ``float`` reads as infinity) when given
+# such a deadline, so the slot cannot require a finite value. ``9.0`` passes
+# where the writer prints ``9``; ``9e`` and ``1..2`` are not numbers at all.
+_NUMBER = r"(?:[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?|inf|nan)"
+_POLICY_TAIL = re.compile(
+    " "
+    + " ".join(
+        _policy_words(
+            "(" + "|".join(_DAEMON_FLAGS.values()) + ")",
+            f"({_NUMBER})",
+            f"({_NUMBER})",
+            "(" + "|".join(_PERSIST_FLAGS.values()) + ")",
+        )
+    )
+)
+# ``/…``, ``C:\…`` or ``C:/…``, ``\\server\…``. The writer takes the directory
+# from ``Path.cwd()``, and a relative word can mean something else to a host
+# shell: ``shlex.join`` leaves ``@project`` bare, which PowerShell splats.
+_ABSOLUTE_DIRECTORY = re.compile(r"/|[A-Za-z]:[\\/]|\\\\")
+
+
+def owned_hook_command(command: str, host: str) -> OwnedHookCommand | None:
+    """``command`` read as a hook command ``mms hook install --host <host>``
+    writes, or ``None`` when it does not have that form.
+
+    The form is :func:`hook_command_words` joined by ``shlex.join``: a
+    :func:`hook_launcher`, ``hook --host <host>``, then either nothing or the
+    six setting words. The directory of a ``uv run`` launcher is any absolute
+    path and each deadline is a number as ``format_seconds`` spells one, or
+    ``inf`` / ``nan``; everything else is
+    fixed, down to the spacing and the quoting ``shlex.join`` chooses.
+
+    The last step decides: the command must equal the join of the words read
+    from it. The steps before only propose those words, so a mistake in them
+    can refuse a command but cannot accept one the writer's join would not
+    produce. Nothing here models a shell, and the cost is linear in the
+    command's length (no ``shlex.split``)."""
+    marker = " " + " ".join(hook_command_words((), host, ()))
+    at = command.rfind(marker)
+    if at < 0:
+        return None
+    head, tail = command[:at], command[at + len(marker) :]
+    policy_words: list[str] = []
+    if tail:
+        match = _POLICY_TAIL.fullmatch(tail)
+        if match is None:
+            return None
+        policy_words = _policy_words(*match.groups())
+    if head == HOOK_ENTRY_POINT:
+        launcher = hook_launcher()
+    else:
+        before, after = " ".join(_UV_LAUNCHER_HEAD) + " ", " " + HOOK_ENTRY_POINT
+        if not (head.startswith(before) and head.endswith(after)):
+            return None
+        directory = _unquoted(head[len(before) : len(head) - len(after)])
+        if "\x00" in directory or not _ABSOLUTE_DIRECTORY.match(directory):
+            return None
+        launcher = hook_launcher(directory)
+    if shlex.join(hook_command_words(launcher, host, policy_words)) != command:
+        return None
+    return OwnedHookCommand(tuple(launcher), _hook_settings(policy_words), tuple(policy_words))
+
+
+def _unquoted(word: str) -> str:
+    """The string ``shlex.quote`` wrote ``word`` for, when it is one of the
+    two shapes ``shlex.quote`` writes; any other text comes back unchanged
+    and fails the comparison in :func:`owned_hook_command`."""
+    if len(word) >= 2 and word[0] == word[-1] == "'":
+        return word[1:-1].replace("'\"'\"'", "'")
+    return word
+
+
+def _hook_overlay(policy_words: Sequence[str]) -> dict[str, str]:
+    """The variables ``mms hook`` sets when given ``policy_words``: the strings
+    its Click options hand :func:`runtime_env_overrides` (each daemon and
+    persist flag's ``flag_value``, the deadline words as written)."""
+    if not policy_words:
+        return {}
+    daemon_flag, _, surfacing, _, daemon, persist_flag = policy_words
+    return runtime_env_overrides(
+        use_daemon="true" if daemon_flag == _DAEMON_FLAGS[True] else "false",
+        surfacing_timeout_seconds=surfacing,
+        daemon_timeout_seconds=daemon,
+        persist_query_text="true" if persist_flag == _PERSIST_FLAGS[True] else "false",
+    )
+
+
+def _hook_settings(policy_words: Sequence[str]) -> PartialHostRuntimePolicy:
+    """``policy_words`` parsed into a policy.
+
+    Read from :func:`_hook_overlay`, so a deadline that is not a positive
+    finite number is dropped and the daemon deadline is at least a second
+    above a usable surfacing one, as at run time. A value that the overlay
+    writes but that does not read back as finite is dropped too."""
+    overlay = _hook_overlay(policy_words)
     return PartialHostRuntimePolicy(
-        use_daemon=use_daemon,
-        surfacing_timeout_seconds=_parse_positive_float(
-            option_values.get("--surfacing-timeout-seconds")
-            or env_values.get(_SURFACING_TIMEOUT_ENV)
-        ),
-        daemon_timeout_seconds=_parse_positive_float(
-            option_values.get("--daemon-timeout-seconds") or env_values.get(_DAEMON_TIMEOUT_ENV)
-        ),
-        persist_query_text=persist_query_text,
+        use_daemon=_parse_bool(overlay.get(_USE_DAEMON_ENV)),
+        surfacing_timeout_seconds=_parse_positive_float(overlay.get(_SURFACING_TIMEOUT_ENV)),
+        daemon_timeout_seconds=_parse_positive_float(overlay.get(_DAEMON_TIMEOUT_ENV)),
+        persist_query_text=_parse_bool(overlay.get(_PERSIST_QUERY_TEXT_ENV)),
     )
 
 
 def resolve_host_runtime_policy(
     *,
-    existing_command: str | None = None,
+    existing: PartialHostRuntimePolicy | None = None,
     use_daemon: bool | None = None,
     surfacing_timeout_seconds: float | None = None,
     config_path: str | Path | None = None,
 ) -> HostRuntimePolicy:
     """Resolve CLI overrides > existing registration > effective config.
 
+    *existing* is the settings of the hook command being replaced
+    (:attr:`OwnedHookCommand.settings`), ``None`` for a fresh registration.
     Query text remains non-persistent for a fresh managed registration.  An
     existing registration that explicitly opted in is retained on refresh;
     ``--inherit-runtime-env`` is the escape hatch for removing all serialized
@@ -226,11 +569,8 @@ def resolve_host_runtime_policy(
     # ClickException with the env-var hint, and a resolver-side
     # ``exc_info`` log printed the raw traceback right before it.
     config = stm_config_for_cli(config_path)
-    existing = (
-        parse_managed_hook_runtime(existing_command)
-        if existing_command is not None
-        else PartialHostRuntimePolicy()
-    )
+    if existing is None:
+        existing = PartialHostRuntimePolicy()
     policy = HostRuntimePolicy(
         use_daemon=(
             use_daemon
@@ -295,10 +635,27 @@ def runtime_env_overrides(
 
 
 __all__ = [
+    "HOOK_ENTRY_POINT",
+    "HOOK_FLAGS_CHANNEL_ENV",
+    "HOOK_FLAG_NAMES",
+    "MCP_FLAG_NAMES",
+    "RUNTIME_FLAG_NAMES",
+    "SERVER_FLAGS_CHANNEL_ENV",
+    "HookFlagsChannelError",
     "HostRuntimePolicy",
+    "OwnedHookCommand",
     "PartialHostRuntimePolicy",
+    "UnwritableDeadlineError",
+    "active_hook_flags",
+    "decode_hook_flags_channel",
+    "decode_server_flags_channel",
+    "encode_hook_flags_channel",
     "format_seconds",
-    "parse_managed_hook_runtime",
+    "hook_flags_scope",
+    "hook_command_words",
+    "hook_launcher",
+    "owned_hook_command",
     "resolve_host_runtime_policy",
     "runtime_env_overrides",
+    "writable_seconds",
 ]

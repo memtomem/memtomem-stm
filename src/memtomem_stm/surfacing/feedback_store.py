@@ -113,11 +113,12 @@ faults from earlier that day that predate the cutoff — and over-report the
 window it advertises. Filtering on ``day`` keeps the count exact for the
 stored granularity at the cost of naming the window in calendar days."""
 
-_HASHED_QUERY_RE = re.compile(r"sha256:[0-9a-f]{16}")
+_HASHED_QUERY_RE = re.compile(r"(?:hmac-)?sha256:[0-9a-f]{16}")
 """Exact shape of the opaque ID written under
 ``SurfacingConfig.persist_query_text=False`` (#352 part 3): the literal
-prefix ``sha256:`` followed by 16 lowercase hex chars (23 chars total).
-Prefix-only matching would misclassify legitimate raw queries that
+prefix ``hmac-sha256:`` followed by 16 lowercase hex chars (28 chars total),
+or, on a row written before the digest was keyed (#1381), ``sha256:`` and 16
+hex chars (23 chars). Prefix-only matching would misclassify legitimate raw queries that
 happen to start with ``sha256:`` — e.g. a user-typed checksum search —
 and bypass the 80-char preview clip, leaking unbounded user-derived
 text. ``re.fullmatch`` against this pattern is the gate."""
@@ -245,8 +246,9 @@ CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
 --   arg_shape_json counts about the arguments, never keys or values
 --                  (``arg_shape``)
 --   response_len   the response size the ``min_response_chars`` gate judged
---   query_digest   ``sha256:`` + 16 hex of the extracted query, a sensitive
---                  one included; NULL before extraction
+--   query_digest   ``hmac-sha256:`` + 16 hex of the extracted query, keyed
+--                  under the ``stm_meta`` key (older rows: ``sha256:``), a
+--                  sensitive one included; NULL before extraction
 -- ``host_session_id`` is the hook host's session id; NULL on the proxy path.
 -- ``arm`` / ``holdout_rate`` (added columns, ``_OPPORTUNITIES_ADDED_COLUMNS``)
 -- are set only on a call where a holdout draw happened; such a row is never
@@ -936,6 +938,16 @@ class FeedbackStore:
     @property
     def db_path(self) -> Path:
         return self._db_path
+
+    @property
+    def hmac_key(self) -> bytes | None:
+        """The per-install HMAC key, or ``None`` until ``initialize`` commits it.
+
+        For in-process writers that must hash under the same key as this store
+        (the surfacing engine's query digest); offline readers use
+        :func:`load_hmac_key`.
+        """
+        return self._hmac_key
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1878,14 +1890,15 @@ class FeedbackStore:
                     # legitimately yield ``None`` here. ``len(None)`` would
                     # crash ``stm_surfacing_stats`` once retention has
                     # actually swept anything — render a stable placeholder.
-                    # #352 part 3: only the exact ``sha256:<16-hex>`` shape
-                    # written by the engine under ``persist_query_text=False``
-                    # bypasses the 80-char clip. Prefix-only matching would
-                    # misclassify legitimate raw queries that happen to
-                    # start with ``sha256:`` (e.g. a user-typed checksum
-                    # search) and leak unbounded text under the default
-                    # config. Raw text — including any ``sha256:``-prefixed
-                    # user query — keeps the legacy 80-char clip.
+                    # #352 part 3: only the exact digest shape the engine
+                    # writes under ``persist_query_text=False``
+                    # (``hmac-sha256:<16-hex>``, or ``sha256:<16-hex>`` on a
+                    # pre-#1381 row) bypasses the 80-char clip. Prefix-only
+                    # matching would misclassify legitimate raw queries that
+                    # happen to start with either prefix (e.g. a user-typed
+                    # checksum search) and leak unbounded text under the
+                    # default config. Raw text — including any such
+                    # prefixed user query — keeps the legacy 80-char clip.
                     if query is None:
                         preview = "<expired>"
                     elif _HASHED_QUERY_RE.fullmatch(query):

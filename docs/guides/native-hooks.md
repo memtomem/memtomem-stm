@@ -42,9 +42,24 @@ mms hook install --host claude --no-daemon --apply
 mms hook install --host claude --inherit-runtime-env --apply
 ```
 
-Reinstalling recognizes and migrates older POSIX commands that began with
-`env MEMTOMEM_STM_...`; the replacement uses cross-platform runtime flags and
-retains the existing managed timeout. The flags are listed in the
+Every host config above is user-scope, so the command install writes runs for
+every project. Its launcher depends on the nearest `pyproject.toml` in the
+directory install runs from or one of its four parents (the search stops at the
+first one found). When that file is STM's own (`name = "memtomem-stm"`) or
+lists `memtomem-stm` as a dependency or optional dependency, the launcher is
+`uv run --directory <that directory> memtomem-stm`; otherwise it is the bare
+`memtomem-stm` console script. Unless that directory is STM's source checkout
+(a `memtomem-stm` project with `src/memtomem_stm/__init__.py`), every hook call
+then runs from that project's environment, and install says so in its output.
+To get the bare launcher (for example with `uv tool install memtomem-stm`),
+re-run install from a directory where no such `pyproject.toml` is found.
+
+Reinstalling updates the command install wrote earlier in place and keeps its
+daemon, timeout and query-text settings. A command install did not write,
+such as one that names `mms` or begins with `env MEMTOMEM_STM_...`, is left
+as it is, and install adds its own beside it; see
+[`mms hook install`](../cli.md).
+The runtime flags are listed in the
 [hook CLI reference](../reference/cli-hooks.md#mms-hook). Unknown host-specific fields on the hook
 entry are preserved.
 
@@ -78,9 +93,9 @@ before diagnosing an apparently missing STM registration.
 
 ## Runtime host selection
 
-The installed command includes `mms hook --host <name>`. On the runtime bridge,
-`--host` accepts text rather than a strict Choice because a non-zero usage exit
-could block a host action. An unrecognized or bare value warns and falls back
+The installed command includes `memtomem-stm hook --host <name>`. On the runtime
+bridge, `--host` accepts text rather than a strict Choice because a non-zero
+usage exit could block a host action. An unrecognized or bare value warns and falls back
 to auto-detection. `install` and `uninstall` remain strict operator commands.
 
 Auto-detection recognizes Codex when the payload carries a non-empty `turn_id`.
@@ -90,7 +105,11 @@ Codex registrations still keep the explicit `--host codex` argument.
 ## Daemon and fallback
 
 The default hook path uses the local `mms daemon`, auto-spawning it on first
-use. Configure the behavior with:
+use. The daemon choice below applies to a hook command that carries neither
+`--use-daemon` nor `--no-daemon`. A command install wrote without
+`--inherit-runtime-env` carries one, and that flag wins: change it with
+`mms hook install --host claude --no-daemon --apply` (or `--daemon`), shown
+above. Configure the behavior with:
 
 ```bash
 export MEMTOMEM_STM_HOOK__USE_DAEMON=true
@@ -139,6 +158,35 @@ Claude-only Bash output replacement is also opt-in:
 export MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=true
 export MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION=0.65
 ```
+
+Replacement also requires the hook command to pass `--host claude`, which
+`mms hook install --host claude --apply` writes. A bare `mms hook`
+auto-detects the host, and auto-detection cannot tell Claude from Codex, so it
+never replaces output. On a call that auto-detection routes to the Claude
+adapter (its fallback; a payload with a non-empty Codex `turn_id` goes to the
+Codex adapter and gets no warning) and that compression would have attempted (a
+Bash result that passes every check made before the compressor runs: safe,
+structured, over `max_chars`, not already compressed, and a budget larger than
+the sentinel and its newline), the hook still passes the output through,
+prints a warning to stderr, and returns it as `systemMessage`, which Claude Code
+and Codex document as a warning shown to the user. Claude Code does not show the stderr of a hook
+that exits 0 outside its debug log.
+
+To fix it, add `--host claude` to the hook command where it is registered; for
+a command you registered by hand, that is a hand edit.
+`mms hook install --host claude --apply` writes a correct registration into
+the user settings file (`$CLAUDE_CONFIG_DIR/settings.json`, otherwise
+`~/.claude/settings.json`), but not into Claude Code's project or local
+settings. It replaces only a command install wrote earlier
+(`memtomem-stm hook --host claude`, bare or after `uv run --directory <dir>`,
+with install's own setting flags or none; see
+[`mms hook install`](../cli.md)),
+and carries that command's daemon, timeout and query-text settings over. Any
+other STM hook command, such as `mms hook`,
+`MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook` or one behind `env`,
+stays in place next to the new one; install and uninstall name its location
+(`hooks.PostToolUse[i].hooks[j]`) when it looks like STM's hook, and you edit
+or remove such a registration by hand.
 
 See the [hook CLI reference](../reference/cli-hooks.md) and the complete
 [environment-variable reference](../reference/environment-variables.md).

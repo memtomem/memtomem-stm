@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import signal
 import subprocess
 import sys
@@ -118,14 +119,14 @@ def _config(tmp_path: Path) -> STMConfig:
 
 def _hs_path(cfg: STMConfig) -> Path:
     """This config's keyed handshake path — what the running daemon publishes."""
-    return handshake_path(cfg.data_dir, config_fingerprint(cfg))
+    return handshake_path(cfg.data_dir, config_fingerprint(cfg, create_key=True))
 
 
 def _lock_path(cfg: STMConfig) -> Path:
     """This config's keyed lifetime-lock path."""
     from memtomem_stm.daemon.locking import lock_path
 
-    return lock_path(cfg.data_dir, config_fingerprint(cfg))
+    return lock_path(cfg.data_dir, config_fingerprint(cfg, create_key=True))
 
 
 def _engine_with_result() -> SurfacingEngine:
@@ -1148,7 +1149,7 @@ async def test_build_engine_default_records_surfacing_event_telemetry(tmp_path: 
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] == "builtin"
-        assert rows[0][1].startswith("sha256:")
+        assert re.fullmatch(r"hmac-sha256:[0-9a-f]{16}", rows[0][1])
     finally:
         if server._tracker is not None:
             server._tracker.close()
@@ -1495,7 +1496,7 @@ async def test_hook_run_hook_autospawn_with_fallback_cold(
 
     cold: list = []
 
-    async def _fake_cold(call):
+    async def _fake_cold(call, **kwargs):
         cold.append(call)
         return {"cold": True}
 
@@ -1706,7 +1707,11 @@ def _burst_config(tmp_path: Path, concurrency: int) -> STMConfig:
     cfg.daemon.max_concurrent_ltm_ops = concurrency
     cfg.surfacing.timeout_seconds = 15.0
     cfg.surfacing.ltm_mcp_command = sys.executable
-    cfg.surfacing.ltm_mcp_args = [str(_FAKE_LTM_SERVER), "--search-delay", str(_BURST_SEARCH_SECONDS)]
+    cfg.surfacing.ltm_mcp_args = [
+        str(_FAKE_LTM_SERVER),
+        "--search-delay",
+        str(_BURST_SEARCH_SECONDS),
+    ]
     return cfg
 
 
@@ -1748,9 +1753,7 @@ async def _warm_and_burst(cfg: STMConfig) -> tuple[DaemonServer, list[dict | Non
             for word in _BURST_PATH_WORDS
         ]
         started = asyncio.get_running_loop().time()
-        outputs = await asyncio.gather(
-            *(client.surface(cfg, call, timeout=2.5) for call in calls)
-        )
+        outputs = await asyncio.gather(*(client.surface(cfg, call, timeout=2.5) for call in calls))
         return server, list(outputs), asyncio.get_running_loop().time() - started
     finally:
         await _stop(cfg, task)

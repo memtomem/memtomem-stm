@@ -245,7 +245,10 @@ mms hook install --host codex --apply
 
 - Claude Code는 재시작 후 LTM 문맥 주입을 받을 수 있고, Bash 출력 교체는
   별도 opt-in 기능입니다. 출력 교체에는 Claude Code 2.1.121 이상이
-  필요합니다.
+  필요하고, hook 명령에 `--host claude`가 있어야 합니다
+  (`mms hook install --host claude --apply`가 이 명령을 씁니다). `--host`
+  없는 `mms hook`은 출력을 교체하지 않으며, 압축이 시도됐을 Bash 호출에서는
+  그 사실을 `systemMessage`로 알립니다.
 - Codex CLI는 설치 후 `/hooks`에서 hook을 승인해야 합니다. STM의 Codex
   어댑터는 출력 교체를 지원하지 않으며, 실제 surfacing 대상은 read-like
   allowlist에 들어가는 `Bash` 호출입니다. Codex의 공식 PostToolUse 계약은

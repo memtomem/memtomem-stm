@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -682,6 +681,86 @@ class TestMaxUpstreamChars:
         # Joined with "\n" between text_parts.
         assert body == "a" * 30 + "\n" + "b" * 20
 
+    # ── #1530: the guard fires only when text is actually lost ──────────
+
+    async def _call_with_blocks(self, blocks: list, cap: int) -> str:
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        mgr._config_loader._cached.max_upstream_chars = cap  # type: ignore[union-attr]
+        session = _get_session(mgr)
+        session.call_tool.return_value = SimpleNamespace(content=blocks, is_error=False)
+        result = await mgr.call_tool("srv", "tool", {})
+        assert isinstance(result, str)
+        return result
+
+    async def test_exact_cap_then_empty_block_has_no_notice(self):
+        """A block that exactly fills the cap, followed by an empty block, loses
+        no text — the client must not be told the payload was oversized."""
+        result = await self._call_with_blocks([_text_content("a" * 50), _text_content("")], 50)
+
+        assert "max_upstream_chars guard" not in result
+        assert result == "a" * 50
+
+    async def test_exact_cap_then_none_text_block_has_no_notice(self):
+        """A spec-noncompliant ``text=None`` block is empty text, not lost text."""
+        none_text = SimpleNamespace(type="text", text=None)
+        result = await self._call_with_blocks([_text_content("a" * 50), none_text], 50)
+
+        assert "max_upstream_chars guard" not in result
+        assert result == "a" * 50
+
+    async def test_exact_cap_then_nonempty_block_keeps_notice(self):
+        """Positive control: a following block that has text DOES lose it."""
+        result = await self._call_with_blocks([_text_content("a" * 50), _text_content("b")], 50)
+
+        assert "max_upstream_chars guard" in result
+        assert result.split("\n\n[response truncated")[0] == "a" * 50
+
+    async def test_empty_block_between_full_and_nonempty_keeps_notice(self):
+        """Positive control: an empty block does not hide a later block's loss."""
+        result = await self._call_with_blocks(
+            [_text_content("a" * 50), _text_content(""), _text_content("b")], 50
+        )
+
+        assert "max_upstream_chars guard" in result
+
+    def _shape(self, blocks: list, cap: int):
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        cfg_snap = mgr._config.model_copy(update={"max_upstream_chars": cap})
+        return mgr._shape_response(
+            SimpleNamespace(content=blocks, is_error=False), "srv", "tool", cfg_snap=cfg_snap
+        )
+
+    @staticmethod
+    def _guard_warnings(caplog) -> list:
+        return [
+            r
+            for r in caplog.records
+            if r.name == "memtomem_stm.proxy.manager"
+            and r.levelname == "WARNING"
+            and "exceeded max_upstream_chars" in r.getMessage()
+        ]
+
+    def test_shape_exact_cap_then_empty_block_is_just_the_text(self, caplog):
+        """The issue's reproduction (cap=3): no notice, no truncation warning."""
+        with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
+            shaped = self._shape([_text_content("abc"), _text_content("")], 3)
+
+        assert shaped.original_text == "abc"
+        assert self._guard_warnings(caplog) == []
+
+    def test_shape_real_truncation_after_empty_block_is_unchanged(self, caplog):
+        """Positive control, and the byte-identity pin: the text, the single
+        notice and the one warning are what the guard produced before #1530 —
+        the skipped empty block adds no separator."""
+        with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
+            shaped = self._shape([_text_content("abc"), _text_content(""), _text_content("b")], 3)
+
+        assert shaped.original_text == (
+            "abc\n\n\n[response truncated to 3 chars at max_upstream_chars guard — "
+            "upstream returned an oversized payload]"
+        )
+        assert len(self._guard_warnings(caplog)) == 1
+
 
 # ── Surfacing failure: graceful degradation ──────────────────────────────
 
@@ -900,6 +979,7 @@ class TestCacheWithErrors:
             return f"{srv}|{tl}|{a}|{kw.get('context_query')}|{kw.get('config_fingerprint')}"
 
         cache.get.side_effect = lambda srv, tl, a, **kw: cache_store.get(_fake_key(srv, tl, a, kw))
+        cache.key_for.side_effect = lambda srv, tl, a, **kw: _fake_key(srv, tl, a, kw)
 
         def _set(srv, tl, a, result, ttl_seconds=None, **kw):
             cache_store[_fake_key(srv, tl, a, kw)] = result
@@ -961,6 +1041,7 @@ class TestCacheWithErrors:
             cache.get.side_effect = lambda srv, tl, a, **kw: cache_store.get(
                 _fake_key(srv, tl, a, kw)
             )
+            cache.key_for.side_effect = lambda srv, tl, a, **kw: _fake_key(srv, tl, a, kw)
 
             writes = 0
 
@@ -1185,13 +1266,13 @@ class TestCallTimeout:
             f"saw {session.call_tool.call_count} attempts"
         )
 
-    async def test_overall_deadline_includes_backoff_sleep(self):
+    async def test_overall_deadline_includes_backoff_sleep(self, deadline_clock):
         """The retry backoff sleep runs under the remaining overall deadline: a
         0.2 s backoff after 0.03 s of a 0.05 s deadline is given a 0.02 s budget
         and cut short, never slept in full.
 
-        The deadline clock (``manager._time``) is faked, so a scheduler stall on
-        a loaded runner cannot consume the budget before the backoff is reached;
+        ``deadline_clock`` fakes the deadline's clock, so a scheduler stall on a
+        loaded runner cannot consume the budget before the backoff is reached;
         the event-loop clock stays real, so the budget still expires (#1363)."""
         mgr = _make_manager(
             max_retries=3,
@@ -1202,11 +1283,9 @@ class TestCallTimeout:
             tools=_read_only_tools(),
         )
         session = _get_session(mgr)
-        fake_now = 100.0
 
         def reset_after_30ms(*_a, **_kw):
-            nonlocal fake_now
-            fake_now += 0.03
+            deadline_clock.advance(0.03)
             raise ConnectionError("ambiguous reset")
 
         session.call_tool.side_effect = reset_after_30ms
@@ -1232,10 +1311,8 @@ class TestCallTimeout:
             backoffs.append((budget, "completed"))
             return result
 
-        fake_time = SimpleNamespace(monotonic=lambda: fake_now, perf_counter=time.perf_counter)
         with (
             patch.object(mgr, "_reconnect_server", new_callable=AsyncMock),
-            patch("memtomem_stm.proxy.manager._time", fake_time),
             patch("memtomem_stm.proxy.manager.asyncio.timeout", side_effect=spy_timeout),
             patch("memtomem_stm.proxy.manager.asyncio.sleep", side_effect=spy_sleep),
         ):
@@ -1362,8 +1439,10 @@ class TestTimeoutReplayGuard:
         assert session.call_tool.call_count == 1
         mock_reconnect.assert_awaited_once_with("srv", ANY)
 
-    async def test_readonly_timeout_is_retried(self):
+    async def test_readonly_timeout_is_retried(self, deadline_clock):
         """A declared read-only tool is replay-safe: timeout still retries."""
+        # ``deadline_clock`` holds the 1.0 s deadline still: it bounds the call, not
+        # the retry under test, and a stall must not spend it first (#1408).
         mgr = _make_manager(
             max_retries=1,
             call_timeout=0.05,
@@ -1435,10 +1514,12 @@ class TestTimeoutReplayGuard:
 
         assert attempts == 1
 
-    async def test_per_tool_cache_true_override_keeps_replay(self):
+    async def test_per_tool_cache_true_override_keeps_replay(self, deadline_clock):
         """An explicit per-tool ``cache: true`` is the operator's 'effectively
         read-only' assertion, so timeout-retry is preserved for an otherwise
         unannotated tool."""
+        # ``deadline_clock`` holds the 1.0 s deadline still: it bounds the call, not
+        # the retry under test, and a stall must not spend it first (#1408).
         mgr = _make_manager(
             max_retries=1,
             call_timeout=0.05,
@@ -1899,7 +1980,12 @@ class TestUpstreamCircuitBreaker:
         assert breaker.state == "open"
         assert breaker.opened_at != first_opened_at  # fresh window from the probe failure
 
-    async def test_overall_deadline_terminal_records_breaker_failure(self):
+    async def test_overall_deadline_terminal_records_breaker_failure(self, deadline_clock):
+        """A deadline spent after an RPC failed charges the breaker once.
+
+        The deadline clock moves only inside the RPC: a stall before dispatch
+        would spend the 0.05 s deadline with no RPC made, and that deadline
+        rightly charges nothing (#1408)."""
         mgr = _make_manager(
             max_retries=10,
             call_timeout=0.01,
@@ -1910,6 +1996,7 @@ class TestUpstreamCircuitBreaker:
         session = _get_session(mgr)
 
         async def hang(*args, **kwargs):
+            deadline_clock.advance(0.06)
             await asyncio.sleep(10)
 
         session.call_tool.side_effect = hang
@@ -1920,6 +2007,7 @@ class TestUpstreamCircuitBreaker:
 
         breaker = mgr._connections["srv"].breaker
         assert breaker.failure_count == 1
+        assert session.call_tool.call_count == 1
 
     async def test_disabled_breaker_never_fast_fails(self):
         mgr = _make_manager(max_retries=0, circuit_max_failures=0)

@@ -10,7 +10,11 @@ so the host appends them next to the tool result the model reads.
 Two stages, two hook fields. *Surfacing* appends ``additionalContext`` (the
 side-effect-free play). *Compression* (P1a) *replaces* a built-in tool's output
 via ``updatedToolOutput`` and is **Bash-only and opt-in**
-(``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``): for the built-in Bash tool the
+(``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``) and runs only when the hook is
+registered with an explicit ``--host claude`` (an ``auto`` registration cannot tell
+Claude from Codex, so it never replaces output; on a call compression would
+have attempted it reports the refusal through ``systemMessage`` instead, #1437):
+for the built-in Bash tool the
 value must be a structured object mirroring the tool result, so we clone the
 original ``tool_response`` and shrink only its ``stdout`` channel (preserving
 ``stderr`` / exit / ``interrupted`` / ``isImage`` verbatim). Compression stays
@@ -33,15 +37,25 @@ loop, cross-session dedup, and a privacy gate for ingestion arrive with the
 daemon stage (P2/Stage D).
 
 Hard rule — a hook must never disrupt the host. This command **always exits
-0** and, on any malformed input, disabled surfacing, timeout, or internal
-error, emits an empty object ``{}`` so the original tool result passes through
-untouched.
+0** and, on any malformed input, timeout, or internal error, emits an empty
+object ``{}`` so the original tool result passes through untouched. Disabled
+surfacing only drops ``additionalContext``; the compression stage, and its
+refusal notice, still run. The one addition is a ``systemMessage`` reporting a compression
+refusal found before a failure that the per-call barrier catches, a timeout
+included (#1437); the tool result still passes through. A ``BaseException``
+that reaches the outermost barrier still emits ``{}``.
 
-Register in Claude Code ``settings.json``::
+Register by hand in Claude Code ``settings.json``::
 
     {"hooks": {"PostToolUse": [
       {"matcher": "Read|Grep|Glob|Bash",
-       "hooks": [{"type": "command", "command": "mms hook"}]}]}}
+       "hooks": [{"type": "command", "command": "mms hook --host claude"}]}]}}
+
+``mms hook install --host claude --apply`` writes the registration for you
+(without ``--apply`` it previews it): the same block under the
+``memtomem-stm`` name, with its runtime flags. Install manages only the block
+it writes, so one registered by hand, like the example above, stays in place
+beside it.
 
 Performance — daemon by default: surfacing routes through the local daemon
 (``HookConfig.use_daemon`` defaults ``True``), a warm LTM connection that turns
@@ -50,11 +64,21 @@ each call into a sub-second round trip. The daemon is auto-spawned on first use
 and later calls hit the warm process. The legacy in-process path spawns a fresh
 LTM MCP child per call, whose cold start (embedding + reranker model load)
 measured ~6s here — exceeding the default ``surfacing.timeout_seconds`` of 3.0,
-so it usually times out to ``{}``. Opt out with
-``MEMTOMEM_STM_HOOK__USE_DAEMON=0``; when the daemon is unreachable the hook
+so it usually times out to ``{}``. Opt out with ``--no-daemon`` on the hook
+command. A command with neither ``--use-daemon`` nor ``--no-daemon`` follows
+``hook.use_daemon`` in any form the settings read
+(``MEMTOMEM_STM_HOOK__USE_DAEMON=0``,
+``MEMTOMEM_STM_HOOK='{"use_daemon": false}'``); a command with either flag
+ignores it. A first ``mms hook install`` writes one of the two flags from
+``hook.use_daemon`` in its own environment (``--use-daemon`` by default); a
+reinstall keeps the flag the existing command has, so an installed hook
+changes mode through ``mms hook install --daemon``/``--no-daemon``, through
+``--inherit-runtime-env`` (no flag written, the settings decide), or by
+editing the flag. When the daemon is unreachable the hook
 degrades per ``HookConfig.fallback`` — ``skip`` (default) returns ``{}``,
-``cold`` runs the in-process path. To exercise the cold path directly, set
-``MEMTOMEM_STM_HOOK__USE_DAEMON=0``, raise
+``cold`` runs the in-process path. To exercise the cold path directly, run
+the hook with ``--no-daemon`` (or with no daemon flag and ``hook.use_daemon``
+set false, e.g. ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``), raise
 ``MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`` (e.g. 8) and lower
 ``MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS``, accepting the per-call latency.
 """
@@ -70,7 +94,7 @@ import sys
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, TextIO
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, TextIO
 
 import click
 
@@ -85,14 +109,24 @@ from memtomem_stm.cli.hook_adapter import (
 )
 from memtomem_stm.cli.host_runtime import (
     HostRuntimePolicy,
+    UnwritableDeadlineError,
+    _parse_bool,
     format_seconds,
+    _SURFACING_TIMEOUT_ENV,
+    hook_command_words,
+    hook_flags_scope,
     resolve_host_runtime_policy,
     runtime_env_overrides,
+    writable_seconds,
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from memtomem_stm.cli.hook_adapter import CanonicalHookCall, HostHookAdapter
-    from memtomem_stm.config import HookCompressionConfig, STMConfig
+    from memtomem_stm.cli.host_runtime import OwnedHookCommand
+    from memtomem_stm.config import EnvSTMConfigLoad, HookCompressionConfig, STMConfig
+    from memtomem_stm.surfacing.config import SurfacingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -194,16 +228,18 @@ def _surface_tools() -> frozenset[str]:
     return frozenset() if saw_token else _DEFAULT_SURFACE_TOOLS
 
 
-def _hook_budget_seconds() -> float:
+def _hook_budget_seconds(overrides: Mapping[str, str]) -> float:
     """Outer wall-clock backstop for the whole hook call.
 
     ``SurfacingEngine`` bounds its own LTM search via
     ``surfacing.timeout_seconds``; this only guards against a hang *outside*
     that window (e.g. tearing down a wedged LTM subprocess). Sized to sit above
     the configured surfacing timeout so raising that env to beat LTM cold start
-    isn't silently clipped.
+    isn't silently clipped. *overrides* is the command's flags
+    (:func:`runtime_env_overrides`): its surfacing deadline is the build's, so
+    it is read first; the variable is read only without one.
     """
-    raw = os.environ.get("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS")
+    raw = overrides.get(_SURFACING_TIMEOUT_ENV) or os.environ.get(_SURFACING_TIMEOUT_ENV)
     try:
         configured = float(raw) if raw else 3.0
     except ValueError:
@@ -286,6 +322,60 @@ class BuiltinCompressionOutcome:
     compressed_chars: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _CompressionCandidate:
+    """A shell result that passed every gate :func:`compress_builtin` checks
+    before it runs the compressor: what remains is the compressor itself and
+    the ``min_retention`` guard on its result."""
+
+    stdout: str
+    original: dict[str, Any]
+
+
+_COMPRESS_PREFIX = f"{_COMPRESS_SENTINEL}\n"
+
+
+def _compression_candidate(
+    call: "CanonicalHookCall", cfg: "HookCompressionConfig"
+) -> BuiltinCompressionOutcome | _CompressionCandidate:
+    """The gates of :func:`compress_builtin` that need no compressor run.
+
+    Returns the early outcome when a gate stops the call, otherwise the
+    candidate. Cost is bounded by the size checks — it never scans ``stdout``
+    beyond the sentinel prefix — so the refused-replacement path in
+    :func:`_orchestrate` can ask "would compression have been attempted?"
+    without paying for an attempt. Unguarded itself: both callers
+    (:func:`compress_builtin`, :func:`_would_attempt_compression`) catch.
+    """
+    if not cfg.enabled:
+        return BuiltinCompressionOutcome("disabled")
+    if call.event_type != "PostToolUse":
+        return BuiltinCompressionOutcome("ineligible_event")
+    if call.canonical_tool != "shell":
+        return BuiltinCompressionOutcome("ineligible_tool")
+    extracted = _bash_stdout(call.tool_response)
+    if extracted is None:
+        return BuiltinCompressionOutcome("unsupported_shape")
+    stdout, original = extracted
+    explicit_error = original.get("isError") is True or original.get("is_error") is True
+    interrupted = original.get("interrupted") is True
+    image = original.get("isImage") is True or original.get("is_image") is True
+    exit_code = original.get("exitCode", original.get("exit_code"))
+    nonzero_exit = isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
+    if explicit_error or interrupted or image or nonzero_exit:
+        return BuiltinCompressionOutcome("unsafe_result", original_chars=len(stdout))
+    if len(stdout) <= cfg.max_chars or _already_compressed(stdout):
+        status = "already_compressed" if _already_compressed(stdout) else "below_threshold"
+        return BuiltinCompressionOutcome(status, original_chars=len(stdout))
+    if cfg.max_chars <= len(_COMPRESS_PREFIX):
+        # A budget that cannot even hold the sentinel cannot produce a
+        # meaningful replacement — prepending anyway would EXPAND the
+        # configured cap many-fold (max_chars=1 → ~18 chars of sentinel).
+        # Leave the output unchanged instead.
+        return BuiltinCompressionOutcome("budget_too_small", original_chars=len(stdout))
+    return _CompressionCandidate(stdout, original)
+
+
 def compress_builtin(
     call: "CanonicalHookCall", cfg: "HookCompressionConfig"
 ) -> BuiltinCompressionOutcome:
@@ -297,9 +387,11 @@ def compress_builtin(
     Only structured shell results are handled (see :func:`_bash_stdout`).
     **Never raises.**
 
-    Gate: ``cfg.enabled`` + PostToolUse + ``canonical_tool == "shell"`` + ``stdout``
-    longer than ``cfg.max_chars`` + not already compressed. The strategy is fixed
-    to :class:`TruncateCompressor` (self-contained — no chunk-store callback,
+    Gate (:func:`_compression_candidate`): ``cfg.enabled`` + PostToolUse +
+    ``canonical_tool == "shell"`` + a safe result + ``stdout`` longer than
+    ``cfg.max_chars`` + not already compressed + a budget that holds the
+    sentinel. The strategy is fixed to :class:`TruncateCompressor`
+    (self-contained — no chunk-store callback,
     unlike SELECTIVE/HYBRID/PROGRESSIVE, whose retrieval tools live in the
     separate ``mms`` server process). ``cfg.max_chars`` budgets the *whole*
     replacement stdout: the sentinel prefix is reserved out of the compressor's
@@ -308,28 +400,10 @@ def compress_builtin(
     Claude), so this is reached only for a host that honors ``updatedToolOutput``.
     """
     try:
-        if not cfg.enabled:
-            return BuiltinCompressionOutcome("disabled")
-        if call.event_type != "PostToolUse":
-            return BuiltinCompressionOutcome("ineligible_event")
-        if call.canonical_tool != "shell":
-            return BuiltinCompressionOutcome("ineligible_tool")
-        extracted = _bash_stdout(call.tool_response)
-        if extracted is None:
-            return BuiltinCompressionOutcome("unsupported_shape")
-        stdout, original = extracted
-        explicit_error = original.get("isError") is True or original.get("is_error") is True
-        interrupted = original.get("interrupted") is True
-        image = original.get("isImage") is True or original.get("is_image") is True
-        exit_code = original.get("exitCode", original.get("exit_code"))
-        nonzero_exit = (
-            isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
-        )
-        if explicit_error or interrupted or image or nonzero_exit:
-            return BuiltinCompressionOutcome("unsafe_result", original_chars=len(stdout))
-        if len(stdout) <= cfg.max_chars or _already_compressed(stdout):
-            status = "already_compressed" if _already_compressed(stdout) else "below_threshold"
-            return BuiltinCompressionOutcome(status, original_chars=len(stdout))
+        candidate = _compression_candidate(call, cfg)
+        if isinstance(candidate, BuiltinCompressionOutcome):
+            return candidate
+        stdout, original = candidate.stdout, candidate.original
 
         # Lazy import: keep ``mms hook --help`` and the no-op path off the
         # compression module's import cost.
@@ -338,16 +412,9 @@ def compress_builtin(
         # Reserve the sentinel prefix out of the budget so sentinel + body stays
         # at/near ``max_chars`` (TruncateCompressor's own suffix may still add a
         # small, bounded overage — the budget is a target, not a hard cap).
-        prefix = f"{_COMPRESS_SENTINEL}\n"
-        if cfg.max_chars <= len(prefix):
-            # A budget that cannot even hold the sentinel cannot produce a
-            # meaningful replacement — prepending anyway would EXPAND the
-            # configured cap many-fold (max_chars=1 → ~18 chars of sentinel).
-            # Leave the output unchanged instead.
-            return BuiltinCompressionOutcome("budget_too_small", original_chars=len(stdout))
-        body_budget = cfg.max_chars - len(prefix)
+        body_budget = cfg.max_chars - len(_COMPRESS_PREFIX)
         compressed = TruncateCompressor().compress(stdout, max_chars=body_budget)
-        replacement_text = prefix + compressed
+        replacement_text = _COMPRESS_PREFIX + compressed
         if len(stdout) and len(replacement_text) / len(stdout) < cfg.min_retention:
             return BuiltinCompressionOutcome(
                 "retention_guard",
@@ -367,6 +434,38 @@ def compress_builtin(
             "builtin output compression failed — leaving tool output unchanged", exc_info=True
         )
         return BuiltinCompressionOutcome("error")
+
+
+# Shown to the user (``systemMessage``) and logged to stderr when replacement
+# is refused for a call compression would have attempted (#1437). Conditional
+# on Claude Code because ``auto`` resolves an ambiguous Codex payload (no
+# ``turn_id``) to the Claude adapter too, and for Codex the fix is
+# ``--host codex``, not ``--host claude``.
+# The fix it names is the edit itself, not ``mms hook install``: install
+# rewrites only the user settings file, and drops inline ``env`` compression
+# settings when it does.
+HOST_NOT_EXPLICIT_NOTICE = (
+    "memtomem-stm: Bash output compression is enabled, but this hook was not "
+    "registered with --host claude, so compression was not attempted and the "
+    "output was passed through. If this is Claude Code, add --host claude to "
+    "the hook command where it is registered."
+)
+
+
+def _would_attempt_compression(call: "CanonicalHookCall", cfg: "HookCompressionConfig") -> bool:
+    """Whether :func:`compress_builtin` would have run its compressor on
+    ``call``, for a registration that did not authorize replacement
+    (``--host`` other than ``claude``). **Never raises.**
+
+    Runs only the cheap gates: the compressor and the retention guard are
+    skipped, which is why the notice says the attempt was not made rather
+    than that output would have shrunk.
+    """
+    try:
+        return isinstance(_compression_candidate(call, cfg), _CompressionCandidate)
+    except Exception:
+        logger.debug("compression gate failed on the refused path", exc_info=True)
+        return False
 
 
 def maybe_compress_builtin(
@@ -423,6 +522,7 @@ async def run_surfacing_hook(
     *,
     engine: Any | None = None,
     deadline_monotonic: float | None = None,
+    surfacing_config: "SurfacingConfig | None" = None,
 ) -> dict[str, Any]:
     """Core hook logic. Returns the hook-output dict (``{}`` means no-op).
 
@@ -445,10 +545,18 @@ async def run_surfacing_hook(
     this call's LTM attempt for a caller that is itself deadline-bounded (the
     daemon). ``None`` (the cold in-process path, which owns its whole process)
     keeps the configured ``surfacing.timeout_seconds``.
+
+    ``surfacing_config`` is the caller's already-loaded config for the cold
+    path. :func:`_run_hook` passes it so one tool call loads the environment
+    once; under a degraded load a second load would report it a second time.
+    ``None`` loads it here.
     """
     try:
         return await _run_surfacing_hook_inner(
-            call, engine=engine, deadline_monotonic=deadline_monotonic
+            call,
+            engine=engine,
+            deadline_monotonic=deadline_monotonic,
+            surfacing_config=surfacing_config,
         )
     except Exception:
         logger.warning("hook surfacing failed — passing tool output through", exc_info=True)
@@ -456,7 +564,11 @@ async def run_surfacing_hook(
 
 
 async def _run_surfacing_hook_inner(
-    call: "CanonicalHookCall", *, engine: Any | None, deadline_monotonic: float | None = None
+    call: "CanonicalHookCall",
+    *,
+    engine: Any | None,
+    deadline_monotonic: float | None = None,
+    surfacing_config: "SurfacingConfig | None" = None,
 ) -> dict[str, Any]:
     if call.event_type != "PostToolUse":
         return {}
@@ -483,20 +595,15 @@ async def _run_surfacing_hook_inner(
 
     # Lazy imports: keep ``mms hook --help`` and unrelated CLI paths off the
     # surfacing/MCP import cost.
-    from memtomem_stm.config import STMConfig, log_stm_config_failure
     from memtomem_stm.surfacing.engine import SurfacingEngine
     from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
     from memtomem_stm.surfacing.observability import SurfacingObservability
 
-    try:
-        surfacing_cfg = STMConfig().surfacing
-    except Exception as exc:
-        # Observability only (#847): the outer barrier still turns this into
-        # the `{}` pass-through, but no longer silently.
-        log_stm_config_failure(
-            exc, logger=logger, context="running the surfacing hook", exc_info=False
-        )
-        raise
+    surfacing_cfg = (
+        surfacing_config
+        if surfacing_config is not None
+        else _load_hook_config("running the surfacing hook").config.surfacing
+    )
     if not surfacing_cfg.enabled:
         return {}
 
@@ -581,10 +688,20 @@ async def _quiet_async(coro: Any, what: str) -> None:
 
 
 def _read_payload(stream: TextIO) -> dict[str, Any] | None:
-    """Read and JSON-parse the hook payload from ``stream``; ``None`` if absent
-    or malformed (caller treats that as a clean no-op)."""
+    """Read and JSON-parse the hook payload from ``stream``; ``None`` if absent,
+    not UTF-8, or malformed (caller treats that as a clean no-op).
+
+    The payload is JSON, whose interchange encoding is UTF-8, so the bytes under
+    a text stream are decoded as UTF-8 (a leading BOM tolerated), not in the
+    stream's configured encoding, which need not be UTF-8 (#1444).
+
+    Reading ``.buffer`` bypasses anything the text layer has already buffered,
+    so ``stream`` must not have been read from: true for the one caller, which
+    passes a fresh ``sys.stdin``. A stream without ``.buffer`` is read as text.
+    """
     try:
-        raw = stream.read()
+        buffer = getattr(stream, "buffer", None)
+        raw = buffer.read().decode("utf-8-sig") if buffer is not None else stream.read()
     except Exception:
         return None
     if not raw or not raw.strip():
@@ -594,26 +711,6 @@ def _read_payload(stream: TextIO) -> dict[str, Any] | None:
     except (json.JSONDecodeError, ValueError):
         return None
     return data if isinstance(data, dict) else None
-
-
-def _daemon_enabled() -> bool:
-    """Whether the hook should route through the local daemon.
-
-    Daemon mode is the default (``HookConfig.use_daemon=True``); unset → on. We
-    read ``MEMTOMEM_STM_HOOK__USE_DAEMON`` directly here (mirroring the field's
-    env binding) so the explicit opt-out path pays no extra config load —
-    ``_surface_tools()`` reads its env knob the same way. The falsy-token set
-    matches Pydantic's bool parsing so this and ``mms daemon status`` (which
-    reads the parsed field) agree on every value Pydantic accepts. We strip and
-    lower-case first, so a padded token like ``" off "`` still disables (Pydantic
-    doesn't strip and would reject it); any other value Pydantic rejects (empty,
-    garbage) returns enabled here, while a config load like ``mms daemon status``
-    would raise.
-    """
-    val = os.environ.get("MEMTOMEM_STM_HOOK__USE_DAEMON")
-    if val is None:
-        return True
-    return val.strip().lower() not in ("0", "false", "f", "no", "n", "off")
 
 
 def _hook_eligible(call: "CanonicalHookCall") -> bool:
@@ -627,7 +724,10 @@ def _hook_eligible(call: "CanonicalHookCall") -> bool:
 
 
 async def _run_hook(
-    call: "CanonicalHookCall", *, config: "STMConfig | None" = None
+    call: "CanonicalHookCall",
+    *,
+    config: "STMConfig | None" = None,
+    use_daemon: bool | None = None,
 ) -> dict[str, Any]:
     """Resolve the *surfacing* hook output, preferring the warm daemon when enabled.
 
@@ -637,31 +737,34 @@ async def _run_hook(
     cold path see the same bounded ``tool_response_text`` (and the wire frame
     stays under the daemon's 4 MiB cap).
 
-    Degradation ladder (every rung still yields a hook-output dict, never
-    raises): daemon disabled → cold in-process path. Daemon enabled → one
-    bounded round trip; on unavailable/stale/slow we (optionally) fire-and-forget
-    spawn the daemon so the *next* call is warm, then for *this* call either
+    Degradation ladder: daemon disabled → cold in-process path. Daemon
+    enabled → one bounded round trip; on unavailable/stale/slow we
+    (optionally) fire-and-forget spawn the daemon so the *next* call is warm,
+    then for *this* call either
     return ``{}`` (default ``fallback=skip`` — the daemon exists precisely to
     avoid the ~6s cold start) or take the cold path (``fallback=cold``). The
-    whole call runs inside ``_hook_budget_seconds()`` in :func:`hook_command`.
-    ``config`` is reused from :func:`_orchestrate` when given (saving a redundant
-    ``STMConfig()`` load); ``None`` loads on demand.
+    whole call runs inside ``_hook_budget_seconds(overrides)`` in :func:`hook_command`.
+    ``config`` is reused from :func:`_orchestrate` when given, on both routes,
+    so one tool call loads the environment once; ``None`` loads it before
+    either route, and a settings error that load does not recover from
+    raises from here (the caller's barrier owns it).
+
+    The route is ``hook.use_daemon`` as the settings read it, in any form they
+    accept (#1495), unless *use_daemon* carries the hook command's explicit
+    ``--use-daemon``/``--no-daemon``, which decides here directly. The flag
+    also reaches the settings, laid over everything the environment gives
+    ``hook.use_daemon`` (``host_runtime.hook_flags_scope``, #1537), so the two
+    agree whenever the build succeeds; reading it here keeps the route the
+    command's even for a caller that passes a config built without the flag.
     """
     if not _hook_eligible(call):
         return {}
     bounded = _bounded_call(call)
-    if _daemon_enabled():
-        from memtomem_stm.config import STMConfig, log_stm_config_failure
+    if config is None:
+        config = _load_hook_config("routing the hook").config
+    if use_daemon if use_daemon is not None else config.hook.use_daemon:
         from memtomem_stm.daemon import client
 
-        if config is None:
-            try:
-                config = STMConfig()
-            except Exception as exc:
-                log_stm_config_failure(
-                    exc, logger=logger, context="routing the hook to the daemon", exc_info=False
-                )
-                raise
         # Reject ineligible calls (surfacing globally off, non-PostToolUse, or
         # a non-allowlisted tool) before routing to / spawning the daemon — an
         # off-target hook call must not warm a pointless daemon. The cold path
@@ -693,7 +796,35 @@ async def _run_hook(
         if config.hook.fallback != "cold":
             return {}
         # fallback=cold → fall through to the in-process surfacing path.
-    return await run_surfacing_hook(bounded)
+    return await run_surfacing_hook(bounded, surfacing_config=config.surfacing)
+
+
+def _load_hook_config(context: str) -> "EnvSTMConfigLoad":
+    """The hook's env config, tolerating a proxy-only break (#847).
+
+    The hook never reads ``proxy`` except for the metrics row, which
+    :func:`_record_hook_metrics` skips on a degraded load. A recovered load
+    logs one names-only line; any other failure logs the hint and re-raises
+    into the caller's pass-through barrier, which owns the traceback.
+    """
+    from memtomem_stm.config import (
+        load_env_stm_config,
+        log_proxy_env_ignored,
+        log_stm_config_failure,
+    )
+
+    try:
+        load = load_env_stm_config()
+    except Exception as exc:
+        log_stm_config_failure(exc, logger=logger, context=context, exc_info=False)
+        raise
+    if load.proxy_error is not None:
+        log_proxy_env_ignored(
+            load.proxy_error,
+            logger=logger,
+            context=f"{context} (hook metrics are not recorded)",
+        )
+    return load
 
 
 def _record_hook_metrics(
@@ -701,6 +832,10 @@ def _record_hook_metrics(
     updated: dict[str, Any] | None,
     additional_context: str | None,
     config: "STMConfig",
+    host_tag: str,
+    status: str,
+    *,
+    proxy_ignored: bool = False,
 ) -> None:
     """Record one native built-in tool call into ``proxy_metrics.db`` (``source='hook'``).
 
@@ -708,7 +843,11 @@ def _record_hook_metrics(
     to proxied calls. Reads the normalized :class:`CanonicalHookCall` (``tool_name``
     + the once-flattened ``tool_response_text``), so the raw payload is parsed
     exactly once. Persists **sizes only** (original / compressed / surfaced chars
-    + the tool name): never ``tool_input`` and never the output text, mirroring
+    + the tool name, under a ``server`` that names the host — see
+    :func:`~memtomem_stm.proxy.metrics.hook_server_label`) and the compression
+    stage's ``status`` (one of
+    :data:`~memtomem_stm.proxy.metrics.HOOK_COMPRESSION_STATUSES`): never ``tool_input``
+    and never the output text, mirroring
     the hook's no-query-text privacy posture (a ``Bash`` command may carry
     secrets). Gated on ``config.hook.metrics_enabled`` (independent of
     ``proxy.metrics.enabled`` so a hook-only deployment still measures), reusing
@@ -716,9 +855,14 @@ def _record_hook_metrics(
     opened per call — the hook is a one-shot subprocess, so there is no
     long-lived tracker to write through. **Never raises**: any failure degrades
     to no row, so metrics can't disrupt the host.
+
+    ``proxy_ignored`` (a degraded load, see
+    :func:`~memtomem_stm.config.load_env_stm_config`) skips the row: the DB path
+    and retention are proxy fields, so their defaults may name a different DB
+    from the one the operator configured.
     """
     try:
-        if not config.hook.metrics_enabled:
+        if not config.hook.metrics_enabled or proxy_ignored:
             return
         tool_name = call.tool_name
         if not tool_name:
@@ -733,7 +877,7 @@ def _record_hook_metrics(
 
         # Lazy import: keep ``mms hook --help`` and the metrics-disabled path off
         # the metrics / sqlite import cost.
-        from memtomem_stm.proxy.metrics import CallMetrics
+        from memtomem_stm.proxy.metrics import CallMetrics, hook_server_label
         from memtomem_stm.proxy.metrics_store import MetricsStore
 
         # reconcile_on_init=False: this config is the env-only STMConfig, not
@@ -750,13 +894,14 @@ def _record_hook_metrics(
         try:
             store.record(
                 CallMetrics(
-                    server="builtin",
+                    server=hook_server_label(host_tag),
                     tool=tool_name,
                     original_chars=original_chars,
                     compressed_chars=compressed_chars,
                     surfaced_chars=surfaced_chars,
                     compression_strategy="truncate" if updated is not None else None,
                     source="hook",
+                    hook_compression_status=status,
                 )
             )
         finally:
@@ -770,6 +915,8 @@ async def _orchestrate(
     adapter: "HostHookAdapter",
     *,
     allow_output_replacement: bool | None = None,
+    notices: list[str] | None = None,
+    use_daemon: bool | None = None,
 ) -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
     LTM *surfacing*, as one host-shaped output.
@@ -801,31 +948,40 @@ async def _orchestrate(
     ``client.surface`` → ``CanonicalHookCall.to_wire``), so it needs no host
     knowledge; compression still runs here in the hook process (it needs the
     original ``tool_response`` object, which is not transmitted).
-    """
-    from memtomem_stm.config import STMConfig, log_stm_config_failure
 
+    *use_daemon* is the hook command's explicit daemon flag (``None`` when the
+    command has none), handed to :func:`_run_hook` to decide the route.
+    """
     call = adapter.parse(payload)
     if call is None:  # unusable payload → pass the tool output through untouched
         return {}
-    try:
-        config = STMConfig()
-    except Exception as exc:
-        # Raised before the compression/surfacing split, so this one failure
-        # kills both halves — the hint line is the only attributable trace.
-        # exc_info=False: the pass-through barrier logs the traceback once
-        # already — this line carries the hint, not a second traceback.
-        log_stm_config_failure(exc, logger=logger, context="orchestrating the hook", exc_info=False)
-        raise
-    replacement_allowed = (
-        adapter.can_replace_output
-        if allow_output_replacement is None
-        else adapter.can_replace_output and allow_output_replacement
-    )
-    compression = (
-        compress_builtin(call, config.hook.compression)
-        if replacement_allowed
-        else BuiltinCompressionOutcome("unsupported_host")
-    )
+    # An unrecovered failure raises before the compression/surfacing split, so
+    # it kills both halves; the pass-through barrier owns its traceback.
+    load = _load_hook_config("orchestrating the hook")
+    config = load.config
+    # Each refusal gets its own status, so ``mms stats`` can tell them apart.
+    # ``disabled`` comes first: a hook that never enabled compression must not
+    # read as one that is missing ``--host claude``. ``allow_output_replacement``
+    # is tri-state — ``None`` (direct callers) defers to the adapter.
+    notice = False
+    if not config.hook.compression.enabled:
+        compression = BuiltinCompressionOutcome("disabled")
+    elif not adapter.can_replace_output:
+        compression = BuiltinCompressionOutcome("unsupported_host")
+    elif allow_output_replacement is False:
+        compression = BuiltinCompressionOutcome("replacement_not_requested")
+        # The status above covers every call of such a registration; the
+        # notice only the ones compression would have attempted (#1437).
+        # Reported before surfacing starts: if surfacing then runs past the
+        # outer hook deadline, the caller still has the notice to emit
+        # (``notices``), and stderr already carries it.
+        notice = _would_attempt_compression(call, config.hook.compression)
+        if notice:
+            logger.warning("%s", HOST_NOT_EXPLICIT_NOTICE)
+            if notices is not None:
+                notices.append(HOST_NOT_EXPLICIT_NOTICE)
+    else:
+        compression = compress_builtin(call, config.hook.compression)
     logger.debug(
         "native compression status=%s original_chars=%d compressed_chars=%d",
         compression.status,
@@ -836,12 +992,27 @@ async def _orchestrate(
     surf_out: dict[str, Any] = {}
     if adapter.can_inject_context:
         try:
-            surf_out = await _run_hook(call, config=config)
+            surf_out = await _run_hook(call, config=config, use_daemon=use_daemon)
         except Exception:
             logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
-    _record_hook_metrics(call, updated, additional_context, config)
-    return adapter.render(updated_tool_output=updated, additional_context=additional_context)
+    _record_hook_metrics(
+        call,
+        updated,
+        additional_context,
+        config,
+        adapter.host_tag,
+        compression.status,
+        proxy_ignored=load.proxy_error is not None,
+    )
+    rendered = adapter.render(updated_tool_output=updated, additional_context=additional_context)
+    if notice:
+        # ``systemMessage`` is a top-level field of the JSON output that both
+        # Claude Code and Codex document as a warning shown to the user.
+        # Reachable only through a replacement-capable adapter, which is a
+        # JSON host.
+        rendered = {**rendered, "systemMessage": HOST_NOT_EXPLICIT_NOTICE}
+    return rendered
 
 
 def _resolve_host_tag(host: str, payload: dict[str, Any] | None) -> str:
@@ -875,24 +1046,19 @@ def _resolve_host_tag(host: str, payload: dict[str, Any] | None) -> str:
 
 @contextmanager
 def _runtime_registration_env(overrides: dict[str, str]) -> Iterator[None]:
-    """Temporarily apply registration flags through the existing env bindings.
+    """Apply the command's runtime flags to every settings build of this call.
 
-    ``STMConfig`` already has the authoritative parsing and the detached daemon
-    deliberately inherits the hook process environment.  A short-lived overlay
-    therefore keeps both consumers aligned without adding a second config path.
-    Restoring every value matters for ``CliRunner`` and embedders that invoke
-    multiple commands in one Python process.
+    *overrides* is what :func:`runtime_env_overrides` returned; ``{}`` (a
+    command without flags) builds with none. The flags are a settings layer
+    over the environment (``host_runtime.hook_flags_scope``), not variables
+    set in it, so no spelling of a variable, no case variant of the field in
+    the block's JSON and no ``null`` block outranks them (#1503, #1537), and
+    the environment is left as it is. A daemon this call spawns receives them
+    from ``daemon.spawn`` in its own environment. Nothing here imports the
+    settings: the hook enters this before it has read its payload.
     """
-    previous = {key: os.environ.get(key) for key in overrides}
-    os.environ.update(overrides)
-    try:
+    with hook_flags_scope(overrides):
         yield
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 @click.group(name="hook", invoke_without_command=True)
@@ -975,12 +1141,16 @@ def hook_command(
     Bare ``mms hook`` (no subcommand) is the *runtime* bridge: it reads the hook
     JSON payload on stdin and prints a hook response that may carry
     ``updatedToolOutput`` (compressed Bash output — opt-in via
-    ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``) and/or ``additionalContext``
+    ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``, and only with an explicit
+    ``--host claude``) and/or ``additionalContext``
     (relevant LTM memories, for read-like tools). Surfacing runs in the warm
     ``mms daemon`` by default (no per-call cold start), auto-spawned on first
-    use; set ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` for the legacy cold in-process
-    path. Always exits 0; on any problem the tool output passes through unchanged
-    (prints ``{}``).
+    use; pass ``--no-daemon`` for the legacy cold in-process path. A command
+    with neither daemon flag follows the ``hook.use_daemon`` setting instead
+    (set false, e.g. ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``). Always exits 0; on any
+    problem the tool output passes through unchanged
+    (prints ``{}``, or only a ``systemMessage`` when compression was refused for
+    the call before a timeout or other caught failure, #1437).
 
     ``--host`` selects the adapter, which owns both the output *shape*
     (``render``) and its *stdout serialization* (``serialize`` — JSON for
@@ -1002,8 +1172,7 @@ def hook_command(
     """
     # A subcommand (install/uninstall) was invoked — don't run the runtime bridge
     # (and never read stdin). The bare ``mms hook`` invocation, where
-    # ``invoked_subcommand`` is None, falls through to the payload path below,
-    # byte-identical to the pre-group command.
+    # ``invoked_subcommand`` is None, falls through to the payload path below.
     if ctx.invoked_subcommand is not None:
         return
     # Top-level always-exit-0 barrier (#865). The inner ``except Exception``
@@ -1041,6 +1210,7 @@ def hook_command(
             host_tag = _resolve_host_tag(host, payload)
             adapter = get_adapter(host_tag)
             output: dict[str, Any] = {}
+            notices: list[str] = []
             if payload is not None:
                 try:
                     output = asyncio.run(
@@ -1050,32 +1220,38 @@ def hook_command(
                                 adapter,
                                 # Automatic/ambiguous routing must never enable the
                                 # sole destructive capability (native output replace).
-                                allow_output_replacement=host.strip() == "claude",
+                                allow_output_replacement=host_authorizes_replacement(host),
+                                notices=notices,
+                                use_daemon=_parse_bool(runtime_use_daemon),
                             ),
-                            timeout=_hook_budget_seconds(),
+                            timeout=_hook_budget_seconds(overrides),
                         )
                     )
                 except Exception:
                     logger.warning(
                         "hook processing failed — passing tool output through", exc_info=True
                     )
-                    output = {}
+                    # A refusal found before the failure (typically a surfacing
+                    # timeout) is still reported; nothing else of the partial
+                    # run is kept.
+                    output = render_notices(adapter, notices)
             serialized = adapter.serialize(output)
         # ``serialize`` returns "" only when nothing is emitted (Kimi's raw-stdout
         # channel with nothing surfaced). An unconditional ``click.echo`` would
         # still append a newline, making stdout "\n" — non-empty, which Kimi
         # injects into the model context — so the "empty stdout" pass-through
         # contract requires suppressing the newline on an empty payload. JSON
-        # hosts always serialize to a non-empty string ("{}" or more), so their
-        # trailing newline (and the pre-seam byte-identity) is unchanged.
+        # hosts always serialize to a non-empty string ("{}" or more), so they
+        # keep their trailing newline.
         wrote = True
         try:
             click.echo(serialized, nl=bool(serialized))
         except UnicodeEncodeError:
             # Last resort for the always-exit-0 contract (#757). The JSON hosts'
-            # payload is escaped by the writer in ``serialize``, but Kimi's
-            # channel is raw stdout — surfaced text, not a JSON document — so
-            # nothing escapes an unencodable code unit there. Degrade to
+            # payload is ASCII (``serialize`` escapes every non-ASCII code unit,
+            # #1444), so it encodes on any ASCII-compatible stdout. A raw-stdout
+            # adapter such as Kimi's writes surfaced text, not a JSON document,
+            # so nothing escapes an unencodable character there. Degrade to
             # "nothing surfaced" rather than let the final write become a hook
             # failure the host reads as a broken tool call.
             logger.warning("hook output was not encodable — passing tool output through")
@@ -1111,50 +1287,145 @@ def hook_command(
                     logger.warning("hook fallback emit failed — emitting nothing")
 
 
-def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:
+def host_authorizes_replacement(host: str) -> bool:
+    """Whether a runtime ``--host`` value lets ``mms hook`` replace tool output.
+
+    Only an explicit ``claude`` does: ``auto`` and an unrecognized value both
+    resolve by payload shape, which cannot tell Codex from Claude (#1437)."""
+    return host.strip() == "claude"
+
+
+def render_notices(adapter: "HostHookAdapter", notices: list[str]) -> dict[str, Any]:
+    """The pass-through output, plus ``systemMessage`` when a notice was
+    raised and the host's channel is JSON (Kimi's raw stdout has no field
+    for it, and cannot raise one: it cannot replace output)."""
+    if not notices or not adapter.can_replace_output:
+        return {}
+    return {"systemMessage": notices[0]}
+
+
+def _hook_install_command_argv(
+    host: str,
+    *,
+    policy: HostRuntimePolicy | None = None,
+    launcher: tuple[str, list[str]] | None = None,
+) -> list[str]:
     """The argv a host should fire on PostToolUse: ``<entrypoint> hook --host <host>``.
 
-    Reuses the MCP-registration entry-point detection (``_detect_install_type``):
-    a source/editable checkout registers ``uv run --directory <root>
-    memtomem-stm hook --host <host>`` and a global install the bare
-    ``memtomem-stm hook --host <host>`` console script. ``--host`` is always
+    The launcher is the user-scope hook launcher (``_detect_install_type``,
+    or ``launcher`` when the caller already resolved it): a source checkout or
+    a project that depends on memtomem-stm registers ``uv run --directory
+    <root> memtomem-stm hook --host <host>`` and a global install the bare
+    ``memtomem-stm hook --host <host>`` console script; ``mms hook install``
+    reports the dependent-project case from the same lookup (#1379).
+    ``--host`` is always
     written explicitly so raw-stdout (Kimi) and Codex routing are unambiguous (a
     bare ``mms hook`` would auto-detect, which cannot tell Codex from Claude)."""
-    # Lazy import: ``cli.proxy`` resolves this module lazily to register the
-    # group (#862), so importing it here (only on the install path) avoids a
-    # cycle and keeps it off the latency-sensitive bare-hook path.
-    from memtomem_stm.cli.proxy import _detect_install_type
+    if launcher is None:
+        # Lazy import: ``cli.proxy`` resolves this module lazily to register
+        # the group (#862), so importing it here (only on the install path)
+        # avoids a cycle and keeps it off the latency-sensitive bare-hook path.
+        from memtomem_stm.cli.proxy import _detect_install_type
 
-    server_cmd, server_args = _detect_install_type()
-    argv = [server_cmd, *server_args, "hook", "--host", host]
-    if policy is not None:
-        argv.extend(policy.hook_args())
-    return argv
+        launcher = _detect_install_type()
+    server_cmd, server_args = launcher
+    # One definition of the written words, shared with the reader that decides
+    # which existing handlers are install's own (``owned_hook_command``).
+    return hook_command_words(
+        [server_cmd, *server_args], host, policy.hook_args() if policy is not None else ()
+    )
+
+
+def _emit_unmanaged(
+    change: Any, locations: tuple[str, ...], *, written: bool, preview: bool = False
+) -> None:
+    """Name the handlers that look like STM's hook but that this command leaves
+    alone (#1453), by location only: their text can hold secret values.
+
+    ``written`` says whether ``locations`` index the file just written or the
+    current one; a preview names the current file, since that is the one the
+    operator can open now. For an install the line says the handlers stay
+    beside STM's hook, not that they run: whether one runs depends on its
+    matcher, its event and the host's own approval, none of which is read."""
+    if not locations:
+        return
+    from memtomem_stm.cli.proxy import _warn
+
+    one = len(locations) == 1
+    managed_by = "install" if change.action == "install" else "uninstall"
+    if one:
+        subject = f"1 other handler looks like memtomem-stm's hook but is not one {managed_by}"
+        stays = "it will stay" if preview else "it stays"
+        them = "it"
+    else:
+        subject = (
+            f"{len(locations)} other handlers look like memtomem-stm's hook but are not "
+            f"ones {managed_by}"
+        )
+        stays = "they will stay" if preview else "they stay"
+        them = "them"
+    where = "in the written file" if written else "in the current file"
+    if change.action == "install":
+        stays += " beside memtomem-stm's hook"
+    click.echo(
+        f"  {_warn('!')} {subject} manages, so {stays} in the config ({where}: "
+        f"{_disp(', '.join(locations))}). Check {them} by hand, and edit or remove any "
+        "that should not run."
+    )
 
 
 def _emit_hook_change(
-    change: Any, *, apply_: bool, backup: Any, apply_hint: str | None = None
+    change: Any,
+    *,
+    apply_: bool,
+    backup: Any,
+    apply_hint: str | None = None,
+    project_binding: Path | None = None,
 ) -> None:
     """Render a planned (or applied) install/uninstall to the terminal.
 
     Pure output: the caller has already applied the change when ``apply_`` and
     passes the resulting ``backup`` path (or ``None``). Dry-run (the default)
-    shows what *would* happen and how to apply it."""
+    shows what *would* happen and how to apply it. ``project_binding`` is the
+    project an install's launcher is tied to (``_hook_project_binding``); it is
+    reported for every install outcome, an unchanged one included (#1379)."""
     from memtomem_stm.cli.proxy import _hdr, _ok, _warn
 
-    # `change.path` and the backup beside it are filesystem paths; a
-    # directory name can hold anything the filesystem allows. `label`,
+    # `change.path`, the backup beside it and `project_binding` are filesystem
+    # paths; a directory name can hold anything the filesystem allows. `label`,
     # `action`, `host_tag` and `notes` are literals this package writes
     # itself and stay raw. Escape the value, never the styled line (#760).
     click.echo(f"{_hdr(change.label + ' hook')} — {_disp(str(change.path))}")
+    unmanaged = change.unmanaged
+
+    def _echo_binding() -> None:
+        if project_binding is None or change.action != "install":
+            return
+        # A dry run that would change the config describes the hook it would
+        # write; until --apply the installed one may still use another launcher.
+        runs = "would run" if change.changed and not apply_ else "runs"
+        click.echo(
+            f"  {_warn('•')} This user-scope hook {runs} STM through `uv run --directory` "
+            f"in {_disp(str(project_binding))}, for every project. For the bare "
+            "`memtomem-stm` launcher (e.g. after `uv tool install memtomem-stm`), "
+            "re-run this command from a directory where the nearest pyproject.toml "
+            "within four parents neither names nor depends on memtomem-stm."
+        )
 
     if not change.changed:
+        not_installed = (
+            "not installed (no memtomem-stm hook that uninstall manages)."
+            if unmanaged
+            else "not installed (no memtomem-stm hook found)."
+        )
         no_change = {
             "already": "already installed (no change).",
-            "not_installed": "not installed (no memtomem-stm hook found).",
+            "not_installed": not_installed,
             "absent": "config not found (nothing to remove).",
         }.get(change.status, "no change.")
         click.echo(f"  {_ok(no_change) if change.status == 'already' else no_change}")
+        _emit_unmanaged(change, unmanaged, written=False)
+        _echo_binding()
         return
 
     if change.action == "install":
@@ -1163,6 +1434,9 @@ def _emit_hook_change(
                 click.echo(f"  {_ok('Backed up')} {_disp(str(backup))}")
             click.echo(f"  {_ok('Installed')} memtomem-stm's PostToolUse hook.")
         else:
+            # Before the block: applying leaves these handlers registered next
+            # to the one shown, which is the first thing to know about it.
+            _emit_unmanaged(change, unmanaged, written=False, preview=True)
             verb = "create the config and add" if change.status == "create" else "add"
             click.echo(f"  Would {verb} memtomem-stm's PostToolUse hook:")
             click.echo("")
@@ -1186,13 +1460,27 @@ def _emit_hook_change(
                 # blank, and prefixing them would emit trailing-whitespace lines.
                 click.echo(f"    {line}" if line else "")
             click.echo("")
-    else:  # uninstall (only reached when changed → status == "remove")
+    else:  # uninstall, changed: status "remove" or "prune"
+        if change.status == "prune":
+            # Only emptied containers go; nothing the host runs is removed.
+            what = "empty hook entries only (no memtomem-stm hook that uninstall manages)."
+        elif unmanaged:
+            # With a look-alike left behind, "the hook" alone would read as
+            # every STM hook in the file.
+            what = "the memtomem-stm hook install manages."
+        else:
+            what = "memtomem-stm's PostToolUse hook."
         if apply_:
             if backup is not None:
                 click.echo(f"  {_ok('Backed up')} {_disp(str(backup))}")
-            click.echo(f"  {_ok('Removed')} memtomem-stm's PostToolUse hook.")
+            click.echo(f"  {_ok('Removed')} {what}")
         else:
-            click.echo("  Would remove memtomem-stm's PostToolUse hook.")
+            click.echo(f"  Would remove {what}")
+
+    if apply_:
+        _emit_unmanaged(change, change.unmanaged_after, written=True)
+    elif change.action != "install":
+        _emit_unmanaged(change, unmanaged, written=False, preview=True)
 
     if not apply_ and change.fmt == "toml":
         click.echo(
@@ -1203,6 +1491,7 @@ def _emit_hook_change(
 
     for note in change.notes:
         click.echo(f"  {_warn('•')} {note}")
+    _echo_binding()
 
     if not apply_:
         click.echo("")
@@ -1210,6 +1499,41 @@ def _emit_hook_change(
             f"  To apply: "
             f"{_hdr(apply_hint or f'mms hook {change.action} --host {change.host_tag} --apply')}"
         )
+
+
+def _writable_surfacing_timeout(
+    ctx: click.Context, param: click.Parameter, value: float | None
+) -> float | None:
+    """Refuse a ``--surfacing-timeout`` the hook command cannot carry: the
+    hook drops a deadline that does not read back as a positive finite number
+    (``inf``, ``nan``, or one ``format_seconds`` rounds to infinity), so the
+    pinned value would not be the one in effect."""
+    if value is not None and not writable_seconds(value):
+        raise click.BadParameter(
+            "must be a positive finite number that stays finite in the hook command",
+            ctx=ctx,
+            param=param,
+        )
+    return value
+
+
+def _unwritable_deadline_message(field: str) -> str:
+    """The refusal for a resolved deadline the hook command cannot carry.
+    Names the setting and its variable, never the value."""
+    variable = "MEMTOMEM_STM_" + field.upper().replace(".", "__")
+    # ``--inherit-runtime-env`` cannot be combined with the runtime options,
+    # so it is offered in their place.
+    way_out = (
+        "pass --surfacing-timeout SECONDS"
+        if field == "surfacing.timeout_seconds"
+        else f"set {variable} to a smaller value"
+    )
+    return (
+        f"the configured {field} ({variable}) cannot be written into the hook command "
+        "as a positive finite number, and the hook would ignore the value written there; "
+        f"to go on, {way_out}, or pass --inherit-runtime-env in place of "
+        "--surfacing-timeout, --daemon and --no-daemon"
+    )
 
 
 @hook_command.command(name="install")
@@ -1232,7 +1556,9 @@ def _emit_hook_change(
     type=click.FloatRange(min=0.0, min_open=True),
     default=None,
     metavar="SECONDS",
-    help="Pin the LTM search deadline in the installed hook command.",
+    callback=_writable_surfacing_timeout,
+    help="Pin the LTM search deadline in the installed hook command. A positive, "
+    "finite number that stays finite when written there.",
 )
 @click.option(
     "--daemon",
@@ -1264,8 +1590,13 @@ def hook_install_command(
     Read-modify-writes the host's hook-config file (``~/.claude/settings.json``,
     ``~/.cursor/hooks.json``, ``$KIMI_CODE_HOME/config.toml`` or
     ``~/.kimi-code/config.toml``, or ``~/.codex/config.toml``)
-    so the host fires ``mms hook --host <name>`` after each built-in tool call.
-    Re-running updates STM's existing block in place rather than duplicating it.
+    so the host fires ``memtomem-stm hook --host <name>`` (behind
+    ``uv run --directory <dir>`` in a project that uses STM) after each
+    built-in tool call.
+    Re-running updates the handler install wrote in place rather than
+    duplicating it. Only a handler in the form install writes is install's
+    own; one that only looks like STM's hook is left alone and named by
+    location, above the block a preview shows.
     Default is a dry-run preview; ``--apply`` writes (backing up any prior file)
     under the hook-host write lock, with plan and apply in one locked span so
     concurrent mms runs cannot interleave (the host app's own concurrent writes
@@ -1279,6 +1610,7 @@ def hook_install_command(
     # this module is imported on the per-tool-call hook hot path.
     from memtomem_stm.cli import hook_hosts
     from memtomem_stm.cli._write_lock import hook_hosts_write_lock
+    from memtomem_stm.cli.proxy import _binding_for, _launcher_for, _stm_project
 
     if inherit_runtime_env and (surfacing_timeout is not None or daemon_mode is not None):
         raise click.UsageError(
@@ -1286,23 +1618,51 @@ def hook_install_command(
             "--daemon, or --no-daemon"
         )
     with hook_hosts_write_lock(enabled=apply_):
-        try:
-            commands = hook_hosts.installed_stm_hook_commands(host)
+        # One lookup feeds both the written command and its binding
+        # notice, so the two cannot disagree (#1379).
+        project = _stm_project()
+
+        # The settings the command takes from the first owned handler: each
+        # one no option sets, none under --inherit-runtime-env. The plan
+        # refuses to fold owned handlers that differ in one of them (#1470).
+        carried: frozenset[str] = frozenset()
+        if not inherit_runtime_env:
+            carried = frozenset({"daemon_timeout_seconds", "persist_query_text"})
+            if daemon_mode is None:
+                carried |= {"use_daemon"}
+            if surfacing_timeout is None:
+                carried |= {"surfacing_timeout_seconds"}
+
+        def build_command(owned: tuple[OwnedHookCommand, ...]) -> str:
+            # ``owned`` are install's handlers in the one read of the config
+            # that the merge also works on. The first one's settings carry
+            # over, as the first one is the handler the merge refreshes; the
+            # plan has already refused handlers that differ in ``carried``.
             policy = None
             if not inherit_runtime_env:
                 policy = resolve_host_runtime_policy(
-                    existing_command=commands[0] if commands else None,
+                    existing=owned[0].settings if owned else None,
                     use_daemon=daemon_mode,
                     surfacing_timeout_seconds=surfacing_timeout,
                 )
-            command = shlex.join(_hook_install_command_argv(host, policy=policy))
-            change = hook_hosts.plan_install(host, command)
+            return shlex.join(
+                _hook_install_command_argv(host, policy=policy, launcher=_launcher_for(project))
+            )
+
+        try:
+            project_binding = _binding_for(project)
+            change = hook_hosts.plan_install(host, build_command, carried=carried)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
             # One choke point for every ``HookInstallError`` raise: the
             # messages interpolate a config path and a parser's own text, and
             # this is where they become terminal output (#780).
             raise click.ClickException(_disp(str(exc))) from exc
+        except UnwritableDeadlineError as exc:
+            # Raised by ``hook_args`` inside ``build_command``, before
+            # ``apply_change``: the host config is unchanged and no backup is
+            # made (an ``--apply`` may still have created the lock file).
+            raise click.ClickException(_unwritable_deadline_message(exc.field)) from exc
         except (ValidationError, SettingsError) as exc:
             # A broken MEMTOMEM_STM_* env fails the policy's STMConfig
             # construction (#847): a ValidationError for a wrong value, a
@@ -1332,6 +1692,7 @@ def hook_install_command(
             apply_=apply_,
             backup=backup,
             apply_hint=shlex.join(hint),
+            project_binding=project_binding,
         )
 
 
@@ -1353,9 +1714,12 @@ def hook_install_command(
 def hook_uninstall_command(host: str, apply_: bool) -> None:
     """Remove STM's PostToolUse hook from a host's config (symmetric to install).
 
-    Removes exactly the block ``install`` would add (recognized by command
-    shape), leaving any hand-written hooks untouched. A no-op when the config is
-    absent or holds no STM block. Default is a dry-run preview; ``--apply`` writes
+    Removes the handlers in the form ``install`` writes, leaving other hooks
+    untouched; one that only looks like STM's hook is named by location. A
+    no-op when the config is absent or holds no such handler, except that
+    empty hook containers (an empty matcher
+    group, event list or ``hooks`` section) are still pruned, and reported as
+    such. Default is a dry-run preview; ``--apply`` writes
     (backing up the prior file) under the same locked plan+apply span as
     ``install``."""
     # Lazy import: see hook_install_command.

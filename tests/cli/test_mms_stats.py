@@ -457,6 +457,737 @@ class TestStatsBySource:
         assert "all-time" not in result.output
 
 
+def _seed_hook_rows(db: Path, rows: list[tuple[str, str, int, int]], **store_kwargs) -> None:
+    """``(server, tool, original_chars, compressed_chars)`` rows with ``source='hook'``."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    store = MetricsStore(db, **store_kwargs)
+    store.initialize()
+    try:
+        for server, tool, orig, comp in rows:
+            store.record(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=orig,
+                    compressed_chars=comp,
+                    source="hook",
+                )
+            )
+    finally:
+        store.close()
+
+
+_CLAUDE_AND_CODEX = [
+    ("builtin:claude", "Bash", 20_000, 16_000),
+    ("builtin:claude", "Read", 5_000, 5_000),
+    ("builtin:codex", "Bash", 30_000, 30_000),
+    ("builtin:codex", "Bash", 30_000, 30_000),
+]
+_CLAUDE_ENTRY = {
+    "host": "claude",
+    "calls": 2,
+    "original_chars": 25_000,
+    "compressed_chars": 21_000,
+    "saved_ratio": 0.16,
+    "can_replace_output": True,
+}
+_CODEX_ENTRY = {
+    "host": "codex",
+    "calls": 2,
+    "original_chars": 60_000,
+    "compressed_chars": 60_000,
+    "saved_ratio": 0.0,
+    "can_replace_output": False,
+}
+
+
+class TestStatsHookByHost:
+    """The hook ratio is split by host (#1438).
+
+    A host that cannot replace tool output only ever adds to the denominator,
+    so one blended ``hook`` ratio says nothing about the host that can.
+    """
+
+    def test_each_host_gets_its_own_line_under_the_hook_source(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX)
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        hook = lines.index("    hook  calls: 4  chars: 85,000 -> 81,000  (saved 4.7%)")
+        # Largest host first; the one that cannot replace output has no ratio.
+        assert lines[hook + 1 : hook + 3] == [
+            "      codex  calls: 2  chars: 60,000  (measured only: host cannot replace output)",
+            "      claude calls: 2  chars: 25,000 -> 21,000  (saved 16.0%)",
+        ]
+        # The longest label fits the per-tool table's server cell whole.
+        assert any(line.startswith("  builtin:claude Bash ") for line in lines)
+
+    def test_json_reports_the_hosts(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["hook_by_host"] == [_CODEX_ENTRY, _CLAUDE_ENTRY]
+
+    def test_a_lone_host_that_cannot_replace_output_is_still_explained(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # Hook-only DB with one host: no per-source lines to hang the host
+        # under, and a bare "saved 0.0%" would read as compression not working.
+        set_home(monkeypatch, tmp_path)
+        _seed_hook_rows(
+            tmp_path / ".memtomem" / "proxy_metrics.db", [("builtin:codex", "Bash", 30_000, 30_000)]
+        )
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert (
+            "    codex  calls: 1  chars: 30,000  (measured only: host cannot replace output)"
+            in result.output.splitlines()
+        )
+
+    def test_a_lone_host_that_can_replace_output_adds_no_line(self, runner, tmp_path, monkeypatch):
+        # Its ratio is the hook ratio already.
+        set_home(monkeypatch, tmp_path)
+        _seed_hook_rows(
+            tmp_path / ".memtomem" / "proxy_metrics.db",
+            [("builtin:claude", "Bash", 20_000, 16_000)],
+        )
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert "chars: 20,000 -> 16,000  (saved 4,000, 20.0%)" in result.output
+        assert "claude calls:" not in result.output
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert [entry["host"] for entry in data["hook_by_host"]] == ["claude"]
+
+    def test_rows_without_a_recorded_host_are_reported_apart(self, runner, tmp_path, monkeypatch):
+        # Rows written before the host was recorded, or by an older hook that
+        # shares the DB, keep the bare ``builtin`` and cannot be attributed.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(
+            db, [("builtin", "Bash", 90_000, 90_000), ("builtin:claude", "Bash", 20_000, 16_000)]
+        )
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        # Last, whatever its volume.
+        first = lines.index("    claude calls: 1  chars: 20,000 -> 16,000  (saved 20.0%)")
+        assert lines[first + 1 : first + 3] == [
+            "      status: not recorded 1",
+            "    (host not recorded) calls: 1  chars: 90,000 -> 90,000  (saved 0.0%)",
+        ]
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert data["hook_by_host"][1] == {
+            "host": None,
+            "calls": 1,
+            "original_chars": 90_000,
+            "compressed_chars": 90_000,
+            "saved_ratio": 0.0,
+            "can_replace_output": None,
+        }
+
+    def test_a_host_this_version_does_not_know_gets_no_capability(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # ``get_adapter`` falls back to Claude for an unknown tag; the reader
+        # must not, or a newer hook's rows would be labelled as replaceable.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(
+            db, [("builtin:future", "Bash", 10_000, 10_000), ("builtin:codex", "Bash", 1, 1)]
+        )
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert [(e["host"], e["can_replace_output"]) for e in data["hook_by_host"]] == [
+            ("future", None),
+            ("codex", False),
+        ]
+        human = runner.invoke(cli, ["stats"]).output.splitlines()
+        assert "    future calls: 1  chars: 10,000 -> 10,000  (saved 0.0%)" in human
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [("hook", [_CODEX_ENTRY, _CLAUDE_ENTRY]), ("mcp", None)],
+    )
+    def test_source_filter(self, runner, tmp_path, monkeypatch, source, expected):
+        # ``--source hook`` drops the per-source breakdown the hosts hang under
+        # by default; the split has to follow the hook summary itself.
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--source", source, "--json"]).output)
+        human = runner.invoke(cli, ["stats", "--source", source]).output.splitlines()
+
+        assert data["compression_by_source"] is None
+        assert data["hook_by_host"] == expected
+        shown = "    claude calls: 2  chars: 25,000 -> 21,000  (saved 16.0%)" in human
+        assert shown is (expected is not None)
+
+    def test_tool_filter_reaches_the_hosts(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--tool", "Read", "--json"]).output)
+
+        assert data["hook_by_host"] == [
+            {
+                "host": "claude",
+                "calls": 1,
+                "original_chars": 5_000,
+                "compressed_chars": 5_000,
+                "saved_ratio": 0.0,
+                "can_replace_output": True,
+            }
+        ]
+
+    def test_hosts_survive_trimming_into_the_rollup(self, runner, tmp_path, monkeypatch):
+        # The daily rollup is keyed by server, which is why the host rides there.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(db, _CLAUDE_AND_CODEX, max_history=1)
+
+        raw = sqlite3.connect(str(db))
+        try:
+            retained = raw.execute("SELECT server, tool FROM proxy_metrics").fetchall()
+            rolled = dict(
+                raw.execute(
+                    "SELECT server, SUM(calls) FROM proxy_metrics_daily GROUP BY server"
+                ).fetchall()
+            )
+        finally:
+            raw.close()
+        # Positive control: rows of BOTH hosts left the raw table.
+        assert retained == [("builtin:codex", "Bash")]
+        assert rolled == {"builtin:claude": 2, "builtin:codex": 1}
+
+        windowed = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert [entry["host"] for entry in windowed["hook_by_host"]] == ["codex"]
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+        assert data["hook_by_host"] == [_CODEX_ENTRY, _CLAUDE_ENTRY]
+        human = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+        assert "    claude calls: 2  chars: 25,000 -> 21,000  (saved 16.0%)" in human
+
+    def test_an_upstream_server_with_a_hook_label_is_not_a_host(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # ``server`` is operator data for MCP rows: nothing stops an upstream
+        # from being named like a hook label. Only ``source='hook'`` rows count.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(db, [("builtin:codex", "Bash", 30_000, 30_000)])
+        store = MetricsStore(db)
+        store.initialize()
+        try:
+            for server in ("builtin:claude", "builtin"):
+                store.record(
+                    CallMetrics(
+                        server=server, tool="Bash", original_chars=8_000, compressed_chars=2_000
+                    )
+                )
+        finally:
+            store.close()
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["compression_by_source"]["mcp"]["total_calls"] == 2
+        assert data["hook_by_host"] == [
+            {
+                "host": "codex",
+                "calls": 1,
+                "original_chars": 30_000,
+                "compressed_chars": 30_000,
+                "saved_ratio": 0.0,
+                "can_replace_output": False,
+            }
+        ]
+
+    def test_host_tag_is_escaped_for_display(self, runner, tmp_path, monkeypatch):
+        # The tag is read back from the DB file, like every other recorded name.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_rows(
+            db, [("builtin:\x1b[31mx", "Bash", 10, 10), ("builtin:codex", "Bash", 1, 1)]
+        )
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert "\x1b" not in result.output
+        assert (
+            "    \\u001B[31mx calls: 1  chars: 10 -> 10  (saved 0.0%)" in result.output.splitlines()
+        )
+
+
+def _seed_hook_statuses(
+    db: Path, rows: list[tuple[str, str, int, str | None]], **store_kwargs
+) -> None:
+    """``(server, tool, original_chars, status)`` hook rows; compressed only when
+    the status says so, as the hook writes them."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    store = MetricsStore(db, **store_kwargs)
+    store.initialize()
+    try:
+        for server, tool, orig, status in rows:
+            store.record(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=orig,
+                    compressed_chars=orig // 2 if status == "compressed" else orig,
+                    compression_strategy="truncate" if status == "compressed" else None,
+                    source="hook",
+                    hook_compression_status=status,
+                )
+            )
+    finally:
+        store.close()
+
+
+_MIXED_STATUSES = [
+    ("builtin:claude", "Bash", 20_000, "compressed"),
+    ("builtin:claude", "Bash", 600, "below_threshold"),
+    ("builtin:claude", "Bash", 900, "below_threshold"),
+    ("builtin:claude", "Read", 4_000, "ineligible_tool"),
+    ("builtin:claude", "Bash", 300, None),
+    ("builtin:codex", "Bash", 30_000, "unsupported_host"),
+    ("builtin:codex", "Bash", 30_000, "unsupported_host"),
+]
+
+
+class TestStatsHookStatus:
+    """Why each retained hook call was or was not compressed (#1438)."""
+
+    def test_capable_hosts_get_a_status_line(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_statuses(db, _MIXED_STATUSES)
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        claude = lines.index("      claude calls: 5  chars: 25,800 -> 15,800  (saved 38.8%)")
+        assert lines[claude + 1] == (
+            "        status: below_threshold 2, compressed 1, ineligible_tool 1, not recorded 1"
+        )
+        # The "measured only" note already explains a host that cannot replace.
+        codex = lines.index(
+            "      codex  calls: 2  chars: 60,000  (measured only: host cannot replace output)"
+        )
+        assert not lines[codex + 1].lstrip().startswith("status:")
+        assert "unsupported_host" not in result.output
+
+    def test_json_reports_every_host(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_statuses(db, _MIXED_STATUSES)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["hook_status"] == {
+            "scope": "retained",
+            "by_host": [
+                {
+                    "host": "claude",
+                    "statuses": [
+                        {"status": "below_threshold", "calls": 2, "original_chars": 1_500},
+                        {"status": "compressed", "calls": 1, "original_chars": 20_000},
+                        {"status": "ineligible_tool", "calls": 1, "original_chars": 4_000},
+                        {"status": None, "calls": 1, "original_chars": 300},
+                    ],
+                    "status_not_kept_calls": None,
+                },
+                {
+                    "host": "codex",
+                    "statuses": [
+                        {"status": "unsupported_host", "calls": 2, "original_chars": 60_000}
+                    ],
+                    "status_not_kept_calls": None,
+                },
+            ],
+        }
+        # Reported once, at the top level, not again inside the hook summary.
+        assert "hook_status" not in data["compression_by_source"]["hook"]
+
+    @pytest.mark.parametrize(
+        ("with_mcp", "indent"),
+        [(True, "      "), (False, "    ")],
+        ids=["under-the-hook-source", "under-the-total"],
+    )
+    def test_a_lone_capable_host_still_gets_its_status(
+        self, runner, tmp_path, monkeypatch, with_mcp, indent
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path) if with_mcp else tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+                ("builtin:claude", "Bash", 30_000, "retention_guard"),
+                ("builtin:claude", "Bash", 30_000, "retention_guard"),
+            ],
+        )
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        assert f"{indent}status: retention_guard 2, compressed 1" in lines
+        assert not any("claude calls:" in line for line in lines)
+
+    def test_a_known_host_with_no_recorded_status_says_so(self, runner, tmp_path, monkeypatch):
+        # Rows from part 1 of #1438: the host was recorded, the status not yet.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(db, [("builtin:claude", "Bash", 300, None)])
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert "    status: not recorded 1" in result.output.splitlines()
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert data["hook_status"]["by_host"] == [
+            {
+                "host": "claude",
+                "statuses": [{"status": None, "calls": 1, "original_chars": 300}],
+                "status_not_kept_calls": None,
+            }
+        ]
+
+    def test_rows_with_neither_host_nor_status_add_no_line(self, runner, tmp_path, monkeypatch):
+        # Older than both: ``(host not recorded)`` already says all there is.
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                ("builtin", "Bash", 90_000, None),
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+            ],
+        )
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        unrecorded = next(i for i, line in enumerate(lines) if "(host not recorded)" in line)
+        assert not lines[unrecorded + 1].lstrip().startswith("status:")
+        assert "      status: compressed 1" in lines
+
+    def test_order_is_by_calls_with_not_recorded_last_and_ties_by_name(
+        self, runner, tmp_path, monkeypatch
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                *[("builtin:claude", "Bash", 10, None)] * 3,
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+                ("builtin:kimi", "Bash", 10, "unsupported_host"),
+                ("builtin:codex", "Bash", 10, "unsupported_host"),
+            ],
+        )
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        by_host = data["hook_status"]["by_host"]
+        assert [entry["host"] for entry in by_host] == ["claude", "codex", "kimi"]
+        assert [item["status"] for item in by_host[0]["statuses"]] == ["compressed", None]
+
+    def test_a_lone_host_status_shares_the_snapshot_of_the_total_above_it(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """A row committed after the total was read must not appear in the
+        status line printed under that total (hook-only DB, one host)."""
+        from memtomem_stm.proxy import metrics_store
+
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
+        real = metrics_store.read_compression_summary
+        reads = []
+
+        def _write_after_first_read(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not reads:
+                _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
+            reads.append(kwargs.get("source"))
+            return result
+
+        monkeypatch.setattr(metrics_store, "read_compression_summary", _write_after_first_read)
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        assert reads[0] is None  # the aggregate was read first, then the row landed
+        assert "  calls: 1  (errors: 0)" in lines
+        assert "    status: compressed 1" in lines
+
+    def test_host_ties_do_not_depend_on_the_row_order(self):
+        # SQLite happens to return groups sorted; the order must not rely on it.
+        from memtomem_stm.cli.proxy import _hook_status
+
+        rows = [
+            {
+                "server": f"builtin:{host}",
+                "status": "unsupported_host",
+                "not_kept": False,
+                "calls": 1,
+                "original_chars": 1,
+            }
+            for host in ("kimi", "codex", "cursor")
+        ]
+        hosts = [
+            [e["host"] for e in _hook_status({"scope": "retained", "rows": order})["by_host"]]
+            for order in (rows, rows[::-1])
+        ]
+        assert hosts == [["codex", "cursor", "kimi"]] * 2
+
+    def test_status_not_kept_comes_last_whatever_its_count(self):
+        from memtomem_stm.cli.proxy import _hook_status, _hook_status_line
+
+        def row(status, calls, not_kept=False):
+            return {
+                "server": "builtin:claude",
+                "status": status,
+                "not_kept": not_kept,
+                "calls": calls,
+                "original_chars": calls,
+            }
+
+        value = {
+            "scope": "all_time",
+            "rows": [row(None, 9, not_kept=True), row(None, 2), row("compressed", 1)],
+        }
+        lines = _hook_status_line(_hook_status(value), "claude", "  ", True)
+        assert lines == ["  status: compressed 1, not recorded 2, status not kept 9"]
+
+    def test_json_status_for_unreadable_and_pre_source_stores(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b"not a sqlite database" * 100)
+        corrupt = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert corrupt["hook_status"] is None
+
+        db.unlink()
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute(
+                "CREATE TABLE proxy_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "server TEXT, tool TEXT, original_chars INTEGER, compressed_chars INTEGER, "
+                "cleaned_chars INTEGER DEFAULT 0, created_at REAL)"
+            )
+            raw.execute(
+                "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+                "created_at) VALUES ('builtin:claude', 'Bash', 100, 40, 0)"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        legacy = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert legacy["hook_status"] == {"scope": "retained", "by_host": []}
+
+    def test_a_stored_value_outside_the_set_prints_as_other(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+                "source, created_at, hook_compression_status) "
+                "VALUES ('builtin:claude', 'Bash', 10, 10, 'hook', 0, '\x1b[31mred')"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert result.exit_code == 0, result.output
+        assert "\x1b" not in result.output and "31mred" not in result.output
+        assert "    status: compressed 1, other 1" in result.output.splitlines()
+
+    def test_all_time_keeps_the_status_of_trimmed_rows(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+                ("builtin:claude", "Bash", 900, "below_threshold"),
+                ("builtin:codex", "Bash", 30_000, "unsupported_host"),
+                ("builtin:kimi", "Bash", 7_000, "unsupported_host"),
+            ],
+            max_history=1,
+        )
+        raw = sqlite3.connect(str(db))
+        try:
+            retained = raw.execute("SELECT server FROM proxy_metrics").fetchall()
+        finally:
+            raw.close()
+        assert retained == [("builtin:kimi",)]  # the others live only in the rollups
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+
+        assert [entry["host"] for entry in data["hook_by_host"]] == ["codex", "claude", "kimi"]
+        assert data["hook_status"] == {
+            "scope": "all_time",
+            "by_host": [
+                {
+                    "host": "claude",
+                    "statuses": [
+                        {"status": "below_threshold", "calls": 1, "original_chars": 900},
+                        {"status": "compressed", "calls": 1, "original_chars": 20_000},
+                    ],
+                    "status_not_kept_calls": 0,
+                },
+                {
+                    "host": "codex",
+                    "statuses": [
+                        {"status": "unsupported_host", "calls": 1, "original_chars": 30_000}
+                    ],
+                    "status_not_kept_calls": 0,
+                },
+                {
+                    "host": "kimi",
+                    "statuses": [
+                        {"status": "unsupported_host", "calls": 1, "original_chars": 7_000}
+                    ],
+                    "status_not_kept_calls": 0,
+                },
+            ],
+        }
+        lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+        assert "      status: below_threshold 1, compressed 1" in lines
+
+    def test_all_time_labels_the_status_line_only_without_the_status_rollup(
+        self, runner, tmp_path, monkeypatch
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(db, [("builtin:claude", "Bash", 20_000, "compressed")])
+
+        lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+        assert "    status: compressed 1" in lines
+
+        # A DB an earlier build last stamped has the daily rollup only.
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute("DROP TRIGGER proxy_metrics_hook_status_follow_daily_delete_v1")
+            raw.execute("DROP TRIGGER proxy_metrics_hook_status_rollup_on_delete_v1")
+            raw.execute("DROP TABLE proxy_metrics_hook_status_daily")
+            raw.commit()
+        finally:
+            raw.close()
+        lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+        assert "    status: compressed 1  (retained rows)" in lines
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+        assert data["hook_status"]["scope"] == "retained"
+        assert data["hook_status"]["by_host"][0]["status_not_kept_calls"] is None
+
+    def test_all_time_counts_calls_trimmed_without_their_status(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """Calls trimmed while only the daily rollup existed keep their place in
+        the totals but not their status; the line says how many."""
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        _seed_hook_statuses(
+            db,
+            [
+                ("builtin", "Bash", 500, None),
+                ("builtin:claude", "Bash", 20_000, "compressed"),
+                ("builtin:claude", "Bash", 900, "below_threshold"),
+                ("builtin:claude", "Bash", 800, "below_threshold"),
+            ],
+        )
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute("DROP TRIGGER proxy_metrics_hook_status_follow_daily_delete_v1")
+            raw.execute("DROP TRIGGER proxy_metrics_hook_status_rollup_on_delete_v1")
+            raw.execute("DROP TABLE proxy_metrics_hook_status_daily")
+            raw.execute("DELETE FROM proxy_metrics WHERE id <= 2")
+            raw.execute("UPDATE metrics_meta SET value = 'older' WHERE key = 'schema_fingerprint'")
+            raw.commit()
+        finally:
+            raw.close()
+        MetricsStore(db).initialize()  # this version opens it: installs and seeds
+
+        lines = runner.invoke(cli, ["stats", "--all-time"]).output.splitlines()
+
+        assert "      status: below_threshold 2, status not kept 1" in lines
+        # The unrecorded host has nothing but a trimmed call without a status:
+        # that is still worth a line, since it explains part of the total.
+        unrecorded = next(i for i, line in enumerate(lines) if "(host not recorded)" in line)
+        assert lines[unrecorded + 1] == "      status: status not kept 1"
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--all-time"]).output)
+        not_kept = {e["host"]: e["status_not_kept_calls"] for e in data["hook_status"]["by_host"]}
+        assert not_kept == {"claude": 1, None: 1}
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["--source", "mcp"], None),
+            (
+                ["--source", "hook", "--tool", "Read"],
+                [
+                    {
+                        "host": "claude",
+                        "statuses": [
+                            {"status": "ineligible_tool", "calls": 1, "original_chars": 4_000}
+                        ],
+                        "status_not_kept_calls": None,
+                    }
+                ],
+            ),
+        ],
+        ids=["mcp", "hook-and-tool"],
+    )
+    def test_filters(self, runner, tmp_path, monkeypatch, argv, expected):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        _seed_hook_statuses(db, _MIXED_STATUSES)
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json", *argv]).output)
+
+        if expected is None:
+            assert data["hook_status"] is None
+        else:
+            assert data["hook_status"] == {"scope": "retained", "by_host": expected}
+
+    def test_empty_and_missing_stores(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        missing = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert missing["hook_status"] is None
+
+        db = _seed_metrics(tmp_path)  # MCP rows only, one named like a hook label
+        store = MetricsStore(db)
+        store.initialize()
+        try:
+            store.record(
+                CallMetrics(
+                    server="builtin:claude", tool="Bash", original_chars=10, compressed_chars=10
+                )
+            )
+        finally:
+            store.close()
+        empty = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert empty["hook_status"] == {"scope": "retained", "by_host": []}
+
+
 class TestStatsProgressive:
     def test_delivered_vs_produced(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)
@@ -544,6 +1275,124 @@ class TestStatsProgressive:
         assert data["config_status"] == "invalid"
         assert data["progressive"]["total_responses"] == 2
         assert data["compression"]["total_calls"] == 1
+
+
+class TestStatsProgressiveAllTime:
+    """``--all-time`` covers progressive delivery through its rollup (#1328)."""
+
+    def _db(self, tmp_path: Path) -> Path:
+        return tmp_path / ".memtomem" / "stm_feedback.db"
+
+    def test_purged_reads_still_count(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_progressive(db)
+        conn = sqlite3.connect(db)
+        conn.execute("DELETE FROM progressive_reads WHERE key = 'a'")
+        conn.commit()
+        conn.close()
+
+        retained = runner.invoke(cli, ["stats"]).output
+        result = runner.invoke(cli, ["stats", "--all-time"])
+
+        assert result.exit_code == 0, result.output
+        assert "  responses: 1  (with follow-up reads: 0; reads recorded: 1)" in retained
+        assert "Progressive delivery (all time)" in result.output
+        assert "  responses: 2  (with follow-up reads: 1; reads recorded: 3)" in result.output
+        assert "  chars: 20,000 produced -> 5,000 delivered (25.0%)" in result.output
+        assert "  Window: all time — retained rows plus the rollup, since " in result.output
+        assert "Incomplete" not in result.output
+        assert "rows older than" not in result.output
+
+    def test_json_names_the_scope_and_the_coverage(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_progressive(self._db(tmp_path))
+
+        data = json.loads(runner.invoke(cli, ["stats", "--all-time", "--json"]).output)
+        default = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["progressive_scope"] == "all_time"
+        rollup = data["progressive"]["rollup"]
+        assert rollup["installed"] is True
+        assert rollup["lost_before_install"] == 0
+        assert rollup["incomplete_before"] is None
+        assert rollup["earliest_created_at"] == data["progressive"]["oldest_at"]
+        assert default["progressive_scope"] == "retained"
+        assert "rollup" not in default["progressive"]
+
+    def test_a_db_without_the_rollup_is_unavailable(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        db.parent.mkdir(parents=True)
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE progressive_reads (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, "
+            "trace_id TEXT, server TEXT, tool TEXT, offset INTEGER, chars INTEGER, "
+            "served_to INTEGER, total_chars INTEGER, created_at REAL, is_initial INTEGER);"
+            "INSERT INTO progressive_reads (key, server, tool, offset, chars, served_to, "
+            "total_chars, created_at, is_initial) VALUES ('k', 's', 't', 0, 1, 1, 1, 1.0, 1);"
+        )
+        conn.commit()
+        conn.close()
+
+        result = runner.invoke(cli, ["stats", "--all-time"])
+        data = json.loads(runner.invoke(cli, ["stats", "--all-time", "--json"]).output)
+
+        assert "All-time totals unavailable: this feedback DB has no usable progressive" in (
+            result.output
+        )
+        assert "No progressive responses recorded yet." not in result.output
+        assert data["progressive"]["available"] is False
+        assert data["progressive"]["rollup"]["installed"] is False
+
+    def test_a_malformed_marker_is_unavailable_in_text_and_json(
+        self, runner, tmp_path, monkeypatch
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_progressive(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE progressive_reads_meta SET value = 'nan' WHERE key = 'rollup_complete_from'"
+        )
+        conn.commit()
+        conn.close()
+
+        output = runner.invoke(cli, ["stats", "--all-time"]).output
+        data = json.loads(runner.invoke(cli, ["stats", "--all-time", "--json"]).output)
+
+        assert "All-time totals unavailable" in output
+        assert data["progressive"]["available"] is False
+        assert data["progressive"]["rollup"]["installed"] is False
+
+    def test_an_empty_installed_rollup_still_shows_coverage(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        store = ProgressiveReadsStore(self._db(tmp_path), retention_days=0)
+        store.initialize()
+        store.close()
+
+        output = runner.invoke(cli, ["stats", "--all-time"]).output
+
+        assert "No progressive responses recorded yet." in output
+        assert "  Window: all time — retained rows plus the rollup." in output
+
+    def test_a_repaired_rollup_says_the_loss_is_unknown(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_progressive(db)
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TRIGGER progressive_reads_rollup_on_delete_v1")
+        conn.commit()
+        conn.close()
+        store = ProgressiveReadsStore(db, retention_days=0)
+        store.initialize()
+        store.close()
+
+        output = runner.invoke(cli, ["stats", "--all-time"]).output
+
+        assert "  Possibly incomplete before " in output
+        assert "an unknown number of reads\n    recorded before then may be missing." in output
+        assert "before the\n    rollup was installed" not in output
 
 
 class TestReadProgressiveSummary:
@@ -734,6 +1583,11 @@ class TestMmsStatsAllTime:
         assert result.exit_code == 0, result.output
         assert "All-time totals unavailable" in result.output
         assert "calls:" not in result.output.split("Progressive delivery")[0]
+        # The hook split follows the summary it belongs to: unavailable too,
+        # though the retained rows are readable (the rollup arrives on the
+        # next writing open).
+        data = json.loads(runner.invoke(cli, ["stats", "--all-time", "--json"]).output)
+        assert (data["hook_by_host"], data["hook_status"]) == (None, None)
         raw = sqlite3.connect(str(db))
         tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master")}
         raw.close()
@@ -845,3 +1699,332 @@ class TestMmsStatsAllTime:
             runner.invoke(cli, ["stats", "--json", "--all-time"]).output, parse_constant=_reject
         )
         assert data["compression"]["total_original_chars"] == 3010
+
+
+class TestStatsCache:
+    """#1329: cache counts persisted in ``proxy_cache_daily`` are reported."""
+
+    @staticmethod
+    def _seed(home: Path, counts: dict[tuple[str, str, str], list[int]]) -> Path:
+        db = _seed_metrics(home)
+        store = MetricsStore(db)
+        store.initialize()
+        try:
+            store.record_cache_counts(counts)
+        finally:
+            store.close()
+        return db
+
+    def test_text_and_json_report_the_persisted_counts(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed(
+            tmp_path,
+            {
+                ("2026-11-20", "c7", "query-docs"): [3, 900, 2, 1],
+                ("2026-11-21", "c7", "resolve"): [1, 100, 0, 0],
+            },
+        )
+
+        text = runner.invoke(cli, ["stats"])
+        assert text.exit_code == 0, text.output
+        block = text.output.split("Proxy / Cache", 1)[1].split("Progressive delivery", 1)[0]
+        assert "lookups: 4 hits, 2 misses (1 unstorable)" in block
+        assert "hit rate: 80.0% of storable lookups" in block
+        assert "served from cache: 1,000 chars" in block
+        assert "Coverage: since " in block
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        cache = data["cache"]
+        assert cache["available"] is True
+        assert (cache["hits"], cache["hit_chars"], cache["misses"], cache["unstorable"]) == (
+            4,
+            1000,
+            2,
+            1,
+        )
+        assert cache["storable_hit_rate"] == 0.8
+        assert isinstance(cache["installed_at"], float)
+
+        filtered = json.loads(runner.invoke(cli, ["stats", "--json", "--tool", "resolve"]).output)
+        assert (filtered["cache"]["hits"], filtered["cache"]["storable_hit_rate"]) == (1, 1.0)
+
+    def test_huge_buckets_report_an_exact_count_in_strict_json(self, runner, tmp_path, monkeypatch):
+        """Two outside-written ``1e308`` buckets: a float total would be inf.
+        The reader adds whole numbers as ints, so the block renders the exact
+        count and --json stays strict JSON with a finite rate."""
+        set_home(monkeypatch, tmp_path)
+        db = self._seed(tmp_path, {("2026-11-21", "s", "t"): [1, 1, 0, 0]})
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO proxy_cache_daily VALUES ('2026-11-21', 's', 'a', 1e308, 0, 0, 0), "
+            "('2026-11-21', 's', 'b', 1e308, 0, 0, 0)"
+        )
+        conn.commit()
+        conn.close()
+
+        text = runner.invoke(cli, ["stats"])
+        assert text.exit_code == 0, text.output
+        block = text.output.split("Proxy / Cache", 1)[1].split("Progressive delivery", 1)[0]
+        hits = 2 * int(1e308) + 1
+        assert "unreadable" not in block
+        assert f"lookups: {hits:,} hits, 0 misses (0 unstorable)" in block
+        assert "hit rate: 100.0% of storable lookups" in block
+
+        def _reject(token: str) -> None:
+            raise AssertionError(f"non-JSON constant {token}")
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output, parse_constant=_reject)
+        assert data["cache"]["available"] is True
+        assert data["cache"]["error"] is None
+        assert data["cache"]["hits"] == hits
+        assert data["cache"]["storable_hit_rate"] == 1.0
+
+    def test_zero_counts_still_show_the_coverage_start(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed(tmp_path, {("2026-11-21", "s", "t"): [1, 1, 0, 0]})
+        result = runner.invoke(cli, ["stats", "--tool", "no-such-tool"])
+        assert result.exit_code == 0, result.output
+        block = result.output.split("Proxy / Cache", 1)[1].split("Progressive delivery", 1)[0]
+        assert "No cache lookups recorded yet." in block
+        assert "Coverage: since " in block
+        assert "an unknown start" not in block
+
+    def test_unstorable_only_tool_is_shown(self, runner, tmp_path, monkeypatch):
+        """An unstorable count with no miss in the same bucket is a supported
+        state (eligibility can change mid-call); it must not read as empty."""
+        set_home(monkeypatch, tmp_path)
+        self._seed(
+            tmp_path,
+            {
+                ("2026-11-21", "s", "flip"): [0, 0, 0, 1],
+                ("2026-11-21", "s", "other"): [2, 2, 1, 0],
+            },
+        )
+        result = runner.invoke(cli, ["stats", "--tool", "flip"])
+        assert result.exit_code == 0, result.output
+        block = result.output.split("Proxy / Cache", 1)[1].split("Progressive delivery", 1)[0]
+        assert "No cache lookups recorded yet." not in block
+        assert "lookups: 0 hits, 0 misses (1 unstorable)" in block
+        assert "Coverage: since " in block
+
+    def test_no_storable_lookups_renders_na(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed(tmp_path, {("2026-11-21", "s", "t"): [0, 0, 2, 3]})
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert "hit rate: n/a (no storable lookups) of storable lookups" in result.output
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+        assert data["cache"]["storable_hit_rate"] is None
+
+    def test_source_hook_omits_the_cache_block(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        self._seed(tmp_path, {("2026-11-21", "s", "t"): [1, 1, 0, 0]})
+        result = runner.invoke(cli, ["stats", "--source", "hook"])
+        assert result.exit_code == 0, result.output
+        assert "Proxy / Cache" not in result.output
+        data = json.loads(runner.invoke(cli, ["stats", "--json", "--source", "hook"]).output)
+        assert data["cache"] is None
+
+    def test_pre_cache_db_reports_nothing_recorded_and_stays_untouched(
+        self, runner, tmp_path, monkeypatch
+    ):
+        set_home(monkeypatch, tmp_path)
+        db = _seed_metrics(tmp_path)
+        conn = sqlite3.connect(db)
+        conn.execute("DROP TABLE proxy_cache_daily")
+        conn.commit()
+        conn.close()
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert "No cache lookups recorded yet." in result.output
+        conn = sqlite3.connect(db)
+        try:
+            assert (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'proxy_cache_daily'"
+                ).fetchone()
+                is None
+            )
+        finally:
+            conn.close()
+
+    def test_coverage_start_outside_pythons_date_range_renders(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        db = self._seed(tmp_path, {("2026-11-21", "s", "t"): [1, 1, 0, 0]})
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE metrics_meta SET value = '1e300' WHERE key = 'cache_rollup_installed_at'"
+        )
+        conn.commit()
+        conn.close()
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert "Coverage: since an unknown start" in result.output
+
+
+def _seed_query_rows(db: Path, rows: list[tuple[str, str, str | None]]) -> None:
+    """``(source, tool, context_query_source)`` rows."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    store = MetricsStore(db)
+    store.initialize()
+    try:
+        for source, tool, value in rows:
+            store.record(
+                CallMetrics(
+                    server="builtin:claude" if source == "hook" else "c7",
+                    tool=tool,
+                    original_chars=1000,
+                    compressed_chars=600,
+                    source=source,
+                    context_query_source=value,
+                )
+            )
+    finally:
+        store.close()
+
+
+_MCP_ROWS = [("mcp", "query-docs", "agent"), ("mcp", "query-docs", "none"), ("mcp", "x", "none")]
+_QUERY_LINE = "Context query supplied on 1 of 3 observed live MCP responses (33.3%)"
+
+
+def _only_query_line(lines: list[str]) -> int:
+    """The index of the query line, which a block prints at most once."""
+    (at,) = [i for i, line in enumerate(lines) if "Context query supplied" in line]
+    return at
+
+
+class TestContextQueryLine:
+    """The line counts the MCP rows that record whether ``_context_query`` was
+    supplied, and hangs under the total it was read with."""
+
+    def _db(self, home: Path) -> Path:
+        return home / ".memtomem" / "proxy_metrics.db"
+
+    def test_mcp_only_db_shows_it_under_the_total(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), _MCP_ROWS)
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        at = _only_query_line(lines)
+        assert lines[at] == f"    {_QUERY_LINE}"
+        assert at > lines.index("  calls: 3  (errors: 0)")
+
+    def test_source_mcp_shows_it_under_the_total(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [*_MCP_ROWS, ("hook", "Bash", None)])
+
+        lines = runner.invoke(cli, ["stats", "--source", "mcp"]).output.splitlines()
+
+        at = _only_query_line(lines)
+        assert lines[at] == f"    {_QUERY_LINE}"
+        assert at > lines.index("  calls: 3  (errors: 0)")
+
+    def test_two_sources_show_it_under_the_mcp_line(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [*_MCP_ROWS, ("hook", "Bash", None)])
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        at = _only_query_line(lines)
+        assert lines[at] == f"      {_QUERY_LINE}"
+        assert lines[at - 1].startswith("    mcp   calls: 3")
+
+    def test_tool_filter_narrows_both_numbers(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        # The other tool's row is an ``agent`` one, so a numerator that ignored
+        # the filter would read 2.
+        rows = [*_MCP_ROWS[:2], ("mcp", "x", "agent"), ("hook", "query-docs", "agent")]
+        _seed_query_rows(self._db(tmp_path), rows)
+
+        result = runner.invoke(cli, ["stats", "--tool", "query-docs", "--json"])
+
+        data = json.loads(result.output)
+        assert data["compression"]["context_query"] == {"observed": 2, "agent": 1}
+
+    def test_json_carries_the_counts_per_summary(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [*_MCP_ROWS, ("hook", "Bash", "agent")])
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["compression"]["context_query"] == {"observed": 3, "agent": 1}
+        assert data["compression_by_source"]["mcp"]["context_query"] == {
+            "observed": 3,
+            "agent": 1,
+        }
+        assert data["compression_by_source"]["hook"]["context_query"] is None
+
+    @pytest.mark.parametrize("args", [["--source", "hook"], ["--all-time"]])
+    def test_absent_where_the_figure_does_not_exist(self, runner, tmp_path, monkeypatch, args):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [*_MCP_ROWS, ("hook", "Bash", "agent")])
+
+        text = runner.invoke(cli, ["stats", *args])
+        data = json.loads(runner.invoke(cli, ["stats", *args, "--json"]).output)
+
+        assert text.exit_code == 0, text.output
+        assert "calls:" in text.output  # the block rendered; only the line is absent
+        assert "Context query" not in text.output
+        assert data["compression"]["total_calls"] > 0
+        assert data["compression"]["context_query"] is None
+
+    def test_no_line_when_no_call_was_observed(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [("mcp", "query-docs", None)])
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert "  calls: 1  (errors: 0)" in result.output.splitlines()
+        assert "Context query" not in result.output
+
+    def _write_after_first_read(self, monkeypatch, db: Path) -> list:
+        from memtomem_stm.proxy import metrics_store
+
+        real = metrics_store.read_compression_summary
+        reads: list = []
+
+        def _read(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not reads:
+                _seed_query_rows(db, [("mcp", "query-docs", "agent")])
+            reads.append(kwargs.get("source"))
+            return result
+
+        monkeypatch.setattr(metrics_store, "read_compression_summary", _read)
+        return reads
+
+    def test_under_the_total_it_keeps_the_totals_snapshot(self, runner, tmp_path, monkeypatch):
+        """MCP only: a row committed after the total was read is in neither
+        the total nor the line under it."""
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_query_rows(db, [("mcp", "query-docs", "none")])
+        reads = self._write_after_first_read(monkeypatch, db)
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        assert reads[0] is None
+        at = _only_query_line(lines)
+        assert lines[at] == (
+            "    Context query supplied on 0 of 1 observed live MCP responses (0.0%)"
+        )
+        assert at > lines.index("  calls: 1  (errors: 0)")
+
+    def test_under_the_mcp_line_it_follows_that_lines_snapshot(self, runner, tmp_path, monkeypatch):
+        """Two sources: the MCP line is read after the total, so it and the
+        line under it both include the row the total missed."""
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_query_rows(db, [("mcp", "query-docs", "none"), ("hook", "Bash", None)])
+        reads = self._write_after_first_read(monkeypatch, db)
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        assert reads[0] is None
+        assert "  calls: 2  (errors: 0)" in lines  # the total, read first
+        at = _only_query_line(lines)
+        assert lines[at] == (
+            "      Context query supplied on 1 of 2 observed live MCP responses (50.0%)"
+        )
+        assert lines[at - 1].startswith("    mcp   calls: 2")

@@ -11,15 +11,1399 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms stats` reports how many proxied responses carried `_context_query`
+  (#1542).
+  Query-aware compression needs the agent to supply that argument, and
+  `proxy_metrics` did not record whether it did. A proxied call that
+  the proxy records as successful, and whose upstream result has a text block, now stores `agent` or `none` in a new
+  `context_query_source` column of `proxy_metrics`; the row does not store
+  the query's text. The compression block prints `Context query supplied on N of M
+  observed live MCP responses` under the MCP figures, and `--json` carries
+  the two counts as `context_query` inside `compression` and inside the
+  `mcp` entry of `compression_by_source` (`null` in the `hook` entry). Failed calls, upstream results with no text
+  block, cache hits, `mms hook` rows and rows written before this version
+  are not counted, and the figure covers the retained rows only, so it is
+  absent under `--all-time`. See
+  [Measuring whether queries arrive](docs/compression.md#measuring-whether-queries-arrive).
+- `mms stats --all-time` now covers the **Progressive delivery** block too
+  (issue #1328, part B of #1316). Reads removed by the
+  `proxy.progressive_reads.retention_days` purge at server start were lost,
+  so its produced and delivered chars covered only that window (90 days by
+  default). A database trigger now folds every deleted `progressive_reads`
+  row into a never-pruned `progressive_reads_rollup` table in
+  `stm_feedback.db`, one row per response and tool, so a response purged in
+  part is still counted once. It is installed when the MCP server of this
+  version starts with progressive-read collection enabled, before that
+  start's purge; reads purged earlier are counted as lost, not recovered.
+  Until then `--all-time` reports the progressive totals as unavailable.
+  `--json` adds `progressive_scope`, and a `rollup` coverage object under
+  `progressive` in all-time mode. Without `--all-time` the text output is
+  unchanged; the JSON gains `progressive_scope: "retained"` and a `scope` key
+  in `progressive`. To reset the history, delete from `progressive_reads` and
+  then from `progressive_reads_rollup` in one transaction; never `DROP` the
+  rollup table while its trigger exists.
+
 ### Fixed
 
+- An MCP server registration's runtime policy now holds against a `null`
+  parent block and against the field repeated under another letter case in
+  the block's JSON (issue #1544), as the hook's flags already do (#1537).
+  With `MEMTOMEM_STM_SURFACING=null` in the host's environment, a server
+  registered with query hashing persisted raw query text and did not use the
+  daemon; with `persist_query_text` repeated as `PERSIST_QUERY_TEXT` in that
+  block's JSON, it persisted raw query text and its daemon configuration
+  differed from the hook's, so the two did not share a daemon. `mms
+  register` and `mms init` now also write the policy as
+  `MEMTOMEM_STM_SERVER_FLAGS`, a JSON object of its three variables, and the
+  server applies it as a settings layer; a daemon it spawns receives the
+  same values. **Behavior change**: in a new registration the plain
+  `MEMTOMEM_STM_SURFACING__USE_DAEMON`, `…__TIMEOUT_SECONDS` and
+  `…__PERSIST_QUERY_TEXT` are kept for older releases but outranked, so
+  editing one of them alone changes nothing. A
+  `MEMTOMEM_STM_SERVER_FLAGS` that is not exactly those three keys, each
+  once, with string values, stops the server with exit 1 and a line naming
+  the variable. Registrations written before this version are not rewritten:
+  they carry only the plain variables and behave as before.
+
+- `stm_proxy_read_more` and `stm_proxy_select_chunks` continuations now
+  carry the upstream text block's `annotations` and block `_meta`, as the
+  first progressive, selective or hybrid response already did (issue #1529).
+  Text an upstream addressed to `audience: ["assistant"]` no longer loses that
+  hint from the second chunk on. The metadata is stored with the pending
+  entry, in both pending stores, up to about 64 KiB of UTF-8 JSON (counted
+  before the SDK serializes it, so approximate near the limit); larger metadata
+  stays on the first response only, and its continuations go out without it
+  as before. **Behavior change**: a structured
+  continuation's frame now reserves room for that metadata, so it holds
+  less content and a selection that fit before can return `budget_exceeded`;
+  a read at or past the end carries none. With a SQLite pending store, a
+  credential in that metadata now refuses the persistent write the way one
+  in the text does: progressive falls back to passthrough (in structured
+  delivery, to a truncation fitted to the budget when the passthrough would
+  not fit), selective and hybrid to truncation. A present but invalid stored
+  value is a delivery error that keeps the row. Responses without block
+  metadata, and keys written before this version, are unchanged.
+
+- `mms doctor`'s `env_overrides` row now says which daemon command its
+  failing clause for doctor's environment alone describes, and names the
+  one that starts the hook's daemon (issue #1524). When doctor takes the
+  hook's daemon route for the one STM hook command it read and that
+  command's build constructs, that clause says `plain mms daemon start`
+  exits 1, and the next action adds `or start the hook's daemon as its
+  command builds it: mms daemon start --hook-command claude` (the option
+  #1518 added). The addition is left out when the command says
+  `--no-daemon` and when doctor's config file is missing (the route is not
+  decided). The row does not judge whether that start would succeed; the
+  `ltm server` row reports what its probe found, such as an unusable
+  discovery key or surfacing off.
+- A runtime flag of the `mms hook` command (`--surfacing-timeout-seconds`,
+  `--daemon-timeout-seconds`, `--[no-]persist-query-text`, `--use-daemon` /
+  `--no-daemon`) is no longer outranked by another letter-case spelling of
+  its variable later in the environment (issue #1503), such as
+  `memtomem_stm_surfacing__persist_query_text=true` against
+  `--no-persist-query-text`. The hook applies the flag over what the
+  environment gives the same setting (see the entry for issue #1537 below
+  for how), and a daemon it spawns, `mms daemon … --hook-command claude` and
+  `mms doctor`'s build of the hook's configuration read the same values.
+  **Behavior change**: where such a spelling outranked a flag, the hook, the
+  daemon it spawns and doctor now use the flag's value, and when that build
+  succeeds and doctor takes the hook's daemon route, doctor's timeout advice
+  names the command's flag instead of an export.
+  A case variant of the field in the block's JSON and a `null` block are
+  covered by the entry for issue #1537 below.
+- A runtime flag of the `mms hook` command is no longer outranked by the
+  field repeated under another letter case in its block's JSON
+  (`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`)
+  or dropped by a `null` block (`MEMTOMEM_STM_HOOK=null`) (issue #1537). With
+  `MEMTOMEM_STM_SURFACING=null`, `--no-persist-query-text` was read as
+  `persist_query_text` true. The hook now applies its flags while it builds
+  its settings, over what the environment gives the same field, instead of
+  setting variables in its environment; a `null` block still hides its other
+  variables, and a block that is not a JSON object still fails the build. A
+  daemon the hook or `mms daemon start --hook-command claude` spawns
+  receives the flags in its environment as `MEMTOMEM_STM_HOOK_FLAGS`, which
+  only `mms daemon run --detached` reads; a value that is not a JSON object
+  of the flags' variables with string values ends that run with exit 1 and a
+  stderr line naming the variable (discarded for a spawned daemon), and a
+  spawn without flags passes none on. `mms doctor`'s build of the hook's
+  configuration applies them the same way, and when that build succeeds and
+  doctor takes the hook's daemon route, its timeout advice names the
+  command's flag whenever the command sets that deadline. When the command's
+  own value is the one rejected, the hint of the hook's build, in its log
+  line and in doctor's `env_overrides` row, names the flag's variable for
+  that error, not a block above it that set nothing there. **Behavior
+  change**: where one of those forms outranked a flag, the hook, its daemon and doctor now use the
+  flag's value; the hook no longer sets the flags' variables in its
+  environment, so a process it starts other than the daemon (the LTM server)
+  no longer sees them. An MCP server registration still carries its policy
+  as plain variables, so under one of those forms the server can build a
+  daemon configuration other than the hook's.
+- The look-alike test of `mms hook install`, `mms hook uninstall`,
+  `mms doctor` and `mms daemon … --hook-command claude` now reads a hook
+  handler's words in time linear in the line's length (issue #1498). For a
+  line the cheaper candidate test does not name, it read the words of the
+  whole line with `shlex`, whose cost is quadratic in a word's length: a
+  handler `echo ` + 160,000 × `x` took about 0.34 s per scan (macOS,
+  CPython 3.14.7), and install and uninstall scan twice. The words are read
+  the way `shlex` reads them, so the same handlers are named as before.
+- Cleaning no longer removes markup as one element across two upstream text
+  blocks (#1538, issue #1531). When a response's text blocks carry no
+  metadata they are joined and cleaned as one string, so a tag or a
+  `<script>`/`<style>` element that opened in one block and closed in a
+  later one was removed together with the text of both blocks between them:
+  `Intro <style>Release notes` and `Rollback instructions</style> end` were
+  delivered as `Intro  end`. Line-ending normalization and markup removal now
+  read one block at a time; code-fence and generic protection, duplicate
+  paragraph removal, link-flood collapse and blank-line normalization still
+  read the joined text, so a fence split across blocks stays protected as
+  before. **Behavior change**: such a reply now keeps that text
+  (`Intro Release notes` / `Rollback instructions end`), and a block ending
+  in a lone `\r` now ends its own line instead of merging with the newline
+  that joins it to the next block; any other reply is unchanged. A cache hit
+  can still serve a reply stored earlier while that entry stays valid
+  (#1540).
+- `mms hook install` and `mms hook uninstall` no longer manage a Claude Code
+  handler whose `shell` field is present and anything but `"bash"` (issue
+  #1497). Install writes a POSIX line; with `"shell": "powershell"`
+  PowerShell reads it, yet install used to read settings from that line,
+  rewrite it and keep the `shell` field, and uninstall deleted it. Such a
+  handler (any other `shell` value, `null` included) is now left in place,
+  and named as a look-alike when its command looks like STM's hook, as
+  `mms doctor` already treated it. Codex
+  handlers are unchanged: what Codex does with a `shell` key is not
+  established. **Behavior change**: a Claude Code handler install wrote, to
+  which a `shell` other than `"bash"` was added by hand, is no longer
+  refreshed or removed; install refreshes the handler it does own, or adds
+  one beside it when it owns none.
+
+- The `max_upstream_chars` guard no longer reports an oversized payload when
+  no text was cut (#1536, issue #1530). A text block that exactly filled the cap
+  followed by an empty text block used to get the "response truncated …
+  upstream returned an oversized payload" notice appended to the joined
+  text, and a truncation warning in the log; the guard now fires only when
+  a block with text loses some or all of it. **Behavior change**: such a
+  reply is now delivered without that notice and no longer logs the
+  warning; a reply that really is cut is unchanged. A cache hit can still
+  serve a notice stored earlier while that entry stays valid.
+- `mms doctor`'s `env_overrides` row no longer says the hook degrades when
+  the registered hook command's options shadow the invalid variable (issue
+  #1506). When doctor reads exactly one STM hook command `mms hook install`
+  owns, the row now reports two builds, each with its own consequence and the
+  variables its own error implicates: the command's options over doctor's
+  environment (when the `ltm server` check runs, the build doctor decides the
+  hook-daemon route with) and doctor's environment alone (what `mms daemon
+  start` from it builds). When the command's build warns (it fails, or
+  ignores an invalid `MEMTOMEM_STM_PROXY*`), the next action points to that
+  command's options, named by its location, or the variables its build
+  reads, then a rerun of doctor. **Behavior change**: in that case the
+  row's text changes; an invalid ambient value one of the command's four
+  options overrides is still a WARN, now attributed to `mms daemon start`
+  rather than to the hook; and a hook build that only the command's options
+  break (such as #1508's extreme deadline) now WARNs where the row passed.
+  Without such a command (none, several, unreadable, Windows, or a settings
+  error) the row is unchanged.
+
+- A proxied call whose upstream reply fails the MCP SDK's result checks is now
+  recorded with the `protocol` error category instead of `programming`
+  (issue #1131). The checks matched are a reply outside the negotiated schema
+  (for example a list `structuredContent`, or `resultType: "input_required"`
+  on a 2025-11-25 connection), an `InputRequiredResult` on a 2026-07-28
+  connection (valid there, but STM cannot relay it yet), a result that
+  breaks the tool's own `outputSchema` or omits the structured content it
+  declares, and an `outputSchema` the SDK cannot resolve. A failure these
+  checks do not match keeps the category it had before. Such a call is
+  still not retried, and it now resets the circuit breaker's failure count,
+  since a reply arrived. **Behavior change**: tool health counts
+  `programming` rows as calls but not as errors; these rows now count as
+  upstream errors too.
+  Health is evaluated at proxy startup, so once a tool that keeps sending
+  such replies crosses the health thresholds, the `strict` exposure profile
+  withholds it on a later startup and `review` gives it a risk penalty. Known
+  limit: a malformed `tools/list` reply to the SDK's output-schema refresh
+  during the call is still `programming`.
+
+- `mms doctor --measure-ltm` no longer advises `mms daemon start` when the
+  daemon discovery key (`stm-discovery.key` under `data_dir`) cannot be used
+  (#1520, issue #1519). `start` reads the same key and exits 1 on it. The
+  `ltm measurement` row read the key error as a daemon that was not running.
+  **Behavior change**: with an unusable key, that row's detail is
+  `--measure-ltm result unavailable: the daemon discovery key cannot be used
+  (see the ltm server row)` and its next action is the command the
+  `ltm server` row names: `mms daemon status`, or `mms daemon status
+  --hook-command claude` when doctor reads exactly one STM hook command and
+  takes the hook's daemon route. On the daemon route, `surfacing.ltm_server`
+  in `doctor --json` and `health --json` gains a `discovery_key_unusable`
+  field, `true` only for this case.
+- `mms hook install` no longer drops the runtime settings of a second hook
+  handler it manages in Claude Code or Codex (issue #1470). Install merges every
+  handler it owns there into one and carried the settings of the first one
+  over, so a later handler's daemon mode, deadlines or query-text setting were
+  replaced with nothing said. **Behavior change**: when two or more owned
+  handlers differ in a setting install would carry over, install now exits
+  non-zero, with or without `--apply`, leaves the host config unchanged and
+  makes no backup.
+  The error names the handlers' locations and the settings they differ in.
+  `--daemon` / `--no-daemon` and `--surfacing-timeout` resolve a difference in
+  their own setting (a surfacing difference can also be a daemon-deadline
+  difference, which no option sets), `--inherit-runtime-env` writes one
+  handler without settings, and removing all but one handler by hand works
+  for any case. A handler without setting words (what 0.1.29–0.1.38 and
+  `--inherit-runtime-env` write) differs from one with them. Cursor and Kimi
+  keep the further handlers as they are and are unchanged.
+- `mms doctor`'s `mms daemon start` / `status` / `restart` advice for the
+  hook's daemon now names a command that acts on that daemon (#1515). Since
+  #1494 doctor looks the hook's daemon up with the registered Claude Code hook
+  command's options laid over its environment, and two of them enter the
+  daemon fingerprint, so the bare commands, which build from the shell's
+  environment alone, could address another daemon (a default install writes
+  `--no-persist-query-text`). `mms daemon start`, `stop`, `status` and
+  `restart` accept a new `--hook-command claude`: it reads the STM hook command
+  `mms hook install --host claude` wrote, applies its options to the
+  command's settings builds as the hook does (a daemon it starts receives
+  them at launch, as `MEMTOMEM_STM_HOOK_FLAGS`; issue #1537), and exits 1
+  when there is not exactly one such command, or on Windows. The hints
+  those subcommands print during such a run name the option too, and none
+  suggests `stop --all`, which targets every daemon under `data_dir`, the
+  hook's own included.
+  **Behavior change**: when doctor reads exactly one such command and
+  takes the hook's daemon route, the next action of the `ltm server` (`ltm`),
+  `ltm measurement` and `surfacing outcomes` rows, and the `ltm` row's
+  "run `mms daemon status`" detail, name `mms daemon <subcommand>
+  --hook-command claude`. Known limit: doctor and the option both build from
+  the shell's environment plus the command's options; a hook Claude Code runs
+  with a different environment, working directory or STM version can still
+  use another daemon.
+- `mms doctor` now applies the registered hook command's flag words to its
+  own environment the way the hook does (#1512, issue #1508). 0.7.11's doctor
+  parsed the words into settings and formatted those back, and the round
+  trip is not exact. A deadline too large to write back as a finite number
+  (a hand-edited `1.7976931348623157e+308`, which `mms hook install` does not
+  write) was dropped, while the hook keeps it and then fails to build its
+  configuration. A surfacing deadline whose 15-digit form rounds moved the
+  daemon deadline by its last digit. **Behavior change**: with such an
+  extreme deadline in either slot, doctor's build of the hook's
+  configuration now fails as the hook's does, so the `ltm server` row (`ltm`
+  in `--json`) no longer reports the hook's daemon and falls back to the
+  standalone view, as when the hook's daemon is off. With a rounding
+  surfacing deadline, when doctor takes the hook's daemon route, the timeout
+  checks read the hook's own daemon deadline. The `env_overrides` row now
+  reports such a failure (issue #1506).
+- `mms doctor`'s advice no longer asks to export an environment variable or
+  to set a setting that the registered Claude Code hook command's options
+  override (#1505). **Behavior change**: when doctor reads exactly one STM
+  hook command that `mms hook install` owns, the text of up to three rows
+  changes in these cases, and only these. With `--measure-ltm`, a command whose
+  `--no-daemon` decided the route (doctor's build of the hook's
+  configuration succeeded) and the standalone daemon route off, both the
+  detail and the next action of the `ltm measurement` row change: the
+  detail says that flag decided the route, and the action asks to replace
+  it in the command at its location, instead of "set hook.use_daemon back to
+  true"; with the standalone daemon route on, the row describes that route as
+  before. The `surfacing timeout` and `hook daemon timeout` rows, on the
+  hook's daemon route and when they WARN that the deadline is too small, ask
+  to set `--surfacing-timeout-seconds` /
+  `--daemon-timeout-seconds` in the command when the value in effect is the
+  command's, instead of an `export` the command's timeout options override.
+  The advice names the handler's location and flags, never their values;
+  `--json` gains no field. Known limits: with a case-equivalent spelling that
+  outranks a variable (#1503), the rows keep the `export` advice, which that
+  spelling outranks too. The `mms daemon start` / `status` / `restart`
+  advice is unchanged: it builds from the shell without the command's
+  options, so on the hook's daemon route it can address another daemon, and
+  doctor cannot state a command that reproduces the hook's configuration
+  (tracked separately; the standalone route's half is #1504).
+
+## [0.7.11] — 2026-11-24
+
+### Upgrade notes
+
+- **`mms hook install` and `uninstall` now act only on handlers in the form
+  install writes.** The test is the handler's shape, not who wrote it: the
+  place, fields and exact command text a release of install writes, in the
+  container install writes to (for
+  Kimi, an entry on `PostToolUse`), with `"type": "command"` and no `args`
+  (Claude Code, Codex), and with `memtomem-stm hook --host <host>`, bare or
+  after `uv run --directory <absolute dir>`, followed by nothing or by
+  install's own setting words. A hand-written `mms hook --host claude`, an
+  `env MEMTOMEM_STM_…` prefix, a path to the executable, reordered flags and
+  similar handlers are left in place, and so is a handler with an `args` key
+  that 0.7.10's install refreshed (it kept the key): `install --apply` adds
+  its own handler beside such a line, so both stay registered, and uninstall
+  leaves it. Both
+  commands name the location of a line they recognize as a look-alike, a
+  heuristic that can miss some spellings; remove such a line by hand if it
+  should not stay (#1475, #1481, #1489, #1499, #1500).
+- **The hook and the daemon keep running when only a
+  `MEMTOMEM_STM_PROXY*` variable is invalid.** They then run with every
+  `MEMTOMEM_STM_PROXY*` variable ignored, valid ones included, log a warning
+  each time they load the configuration, and the hook records no metrics
+  rows. The daemon and the `mms daemon` subcommands no longer exit 1 there.
+  Because a valid proxy variable such as the consumer model is also ignored,
+  a daemon started in that state can show as foreign in `mms daemon status`
+  once the variable is fixed. `mms doctor`'s `env_overrides` row says, for
+  doctor's own environment, when this applies (#1482).
+- **The hook's daemon mode follows `hook.use_daemon` as the settings read
+  it.** A nested `MEMTOMEM_STM_HOOK='{"use_daemon": false}'` or an
+  other-case spelling now turns the daemon off for a hook command that
+  carries neither `--use-daemon` nor `--no-daemon`; a command with either
+  flag follows the flag (#1501). 0.7.10 ignored those forms, so such a hook
+  surfaced through the daemon; it now takes the cold in-process route, which
+  can return no memories when LTM starts slower than the hook's deadline.
+  Add `--use-daemon` to the command, or remove the setting, to keep the
+  daemon. Since 0.1.40, `mms hook install` writes one of the two flags
+  unless given `--inherit-runtime-env`; a hook installed by 0.1.29–0.1.38
+  and not reinstalled since has neither.
+- **`mms doctor` describes the daemon the hook would use.** When the hook
+  would use the daemon, the `ltm` row, `--measure-ltm` and the surfacing
+  checks are built from the configuration a bare `mms hook` builds in
+  doctor's environment, so `--config` no longer steers them (#1491). When
+  Claude Code's user settings hold exactly one handler in install's form,
+  with no `shell` or a Bash one, and nothing else that install's look-alike
+  heuristic says may run STM's hook (not on Windows), doctor also applies
+  that command's options, and a `--no-daemon` handler sends these checks to
+  the standalone view, where `--config` still applies (#1502); with
+  `surfacing.use_daemon` off there, doctor probes LTM directly and
+  `--measure-ltm` warns instead of measuring a daemon. So the rows
+  doctor emits can differ from 0.7.10's on the same machine, and so can its
+  exit status: a check that now reaches a daemon 0.7.10 missed can FAIL,
+  and any FAIL exits 1. The #1491 and #1502 entries below say how. A proxy
+  variable the hook recovers from no longer shows in the `ltm` row on the
+  hook's route; `env_overrides` reports it, and `config_schema`, which
+  validates the proxy configuration resolved from `--config`, reports it
+  only if it fails there. `env_overrides` reads doctor's environment without
+  the registered command's options, so it can disagree with the `ltm` row
+  about whether the hook recovers. The `ltm` row's detail, in the text output and in
+  `--json`, now ends with the route doctor chose and what it chose it from,
+  and `--json` gains `surfacing.hook_view`.
+- **A signalled shutdown that reaches its normal exit with its close
+  sequence cut short exits 1.** 0.7.10 exited 0 there, without the
+  "teardown did not run to the end" warning (#1465); the watchdog's exit
+  and a second signal's `128 +` the signal number are unchanged. While the
+  watchdog is armed, the close sequence is also shielded from the SDK's
+  cancelled scopes: on the build with #1465 and without the shield, SIGINT
+  sent as soon as the client wrote `notifications/initialized` cut 11 of 20
+  local shutdowns short, and 0 of 20 with it (#1478).
+- **`otlp.enabled=true` without `requests` installed is refused at
+  validation**, naming `requests`, instead of failing when the exporter
+  starts (#1493).
+- **The metrics DB gains the `proxy_cache_daily` table** the first time
+  this version opens it for writing (the MCP server, `mms tune` or `mms
+  hook`), and rebuilds its schema stamp. After an older version sharing the
+  DB re-stamps it, the next such open restores the stamp and keeps the
+  table's rows; `mms stats` only reads. The table is never pruned, and a
+  proxy with cache counts waiting writes them every 30 seconds even when it
+  has no new metrics row. `mms stats` gains a
+  `Proxy / Cache` block (`cache` in `--json`), counted with the corrected
+  accounting of #1474 from the start (#1466). The cache hit rate `stm_admin`
+  `proxy_stats` reports can change for calls whose cache eligibility
+  changed while they ran (#1474).
+- **Some text output reads differently** for scripts that parse it: `mms
+  hook install` adds a line when the hook it writes is bound to a project
+  (#1464); the detail of `mms doctor`'s `hook registration` row, also in
+  `checks[].detail` of `--json` (#1462); `mms daemon status` says `no
+  (hook.use_daemon is false)` (#1501); `mms doctor --measure-ltm`'s warning
+  when no daemon is measured is split by cause (#1491, #1501); the OTLP
+  validation message (#1493).
+
+### Added
+
+- `mms stats` reports response-cache savings (#1466, issue #1329). The proxy used to
+  keep cache hits, misses and unstorable misses in memory only, with no server
+  or tool, so `mms stats` could not see them. Each proxy process now also
+  counts them per UTC day, server and tool, together with the characters
+  served from cache, and writes them into a new never-pruned
+  `proxy_cache_daily` table in the metrics DB, best-effort, with its next
+  metrics row, every 30 seconds while counts are waiting, and during an
+  orderly MCP server stop; the cache hit path itself does no database write. A new `Proxy / Cache` block (`cache` in `--json`) shows hits, misses,
+  unstorable misses, the hit rate over storable lookups (the `stm_admin`
+  `proxy_stats` formula; `n/a`/`null` when there are none) and the
+  characters served, with the date coverage starts; `--tool` filters it and
+  `--source hook` omits it. A killed process loses the counts buffered since
+  its last successful write, older STM versions sharing the DB write none,
+  and a miss and its
+  unstorable outcome can land on adjacent UTC days. **Behavior change**:
+  `mms stats` gains the block and the `cache` key; the metrics DB gains one
+  table, so this version's first open rebuilds the schema stamp (and does
+  again after an older version sharing the DB re-stamps it).
+
+### Changed
+
+- The package declares `anyio>=4.9` and `pydantic-core`, which STM imports
+  directly and which were installed only because other dependencies require
+  them (#1488, #1490). The wheel's `Requires-Dist` gains both. The `anyio`
+  floor is the one `mcp` declares on Python < 3.14 and `pydantic-core` has
+  none, so the locked versions are unchanged.
+- `mms hook` and the surfacing daemon keep running when only a
+  `MEMTOMEM_STM_PROXY*` variable is invalid (#1482, issue #847). Compression,
+  surfacing and the daemon need only the `surfacing`, `hook` and `daemon`
+  settings (the hook reads `proxy` just for its metrics database), yet one
+  invalid proxy variable (an override naming an upstream server the config
+  file does not declare, a `MEMTOMEM_STM_PROXY` value settings cannot decode,
+  an out-of-range proxy field) failed their whole configuration: the hook
+  passed every tool output through, and the daemon and the `mms daemon`
+  subcommands exited 1. When the configuration fails, they now build it once
+  more without any `MEMTOMEM_STM_PROXY*` variable. If that succeeds, they run
+  with proxy settings at their defaults and log a warning each time they load
+  the configuration (once per hook call; `mms daemon restart` loads it three
+  times). The warning names the variable unless its value could not be
+  decoded at all, and a detached daemon writes it to its log file unless
+  `MEMTOMEM_STM_LOG_LEVEL` is `ERROR` or higher. An invalid variable outside
+  `proxy` fails as before. `mms doctor`'s `env_overrides` row says which case
+  applies. Doctor's LTM row keeps strict validation when the hook's daemon is
+  off; with it on, the row uses the hook's build, so a proxy-only failure the
+  hook recovers from no longer shows there (see the `mms doctor` entry under
+  Fixed, #1485). **Behavior change**: when only a `MEMTOMEM_STM_PROXY*`
+  variable is invalid, the hook compresses and surfaces again and the daemon
+  starts. These paths ignore every `MEMTOMEM_STM_PROXY*` variable, valid ones
+  included, so `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` no longer reaches
+  surfacing, and the hook records no metrics rows, because the metrics
+  database path is a proxy setting. Fixing the variable can change the
+  daemon's identity (when it restores a consumer model), so a daemon started
+  in the meantime shows as foreign in `mms daemon status`, which says how to
+  stop it on that platform. `mms hook install`, `mms register` and the MCP
+  server keep validating the proxy settings strictly against the config file
+  they resolve.
+- `mms hook install` says when the user-scope hook it writes is bound to a
+  project (#1464, issue #1379). When the nearest `pyproject.toml` (the current
+  directory or one of its four parents) lists `memtomem-stm` as a dependency,
+  install writes `uv run --directory <project> memtomem-stm hook …` into a
+  config every project shares, so every hook call runs from that project's
+  environment. The output now names the project and how to get the bare
+  launcher instead, in the preview, after `--apply`, and when the hook is
+  already installed. STM's own source checkout (a `memtomem-stm` project with
+  `src/memtomem_stm/__init__.py`) and directories where no such file is found
+  get no notice; a project that is only named `memtomem-stm` does. **Behavior
+  change**: one more line of install output in those cases; the written
+  command is unchanged.
+
+### Fixed
+
+- The `otlp` extra declares `requests` and `opentelemetry-api`, which STM's OTLP
+  exporter imports directly, and config validation now also checks that
+  `requests` can be found (#1493, issue #1486). Both were previously installed
+  only as transitive dependencies; the lock keeps the versions of both that
+  0.7.10 locked. Validation used to check only the SDK and the HTTP exporter, so an
+  install without `requests` passed it and then failed when the exporter
+  started.
+  **Behavior change**: with `otlp.enabled=true` and `requests` missing, STM
+  now refuses the configuration at validation, naming `requests` and the
+  install command, instead of raising an import error at startup. The message
+  now reads "required OTLP modules could not be found" in place of "the
+  OpenTelemetry packages are not installed".
+- `mms doctor`'s `ltm` row looks the hook's daemon up under the
+  configuration a bare `mms hook` builds in doctor's environment, rather than
+  under one built from doctor's `--config` (#1491, issue #1485). A daemon is
+  looked up by a fingerprint of the configuration it started with, and the hook
+  builds from the environment alone and, since #1482, without an invalid
+  `MEMTOMEM_STM_PROXY*` variable. Under such a variable, a
+  `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` (which the hook then drops) made doctor
+  report a running daemon as unreachable, and without a `--config` file that
+  builds, the row reported the configuration error without probing. When the
+  hook would use the daemon (`hook.use_daemon` true, read as the hook reads
+  it), doctor's surfacing checks now use the
+  configuration the hook builds in doctor's environment. That covers the `ltm`
+  row, the measurement, the feedback database and the RRF, profile and timeout
+  checks. **Behavior change**: on that route `--config` no longer steers those
+  checks, and a broken proxy variable the hook recovers from (nothing outside
+  `proxy` is invalid) drops out of the `ltm` row on that route. Doctor's
+  proxy checks still see it: `env_overrides` reports it, and `config_schema`,
+  which validates the proxy configuration resolved from `--config`, reports
+  it if it fails there. `env_overrides` reads doctor's environment without
+  the registered command's options (issue #1494 entry), so it can disagree
+  with the `ltm` row about whether the hook recovers. Which forms of the setting the hook reads is the
+  subject of the issue #1495 entry. `mms health`, and doctor with the hook's
+  daemon off, keep the standalone view built from `--config`. Known limit:
+  doctor sees its own environment, not the host's, and reads the options
+  registered on the hook command, which also change the daemon's
+  fingerprint, only in the case the next entry (issue #1494) describes.
+  Outside that case, doctor finds the hook's daemon only when its own
+  environment builds the same fingerprint. The usual mismatch is
+  `--no-persist-query-text`, which `mms hook install` writes unless the
+  existing command says otherwise, while the settings default to persisting
+  query text: for such a hook, doctor's environment also needs
+  `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=false`, and the other inputs of
+  the fingerprint have to match as well. `--no-daemon` and the timeout
+  options are not read either there. So next to such a hook installed with `--no-daemon`,
+  with a standalone `surfacing.use_daemon` daemon and `hook.use_daemon` true
+  in doctor's environment, doctor looks under the bare hook's fingerprint,
+  not the `--config` one.
+- `mms doctor`'s `ltm` row reads the hook command `mms hook install` wrote
+  into Claude Code's user settings before it looks the hook's daemon up
+  (#1502, issue #1494). The hook applies that command's runtime options over its
+  environment, and two of them change the daemon's fingerprint: install
+  writes `--no-persist-query-text`, while the settings default to persisting
+  query text. 0.7.10's doctor ignored the registered command: it looked a
+  daemon up under its `--config` build whenever that build had
+  `surfacing.use_daemon` or `hook.use_daemon` (default true) on, so it
+  missed the daemon of an ordinarily installed hook and did not follow a
+  `--no-daemon` registration. Doctor now reads the
+  file `mms hook install --host claude` writes. It acts only when that file
+  holds exactly one handler install owns (the rule of #1499) and nothing
+  else that may run STM's hook. Then doctor builds the hook's configuration
+  with that command's settings applied as the hook applies its flags
+  (`--use-daemon`/`--no-daemon`, `--surfacing-timeout-seconds`,
+  `--daemon-timeout-seconds` and `--[no-]persist-query-text`), without
+  setting them in its own environment, and routes on the command's
+  `--use-daemon`/`--no-daemon` when it has one, as the hook does (issue
+  #1495 entry). The standalone route's build does not see them. In any
+  other case doctor keeps the view from its own environment alone: no
+  owned handler, several, a handler install does not own that may
+  still run the hook (a hand-written `mms hook --host claude`, an
+  `env MEMTOMEM_STM_…` prefix, exec-form `args`), a handler with a non-Bash
+  `shell`, an unreadable settings file, or any handler on Windows. The row
+  now ends with the route it chose (noting when surfacing is disabled and
+  nothing was probed) and what doctor chose it from, naming the handler's location
+  (`hooks.PostToolUse[i].hooks[j]`), never its text. Handlers that may run
+  STM's hook are found with the look-alike test `mms hook install` uses,
+  except that one `mms hook` would not run as the bridge (`--help`, a
+  subcommand) is left out. One behind a wrapper script or spelled with shell
+  syntax can be missed. Some handlers that cannot run the hook (a comment,
+  an exec-form `--help` with a quoted argument) are counted anyway, and then
+  doctor falls back to its own environment.
+  **Behavior change**: with an installed hook, the `ltm` row,
+  `--measure-ltm` and the timeout checks describe the daemon the hook's
+  options select. A `--no-daemon` hook sends them to the standalone route or
+  the direct LTM route: with `surfacing.use_daemon` off, doctor probes LTM
+  directly where 0.7.10 probed a daemon, and `--measure-ltm` warns that it
+  needs a daemon instead of measuring. The row's detail gains that note. Not covered:
+  Claude Code project, local and managed settings, other hosts' hook
+  configurations, and the host's own environment. The `--measure-ltm`,
+  timeout and `mms daemon status` advice still names commands that run in
+  doctor's environment (issue #1505).
+- `mms hook install` and `mms hook uninstall` now manage only the handlers
+  install writes (#1475, #1481, #1489, #1499, #1500, issues #1453, #1460,
+  #1461, #1476, #1483, #1484).
+  They used to decide whether a handler was STM's hook by reading its command the way
+  a shell might: any entry-point name followed by `hook`, alone or behind
+  `env MEMTOMEM_STM_*=…` or `uv run`. That reading took over lines that do
+  not run the hook (`mms hook uninstall`, `uv run --help mms hook`,
+  `OTHER=/mms hook`), lines a shell reads differently (a `#` comment, `$VAR`,
+  a glob, a here-string: for `mms hook --host # --persist-query-text` install
+  wrote `--persist-query-text` into the replacement, a flag the shell never
+  passed), a quoted executable whose PowerShell reading was never measured
+  (`"mms" hook`),
+  and a Kimi entry registered on another event, which install moved to
+  `PostToolUse` and uninstall deleted. It also read a setting the hook does
+  not: `env MEMTOMEM_STM_SURFACING__USE_DAEMON=false mms hook` turned the
+  daemon off in the replacement. A handler is now install's own only in the
+  form install writes: in the container install writes to (for Kimi, an entry
+  whose `event` is `PostToolUse`), with `"type": "command"` and no `args`
+  (Claude Code, Codex), and with the command
+  `memtomem-stm hook --host <that host>`, bare or after
+  `uv run --directory <absolute dir>`, followed by nothing or by install's six
+  runtime-setting words, spelled as install spells it. Every command a release
+  of install has written has that form, including one written with a
+  non-finite deadline (#1492). The command must have install's
+  words, in install's order and in `shlex.join`'s spelling; only the
+  directory and the two deadlines are read from it, as text (`9.0` passes
+  where install writes `9`). No shell is modelled, so the rule is the same
+  on every platform. Install now reads the host file
+  once, so the settings it carries over and the handler it replaces come from
+  the same version of the file. Those settings are read from the handler's
+  setting words as the hook applies them.
+  **Behavior change**: these commands leave in place handlers they used to
+  update or remove: `mms hook …` and `memtomem-stm-proxy hook …` (including
+  the manual registration `mms hook --host claude`), a path to the executable,
+  an `env MEMTOMEM_STM_…` prefix (its settings are no longer turned into
+  flags), a quoted name, a
+  `--directory` quoted another way than install quotes it (`"/a b"`), flags
+  added, left out or in another order, another
+  host's `--host`, a relative `uv run --directory`, other spacing, a handler
+  with `args` or without `"type": "command"`, and a Kimi entry on another
+  event. Install adds its own handler beside such a line and reads no setting
+  from it; uninstall leaves it. Both name the location of such a line when
+  their look-alike test recognizes it (a heuristic), and install's preview
+  now does so above the block it would write. Remove the old line by hand if
+  it should not stay registered. `--surfacing-timeout` and `--daemon` /
+  `--no-daemon` still set the surfacing deadline and the daemon mode over
+  any setting carried over from an owned handler; a
+  custom daemon deadline or `--persist-query-text` has no install option and
+  is edited into the written command by hand, which install then keeps.
+- `mms hook` decides whether to use the daemon from `hook.use_daemon` as the
+  settings read it, rather than from a raw read of
+  `MEMTOMEM_STM_HOOK__USE_DAEMON` alone (#1501, issue #1495). The settings also accept
+  the nested form (`MEMTOMEM_STM_HOOK='{"use_daemon": false}'`) and any letter
+  case of either variable; those forms turned `hook.use_daemon` off for
+  `mms daemon status` while the hook kept surfacing through the daemon and
+  spawning it. An
+  explicit `--use-daemon` or `--no-daemon` on the hook command decides the
+  route directly: it reaches the settings through one exact variable, which a
+  case-equivalent spelling elsewhere in the environment can outrank. Doctor
+  follows the same setting, and when its environment-only build of the
+  hook's configuration fails on a variable outside `proxy` (in the hook, such
+  a failure passes every call through; doctor's build uses its own
+  environment, with the registered command's flags when it reads them, issue
+  #1494 entry, so it can differ from the host's), doctor falls back to the
+  view of its own `--config` build, which carries no hook flags, and
+  reports that build's error if it fails too.
+  `mms daemon status` says `no (hook.use_daemon is false)` instead of `no
+  (opted out via MEMTOMEM_STM_HOOK__USE_DAEMON=0)`, and the `--measure-ltm`
+  warning names `hook.use_daemon` as well as `surfacing.use_daemon=true`,
+  which was all 0.7.10's warning named. **Behavior change**: a nested or
+  other-case `use_daemon` false in the hook's environment now keeps a hook
+  command with neither flag off the daemon, with no auto-spawn; a command
+  carrying either flag follows the flag, as it did before. `mms hook install`
+  writes one: on a first install from the installer's own `hook.use_daemon`
+  (`--use-daemon` by default), on a reinstall the existing command's, unless
+  `--daemon`, `--no-daemon` or `--inherit-runtime-env` says otherwise.
+  Doctor, which reads its own environment and not the command (outside
+  the case the issue #1494 entry covers), then takes
+  for its `ltm` row the standalone view built from
+  `--config` (the direct probe, or the `surfacing.use_daemon` daemon). Code that
+  calls the hook's internal `_run_hook` without a config now gets a settings
+  error raised from it on either route; the cold route used to log it and
+  return nothing.
+- An unstorable cache miss is now counted only for a call that counted the
+  miss itself (#1474, issue #1473). Whether a call had counted a miss was
+  decided again when it completed, from the tool's cache eligibility at that
+  moment. Eligibility can change while a call is in flight, because tool
+  annotations are refreshed by a reconnect or a `tools/list_changed`
+  notification. A call that skipped the lookup could then still count an
+  unstorable miss, which raised the hit rate over storable lookups in
+  `stm_admin` `proxy_stats` above the true rate (the new `mms stats` cache
+  block counts this way from its introduction, #1466). The reverse
+  flip also dropped the unstorable outcome of a call that had counted its
+  miss, when the store was refused before eligibility is checked (a mixed,
+  non-text, empty or block-metadata response, for example). Both now follow
+  the lookup.
+- A server shutdown started by SIGTERM, SIGINT or the parent-liveness backstop
+  no longer exits 0 when its teardown was cut short. The exit status was
+  meant to say whether the close sequence ran to the end, but the completion
+  was recorded in a `finally`, so it was recorded on every path. A
+  `CancelledError` that escaped a step, skipping every close after it, still
+  exited 0 without the "teardown did not run to the end" warning. Completion
+  is now recorded only when the sequence reaches its end, and a new lifespan
+  in the same process starts with it cleared (#1465, issue #1459). In local
+  macOS runs, SIGINT sent immediately after the MCP handshake cut the
+  teardown short this way.
+  **Behavior change**: such a shutdown now exits 1 and logs the warning. A
+  shutdown whose close sequence and leaked-child sweep both finish still
+  exits 0, including one where a step failed inside its own error handling.
+- A shutdown started by SIGTERM, SIGINT or the parent-liveness backstop, with
+  the teardown watchdog armed, now runs its close sequence shielded from
+  cancellation of the AnyIO scopes around the lifespan (#1478, issue #1468).
+  The MCP SDK runs the lifespan inside the stdio transport's task group, and
+  when that group's scope was cancelled during teardown, AnyIO delivered the
+  cancellation into `ProxyManager.stop()`: the closes after it were skipped
+  and the leaked-child sweep terminated the upstream. 0.7.10 still exited 0
+  then; with the previous entry such a shutdown exits 1.
+  This happened when SIGINT came right after the handshake: in local macOS
+  runs with SIGINT sent as soon as the client wrote
+  `notifications/initialized`, 11 of 20 shutdowns were cut short before and
+  0 of 20 after. The shield does not block a direct task cancellation, so the
+  per-step time limits still cancel their waits; a second signal still takes
+  the immediate-exit path, and the watchdog remains the hard deadline. Not
+  shielded: a teardown with the watchdog disabled
+  (`teardown_watchdog_seconds = 0`), or one no deliberate shutdown started,
+  such as a host unmounting an embedded lifespan. A deliberate shutdown whose
+  close sequence is still cut short some other way, and whose teardown then
+  reaches its normal exit, exits 1 (previous entry); a second signal still exits with
+  128 + the signal number.
+- `mms doctor`'s `hook registration` row now says what it can miss. It
+  recognizes an STM hook from the command text (in exec form, the command and
+  its `args`) by a heuristic, the matching described with the row under
+  0.7.10. So some hooks are not counted: a wrapper script whose command names
+  neither an STM executable nor `hook`, and spellings such as
+  `m"m"s hook # note`, `sh -c 'm"m"s hook'` and `python -mmemtomem_stm hook`.
+  (Others are counted, for example `m"m"s hook` and `sh -c "mms hook"`.) A
+  hook that is not counted does not by itself keep the row from PASS; the
+  other handlers decide. The PASS now reads `N recognized, all passing --host
+  claude to mms hook`, and the PASS and WARN details that report on commands
+  end by saying such hooks can be missed (the WARN for a settings file that
+  cannot be used does not). Recognition itself is unchanged: those hooks are
+  still missed, and a command that only mentions both words, such as `mms
+  version hook`, is still counted and reported as not checked (#1462, issue
+  #1457).
+  **Behavior change**: the row's detail text changes, in the text output and
+  in `checks[].detail` of `mms doctor --json`. Its statuses, the conditions
+  for showing it, and doctor's exit code do not.
+- The 0.7.10 notes for `mms doctor`'s `hook registration` row now state the
+  conditions of its quote-removal match: a line of at most 4,096 characters,
+  made only of plain-word characters (ASCII letters and digits, and
+  `_./:=+-`), spaces, tabs and quotes, with balanced quotes; never for a
+  handler whose `args` is a list (exec form). They
+  said only "a line made only of plain words and quotes, up to 4,096
+  characters" (#1469).
+  **Behavior change**: none external (documentation only).
+
+## [0.7.10] — 2026-11-21
+
+### Upgrade notes
+
+- **Register the Claude Code hook with `--host claude`.** Hook compression
+  replaces tool output only under an explicit `--host claude`. With
+  compression enabled, a call routed to the Claude adapter without it now
+  warns, on stderr and as a `systemMessage`, when compression would have
+  attempted it (#1440), and `mms stats` counts its rows as
+  `replacement_not_requested` (#1441). `mms doctor`'s new `hook
+  registration` row reports where such a registration is (#1449, #1455).
+  Add the flag by hand where the hook is registered; the doctor entry below
+  says why `mms hook install --apply` is not the fix. Until then the output
+  passes through unchanged, as in 0.7.9.
+- **`mms doctor` can report WARN on a setup it passed.** It adds a
+  `hook_registration` check (in `--json`, `"id": "hook_registration"`) when
+  Claude Code's user settings hold an STM-looking PostToolUse handler or
+  cannot be read. A handler lacking `--host claude`, one that does not run
+  the hook, one it cannot read as plain words, or unreadable settings make
+  the check WARN, which can turn an overall PASS into WARN. The exit code is
+  unchanged (#1449, #1455).
+- **Hook metrics are labeled by host.** `mms hook` rows record
+  `builtin:<host>` (for example `builtin:claude`), the host whose adapter
+  handled the call, instead of `builtin` in
+  the `server` column of `proxy_metrics` and `proxy_metrics_daily`, and in
+  the `server` of `mms stats --json` `by_tool` rows, which are grouped by
+  server and tool: rows written before the upgrade stay under `builtin`, so
+  one tool can show both. A query or script that selects `server =
+  'builtin'` no longer matches new hook rows; `source = 'hook' AND (server =
+  'builtin' OR server GLOB 'builtin:*')` covers rows from both versions.
+  Surfacing events still record `builtin`.
+  `mms stats --json` gains `hook_by_host` and `hook_status`. The text
+  output prints per-host lines only when the split adds something (more
+  than one host, or a host that cannot replace output); how rows from
+  before the upgrade are shown is in the #1439, #1441 and #1446 entries
+  below. The per-tool table's server column is 14 characters wide instead
+  of 12, MCP rows included. Existing `--json` keys keep their meaning (#1439, #1441,
+  #1446).
+- **The metrics DB changes the first time this version opens it for
+  writing**, which the MCP server, `mms tune` or `mms hook` do when they
+  record metrics or tune from them; `mms stats` only reads. `proxy_metrics` gains a nullable
+  `hook_compression_status` column (#1441), and the DB gains the
+  `proxy_metrics_hook_status_daily` table with `AFTER DELETE` triggers on
+  `proxy_metrics` and `proxy_metrics_daily` (#1446). An older STM version
+  sharing the file keeps writing rows, which read as `not recorded`. The
+  reset in `docs/cli.md` now runs in one transaction.
+- **The hook exchanges JSON as UTF-8 and writes ASCII.** Its stdout JSON
+  for Claude Code, Codex and Cursor is ASCII-only, with non-ASCII text
+  written as `\uXXXX` escapes, so a host that parses it reads the same
+  values, while a tool that searches the raw stdout for non-ASCII text has
+  to decode it first. Its input is read as UTF-8 whatever the locale, and
+  input that fails UTF-8 decoding is handled as a malformed payload: the
+  tool output passes through and nothing is surfaced (#1447).
+- **More values count as secrets.** The classifier shared by `mms
+  import`, `mms host sync` and `mms eject` now also catches values such as
+  a URL with a password, a JWT, a recognized provider token behind a
+  `Bearer ` prefix, a PEM private-key header and a `password=` label, and
+  keys named with `COOKIE`, `BEARER` or `DSN`. It reads the `env` values
+  `mms import` and `mms host sync` display, which now show such values as `<REDACTED>`
+  (`mms import --show-imported` still reveals them), and the `env` and
+  `headers` `mms eject` checks before shelling out to `claude mcp
+  add-json`, which then refuses without `--allow-argv-secrets`, asking
+  only in the interactive TUI, so a script that ejected such an entry needs
+  the flag. Command
+  arguments and a payload's `url` are not checked (#1436).
+- **Some text output reads differently** for scripts that parse it; the
+  `--json` output of `mms host sync` and `mms daemon status` is unchanged.
+  `mms hook install` and `uninstall` print a `!` line for an STM-looking
+  handler they do not manage and reword uninstall's status lines, while
+  config files are written exactly as before (#1456); the `mms host sync
+  --plan` preview's hint reads ``Nothing for `mms host sync --apply` to
+  do.`` (with the same flags) when that run would change nothing (#1448);
+  `mms import` prints a `Note:` line on stderr for each host config source it
+  did not inspect and names their count in its empty-result line (#1445); `mms
+  daemon status` and
+  `start` write control and bidirectional-formatting characters from the
+  daemon's answers as `\uXXXX`, so a lone surrogate in the handshake `pid`
+  no longer ends the command with `UnicodeEncodeError` (#1435). Exit codes
+  are otherwise unchanged.
+
+### Added
+
+- `mms doctor` has a `hook registration` row (#1449, issue #1443). It reads the
+  PostToolUse handlers in Claude Code's user settings, the file `mms hook install --host
+  claude` writes, and reports by location the STM hook commands that lack
+  `--host claude`, so hook compression, if enabled, never replaces their
+  output, or that do not run the hook at all (`--help`, a usage error, a
+  subcommand or another leftover word). It reads only commands made of plain
+  words (in exec form, the `args`), and marks anything else as not checked
+  instead of guessing how the shell would run it. That covers quotes, `$HOME`
+  or `~`, settings other than `MEMTOMEM_STM_*` before the executable, a
+  launcher other than `env` or `uv run --directory`, and the `env` launcher on
+  Windows. On Windows, shell form is never read, so those commands, install's
+  own output included, WARN with advice to check them by hand. It never shows
+  command text, and a settings file it cannot use is a WARN naming the reason,
+  never the file's contents. It is not gated on compression being enabled, and
+  it is WARN-only, so doctor's exit code does not change. The suggested fix is
+  a hand edit rather than `mms hook install --apply`: install merges every STM
+  handler it recognizes into one, drops most inline `env` settings, and does
+  not recognize a `NAME=value mms hook` line. Project, local and managed Claude
+  Code settings are not read. Unless the handler's `args` is a list (exec
+  form), a line made only of plain-word characters (ASCII letters and digits,
+  and `_./:=+-`), spaces, tabs and quotes, up to 4,096 characters and with
+  balanced quotes, is also matched on the words left after quote removal, so
+  `m"m"s hook` next to `mms hook --host claude` is counted, marked not
+  checked, and the row WARNs. A quoted hook in a longer line, in a line whose
+  quotes do not balance, or in a line with any other character (a comment, an
+  operator, a line continuation, a non-ASCII letter), is found only by a
+  search of the raw text, which can miss it and let the row PASS. A plain
+  command whose `hook` is only part of a word, such as `mms status --config
+  /tmp/hook.json`, is not counted as an STM hook (#1455, issue #1450).
+  **Behavior change**: when the settings hold an STM-looking handler or
+  cannot be read, `mms doctor` prints the new row and `--json` gains a
+  `hook_registration` check, so a setup doctor passed before can now report
+  WARN. The exit code is unchanged.
+- `scripts/stm_trial.py --status` (#1454; a source-tree utility, not in the
+  wheel) prints the holdout
+  trial's progress toward its frozen target as one JSON object: copied
+  assignments, pre-freeze and rate-excluded rows, and the provisional count of
+  analysable assigned eligible memories, with the extractor's coverage:
+  finished and unfinished run counts over all runs, a worst-case time since the
+  last copy, and, over gaps whose later run ended at or after the freeze,
+  the largest uncovered gap between finished runs, the largest worst-case gap
+  (none, with a note, when runs overlap), and the distinct retention settings
+  recorded by runs that finished
+  at or after it, with a note when a gap outlasts the shortest recorded
+  `cleanupPeriodDays`. It applies no retention-gap exclusion and draws no stop
+  verdict, because the settings an extractor run recorded cannot prove the
+  retention the daemon pruned with. It reads no outcome and nothing per arm,
+  opens both databases read-only (SQLite may still create its WAL `-wal` and
+  `-shm` files) and counts from one snapshot, and refuses (exit 1) before the
+  freeze, under another HMAC key, or on a trial database it cannot read or
+  whose path cannot be inspected. The extractor, `--freeze` and `--purge`
+  behave as before when spelled out; `--stat`, which abbreviated
+  `--stats-retention-days`, is now ambiguous with `--status` and refused.
+
+### Fixed
+- `mms hook install` and `mms hook uninstall` no longer keep quiet about an
+  STM hook they do not recognize, such as
+  `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1 mms hook`. Install added its own
+  handler beside such a line and said nothing, and uninstall printed
+  `Removed` (or `no memtomem-stm hook found`) while it stayed in the config
+  and kept running. Both still leave it in place, but now name the location
+  of each handler that looks like STM's hook and is not one they manage,
+  never its text. They look where install itself looks in the host's
+  config file: `PostToolUse` for Claude Code and Codex, `postToolUse` for
+  Cursor, and every entry for Kimi (#1456, issue #1453).
+  **Behavior change**: when such a handler is present, both commands print a
+  `!` line naming its location: in the written file after an `--apply` that
+  writes, otherwise in the current file. Uninstall's status line then says it
+  covers only the hook it manages (`Removed the memtomem-stm hook install
+  manages.`, `not installed (no memtomem-stm hook that uninstall
+  manages).`); install's status lines are unchanged. Separately, an uninstall
+  that only prunes empty hook containers (an empty matcher group, event list
+  or `hooks` section) now says `Removed empty hook entries
+  only (no memtomem-stm hook that uninstall manages).` instead of `Removed
+  memtomem-stm's PostToolUse hook.` Config files are written exactly as
+  before.
+- `mms host sync --plan` no longer tells you to run an `--apply` that has
+  nothing to do. The text preview always printed ``Run `mms host sync
+  --apply` to execute.``, even when that run had nothing to write — every
+  entry unchanged, or the only changed entries ones it skips (a changed entry
+  without `--force`, an entry that moved to another host), with no sidecar row
+  to re-key or clean up; following it printed `Already synchronized. No
+  changes.` The closing line is now decided by the
+  same test the apply run uses to decide whether it writes anything: added,
+  removed, backfilled, re-stamped and re-keyed entries and stale sidecar
+  rows (#1448, issue #1402).
+  **Behavior change**: when that run would change nothing, the preview's
+  closing line reads ``Nothing for `mms host sync --apply` to do.`` (with the same
+  flags the old line named). A preview with changes to apply is unchanged,
+  and so are `--json` output and exit codes.
+- `mms hook` no longer ignores `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED`
+  silently when the hook is registered without `--host claude`. Output
+  replacement still runs only for an explicit `--host claude`, because
+  auto-detection cannot tell Claude from Codex. A bare `mms hook`, the form the
+  `hook_cmd` module docstring used to show, therefore passed every Bash result
+  through, and nothing said why. This release adds two signals: `mms stats`
+  counts the retained rows of such calls, with compression enabled and
+  routed to the Claude adapter, as `replacement_not_requested` (#1441), and,
+  on a call
+  routed to the Claude adapter (auto-detection's fallback; a payload with a
+  non-empty Codex `turn_id` goes to the Codex adapter and gets no warning) that
+  compression would have attempted (a Bash result that passes every check made
+  before the compressor runs: safe, structured, over `max_chars`, not already
+  compressed, and a budget larger than the sentinel and its newline), the hook
+  still passes the output through, writes a warning to stderr, and returns it
+  as a top-level `systemMessage`, which Claude Code and Codex document as a warning
+  shown to the user. The warning is raised before surfacing runs, so a
+  surfacing call that outlives the hook deadline does not erase it. It says
+  the attempt was not made, and does not claim the output would have shrunk,
+  because the refused path skips the compressor and so the retention guard.
+  It asks for `--host claude` to be added where the hook is registered rather
+  than naming `mms hook install`, which rewrites only the user settings file,
+  leaves a registration it does not recognize in place, and keeps only the
+  daemon, timeout and query-text settings of an inline `env` wrapper. The
+  docstring example and the docs now state the
+  `--host claude` requirement (#1440, issue #1437).
+  **Behavior change**: a bare `mms hook` with compression enabled prints a
+  warning for each such call, and its JSON output gains `systemMessage` on
+  those calls, including when surfacing times out. The tool output itself and
+  its recorded size are unchanged. Registering with `--host claude` removes the
+  warning and turns compression on.
+- `mms import` names the host config sources it chose not to read instead of
+  reporting them as missing. When STM cannot tell which file Claude Code or
+  Codex uses (`CLAUDE_CONFIG_DIR` or `CODEX_HOME` relative, a custom OAuth
+  URL, a legacy `.config.json`, an unusable home directory), cannot name the
+  Claude Code project entry (a linked worktree, a submodule, a symlinked
+  `.git`), or cannot read Claude Code's config or `.mcp.json` as a JSON
+  object, the scan skips that source — and with every source of the host
+  skipped the command said `No MCP definitions found from --from=<host>. Is
+  the host config in place?`, sending the user to look for a file STM had not
+  looked at. Each skipped source now gets one `Note: <source> not inspected:
+  <reason>.` line on stderr, ahead of the skipped-entry notes and the result,
+  with the reason wording `mms host scan` uses (#1445, issue #1407).
+  **Behavior change**: those notes are new stderr lines in `--plan` and
+  `--apply` alike, and an empty result with a skipped source now reads `No MCP
+  definitions found from --from=<host>; <n> sources were not inspected.` (`1
+  source was` for one). Output with no skipped source is unchanged, and exit
+  codes are unchanged.
+- `mms daemon status` and `mms daemon start` escape for display the values
+  they print from a daemon that answers. On `start`'s "daemon already
+  running" and "daemon started" lines (which `restart` prints too) those are
+  the `pid` and `port`; on `status`'s `running`, `queue:` and `surface
+  latency:` lines, every value taken from the daemon's handshake or its ping
+  reply. Nothing checks the type of the `pid`, `ltm`, the counters or the
+  suggested timeout, so a string `pid` in the handshake or a string counter
+  in the reply reached the terminal as it was, control and
+  bidirectional-formatting characters included, and a lone surrogate in the
+  handshake `pid` (a file in the operator's own `data_dir`) ended the command
+  with `UnicodeEncodeError` where the output stream encodes strictly. Each of
+  those lines is now escaped as a whole, so a field added to one later is
+  covered too (#1435, issue #1431).
+  **Behavior change**: on those lines such a character is written as
+  `\uXXXX`. A value without one prints as before, and `--json` output is
+  unchanged.
+- The secret classifier that `mms import`, `mms host sync` and `mms eject`
+  share now recognizes credentials under neutral key names. A value that
+  parses as a URL with a password (`DATABASE_URL=postgresql://user:pw@host/db`,
+  `REDIS_URL=redis://:pw@host`), or that carries a credential the proxy's
+  privacy scanner recognizes (a JWT, a provider token behind a `Bearer `
+  prefix, a PEM private-key header, a `password=` label), was classified
+  non-secret and printed as it was. The key patterns also gain `COOKIE`,
+  `BEARER` and `DSN`. A URL with a user and no password (`git@…`) is still
+  non-secret, and a URL inside a longer value (`--db=postgresql://…`) is
+  not parsed as one (#1436, issue #1345).
+  **Behavior change**: such values are now shown as `<REDACTED>` in the
+  human-readable output of `mms import` and `mms host sync`, in both `--plan`
+  and `--apply` (`mms import --show-imported` still reveals them, in either
+  mode), and `mms eject` of an entry written back through `claude mcp
+  add-json` (Claude Code user or project scope) now refuses such a payload
+  without `--allow-argv-secrets`, or asks on a TTY. A value that only names a
+  password label, such as `--password=false`, counts as a secret too.
+- `mms stats` splits the `hook` compression ratio by host. `mms hook`
+  records every host's native tool calls under one source, and only Claude
+  Code's hook can replace tool output; rows from Codex, Cursor and Kimi can
+  never shrink, so on a machine with more than one host registered they
+  diluted the single `hook` ratio toward zero and nothing on the row said
+  which host wrote it. The hook now records the host, and `mms stats` prints
+  one line per host under the `hook` line: a host that can replace output
+  with its own ratio, one that cannot as `measured only`, and rows with no
+  host as `(host not recorded)`. `--json` carries the same split as
+  `hook_by_host`. The split also holds under `--all-time`, for rows recorded
+  from this version on; earlier rows carry no host and cannot be attributed.
+  Why a host's own ratio is low is recorded too; see the next entry (#1439, issue #1438).
+  **Behavior change**: `mms hook` writes `builtin:<host>` (for example
+  `builtin:claude`) instead of `builtin` in the `server` column of
+  `proxy_metrics` and, as rows are trimmed, of `proxy_metrics_daily`. The
+  per-tool table of `mms stats` and the `by_tool` rows of its `--json` output
+  therefore show one row per host and tool, and the table's server column is
+  14 characters wide instead of 12. The `server` recorded with surfacing
+  events is still `builtin`.
+- `mms stats` says why retained `hook` rows were or were not compressed.
+  The hook decided it on every call (output under the threshold, a result
+  the retention floor would have cut too far, a failed command, a host that
+  cannot replace output) and kept only the size, so a low ratio could not be
+  told apart from a broken registration. Each `hook` row now records that
+  decision, and under each host that can replace output `mms stats` prints a
+  `status:` line counting its rows by it; `--json` carries the counts as
+  `hook_status`. With hook compression enabled, a Claude Code hook registered
+  without `--host claude`, which never replaces output (#1437), now shows as
+  `replacement_not_requested` instead of being folded in with hosts that
+  cannot replace output (with compression off it shows as `disabled`). Rows
+  written before this version count as `not recorded`; under `--all-time`
+  the counts also cover trimmed rows, see the next entry (#1441, issue #1438).
+  **Behavior change**: `proxy_metrics` gains a nullable
+  `hook_compression_status` column, added the first time this version opens
+  the metrics DB for writing (the MCP server, `mms tune` or `mms hook`; `mms
+  stats` only reads). An older STM version sharing the file keeps writing
+  rows without it (they read as `not recorded`), and each time the two
+  versions open the file in turn the schema check runs again: a median of
+  about 0.2 ms more per open, measured on one 10,451-row DB that already had
+  the column and no concurrent writer, before the next entry's rollup. The `mms
+  stats` text output gains the `status:` lines; existing `--json` keys are
+  unchanged.
+- `mms stats --all-time` counts the hook statuses of trimmed rows too.
+  Trimming folds rows into a daily rollup keyed by day, source, server and
+  tool, with no status, so counts over the retained rows alone would leave
+  out calls that still weigh on the host's all-time ratio; on a machine with
+  two hosts registered the retained hook window was under a day. The status of
+  each trimmed `hook` row is now kept in a second never-pruned table,
+  `proxy_metrics_hook_status_daily`, fed by its own
+  database trigger, so rows trimmed by an older STM version sharing the file
+  are counted too. Hook calls already in the daily rollup when this version
+  first opens the DB were trimmed with no status kept: they are counted once,
+  at that point, and the line ends with `status not kept N`. `--json`
+  `hook_status` reports `"scope": "all_time"` and a per-host
+  `status_not_kept_calls` (`null` under the `retained` scope) (#1446, issue #1442).
+  **Behavior change**: the metrics DB gains the table, a second `AFTER
+  DELETE` trigger on `proxy_metrics` and one on `proxy_metrics_daily` (a
+  deleted daily bucket takes its status rows with it, so the documented
+  two-table reset still clears everything), created the first time this
+  version opens the DB for writing. Measured against the schema of the
+  previous entry: each trimmed hook row costs one more insert, deleting 10,000
+  hook rows at once took a median of 61–63 ms instead of 47–49 ms, while the
+  mean write at the cap, trims included,
+  stayed within run-to-run spread (58–65 µs on both), measured on one
+  machine. The schema check that runs each time two versions open the file
+  in turn rose from a median of
+  0.68–0.78 ms to 0.86–0.96 ms on a 10,000-row DB. `docs/cli.md` now runs the
+  reset in one transaction. Under
+  `--all-time` the `status:` line says `(retained rows)` only when the status
+  rollup is unavailable (not installed yet, or its table or a trigger is
+  missing).
+- `mms hook` no longer drops the JSON it writes for Claude Code, Codex and
+  Cursor when its stdout is not UTF-8 but another ASCII-compatible encoding,
+  such as cp1252 on a Windows pipe. That JSON held non-ASCII text as it was: the
+  `⟦stm-compressed⟧` marker that starts every compressed Bash output, `…`,
+  or Korean in surfaced memories. Writing it failed, the hook logged `hook
+  output was not encodable` and printed nothing, so the tool output was never
+  compressed and the surfaced memories in the same reply were lost. The hook
+  also decoded its stdin in that encoding, which turned non-ASCII tool output
+  into mojibake; it now decodes the payload as UTF-8, the encoding JSON is
+  exchanged in, and treats bytes that are not UTF-8 as a malformed payload,
+  passing the tool output through (#1447, issue #1444).
+  **Behavior change**: the hook's stdout JSON for Claude Code, Codex and
+  Cursor is ASCII-only, with non-ASCII text written as `\uXXXX` escapes (two
+  for a character outside the Basic Multilingual Plane); a host that parses
+  it reads the same values as before. Hook input is read as UTF-8
+  whatever the locale, with a leading byte-order mark ignored.
+
+## [0.7.9] — 2026-11-15
+
+### Upgrade notes
+
+- **Stop the daemon an earlier build started.** The daemon's config
+  fingerprint is now keyed (#1416), so a daemon still running from an
+  earlier build is under another fingerprint: `mms daemon stop` and
+  `restart` no longer reach it, and hooks start a new daemon beside it. On
+  macOS and Linux `mms daemon stop --all` stops it; on Windows, end the
+  listed process. One with `daemon.idle_timeout_seconds = 0` never exits on
+  its own. Afterwards the old `stm-daemon-*.json` and `.lock` files can be
+  deleted, as the entry below describes (keep `stm-discovery.key`: deleting
+  or replacing it while daemons run turns them into foreign ones the same
+  way). On a `data_dir` it cannot walk and with no key, `mms daemon status
+  --json` reports `"state": "unknown"` where it reported `"stale"`.
+- **The response cache and the tool-graph consult cache start empty** once.
+  Restart running proxies after upgrading: a process from the previous
+  release can still write unkeyed rows. Each cache now has a key file
+  beside it; deleting or replacing it empties that cache, and an unreadable
+  one disables it for the run, as the entry below describes. (#1418, issue
+  #1416)
+- **The new key files need a filesystem with hard links.**
+  `<data_dir>/stm-discovery.key`, the `.key` file beside each cache database
+  and `~/.mms/import_state.toml.key` are created with a hard link. Where that
+  directory's filesystem has none (FAT, exFAT, some network mounts), the
+  daemon cannot be used, that cache runs disabled, and `mms host sync
+  --apply` / `mms import --apply` exit 1 before writing. Move the directory
+  to a filesystem that supports hard links. (#1416, #1418,
+  GHSA-8xcm-66jc-qmfr)
+- **`mms host` drift hashes are keyed.** `baseline_hash` and `current_hash`
+  become `hmac-sha256:<16 hex>`. Until the first `--apply` that writes
+  creates the key, `current_hash` is `null` and so is the `baseline_hash` of
+  an earlier version's row; such rows keep their state and are re-keyed in
+  place by that write. A lost, replaced or unreadable key changes what is
+  reported, as the Security entry below describes. That write moves
+  `~/.mms/import_state.toml` to `schema_version = 2`, which 0.7.8 refuses to
+  read; to go back, delete the file and run `mms host sync --apply` there.
+  A row that pairs an unkeyed `sha256:` hash with a `drift_hash_version`
+  other than 1, which 0.7.8 loaded and no release wrote, is now refused on
+  load; the same delete-and-sync recovers. Rotate a credential whose entry
+  appeared in a report that left the machine. (GHSA-8xcm-66jc-qmfr)
+- **Surfacing query digests are keyed, and the selection log drops two
+  digests.** New digests start with `hmac-sha256:` and do not compare with
+  earlier `sha256:` rows; selection-log records are `schema_version` 2,
+  which an older STM's replay and `mms selection feedback` skip. (#1381)
+- **With the embedding scorer, a pass whose query or response matches a
+  credential pattern is ranked by BM25** instead of being sent to the
+  endpoint. `relevance_scorer.privacy_scan_enabled = false` turns the screen
+  off. (#1382)
+- **Log messages escape control characters.** A tab, a line break, another
+  control character, a line or paragraph separator, a bidirectional control
+  or a lone surrogate is written as `\uXXXX`, so every message is one line;
+  a traceback keeps its lines (#1425, #1422). The text output of
+  `mms daemon status` and `stop --all` escapes a fingerprint and a recorded
+  `pid` the same way (#1429).
+- **`mms daemon status` and `stop --all` list a daemon that holds its lock
+  without a handshake** (`pid=?`, `handshake_absent: true`). `stop --all`
+  waits for it and exits 1 if its lock is still held, or could not be
+  checked, when the wait ends. (#1421)
+- **Host discovery reads home variables the way the host does.**
+  `CODEX_HOME=""` means `~/.codex`; a relative `CODEX_HOME`, or one with a
+  `.` or `..` component, skips Codex discovery. `mms hook install` and
+  `uninstall` exit with an error for a relative or dotted
+  `CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME` or `CODEX_HOME`, and for an empty
+  `CLAUDE_CONFIG_DIR` or `KIMI_CODE_HOME`. (#1404, issue #1345)
+- **An entry whose baseline source was skipped reads `not_inspected`** where
+  a same-name entry at another host made it `unchanged` or `changed`.
+  (#1403, #1414)
+- **A `<python> -m` host entry for STM or LTM counts as STM's own
+  registration or the LTM companion**: `mms init`, `mms add --from-clients`,
+  `mms import` and `mms host sync` no longer offer it, `mms eject` refuses
+  it, and one already imported shows as `removed_at_host`. (#1383, #1400)
+- **An upstream prefix ending in a newline is refused** by `mms add
+  --prefix`, and an imported host entry whose name ends in one gets prefix
+  `mcp`. Saved prefixes are not migrated. (#1391)
+- **TRUNCATE's code-aware previews change shape**: every remaining block's
+  signature line first, then body lines while the budget lasts. (#1410)
+- **`stm_compression_feedback` stores a placeholder for a `missing` text the
+  privacy screen flags**, and its reply says so. (#1380)
+- **On macOS with Python 3.12**, the leaked-child sweep after a failed LTM
+  adapter shutdown sends SIGKILL to a child that outlives its SIGTERM,
+  where it stopped with `AttributeError`. (#1384)
+- **Hint text only:** `mms project enable` (#1390), `mms host sync` (#1399),
+  `mms import --plan --allow-project-configs` (#1401) and the `mms host
+  status` missing-baseline footer (GHSA-8xcm-66jc-qmfr) now name a command
+  that works. Exit codes and what is written are unchanged.
+
+### Fixed
+
+- A value named in a log message can no longer split or reorder the line. The
+  log formatter escaped an attached traceback only and left each message's
+  values to its call site, and most call sites wrote them as they were.
+  Config does not restrict the characters of an upstream server key or its
+  `prefix`, and many of the proxy's log lines name one of the two, so a key
+  with a newline in it — in a hand-edited or imported `stm_proxy.json` — made
+  a line such as `Connected to '<key>' (3 tools discovered)` continue on a
+  second line that read as a record of its own, and a bidirectional control
+  or an escape sequence in it reached the terminal and the log file as
+  itself. The formatter every STM handler uses (stderr, the log file, the
+  daemon's log, `mms hook`'s stderr) now escapes the whole rendered line,
+  the way the CLI escapes the same values (#1425). That covers the cache path
+  quoted by the warning "Tool-graph consult cache could not be opened at",
+  which a newline in the consult cache path split across two lines (#1422).
+  **Behavior change**: in a log message, a tab, a line break, another control
+  character, a line or paragraph separator, a bidirectional control or a lone
+  surrogate is written as `\uXXXX`, wherever in the message it is. Every
+  message is therefore one line; a message that carried a line break,
+  including one logged by a library STM uses, is written on one line with
+  `\u000A` where the break was. A message with none of those characters is
+  unchanged, and a traceback keeps its lines.
+
+- `mms daemon status` and `mms daemon stop --all` escape for display two
+  values they read from files in `data_dir` and used to print as they were.
+  One is the fingerprint of a daemon under another config, which is taken
+  from its handshake's file name (`stm-daemon-<fingerprint>.json`): a name
+  carrying a control or bidirectional-formatting character reached the
+  terminal with it, and one that was not valid UTF-8 (Linux allows such a
+  name) was written out as the bytes it was or, where the output stream
+  encodes strictly, ended the command with `UnicodeEncodeError` at the first
+  line naming it. The daemons listed from a `.lock` file name (see the next
+  entry) are escaped the same way. The other value, in `status` only, is the
+  `pid` recorded in this config's handshake when no daemon answers for it,
+  which was printed whatever JSON value the file held. Both now appear with
+  such characters as `\uXXXX`; a name or pid without any is printed as
+  before. `--json` was not affected — JSON encoding already escaped them —
+  and still carries both values as found. The file has to be in the
+  operator's own `data_dir` (#1429).
+  **Behavior change**: in the text output of `mms daemon status` and
+  `mms daemon stop --all`, such a character in a fingerprint or `pid` is
+  written as `\uXXXX`, and a file name that is not valid UTF-8 no longer ends
+  the command with `UnicodeEncodeError`. `--json` output is unchanged.
+- `mms daemon status` and `mms daemon stop --all` find a daemon under another
+  config fingerprint that holds its lifetime lock without a handshake. A
+  daemon holds the lock from before it publishes its handshake until after
+  its teardown has removed it, and daemons under other fingerprints were
+  found through handshakes only, so for those two stretches one was not
+  listed: `status` reported `stopped` with an empty `foreign` list and
+  `stop --all` reported nothing to stop, both with exit 0. Such a
+  daemon is now found by its lock file and listed as `pid=?` with `no
+  handshake; lock held — starting or shutting down`; in `status --json` its
+  `foreign` entry has `handshake_absent: true`, `listening: false` and
+  `"lock": "held"`. `stop --all` waits for its lock to be released and never
+  signals it, as for any listed daemon that is not accepting. Lock files left
+  by daemons that have exited are not listed: only a lock that is held, or
+  that could not be checked, is. For a lock file with no handshake, "held"
+  is judged over up to three further rounds, each after a 20 ms pause,
+  because testing a lock takes it for an instant and two commands
+  looking at the same file would otherwise report each other; a lock file on
+  a filesystem without file-lock support is listed as one that could not be
+  checked rather than as held. The state reported for this config is
+  unchanged (#1421).
+  Looking at another fingerprint's lock no longer creates anything. `status`
+  and `stop --all` used to create the lock file of a fingerprint whose
+  handshake was stale and whose lock file was gone, and to create the target
+  of a lock file that was a dangling link and then read that lock as free;
+  they now open only a lock file that already exists.
+  **Behavior change**: `mms daemon status` lists such a daemon under
+  `foreign` where it listed none. `mms daemon stop --all` waits for its lock
+  and exits 1 if the lock is still held, or could not be checked, when the
+  wait ends, where it exited 0 with nothing to stop.
+
+- The response cache's row keys and the tool-graph consult cache's backend
+  fingerprint are keyed. A response-cache key was a plain SHA-256 of the
+  server, tool, call arguments and context query, and the consult cache's
+  `provider_fingerprint` a plain SHA-256 of the backend's command and
+  arguments, stored in every row. A cached body does not always reveal its
+  arguments, so anyone holding a copy of either database could confirm a
+  guessed call or command line by recomputing the value. Both are now an
+  HMAC under a random key kept in a separate file beside the database
+  (`proxy_cache.db.key`, `toolgraph_consult.db.key`, mode `0600`, created on
+  first open), so the database file alone no longer serves as that check.
+  Server and tool names and cached bodies are stored as before and are not
+  covered. The one-time purge of old rows is logical: their bytes can remain
+  in the file's free pages, so before sharing a copy, stop STM and delete the
+  cache database (it is recreated empty), unless another store shares that
+  file (#1418, issue #1416).
+  **Behavior change**: the response cache and the consult cache start empty
+  after the upgrade (response-cache key schema 8, consult scope key 2). A
+  deleted or replaced key file empties its cache on the next open; replace
+  one only while no STM process has that cache open. An
+  unreadable or malformed key file disables that cache for the run, with a
+  warning that names the file; moving it aside makes a new one. The key file
+  is created with a hard link, so a cache directory on a filesystem without
+  hard links (FAT, exFAT, some network mounts) runs without that cache. A
+  process from the previous release that keeps running can write unkeyed
+  rows after the purge, so restart running proxies after upgrading.
+
+- The daemon's config fingerprint is keyed. It names the handshake and lock
+  files under `data_dir` (`stm-daemon-<fingerprint>.json` / `.lock`) and is
+  stored in the handshake, and it was a plain SHA-256 over the surfacing
+  settings — the LTM command line and `ltm_mcp_headers` included — so anyone
+  holding a handshake, or just a directory listing, could confirm a guessed
+  header value by recomputing it. It is now an HMAC under a random key in
+  `<data_dir>/stm-discovery.key` (mode `0600`), created by the first process
+  that needs a daemon to exist: `mms daemon start`, a hook's spawn request,
+  the standalone proxy when it starts with `surfacing.use_daemon` on, or the
+  daemon itself. `mms daemon status` and `mms daemon stop` never create it or
+  change its mode (#1420); with no key they report `stopped` /
+  `no running daemon` for this config, and on a `data_dir` with no daemon
+  files they create nothing. The same settings still feed the fingerprint,
+  so a rotated header still gets a new
+  daemon. An existing key that cannot be read or parsed is an error, not a
+  fallback to an unkeyed value: `mms daemon start`, `stop` and `status` exit 1
+  with one line naming the file (`status --json` reports
+  `"state": "unknown"` with an `error` field, and still lists the daemons
+  published under `data_dir`), `mms daemon stop --all` first acts on those
+  daemons as it does on any under a different config (signalling them on
+  macOS and Linux; on Windows, end the processes), the hook takes its
+  configured fallback, standalone surfacing logs one warning and reports the
+  daemon as unavailable until STM restarts (from the moment it reads the
+  key: at startup, or at its next spawn request if the key is damaged later
+  — requests to a daemon it already found go on), and
+  `mms health` / `mms doctor` report it as an unreachable daemon with their
+  usual exit codes. Moving the file aside makes a new one (#1416). `status`
+  and `stop` read the key once per run, so a key removed while one runs does
+  not make `status` list this config's daemon under `foreign` as well,
+  `stop --all` signal it as a foreign one, or `stop` fall back to signalling
+  it by pid; the run finishes
+  against the fingerprint it started with (#1423).
+  **Behavior change**: every daemon started by an earlier build is under a
+  different fingerprint after the upgrade, as after a protocol change:
+  `mms daemon status` lists it as running under a different config,
+  `mms daemon stop` and `restart` do not reach it, and `mms daemon stop --all`
+  does (on Windows, end the process). One with an idle timeout exits on its
+  own; one with `daemon.idle_timeout_seconds = 0` has to be stopped that way.
+  The earlier build's `stm-daemon-*.lock` files are not removed and still
+  carry the old, recomputable fingerprint in their names: after
+  `mms daemon stop --all`, with no STM process running under any environment
+  that uses this `data_dir`, every `stm-daemon-*.json` and `stm-daemon-*.lock`
+  there can be deleted (they are recreated on demand; keep
+  `stm-discovery.key`). Deleting or replacing the key while daemons run
+  leaves them under a fingerprint nothing derives any more — `status` lists
+  them as foreign, `stop --all` signals them (on Windows, end the processes),
+  and a standalone proxy that was
+  already running keeps looking for the old one until it restarts. The key is
+  created with a hard link, so on a `data_dir` whose filesystem has none the
+  daemon cannot be used. `mms daemon status` on a `data_dir` it cannot walk
+  (a dangling symlink above it) with no key now reports `"state": "unknown"`
+  with an `error` field instead of `"stale"` with `handshake_unreadable`.
+
+- The surfacing query digest is keyed, and the selection log stops writing
+  argument digests. The query digest — written to `surfacing_events.query`
+  when `persist_query_text` is off (always, on the hook daemon path), to
+  `surfacing_opportunities.query_digest`, and to the surface webhook's
+  `query` — was a plain `sha256` of the query, so anyone holding a stored or
+  delivered value could confirm a short or guessable query by hashing
+  candidates. It is now an HMAC under the feedback DB's key, written as
+  `hmac-sha256:<16-hex>`; the proxy and the daemon share that DB, so they
+  agree on a query's digest. The key is stored in that same DB file, so this
+  protects copies that travel without it — `surfacing_stats` output, a
+  webhook payload, an exported row — not someone who has the file. No
+  shipped entry point wires a webhook; an embedder that passes a
+  `webhook_manager` gets the keyed form only under `persist_query_text =
+  false`, and by default still receives a non-sensitive query verbatim.
+  Without a feedback DB (the one-shot
+  hook path) the key is random per engine and nothing is persisted. The
+  selection log stops writing `args_sha256` and
+  `candidate_features.query_sha256`, unkeyed digests of the call arguments
+  and of the ranking query taken from them; no reader used either. Its
+  records are now `schema_version` 2, and every reader accepts 1 and 2
+  (#1381).
+  **Behavior change**: new query digests start with `hmac-sha256:` and are
+  not comparable with the `sha256:` values of rows written earlier, which are
+  left as they are and still render as digests in `surfacing_stats`.
+  Selection-log records lose two fields and carry `schema_version: 2`; an
+  older STM's replay and `mms selection feedback` skip them as unsupported,
+  while its `selection_stats` still counts them.
+
+- The embedding relevance scorer (`relevance_scorer.scorer = "embedding"`) no
+  longer sends credential-bearing text to its endpoint. It sends the context
+  query and each section's title and first 500 body characters, and nothing
+  screened them, while the LLM compressor's credential scan (#289) kept the
+  same responses away from a hosted summarizer. A pass now goes to BM25
+  instead when the query, a section as sent, a whole section, or the response
+  the sections came from matches a credential pattern. The response counts
+  because SELECTIVE and SCHEMA_PRUNING score a JSON key and its value as
+  separate pieces, which a per-section check cannot see as one pair; it is
+  read with JSON string escapes decoded, so `\u0070assword` counts. The new
+  `relevance_scorer.privacy_scan_enabled` (default `true`) turns the screen
+  off, and with it off for a non-loopback `embedding_base_url` the proxy logs
+  a WARNING at startup and again when a config edit rebuilds the scorer
+  (#1382).
+  **Behavior change**: with the embedding scorer configured, a call whose
+  response or query matches a credential pattern is ranked by BM25 for that
+  pass. It is not counted as a `scorer_fallback`.
+
+- `mms host status` and `mms host sync` no longer judge a registry entry by
+  another host, or re-stamp its baseline from one, while the host config that
+  baseline came from was skipped. Before, a same-name entry at another host
+  made the entry `unchanged` or `changed` against that host, although the
+  baseline's own host had not been read. The same rule now also comes before
+  the hash-version check, so a baseline this release cannot compare (one
+  whose drift-hash key was lost, see the Security entry) is not re-stamped
+  from another host's entry and given that host as its source (#1403, #1414).
+  **Behavior change**: those entries now read `not_inspected`, with the
+  skipped source's reason, where they read `unchanged` or `changed`. In
+  `mms host sync --json` they are listed under `not_inspected` instead of
+  `skipped_changed`, or instead of being counted in `summary.unchanged`.
+  `mms host sync --apply` (with or without `--force`) keeps their recorded
+  host shape and source; it can still re-key an earlier version's hash in
+  place. In `mms host status --json` their `current_hash` is the other
+  host's entry's hash when there is one and a drift-hash key exists, and
+  `null` otherwise.
+- TRUNCATE's code-aware output names more of the blocks it cannot keep whole.
+  Those blocks are previewed after a `... (N more blocks)` line, and the
+  previews used to be built one block at a time, each with its body lines, so
+  on a tight budget the first few blocks used it up and the rest were dropped
+  or shown as `# <signature>` — for SQL only the keyword, `# WITH` or
+  `# SELECT`. Now every block's signature line goes in first, and body lines
+  are added one round at a time while the budget lasts. On the bench's
+  `code-python-etl` task at its 800-character budget this names all 7
+  remaining blocks instead of 4. Since 0.6.6 a block no longer opens with the
+  blank lines before it, so they stopped filling its preview window, previews
+  grew a body line, and fewer blocks fit.
+  **Behavior change**: a preview is the block's first non-blank line plus up
+  to three more non-blank lines, in place of the non-blank lines among the
+  block's first four physical lines, and keeps its indentation. A signature
+  line is placed cut to 80 characters with `…` and, when the budget allows,
+  gets its whole line back before any block gets a body line; a
+  block is shown as `# <signature>` only when not even its cut signature
+  fits. Blocks are named in order, so a long block early can take the room a
+  later short block used to get, and a signature still cut at 80 characters
+  hides whatever comes after that point, a name included (#1410).
 - On macOS with Python 3.12, the leaked-child sweep that runs when an LTM
-  adapter's shutdown fails no longer raises `AttributeError: module 'os' has
-  no attribute 'waitid'` instead of terminating the child. CPython has
+  adapter's shutdown fails no longer stops with `AttributeError: module 'os'
+  has no attribute 'waitid'` right after its SIGTERM, before it could send
+  SIGKILL to a child that ignored the SIGTERM. CPython has
   `os.waitid` on macOS only from 3.13; without it the sweep now asks
   `os.getpgid`, which the macOS kernel answers with "no such process" for an
   exited child nobody reaped yet, so the sweep still does not wait out its
-  escalation window for a child that already died.
+  escalation window for a child that already died (#1384).
+  **Behavior change**: on macOS with Python 3.12, that sweep now runs to
+  the end: a child still alive when its escalation window closes is sent
+  SIGKILL, where the sweep ended with the `AttributeError`. Other platforms
+  and Python versions are unchanged.
 - An empty or relative host home variable no longer points STM at files in the
   current directory. Before, `CODEX_HOME=""` made `mms import` and
   `mms host sync` read `./config.toml` as the Codex user config, outside
@@ -30,7 +1414,7 @@ changes inline only. See the deprecation policy in
   host reads it, measured on Codex CLI 0.167.2 and Kimi Code 0.39.0: Codex
   treats an empty `CODEX_HOME` as unset, while Claude Code and Kimi Code
   resolve an empty or relative value against their own working directory,
-  which STM does not know.
+  which STM does not know (#1404, issue #1345).
   **Behavior change**: `CODEX_HOME=""` now means `~/.codex`. A `CODEX_HOME`
   that is relative or contains a `.` or `..` component makes Codex discovery
   skip both Codex configs: `mms import` imports nothing from Codex, and
@@ -48,7 +1432,7 @@ changes inline only. See the deprecation policy in
   the prefix given to `mms add` or typed at the `mms add --from-clients` and
   `mms init` prompts, and to the prefix that `mms import` and `mms host sync`
   derive from a host config entry's name: a name ending in a newline now gets
-  the fallback prefix `mcp` instead of keeping the newline.
+  the fallback prefix `mcp` instead of keeping the newline (#1391).
   **Behavior change**: `mms add --prefix` with a trailing newline now exits
   with the invalid-prefix error, and an imported or synced host entry whose
   name ends in a newline is registered with prefix `mcp`. Prefixes already
@@ -63,7 +1447,7 @@ changes inline only. See the deprecation policy in
   registered names. With an empty registry, the command now suggests
   `mms import --apply` instead of `mms import --from <host>`: without
   `--apply`, `mms import` only previews and writes nothing, so re-running
-  `mms project enable` as the message said failed again.
+  `mms project enable` as the message said failed again (#1390).
   **Behavior change**: only the hint text of these two errors changes; the
   exit code and the name check are the same.
 - `mms host sync` now points at a command that actually re-stamps a changed
@@ -84,6 +1468,17 @@ changes inline only. See the deprecation policy in
   only with `--apply`.
   **Behavior change**: only the text output of `mms host sync` changes; exit
   codes, the `--json` payload, and what is written are the same.
+- `mms import --plan --allow-project-configs` now ends with an apply hint that
+  keeps the flag (#1401). It printed `To apply: mms import --from <host>
+  --apply`, and running that refused the project-local entries the plan had
+  just listed; with the flag given, the plan also leaves out its note that
+  `--apply` needs it, so nothing said the hint was incomplete. The flag is
+  still not added when the plan was not given it: the plan's note and the
+  apply refusal name it, the same rule as `mms host sync`'s hints. The
+  plan's `--show-imported` hint for redacted secrets follows the same rule, so
+  going from it to its own apply hint keeps the flag too.
+  **Behavior change**: only those two hint lines change; exit codes and what
+  is written are the same.
 - A host entry that starts STM or LTM as `<python> -m <module>` is now
   recognized as STM's own registration or the LTM companion, like the
   `mms` / `memtomem-server` forms already were. That is the form STM writes
@@ -117,6 +1512,60 @@ changes inline only. See the deprecation policy in
   **Behavior change**: for such a text the stored value is the placeholder,
   and the tool's reply adds `the description was withheld by the privacy
   screen and not stored`. Rows written before this change are not rewritten.
+
+- The "missing baseline hash" footer of `mms host status` names
+  `mms host sync --apply` where it named `mms import --apply`. `mms import
+  --apply` stamps only an entry with no sidecar row; for a row that exists
+  but cannot be compared it answered "Already up to date" and the entry
+  stayed `no_baseline`. On this release such a row is one whose drift-hash
+  key was lost (see the Security entry); an unkeyed row with a hash version
+  other than 1, which no release wrote, is now refused on load instead.
+  `mms host sync --apply` stamps an entry with no row and one whose row
+  cannot be compared, for any entry a host scan still finds, except one
+  whose baseline source the scan skipped, which stays `not_inspected`
+  (GHSA-8xcm-66jc-qmfr).
+  **Behavior change**: only the footer text changes.
+
+### Security
+
+- `mms host status --json` and `mms host sync --json` no longer print a hash
+  that confirms a guessed credential. The drift hash covers a server's
+  `command`, `args` and `env` values. It was the first 16 hex characters of a
+  plain SHA-256 of them, printed as `baseline_hash` / `current_hash` and
+  stored in `~/.mms/import_state.toml`, so someone who saw a report and knew
+  the rest of the entry could confirm a guessed `env` value by recomputing
+  it. The hash is now an HMAC under a random key kept in
+  `~/.mms/import_state.toml.key` (mode `0600`, created by the first
+  `mms import --apply` or `mms host sync --apply` that writes), and no
+  unkeyed value is printed. A report made by an earlier version still
+  confirms guesses: rotate a credential whose entry appeared in one that left
+  the machine. The key sits beside `registry.toml`, which holds the same
+  values in plain text, so this covers reports and copies of the sidecar, not
+  a copy of the whole directory. (GHSA-8xcm-66jc-qmfr)
+  **Behavior change**: `baseline_hash` and `current_hash` are now
+  `hmac-sha256:<16 hex>`, differ between installations, and cannot be
+  recomputed from a host config. While no key file exists — after upgrading,
+  until the first `--apply` that writes — `current_hash` is `null`, and so is
+  the `baseline_hash` of a row an earlier version wrote. `state` does not
+  depend on either field. A sidecar row that pairs an unkeyed `sha256:` hash
+  with a `drift_hash_version` other than 1 is now refused on load like any
+  other malformed row; no release wrote one. Baselines written by an earlier
+  version keep their state: they are compared as before, and
+  `mms host sync --apply`, or an `mms import --apply` that finds at least
+  one host definition, re-keys them in place (`REKEY` in the plan,
+  `summary.rekeyed` in `--json`); until then the sidecar still holds the
+  unkeyed values. That write also moves the sidecar to `schema_version = 2`
+  with a `drift_key_id` on each row, which an earlier STM refuses to read: to
+  go back, delete `~/.mms/import_state.toml` and run `mms host sync --apply`
+  there, which stamps every entry from the host's current config.
+  If the key file is lost or replaced, the rows it stamped read `no_baseline`
+  and `mms host sync --apply` stamps them again from the host's current
+  config, so an edit made there in between is not reported. An unreadable or
+  malformed key file is an error (exit 1, naming the file) for `mms host
+  status`, `mms host sync` and an `--apply` that writes, and is left as it
+  is; moving it aside counts as losing it. The key file is created with a
+  hard link, so with `~/.mms` on a filesystem without hard links `--apply`
+  exits 1 before writing anything.
 
 ## [0.7.8] — 2026-11-14
 

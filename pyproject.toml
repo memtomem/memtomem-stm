@@ -1,6 +1,6 @@
 [project]
 name = "memtomem-stm"
-version = "0.7.8"
+version = "0.7.11"
 description = "MCP proxy for AI agents: compresses and caches tool responses, and surfaces relevant memories from memtomem LTM"
 authors = [
     {name = "DAPADA Inc.", email = "contact@dapada.co.kr"},
@@ -41,6 +41,11 @@ dependencies = [
     # Direct SDK wire-serialization imports in proxy/_fastmcp_compat.py.
     "mcp-types>=2.2.0,<3",
     "pydantic>=2.10",
+    # Imported directly (``proxy/config.py`` imports ``ErrorDetails`` for its
+    # annotations; ``pydantic`` does not re-export it), so declared rather than
+    # borrowed from ``pydantic``. No version bound: ``pydantic`` already pins
+    # ``pydantic-core`` exactly.
+    "pydantic-core",
     "pydantic-settings>=2.7",
     "httpx>=0.28",
     # The 2.0 SDK moved its own HTTP client to ``httpx2``. We import it
@@ -49,6 +54,12 @@ dependencies = [
     # transport errors as retryable — so it is declared rather than borrowed
     # transitively. ``httpx`` stays: this package's own HTTP calls use it.
     "httpx2>=2.5.0",
+    # Imported directly (``server.py``: ``CancelScope``;
+    # ``utils/mcp_transport.py``: stream exceptions), so declared rather than
+    # borrowed transitively (``mcp``, ``httpx`` and ``starlette`` all pull it
+    # in today). The floor matches the one ``mcp`` 2.2 and 2.3 set for
+    # Python < 3.14, so declaring it does not narrow resolution.
+    "anyio>=4.9",
     "click>=8.1",
     "questionary>=2.0",
     "tomli-w>=1.0",
@@ -62,6 +73,13 @@ langfuse = ["langfuse>=4.0", "urllib3>=2.7.0"]
 otlp = [
     "opentelemetry-sdk>=1.45.1",
     "opentelemetry-exporter-otlp-proto-http>=1.45.1",
+    # Imported directly by ``observability/otlp.py`` (``opentelemetry.trace``;
+    # ``requests.Session`` for the export session), so declared rather than
+    # borrowed transitively. The floors are no higher than what the published
+    # SDK and exporter releases (1.45.1, 1.45.2) already require, so declaring
+    # them does not narrow resolution.
+    "opentelemetry-api>=1.45.1",
+    "requests>=2.7",
     "urllib3>=2.7.0",
 ]
 langchain = [
@@ -111,9 +129,12 @@ dev = [
     "nbclient>=0.10",
     "nbmake>=1.5",
     # Exercised by tests/test_observability_otlp.py via an in-memory span
-    # exporter — no network. Mirrors the `otlp` extra.
+    # exporter and loopback collectors. CI syncs this group, not the `otlp`
+    # extra.
     "opentelemetry-sdk>=1.45.1",
     "opentelemetry-exporter-otlp-proto-http>=1.45.1",
+    "opentelemetry-api>=1.45.1",
+    "requests>=2.7",
     # tests/test_docs_links.py parses the public docs with a real CommonMark
     # parser instead of hand-rolling one. Declared rather than leaned on as
     # rich's transitive dependency, which could drop it at any release.

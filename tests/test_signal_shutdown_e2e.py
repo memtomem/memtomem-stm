@@ -15,7 +15,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import IO
 
 import pytest
 
@@ -26,11 +28,18 @@ pytestmark = [
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FAKE_UPSTREAM = Path(__file__).resolve().parent / "_fake_memtomem_server.py"
+_GATED_SERVER = Path(__file__).resolve().parent / "_gated_stm_server.py"
 _EXIT_BUDGET_SECONDS = 30.0
 _HANDSHAKE_BUDGET_SECONDS = 30.0
 
 
-def _start_server(tmp_path: Path, *, log_level: str = "WARNING") -> subprocess.Popen[bytes]:
+def _start_server(
+    tmp_path: Path,
+    *,
+    log_level: str = "WARNING",
+    argv: list[str] | None = None,
+    stderr: IO[bytes] | int = subprocess.PIPE,
+) -> subprocess.Popen[bytes]:
     # A real proxied upstream, so the server owns a real stdio child: without
     # one the "leaves nothing behind" assertion has nothing to assert on.
     upstreams = {
@@ -49,10 +58,10 @@ def _start_server(tmp_path: Path, *, log_level: str = "WARNING") -> subprocess.P
         PYTHONPATH=str(_REPO_ROOT / "src"),
     )
     return subprocess.Popen(
-        [sys.executable, "-m", "memtomem_stm.server"],
+        argv if argv is not None else [sys.executable, "-m", "memtomem_stm.server"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=stderr,
         env=env,
         cwd=str(_REPO_ROOT),
     )
@@ -91,26 +100,40 @@ def _initialize(proc: subprocess.Popen[bytes]) -> None:
     proc.stdin.flush()
 
 
-def _wait_for_stderr(proc: subprocess.Popen[bytes], needle: bytes) -> bool:
-    """Wait until *needle* appears on the child's stderr, under a deadline."""
-    assert proc.stderr is not None
-    seen: list[bool] = []
+def _settle(proc: subprocess.Popen[bytes]) -> None:
+    """Finish one request round trip after the handshake.
 
-    def _scan() -> None:
-        assert proc.stderr is not None
-        for line in proc.stderr:
-            if needle in line:
-                seen.append(True)
-                return
+    A signal in the first milliseconds after the handshake meets a different
+    teardown: the SDK's task group scope can be cancelled while it runs, which
+    the lifespan's shield absorbs (#1468). The test about the ordinary shutdown
+    stays out of that window so it tests one thing; the window has its own
+    test below."""
+    assert proc.stdin is not None
+    proc.stdin.write(b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n')
+    proc.stdin.flush()
+    # Notifications may come first; the answer is the line carrying our id.
+    for _ in range(20):
+        message = json.loads(_read_line_or_fail(proc))
+        if message.get("id") == 2:
+            assert "result" in message, message
+            return
+    raise AssertionError("no answer to tools/list")
 
-    scanner = threading.Thread(target=_scan, daemon=True)
-    scanner.start()
-    scanner.join(timeout=_HANDSHAKE_BUDGET_SECONDS)
-    return bool(seen)
+
+def _wait_until(condition: Callable[[], bool]) -> bool:
+    """Poll *condition* under the handshake deadline."""
+    deadline = time.monotonic() + _HANDSHAKE_BUDGET_SECONDS
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
 
 
 def _children(pid: int) -> set[int]:
-    out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
+    out = subprocess.run(
+        ["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=10.0
+    ).stdout
     return {int(tok) for tok in out.split() if tok.isdigit()}
 
 
@@ -122,6 +145,25 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def _gone(pid: int) -> bool:
+    """Exited, whether or not anyone has reaped it yet.
+
+    The leaked-child sweep terminates a child without reaping it, so after the
+    server exits the child can linger as a zombie of whichever process adopted
+    it, and a signal-0 probe still finds a zombie. ``ps`` reads the state
+    without reaping."""
+    if not _alive(pid):
+        return True
+    state = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10.0
+    ).stdout.strip()
+    if not state:
+        # No status: it may have gone between the probes, or ps may have failed.
+        # Only a second probe tells those apart.
+        return not _alive(pid)
+    return state.startswith("Z")
+
+
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["term", "int"])
 def test_a_signalled_server_exits_and_leaves_nothing_behind(
     tmp_path: Path, sig: signal.Signals
@@ -129,9 +171,14 @@ def test_a_signalled_server_exits_and_leaves_nothing_behind(
     """Before this, the default disposition killed the process where it stood:
     the lifespan teardown never ran and every stdio child was reparented — the
     #906 end state, produced by the first command an operator reaches for."""
-    proc = _start_server(tmp_path)
+    # A file, not a pipe: a failure message that read a pipe to EOF would wait
+    # on any leaked child still holding its write end.
+    stderr_path = tmp_path / "stderr.log"
+    with stderr_path.open("wb") as stderr_file:
+        proc = _start_server(tmp_path, stderr=stderr_file)
     try:
         _initialize(proc)
+        _settle(proc)
         before = _children(proc.pid)
         # The proxied upstream is a real stdio child; without one this test
         # would assert nothing about cleanup.
@@ -142,12 +189,12 @@ def test_a_signalled_server_exits_and_leaves_nothing_behind(
         returncode = proc.wait(timeout=_EXIT_BUDGET_SECONDS)
         elapsed = time.monotonic() - started
 
-        # Exit 0, promptly: the cancellation unwind ran the real teardown. The
-        # watchdog budget here is 10s, so anything slower than that — or a
-        # non-zero status — means the mechanism failed and only the backstop
-        # saved us. (Closing fd 0 to fake EOF was the first design and does
-        # exactly that: the blocked read never wakes.)
-        assert returncode == 0, proc.stderr.read().decode()[-2000:] if proc.stderr else returncode
+        # Exit 0, promptly: the cancellation unwind ran the real teardown to
+        # its end. Status 1 means it was cut short, or the watchdog (budget
+        # 10s here) ended it, in which case only the backstop saved us.
+        # (Closing fd 0 to fake EOF was the first design and does exactly
+        # that: the blocked read never wakes.)
+        assert returncode == 0, stderr_path.read_bytes().decode(errors="replace")[-2000:]
         assert elapsed < 5.0
         assert not any(_alive(pid) for pid in before)
     finally:
@@ -163,20 +210,151 @@ def test_a_twice_signalled_server_exits_with_the_signal_status(tmp_path: Path) -
     """The conventional 128+signum, so a supervisor reading the status sees what
     actually happened rather than a generic failure.
 
-    The second signal is sent only once the first has been *handled* — POSIX
-    does not queue signals, so firing both immediately can collapse into one
-    delivery and let the graceful path satisfy the assertion, which would hide
-    a broken second-signal handler entirely.
+    Two waits come before the second signal. The log line shows the first
+    signal was *handled*: a SIGINT sent while another is still pending
+    coalesces with it, so two sent back to back can arrive as one. The gate
+    (see ``_gated_stm_server.py``) holds the teardown open: its
+    ``gate-entered`` file only marks entry, and the absence of ``gate-left``
+    after the exit is what shows the hold never unwound before the second
+    signal ended the process. Without the gate, an idle server can finish its
+    teardown and exit 0 soon after the log line (121-182 ms in local macOS
+    runs), and a second signal sent later than that never reaches a handler
+    (#1434).
     """
-    proc = _start_server(tmp_path, log_level="INFO")
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    # A file, not a pipe: polling it needs no reader thread, and nothing waits
+    # for EOF on a stream the proxied upstream also inherits.
+    stderr_path = tmp_path / "stderr.log"
+    with stderr_path.open("wb") as stderr_file:
+        proc = _start_server(
+            tmp_path,
+            log_level="INFO",
+            argv=[sys.executable, str(_GATED_SERVER), str(gate_dir)],
+            stderr=stderr_file,
+        )
+
+    def log_tail() -> str:
+        return stderr_path.read_bytes().decode(errors="replace")[-2000:]
+
     try:
         _initialize(proc)
+        assert _children(proc.pid), "expected the proxied upstream to be running as a child"
         proc.send_signal(signal.SIGINT)
-        assert _wait_for_stderr(proc, b"Signal again to exit immediately"), (
-            "the first signal was never handled"
+        assert _wait_until(
+            lambda: b"Signal again to exit immediately" in stderr_path.read_bytes()
+        ), "the first signal was never handled\n" + log_tail()
+        assert _wait_until((gate_dir / "gate-entered").exists), (
+            "teardown never reached ProxyManager.stop()\n" + log_tail()
         )
         proc.send_signal(signal.SIGINT)
-        assert proc.wait(timeout=_EXIT_BUDGET_SECONDS) == 128 + int(signal.SIGINT)
+        returncode = proc.wait(timeout=_EXIT_BUDGET_SECONDS)
+        assert returncode == 128 + int(signal.SIGINT), log_tail()
+        # The exit came while the gate still held the teardown, not after it.
+        assert not (gate_dir / "gate-left").exists(), log_tail()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10.0)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def test_a_signal_right_after_the_handshake_runs_the_close_sequence(tmp_path: Path) -> None:
+    """A SIGINT sent as soon as the client has written ``initialized`` (not
+    waiting for the server to process it) used to cut the teardown short in
+    about half of local macOS runs: the SDK's task group scope, cancelled
+    during teardown, delivered the cancellation into ``ProxyManager.stop()``,
+    and the leaked-child sweep had to terminate the upstream (#1468).
+
+    A smoke test against the real SDK, with several runs because the window is
+    a matter of timing. Each run must show in its log that the upstream
+    connected, read after the exit, since a probe before the signal would move
+    it out of the window. The deterministic check is the lifespan unit test
+    with a cancelled host scope."""
+    for attempt in range(5):
+        run_dir = tmp_path / f"run-{attempt}"
+        run_dir.mkdir()
+        stderr_path = run_dir / "stderr.log"
+        with stderr_path.open("wb") as stderr_file:
+            proc = _start_server(run_dir, log_level="INFO", stderr=stderr_file)
+        try:
+            _initialize(proc)
+            proc.send_signal(signal.SIGINT)
+            returncode = proc.wait(timeout=_EXIT_BUDGET_SECONDS)
+            log = stderr_path.read_bytes()
+            tail = log.decode(errors="replace")[-2000:]
+            # A run whose upstream never connected has no upstream to close, so the
+            # checks below could pass without exercising the upstream close path.
+            assert b"Connected to 'fake' (" in log, (
+                f"attempt {attempt}: upstream never connected\n{tail}"
+            )
+            assert returncode == 0, f"attempt {attempt}\n{tail}"
+            assert b"did not run to the end" not in log, f"attempt {attempt}\n{tail}"
+            assert b"Terminating leaked child" not in log, f"attempt {attempt}\n{tail}"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10.0)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+
+
+# Replaces ``ProxyManager.stop`` with a step that is cut short, the way a
+# ``CancelledError`` out of a step whose guard catches only ``Exception`` cuts
+# the close sequence short. The marker shows the injected exception is what ended
+# it, rather than a cancellation that arrived first.
+_CUT_SHORT_LAUNCHER = """
+import asyncio, runpy, sys
+from memtomem_stm.proxy import manager
+
+async def _cut_short(self):
+    sys.stderr.write("stop-raising\\n")
+    sys.stderr.flush()
+    raise asyncio.CancelledError
+
+manager.ProxyManager.stop = _cut_short
+runpy.run_module("memtomem_stm.server", run_name="__main__", alter_sys=True)
+"""
+
+
+def test_a_signalled_teardown_cut_short_exits_with_a_failure_status(tmp_path: Path) -> None:
+    """Exit 0 after a signal says the close sequence ran to the end. One cut
+    short by an escaping ``CancelledError`` used to exit 0 too, because the
+    completion was recorded in a ``finally`` (#1459).
+
+    The upstream being gone afterwards does not show what ended it: signal
+    cancellation also unwinds its SDK transport, which can close its stdin, so
+    it can exit on that EOF before the leaked-child sweep looks. That the sweep
+    hands a detected PID to the termination helper after a cut-short stop() is
+    pinned in ``test_server_tools.py``, and that the helper's SIGTERM ends a
+    real child in ``test_child_reaper.py``."""
+    stderr_path = tmp_path / "stderr.log"
+    with stderr_path.open("wb") as stderr_file:
+        proc = _start_server(
+            tmp_path,
+            log_level="INFO",
+            argv=[sys.executable, "-c", _CUT_SHORT_LAUNCHER],
+            stderr=stderr_file,
+        )
+
+    def log_tail() -> str:
+        return stderr_path.read_bytes().decode(errors="replace")[-2000:]
+
+    try:
+        _initialize(proc)
+        before = _children(proc.pid)
+        assert before, "expected the proxied upstream to be running as a child"
+        proc.send_signal(signal.SIGINT)
+        returncode = proc.wait(timeout=_EXIT_BUDGET_SECONDS)
+
+        assert returncode == 1, log_tail()
+        log = stderr_path.read_bytes()
+        assert b"stop-raising" in log, log_tail()
+        assert b"did not run to the end" in log, log_tail()
+        assert _wait_until(lambda: all(_gone(pid) for pid in before)), log_tail()
     finally:
         if proc.poll() is None:
             proc.kill()

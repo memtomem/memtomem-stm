@@ -48,7 +48,13 @@ from typing import Any
 
 from memtomem_stm.cli.hook_adapter import CanonicalHookCall
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
-from memtomem_stm.config import STMConfig, _is_loopback_host, log_stm_config_failure
+from memtomem_stm.config import (
+    STMConfig,
+    _is_loopback_host,
+    load_env_stm_config,
+    log_proxy_env_ignored,
+    log_stm_config_failure,
+)
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
 from memtomem_stm.surfacing.config import holdout_startup_warnings
@@ -57,6 +63,8 @@ from memtomem_stm.surfacing.rrf_profile import read_score_ceiling_hint
 from memtomem_stm.surfacing.store_io import close_store_on_worker
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
+from memtomem_stm.utils.display import _disp
+from memtomem_stm.utils.local_key import LocalKeyError
 from memtomem_stm.daemon.protocol import (
     MAX_CONTEXT_COMPOSE_SCHEMA,
     MAX_MESSAGE_BYTES,
@@ -197,7 +205,7 @@ class DaemonServer:
         # path, handshake path, and handshake content — one value, so the lock we
         # hold, the file we publish, and the fingerprint we advertise can never
         # disagree (and a mid-run env change can't repoint us at a different file).
-        self._fingerprint = discovery.config_fingerprint(config)
+        self._fingerprint = discovery.config_fingerprint(config, create_key=True)
         self._token = secrets.token_hex(32)
         self._port = 0
         self._started_at = time.time()
@@ -1108,17 +1116,35 @@ def run(config: STMConfig | None = None) -> int:
     by the time ``run()`` is called (``daemon_cmd.run_cmd``), so logging here
     lands in that file. Re-raise after logging so the exit code still reflects
     the failure — this only adds observability.
+
+    An unusable discovery key is the one failure reported without a traceback:
+    it is an operator-fixable file, named in a single log line, exit code 1.
     """
-    try:
-        cfg = config if config is not None else STMConfig()
-    except Exception as exc:
-        # The construction used to sit outside the barrier below, so a broken
-        # MEMTOMEM_STM_* env killed the daemon with no trace in the file log
-        # this docstring promises (#847). Log with the env-var hint, re-raise.
-        log_stm_config_failure(exc, logger=logger, context="starting the daemon server")
-        raise
+    if config is not None:
+        cfg = config
+    else:
+        try:
+            load = load_env_stm_config()
+        except Exception as exc:
+            # Inside run(), not before it, so a broken MEMTOMEM_STM_* env
+            # reaches the file log this docstring promises (#847). Log with
+            # the env-var hint, re-raise.
+            log_stm_config_failure(exc, logger=logger, context="starting the daemon server")
+            raise
+        if load.proxy_error is not None:
+            log_proxy_env_ignored(
+                load.proxy_error, logger=logger, context="starting the daemon server"
+            )
+        cfg = load.config
     try:
         return asyncio.run(DaemonServer(cfg).serve())
+    except LocalKeyError as exc:
+        # In the message, not the traceback: the log formatter withholds
+        # exception text, and the file name is what the operator has to fix.
+        # Escaped here because the formatter leaves messages to the call site
+        # and this one quotes ``data_dir``.
+        logger.error("daemon cannot start: %s", _disp(str(exc)))
+        return 1
     except (RuntimeError, ExceptionGroup) as e:
         # A clean anyio cancel-scope teardown on shutdown is not a crash — the
         # main server's barrier ignores the same shape (#410 follow-up).

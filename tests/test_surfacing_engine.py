@@ -3749,7 +3749,7 @@ class TestWebhookExceptionPaths:
     @pytest.mark.parametrize("persist", [True, False])
     async def test_webhook_query_follows_persist_query_text(self, persist):
         """The webhook carries the query in the form that is persisted: the raw
-        text by default, the ``sha256:`` digest when ``persist_query_text`` is off."""
+        text by default, the ``hmac-sha256:`` digest when ``persist_query_text`` is off."""
         captured: dict = {}
 
         async def capture_fire(event, payload):
@@ -3769,9 +3769,9 @@ class TestWebhookExceptionPaths:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         raw = engine._mcp_adapter.search.call_args.kwargs["query"]
-        assert raw and not raw.startswith("sha256:")
+        assert raw and not raw.startswith("hmac-sha256:")
         assert captured["query"] == (raw if persist else engine._persistable_query(raw))
-        assert captured["query"].startswith("sha256:") is (not persist)
+        assert captured["query"].startswith("hmac-sha256:") is (not persist)
 
     async def test_webhook_http_error_is_logged_not_raised(self, caplog):
         """fire() raising (simulating HTTP 500) → warning logged, caller unaffected."""
@@ -6224,7 +6224,7 @@ class TestBuiltinQueryPrivacy:
 
         assert out != LONG_RESPONSE
         adapter.search.assert_awaited_once()
-        assert not adapter.search.await_args.kwargs["query"].startswith("sha256:")
+        assert not adapter.search.await_args.kwargs["query"].startswith("hmac-sha256:")
 
     async def test_the_compose_path_is_skipped_too_pinned_context_included(self):
         """With ``context_compose`` available the skip covers the whole bundle:

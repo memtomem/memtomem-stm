@@ -17,7 +17,7 @@ daemon deadline:
 
 | Flag | Overrides | Meaning |
 |---|---|---|
-| `--use-daemon` / `--no-daemon` | `MEMTOMEM_STM_HOOK__USE_DAEMON` | Surface through the shared warm daemon, or run in-process |
+| `--use-daemon` / `--no-daemon` | `hook.use_daemon` in any form (`MEMTOMEM_STM_HOOK__USE_DAEMON`, `use_daemon` in `MEMTOMEM_STM_HOOK`) | Surface through the shared warm daemon, or run in-process |
 | `--surfacing-timeout-seconds SECONDS` | `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` | LTM search deadline |
 | `--daemon-timeout-seconds SECONDS` | `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS` | Hook-to-daemon deadline; raised to at least one second above `--surfacing-timeout-seconds` whenever that flag is given |
 | `--persist-query-text` / `--no-persist-query-text` | `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT` | Store surfacing query text, or only its hash |
@@ -41,6 +41,10 @@ write only with `--apply`, create a non-clobbering backup, and refuse malformed
 host configuration. Install serializes shared-daemon, deadline, and query-text
 privacy settings into portable runtime flags. `--inherit-runtime-env` omits
 those flags and cannot be combined with the explicit daemon/deadline options.
+Both commands manage only the handler install writes
+(`memtomem-stm hook --host <host>`, bare or after `uv run --directory <dir>`).
+A registration made by hand, such as `mms hook --host claude`, is left in
+place and named by location; see [`mms hook install`](../cli.md).
 
 Current host paths are:
 
@@ -50,7 +54,9 @@ Current host paths are:
 - Kimi: `$KIMI_CODE_HOME/config.toml` or `~/.kimi-code/config.toml`
 
 Claude Bash output replacement requires Claude Code 2.1.121+ and remains
-opt-in. Codex officially accepts PostToolUse `additionalContext`, but STM only
+opt-in. It also requires a registration with `--host claude`; under `auto` it
+never runs, and a call routed to the Claude adapter that it would have
+attempted gets a `systemMessage` and a stderr warning instead. Codex officially accepts PostToolUse `additionalContext`, but STM only
 surfaces read-like `Bash` calls after `/hooks` approval; `apply_patch` is
 metrics-only and Codex output replacement is unsupported. Claude `--bare` and
 `--safe-mode` can bypass installed hooks/MCP. See

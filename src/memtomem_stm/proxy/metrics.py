@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time as _time
@@ -10,6 +11,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TYPE_CHECKING
+
+from memtomem_stm.utils.json_out import has_lone_surrogate
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.metrics_store import MetricsStore
@@ -29,12 +32,108 @@ MAX_ERROR_MESSAGE_CHARS = 500
 # rolling window of the most recent successful live calls, not lifetime.
 LATENCY_WINDOW = 10_000
 
+# Response-cache counts waiting for the next metrics write (#1329), keyed by
+# ``(UTC day, server, tool)``; the value is ``[hits, hit_chars, misses,
+# unstorable]``, the column order of ``proxy_cache_daily``. The cap bounds a
+# process whose store keeps failing: a bucket beyond it is dropped (live
+# counters still count) rather than growing without limit.
+CacheBucketKey = tuple[str, str, str]
+CacheDeltas = dict[CacheBucketKey, list[int]]
+MAX_CACHE_BUCKETS = 1024
+
+# How often a running proxy tries to write cache counts that no metrics write
+# has carried yet, so a proxy serving only cache hits still reaches
+# ``mms stats``. A process that exits abruptly loses whatever is still
+# buffered: since the last successful write, which a busy loop or a failing
+# store can push past one interval. The write runs on the event loop like every
+# per-call metrics write, through its own connection with a short lock budget:
+# a DB another process holds locked makes it fail fast and retry on the next
+# tick, instead of stalling every call on the loop for the full busy timeout.
+CACHE_FLUSH_INTERVAL_SECONDS = 30.0
+CACHE_FLUSH_BUSY_TIMEOUT_MS = 50
+
+
+def _utc_day() -> str:
+    """The UTC calendar day a cache event is counted under."""
+    return _time.strftime("%Y-%m-%d", _time.gmtime(_time.time()))
+
+
 # ``compression_strategy`` of a response whose annotated text blocks were kept
 # apart instead of compressed (#1112): no compressor ran, so the base is
 # ``none``, and the suffix names why. The tuner drops these rows by this exact
 # value, so the writer and that reader share this one definition.
 METADATA_BYPASS_STRATEGY = "none→metadata_bypass"
 STRUCTURED_BYPASS_STRATEGY = "none→structured_bypass"
+
+# ``server`` of a ``source='hook'`` row. Native tools have no upstream server,
+# so the column names the host that ran the tool instead: ``builtin:<host_tag>``.
+# The host rides in ``server`` rather than in a column of its own because the
+# daily rollup is keyed by ``(day, source, server, tool)``: per-host totals then
+# survive trimming with no change to the rollup trigger, and the schema
+# fingerprint other STM versions compare against stays the same. A bare
+# ``builtin`` is a row written before the host was recorded.
+HOOK_SERVER = "builtin"
+_HOOK_SERVER_PREFIX = HOOK_SERVER + ":"
+
+
+def hook_server_label(host_tag: str) -> str:
+    """The ``server`` value ``mms hook`` records for a call from ``host_tag``."""
+    return f"{_HOOK_SERVER_PREFIX}{host_tag}" if host_tag else HOOK_SERVER
+
+
+def hook_host_of(server: str) -> str | None:
+    """The host tag in a hook row's ``server``, or ``None`` when none was recorded.
+
+    Only meaningful for ``source='hook'`` rows: an upstream MCP server may carry
+    any name, this prefix included.
+    """
+    if not server.startswith(_HOOK_SERVER_PREFIX):
+        return None
+    return server[len(_HOOK_SERVER_PREFIX) :] or None
+
+
+# The values of ``CallMetrics.context_query_source``.
+CONTEXT_QUERY_AGENT = "agent"
+CONTEXT_QUERY_NONE = "none"
+
+
+def context_query_source(context_query: str | None) -> str:
+    """Whether the caller supplied a usable ``_context_query`` on this call.
+
+    ``agent`` for a string with something other than whitespace in it, ``none``
+    for everything else: the same test the compressors apply before they score
+    with it. It says a query arrived, not that anything used it: whether a
+    scorer ran depends on the path the response took.
+    """
+    return CONTEXT_QUERY_AGENT if context_query and context_query.strip() else CONTEXT_QUERY_NONE
+
+
+# Every value ``mms hook`` stores in ``hook_compression_status``: what the
+# native output-compression stage decided for that call. Readers render only
+# these names and fold anything else into "other", so a value written by
+# something other than this code never reaches a terminal verbatim.
+HOOK_COMPRESSION_STATUSES = frozenset(
+    {
+        "compressed",
+        # Not compressed, by gate:
+        "below_threshold",
+        "already_compressed",
+        "retention_guard",
+        "budget_too_small",
+        "unsafe_result",
+        # Not a candidate for compression:
+        "disabled",
+        "ineligible_event",
+        "ineligible_tool",
+        "unsupported_shape",
+        # The host cannot replace tool output (Codex, Cursor, Kimi).
+        "unsupported_host",
+        # The host can, but the hook was not registered with ``--host claude``
+        # (#1437): replacement is refused under host auto-detection.
+        "replacement_not_requested",
+        "error",
+    }
+)
 
 
 def format_error_message_from_exc(exc: BaseException) -> str:
@@ -98,7 +197,9 @@ class ErrorCategory(StrEnum):
 
     TRANSPORT = "transport"  # OSError, ConnectionError, EOFError
     TIMEOUT = "timeout"  # asyncio.TimeoutError on upstream call_tool (#206)
-    PROTOCOL = "protocol"  # JSON-RPC errors (-32600..-32603)
+    # JSON-RPC errors (-32600..-32603), or an upstream result the SDK rejects
+    # (no ``error_code`` then)
+    PROTOCOL = "protocol"
     UPSTREAM_ERROR = "upstream_error"  # result.isError=True from upstream
     DELIVERY = "delivery"  # configured structured output budget cannot make progress
     OVERSIZE = "oversize"  # inbound MCP message/result exceeded byte budget
@@ -218,7 +319,9 @@ class CallMetrics:
     #               or a branch settled the strategy without consulting it.
     strategy_auto_selected: bool | None = None
     ratio_violation: bool = False
-    # Scorer fallback: True when EmbeddingScorer fell back to BM25 during this call.
+    # Scorer fallback: True when EmbeddingScorer fell back to BM25 during this call
+    # because its endpoint failed. A pass routed to BM25 by the credential screen
+    # (``relevance_scorer.privacy_scan_enabled``) asked no endpoint and is not one.
     scorer_fallback: bool = False
     # Memory-pipeline status — populated by Stage 4 (INDEX) and Stage 4b (EXTRACT).
     #
@@ -271,6 +374,19 @@ class CallMetrics:
     compression_accounting: str | None = None
     delivery_format: str = "legacy"
     wire_bytes: int | None = None
+    # ``source='hook'`` rows only: the native compression stage's decision, one
+    # of ``HOOK_COMPRESSION_STATUSES``. ``None`` on MCP rows and on hook rows
+    # written before the column existed. Kept apart from
+    # ``compression_strategy``, which names a strategy that ran — a call the
+    # gate passed over ran none. Last, so no positional caller shifts.
+    hook_compression_status: str | None = None
+    # ``context_query_source(...)`` for the two MCP success rows that carry a
+    # ``compression_accounting`` stamp. ``None`` on every other row — errors,
+    # an upstream result with no text block, ``mms hook`` rows, rows written
+    # before the column — which a reader leaves out rather than counts as
+    # "no query".
+    # Only the fact is kept; this row never holds the query's text.
+    context_query_source: str | None = None
 
 
 class RPSTracker:
@@ -323,6 +439,15 @@ class TokenTracker:
         self._cache_unstorable = 0
         self._reconnects = 0
         self._metrics_store = metrics_store
+        # Attributed cache counts not yet on disk. They ride the next
+        # ``record``/``record_error`` write, the periodic flush, or
+        # ``flush_cache_counts`` at shutdown, so the hit path itself never
+        # touches SQLite (#1329).
+        self._cache_deltas: CacheDeltas = {}
+        self._cache_cap_warned = False
+        # Set by a failed periodic flush, cleared by any committed batch: one
+        # warning per failure streak, not one every tick.
+        self._periodic_flush_warned = False
         self._by_server = _BoundedCounterDict(
             lambda: {"calls": 0, "original_chars": 0, "compressed_chars": 0},
             max_size=max_tracked_keys,
@@ -404,13 +529,129 @@ class TokenTracker:
         t["compressed_chars"] += compressed
 
         # Persist to SQLite
-        if self._metrics_store is not None:
-            try:
-                self._metrics_store.record(metrics)
-            except Exception:
-                logger.warning("Failed to persist metrics", exc_info=True)
+        self._persist(metrics, "Failed to persist metrics")
 
-    def record_cache_hit(self, chars: int = 0) -> None:
+    def _persist(self, metrics: CallMetrics, failure: str) -> None:
+        """Write one metrics row, carrying the buffered cache counts with it.
+
+        The counts are taken out of the buffer first and merged back unless
+        the store reports them committed, so each count reaches disk exactly
+        once. A store failure stays best-effort, as before #1329. Counts are
+        only passed when there are some, so a store without the keyword (a
+        test double) keeps working."""
+        store = self._metrics_store
+        if store is None:
+            return
+        deltas, self._cache_deltas = self._cache_deltas, {}
+        try:
+            if deltas:
+                committed = store.record(metrics, cache_deltas=deltas)
+            else:
+                store.record(metrics)
+                committed = True
+        except Exception:
+            self._restore_cache_deltas(deltas)
+            logger.warning(failure, exc_info=True)
+            return
+        if not committed:
+            self._restore_cache_deltas(deltas)
+        elif deltas:
+            self._periodic_flush_warned = False
+
+    def flush_cache_counts(self, *, periodic: bool = False) -> None:
+        """Write the buffered cache counts on their own.
+
+        A failure is logged and the counts stay buffered; nothing raises.
+        ``periodic`` is the timer's (and the early teardown) attempt: it uses
+        the short ``CACHE_FLUSH_BUSY_TIMEOUT_MS`` lock budget and warns once
+        per failure streak. The final shutdown attempt keeps the store's full
+        budget and warns every time."""
+        store = self._metrics_store
+        if store is None or not self._cache_deltas:
+            return
+        deltas, self._cache_deltas = self._cache_deltas, {}
+        try:
+            if periodic:
+                store.record_cache_counts(deltas, busy_timeout_ms=CACHE_FLUSH_BUSY_TIMEOUT_MS)
+            else:
+                store.record_cache_counts(deltas)
+        except Exception:
+            self._restore_cache_deltas(deltas)
+            if not periodic:
+                logger.warning("Failed to persist cache counts", exc_info=True)
+            elif not self._periodic_flush_warned:
+                self._periodic_flush_warned = True
+                logger.warning(
+                    "Failed to persist cache counts; kept for the next write "
+                    "(further periodic failures are not logged until one succeeds)",
+                    exc_info=True,
+                )
+            return
+        self._periodic_flush_warned = False
+
+    async def run_cache_flush_loop(
+        self, interval_seconds: float = CACHE_FLUSH_INTERVAL_SECONDS
+    ) -> None:
+        """Flush the buffered cache counts every ``interval_seconds`` until
+        cancelled. The write is synchronous on the loop, as ``record()`` is;
+        an empty buffer writes nothing."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            self.flush_cache_counts(periodic=True)
+
+    def _restore_cache_deltas(self, deltas: CacheDeltas) -> None:
+        for key, counts in deltas.items():
+            bucket = self._cache_bucket(key)
+            if bucket is not None:
+                for i, value in enumerate(counts):
+                    bucket[i] += value
+
+    def _cache_bucket(self, key: CacheBucketKey) -> list[int] | None:
+        bucket = self._cache_deltas.get(key)
+        if bucket is None:
+            if len(self._cache_deltas) >= MAX_CACHE_BUCKETS:
+                if not self._cache_cap_warned:
+                    self._cache_cap_warned = True
+                    logger.warning(
+                        "Dropping persisted cache counts for new server/tool buckets: "
+                        "%d buckets are waiting for a metrics write",
+                        MAX_CACHE_BUCKETS,
+                    )
+                return None
+            bucket = self._cache_deltas[key] = [0, 0, 0, 0]
+        return bucket
+
+    def _buffer_cache(
+        self,
+        server: str | None,
+        tool: str | None,
+        *,
+        hits: int = 0,
+        hit_chars: int = 0,
+        misses: int = 0,
+        unstorable: int = 0,
+    ) -> None:
+        """Add to the persisted cache counts — a dict update, no store call.
+
+        The only side effect beyond the dict is the one overflow warning per
+        tracker that ``_cache_bucket`` logs when the bucket cap is reached.
+
+        Unattributed calls (``server``/``tool`` not given), a tracker with no
+        store, and labels SQLite cannot bind (lone surrogates reach the cache
+        key path) stay in memory only, so one bad label cannot hold back the
+        batch it would join."""
+        if self._metrics_store is None or server is None or tool is None:
+            return
+        if has_lone_surrogate(server) or has_lone_surrogate(tool):
+            return
+        bucket = self._cache_bucket((_utc_day(), server, tool))
+        if bucket is not None:
+            for i, value in enumerate((hits, hit_chars, misses, unstorable)):
+                bucket[i] += value
+
+    def record_cache_hit(
+        self, chars: int = 0, *, server: str | None = None, tool: str | None = None
+    ) -> None:
         """Record a response served from the cache.
 
         Cache hits are deliberately NOT folded into ``record()``: ``_total_calls``
@@ -421,26 +662,36 @@ class TokenTracker:
         otherwise be structurally excluded from (#558); ``get_summary`` exposes
         the reconciliation as ``total_invocations = total_calls + cache_hits +
         total_errors``.
+
+        ``server``/``tool`` attribute the hit for the persisted daily counts
+        (#1329); without them it is counted in memory only.
         """
         self._cache_hits += 1
         self._cache_hit_chars += chars
+        self._buffer_cache(server, tool, hits=1, hit_chars=chars)
 
-    def record_cache_miss(self) -> None:
+    def record_cache_miss(self, *, server: str | None = None, tool: str | None = None) -> None:
         self._cache_misses += 1
+        self._buffer_cache(server, tool, misses=1)
 
-    def record_cache_unstorable(self) -> None:
+    def record_cache_unstorable(
+        self, *, server: str | None = None, tool: str | None = None
+    ) -> None:
         """Record a counted cache miss whose response the cache refused to store.
 
         Without this, a tool whose responses are never storable (mixed/non-text
         content, transient retrieval keys, …) re-misses forever: ``cache_misses``
         grows unbounded while its hit-rate contribution stays 0%, and the
-        diagnostics point at a tool the cache can never help (#558). Callers only
-        invoke this when the lookup path actually recorded a miss, so
-        ``cache_misses - cache_unstorable`` is the demand the cache can convert
-        to hits. Best-effort: store-side failures after an accepted response
-        (sqlite errors, the privacy write gate) are not counted.
+        diagnostics point at a tool the cache can never help (#558). The proxy
+        calls this only for a call whose own lookup recorded a miss — the manager
+        carries that fact from the lookup rather than re-checking eligibility at
+        completion (#1473) — so ``cache_misses - cache_unstorable`` is the miss
+        count the storable hit rate uses. Best-effort: store-side failures
+        after an accepted response (sqlite errors, the privacy write gate) are
+        not counted.
         """
         self._cache_unstorable += 1
+        self._buffer_cache(server, tool, unstorable=1)
 
     def record_reconnect(self) -> None:
         self._reconnects += 1
@@ -473,11 +724,7 @@ class TokenTracker:
             self._errors_by_category[metrics.error_category.value] += 1
         self._errors_by_server[metrics.server] += 1
 
-        if self._metrics_store is not None:
-            try:
-                self._metrics_store.record(metrics)
-            except Exception:
-                logger.warning("Failed to persist error metrics", exc_info=True)
+        self._persist(metrics, "Failed to persist error metrics")
 
     def _percentiles(self, values: deque[float] | list[float]) -> dict[str, float]:
         """Return p50/p95/p99 for a list of latency values."""

@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
+from collections.abc import Mapping
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic_settings import (
+    BaseSettings,
+    EnvSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    SettingsError,
+)
 
+from memtomem_stm.cli.host_runtime import HOOK_FLAG_NAMES, active_hook_flags, hook_flags_scope
 from memtomem_stm.proxy.config import ProxyConfig, UpstreamServerCompletionSource
 from memtomem_stm.surfacing.config import SurfacingConfig
 
@@ -201,15 +212,21 @@ class OtlpExportConfig(BaseModel):
                 except (ModuleNotFoundError, ImportError, ValueError):
                     return True
 
+            # ``requests`` is probed because ``observability/otlp.py`` imports
+            # it to build the export session; it is not an OpenTelemetry module.
             missing = [
                 name
-                for name in ("opentelemetry.sdk", "opentelemetry.exporter.otlp.proto.http")
+                for name in (
+                    "opentelemetry.sdk",
+                    "opentelemetry.exporter.otlp.proto.http",
+                    "requests",
+                )
                 if _absent(name)
             ]
             if missing:
                 raise ValueError(
-                    "OtlpExportConfig.enabled=true but the OpenTelemetry packages are "
-                    f"not installed (missing: {', '.join(missing)}). Install the otlp "
+                    "OtlpExportConfig.enabled=true but required OTLP modules could not "
+                    f"be found (missing: {', '.join(missing)}). Install the otlp "
                     "extra (e.g. `uv tool install --reinstall 'memtomem-stm[otlp]'` "
                     "or `pip install 'memtomem-stm[otlp]'`)."
                 )
@@ -329,7 +346,8 @@ class HookCompressionConfig(BaseModel):
     """Opt-in (default ``False``), mirroring ``proxy.enabled``. Because
     compression *replaces* model-visible output it ships dormant; enable with
     ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`` after the empirical hook test
-    confirms the host honors ``updatedToolOutput`` for Bash."""
+    confirms the host honors ``updatedToolOutput`` for Bash. Takes effect only
+    for a hook registered with an explicit ``--host claude``."""
     max_chars: int = Field(default=16000, gt=0)
     """Target character budget for the replacement ``stdout`` channel, and the
     threshold below which output is left untouched (only stdout longer than this
@@ -356,9 +374,12 @@ class HookConfig(BaseModel):
     """When ``True`` (the default), ``mms hook`` routes surfacing through the
     local daemon (warm LTM connection) instead of spawning a cold LTM subprocess
     per call. The daemon is auto-spawned on first use (see ``auto_spawn``), so no
-    manual ``mms daemon start`` is needed. Set
-    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` to opt out to the legacy cold in-process
-    path."""
+    manual ``mms daemon start`` is needed. Set it false (e.g.
+    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``) to opt out to the legacy cold
+    in-process path. A hook command's ``--use-daemon``/``--no-daemon`` overrides this
+    setting for that command; ``mms hook install`` writes one by default (not
+    with ``--inherit-runtime-env``), and a command with neither follows this
+    setting."""
     daemon_timeout_seconds: float = Field(default=2.5, gt=0.0, allow_inf_nan=False)
     """Per-request wall-clock budget for the hook→daemon round trip, and the
     effective ceiling on the LTM attempt inside it. Small and independent of the
@@ -398,7 +419,7 @@ class HookConfig(BaseModel):
     return a rating) and skips the durable-demotion read; the daemon also
     forces auto-tune off in this mode. Surfacing telemetry is recorded either
     way whenever the dedup tracker exists: ``surfacing_events`` rows with
-    ``server='builtin'`` and a ``sha256:`` digest query (the daemon forces
+    ``server='builtin'`` and an ``hmac-sha256:`` digest query (the daemon forces
     ``persist_query_text=False``, so raw query text — e.g. a ``Bash`` command
     carrying secrets — never persists), so ``stm_surfacing_stats`` /
     ``mms stats`` / ``mms doctor`` reflect hook-path activity. See
@@ -634,10 +655,18 @@ class STMConfig(BaseSettings):
         ``prefix`` (#835). The completion source hands the file's entry for
         those server names to the merge, below the environment, so env fields
         still win — see ``UpstreamServerCompletionSource`` for its scope.
+
+        The hook's runtime flags (``host_runtime.hook_flags_scope``) are laid
+        over the environment source's data here (:class:`_HookFlagsOverEnv`),
+        so they outrank every form the environment can give the same field
+        (#1537). The completion source still reads the environment source
+        itself: the flags never touch ``proxy``.
         """
+        flags = active_hook_flags()
+        env_source = _HookFlagsOverEnv(settings_cls, env_settings, flags) if flags else env_settings
         return (
             init_settings,
-            env_settings,
+            env_source,
             dotenv_settings,
             file_secret_settings,
             UpstreamServerCompletionSource(settings_cls, init_settings, env_settings),
@@ -696,11 +725,10 @@ def log_stm_config_failure(
     names only, never values (the attached traceback is covered by the root
     ``hide_input_in_errors``).
 
-    Logging only, deliberately not a construct-or-``None`` helper: each caller
-    keeps its existing failure path (re-raise into an outer barrier, degrade
-    to pass-through, exit non-zero) — changing WHICH paths fail is the
-    tolerant-construction half of #847, deferred behind its wait-for-signal
-    gate.
+    Logging only: each caller keeps its own failure path (re-raise into an
+    outer barrier, degrade to pass-through, exit non-zero). This line is for a
+    failure nothing recovered from; one that :func:`load_env_stm_config`
+    recovered from is reported by :func:`log_proxy_env_ignored` instead.
 
     ``exc_info=False`` is for sites that re-raise into a barrier which logs
     the traceback itself (the hook's pass-through guard): the hint line and
@@ -709,8 +737,10 @@ def log_stm_config_failure(
     itself rather than ``True``: ``True`` captures whatever exception is
     ambient at call time — ``None`` outside an ``except`` block — not the
     one this line is reporting.
+
+    Under the hook's runtime flags the hint names a flag the way its command
+    sets it (:func:`hook_flags_hint`).
     """
-    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
     from memtomem_stm.utils.display import _disp
 
     logger.warning(
@@ -718,6 +748,249 @@ def log_stm_config_failure(
         context,
         # The names are the operator's own variables, and one can carry a
         # newline or a bidi control that would forge or reorder the line (#1166).
-        _disp(env_var_hint_for_validation_error(exc)),
+        _disp(hook_flags_hint(exc, active_hook_flags())),
+        exc_info=exc if exc_info else None,
+    )
+
+
+_PROXY_ENV_NAME = "memtomem_stm_proxy"
+"""The ``proxy`` field's variable under ``STMConfig``'s prefix, lower-cased the
+way pydantic-settings stores names when ``case_sensitive`` is off."""
+
+
+def _is_proxy_env_name(name: str) -> bool:
+    lowered = name.lower()
+    return lowered == _PROXY_ENV_NAME or lowered.startswith(_PROXY_ENV_NAME + "__")
+
+
+class _ProxyEnvIgnoredSTMConfig(STMConfig):
+    """``STMConfig`` built as if no ``MEMTOMEM_STM_PROXY*`` variable were set.
+
+    Only :func:`load_env_stm_config` builds it. The filter applies to the env
+    source's own snapshot, and ``UpstreamServerCompletionSource`` reads the env
+    through that same source, so it has nothing to complete and reads no file.
+    """
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Any other source type is left alone: the rebuild then sees the same
+        # proxy variables, fails the same way, and the original error is raised.
+        if isinstance(env_settings, EnvSettingsSource):
+            env_settings.env_vars = {
+                name: value
+                for name, value in env_settings.env_vars.items()
+                if not _is_proxy_env_name(name)
+            }
+        return super().settings_customise_sources(
+            settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+        )
+
+
+@dataclass(frozen=True)
+class EnvSTMConfigLoad:
+    """A bare env ``STMConfig`` and, when it is degraded, the error behind it.
+
+    ``proxy_error`` set means every ``MEMTOMEM_STM_PROXY*`` variable was
+    ignored: ``config.proxy`` is at its defaults, valid proxy variables
+    included, and so is anything derived from it (``model_post_init``'s
+    ``consumer_model`` hand-off to ``surfacing``).
+    """
+
+    config: STMConfig
+    proxy_error: ValidationError | SettingsError | None = None
+
+
+HOOK_FLAG_ENV_NAMES = HOOK_FLAG_NAMES
+"""The variables ``mms hook`` names from its command's flags
+(``host_runtime.runtime_env_overrides``), spelled as it spells them: the only
+names a :func:`load_env_stm_config` ``env_overlay`` carries (a
+``host_runtime.hook_flags_scope`` may also carry the MCP server's,
+``host_runtime.RUNTIME_FLAG_NAMES``). Doctor's hook route reads them only
+through that build; the route itself follows the command's daemon flag
+directly when it has one, as the hook does (#1501)."""
+
+
+def _flag_path(name: str) -> tuple[str, str]:
+    """``MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`` → ``("surfacing", "timeout_seconds")``."""
+    block, _, field = name[len("MEMTOMEM_STM_") :].lower().partition("__")
+    return block, field
+
+
+class _HookFlagsOverEnv(PydanticBaseSettingsSource):
+    """The environment source's data with the hook's flags laid over it (#1537).
+
+    The environment source has already folded names and decoded each block's
+    JSON when this runs, so a flag replaces the field however the environment
+    spelled it: a later flat spelling, a case variant of the field in the
+    block's JSON, or a ``null`` block (which the source drops, flat children
+    included) all lose to it. A ``null`` stays a ``null`` for every other child:
+    only the flag's own field is added. A block that decoded to something other
+    than an object (``[]``, a string) is left as it is, so its error stands.
+    Values stay strings, as a flat variable's would.
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        env_settings: PydanticBaseSettingsSource,
+        flags: Mapping[str, str],
+    ) -> None:
+        super().__init__(settings_cls)
+        self._env_settings = env_settings
+        self._flags = dict(flags)
+
+    def _set_current_state(self, state: dict[str, Any]) -> None:
+        super()._set_current_state(state)
+        self._env_settings._set_current_state(state)
+
+    def _set_settings_sources_data(self, states: dict[str, dict[str, Any]]) -> None:
+        super()._set_settings_sources_data(states)
+        self._env_settings._set_settings_sources_data(states)
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        data = dict(self._env_settings())
+        for name, value in self._flags.items():
+            block, field = _flag_path(name)
+            current = data.get(block)
+            if current is None:
+                data[block] = {field: value}
+            elif isinstance(current, dict):
+                data[block] = {**current, field: value}
+        return data
+
+
+def hook_flag_environ(environ: Mapping[str, str], flags: Mapping[str, str]) -> dict[str, str]:
+    """*environ* as a build under *flags* reads it for naming variables: each
+    flag named as the command spells it, its other spellings left out because
+    the flag outranks them."""
+    folded = {name.lower() for name in flags}
+    return {
+        **{name: value for name, value in environ.items() if name.lower() not in folded},
+        **flags,
+    }
+
+
+def hook_flags_hint(
+    exc: Exception, flags: Mapping[str, str], environ: Mapping[str, str] | None = None
+) -> str:
+    """:func:`~memtomem_stm.proxy.config.env_var_hint_for_validation_error` for a
+    build under the hook's *flags*, names only.
+
+    Each error is attributed on its own. One at a flag's own field names that
+    flag alone: the flag supplied the rejected value, and a ``null`` or JSON
+    parent block that supplied nothing there is not named. Any other error is
+    attributed to the environment as the build read it
+    (:func:`hook_flag_environ`), so a model-level error under a flag's block
+    names the flag as the command spells it, not a spelling it outranked."""
+    return _implicated_hint(_flag_names_implicated(exc, flags, environ))
+
+
+def server_flags_hint(
+    exc: Exception, flags: Mapping[str, str], environ: Mapping[str, str] | None = None
+) -> str:
+    """:func:`hook_flags_hint` for the MCP server's build under the flags of
+    ``host_runtime.SERVER_FLAGS_CHANNEL_ENV`` (#1544): a flag is named as the
+    channel's key (``MEMTOMEM_STM_SERVER_FLAGS[<name>]``), because the flat
+    variable of that name is outranked and editing it changes nothing. Every
+    other variable is named as :func:`hook_flags_hint` names it."""
+    from memtomem_stm.cli.host_runtime import SERVER_FLAGS_CHANNEL_ENV
+
+    named = _flag_names_implicated(exc, flags, environ)
+    return _implicated_hint(
+        {f"{SERVER_FLAGS_CHANNEL_ENV}[{name}]" if name in flags else name for name in named}
+    )
+
+
+def _flag_names_implicated(
+    exc: Exception, flags: Mapping[str, str], environ: Mapping[str, str] | None
+) -> set[str]:
+    from memtomem_stm.proxy.config import implicated_env_vars
+
+    env = os.environ if environ is None else environ
+    paths = {_flag_path(name): name for name in flags}
+    named: set[str] = set()
+    if isinstance(exc, ValidationError):
+        for err in exc.errors():
+            loc = tuple(str(part) for part in err.get("loc", ()))
+            if len(loc) == 2 and (loc[0], loc[1]) in paths:
+                named.add(paths[(loc[0], loc[1])])
+    named |= implicated_env_vars(exc, hook_flag_environ(env, flags), skip_locs=frozenset(paths))
+    return named
+
+
+def _implicated_hint(named: set[str]) -> str:
+    if not named:
+        return ""
+    return " (env var(s) implicated: " + ", ".join(sorted(named)) + ")"
+
+
+def load_env_stm_config(env_overlay: Mapping[str, str] | None = None) -> EnvSTMConfigLoad:
+    """Bare ``STMConfig()`` for the readers that never touch ``proxy`` (#847).
+
+    The hook and the daemon read ``surfacing``, ``hook`` and ``daemon``. A
+    broken ``MEMTOMEM_STM_PROXY*`` variable used to fail their whole
+    construction: the hook passed every tool output through and the daemon
+    would not start. When the bare construction fails, this builds once more
+    with every proxy variable removed. If that succeeds, the failure belonged
+    to ``proxy`` alone and the degraded config is returned with the original
+    error. If it fails too, the original error is raised, without the
+    retry's attached. An environment with no proxy variable is not retried:
+    there is nothing to remove, so a retry could only succeed because the
+    environment changed in between.
+
+    Only ``ValidationError`` and ``SettingsError`` are retried; anything else
+    propagates as it is. Commands that serialize or serve the proxy subtree
+    (registration, the MCP server) keep the strict construction.
+
+    ``env_overlay`` builds with those flags applied as the hook applies its
+    command's (``host_runtime.hook_flags_scope``), without touching the
+    environment: ``mms doctor`` builds the hook's config this way (#1494).
+    ``{}`` builds with no flags, also inside an enclosing scope; ``None``
+    keeps whatever scope is active, which is how the hook's own builds get
+    theirs. It accepts only :data:`HOOK_FLAG_ENV_NAMES`, and raises
+    ``ValueError`` for any other name.
+    """
+    unknown = sorted(set(env_overlay or ()) - HOOK_FLAG_ENV_NAMES)
+    if unknown:
+        raise ValueError(f"env_overlay accepts only the hook's flag variables, not {unknown}")
+    scope = nullcontext() if env_overlay is None else hook_flags_scope(env_overlay)
+    with scope:
+        try:
+            return EnvSTMConfigLoad(STMConfig())
+        except (ValidationError, SettingsError) as exc:
+            if not any(_is_proxy_env_name(name) for name in os.environ):
+                raise
+            try:
+                config = _ProxyEnvIgnoredSTMConfig()
+            except (ValidationError, SettingsError):
+                raise exc from None
+            return EnvSTMConfigLoad(config, exc)
+
+
+def log_proxy_env_ignored(
+    exc: Exception, *, logger: logging.Logger, context: str, exc_info: bool = False
+) -> None:
+    """The line for a load :func:`load_env_stm_config` recovered from.
+
+    Names the implicated variable(s) the way :func:`log_stm_config_failure`
+    does, names only. No traceback by default: nothing failed, and the hook
+    would otherwise print one per tool call.
+    """
+    from memtomem_stm.utils.display import _disp
+
+    logger.warning(
+        "invalid MEMTOMEM_STM_PROXY* configuration ignored while %s; proxy settings at defaults%s",
+        context,
+        _disp(hook_flags_hint(exc, active_hook_flags())),
         exc_info=exc if exc_info else None,
     )

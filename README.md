@@ -140,7 +140,8 @@ configured memtomem server.
 `mms hook` is an optional PostToolUse bridge for that client-internal path,
 available for Claude Code, Codex CLI, Cursor, and Kimi Code. Claude and Codex
 can receive surfaced LTM context; Cursor and Kimi are metrics-only. Claude can
-also opt into guarded Bash compression. Native calls still do not gain proxy
+also opt into guarded Bash compression, which needs the hook registered with
+`--host claude` (`mms hook install --host claude --apply` writes it). Native calls still do not gain proxy
 response caching, upstream retries, progressive reads, or general MCP routing,
 and the hook always fails open. See the
 [native-hook guide](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/native-hooks.md)

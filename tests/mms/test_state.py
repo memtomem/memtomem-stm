@@ -232,7 +232,7 @@ def test_save_import_state_creates_directory_on_fresh_home(sandbox_home):
 def test_load_import_state_returns_empty_when_missing(sandbox_home):
     s = state.load_import_state()
     assert s.entries == {}
-    assert s.schema_version == state.SCHEMA_VERSION
+    assert s.schema_version == state.IMPORT_STATE_SCHEMA_VERSION
 
 
 def test_import_state_round_trip(sandbox_home):
@@ -292,7 +292,8 @@ def test_save_load_preserves_drift_hash(sandbox_home, server: state.RegistryServ
 
     assert loaded.servers["x"] == server
     assert canonical_form(loaded.servers["x"]) == canonical_form(server)
-    assert compute_drift_hash(loaded.servers["x"]) == compute_drift_hash(server)
+    key = bytes(range(32))
+    assert compute_drift_hash(loaded.servers["x"], key) == compute_drift_hash(server, key)
 
 
 @pytest.mark.skipif(
@@ -317,10 +318,10 @@ def test_save_import_state_uses_0o600(sandbox_home):
 
 def test_import_state_schema_version_mismatch(tmp_path):
     target = tmp_path / "import_state.toml"
-    target.write_text("schema_version = 2\n[entries]\n", encoding="utf-8")
+    target.write_text("schema_version = 3\n[entries]\n", encoding="utf-8")
     with pytest.raises(state.SchemaVersionMismatch) as exc_info:
         state.load_import_state(target)
-    assert exc_info.value.found == 2
+    assert exc_info.value.found == 3
     assert exc_info.value.path == target
     # Error message names the *sidecar* expected version, not the registry's
     # — proves the SchemaVersionMismatch.expected plumbing reaches the user.
@@ -354,13 +355,14 @@ def test_sidecar_rejects_when_only_sidecar_version_bumps(tmp_path, monkeypatch):
     """Symmetric to the previous: bumping only the sidecar version must
     flip sidecar load to mismatch *without* affecting the registry path.
     """
-    monkeypatch.setattr(state, "IMPORT_STATE_SCHEMA_VERSION", 2)
-    # Old sidecar (v1) under new code (expects v2) → mismatch
+    monkeypatch.setattr(state, "IMPORT_STATE_SCHEMA_VERSION", 3)
+    # A sidecar of a version the new code does not read (expects v3, also
+    # reads v1) → mismatch
     target = tmp_path / "import_state.toml"
-    target.write_text("schema_version = 1\n[entries]\n", encoding="utf-8")
+    target.write_text("schema_version = 2\n[entries]\n", encoding="utf-8")
     with pytest.raises(state.SchemaVersionMismatch) as exc_info:
         state.load_import_state(target)
-    assert exc_info.value.expected == 2
+    assert exc_info.value.expected == 3
 
     # Registry under same monkeypatched env is unaffected — uses SCHEMA_VERSION (still 1)
     reg_path = tmp_path / "registry.toml"
@@ -462,10 +464,148 @@ def test_import_state_on_disk_shape(sandbox_home):
     )
     state.save_import_state(s)
     raw = tomllib.loads(state.import_state_path().read_text(encoding="utf-8"))
-    assert raw["schema_version"] == 1
+    assert raw["schema_version"] == 2
     assert raw["entries"]["filesystem"]["drift_hash"] == "sha256:40c96f4ab4762ceb"
     assert raw["entries"]["filesystem"]["drift_hash_version"] == 1
     assert raw["entries"]["filesystem"]["source_label"] == "Claude Code (user)"
+    # A version 1 row has no key id, and TOML has no null to write one as.
+    assert "drift_key_id" not in raw["entries"]["filesystem"]
+
+
+_V1_SIDECAR = (
+    "schema_version = 1\n[entries.foo]\n"
+    'drift_hash = "sha256:0123456789abcdef"\n'
+    "drift_hash_version = 1\n"
+    'last_imported = "2026-05-01T13:24:03Z"\n'
+    'source_label = "test"\n'
+)
+
+
+def test_a_version_1_sidecar_loads_and_is_saved_as_the_current_version(tmp_path):
+    """The file an earlier release wrote must keep loading: rejecting it would
+    cost every entry its baseline on upgrade. The next save moves it forward,
+    so an older mms then refuses the file by version instead of misreading it.
+    """
+    target = tmp_path / "import_state.toml"
+    target.write_text(_V1_SIDECAR, encoding="utf-8")
+
+    loaded = state.load_import_state(target)
+    assert loaded.schema_version == 1
+    assert loaded.entries["foo"].drift_hash == "sha256:0123456789abcdef"
+    assert loaded.entries["foo"].drift_key_id is None
+
+    state.save_import_state(loaded, target)
+    raw = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == state.IMPORT_STATE_SCHEMA_VERSION == 2
+    assert state.load_import_state(target).entries == loaded.entries
+
+
+def test_a_keyed_row_round_trips_with_its_key_id(sandbox_home):
+    s = state.ImportState(
+        entries={
+            "x": state.ImportStateEntry(
+                drift_hash="hmac-sha256:0123456789abcdef",
+                drift_hash_version=2,
+                drift_key_id="fedcba9876543210",
+                last_imported="2026-11-14T00:00:00Z",
+                source_label="Cursor (user)",
+            )
+        }
+    )
+    state.save_import_state(s)
+    raw = tomllib.loads(state.import_state_path().read_text(encoding="utf-8"))
+    assert raw["entries"]["x"]["drift_key_id"] == "fedcba9876543210"
+    assert state.load_import_state() == s
+
+
+@pytest.mark.parametrize(
+    ("version", "drift_hash", "key_id"),
+    [
+        (1, "hmac-sha256:0123456789abcdef", None),
+        (1, "sha256:0123456789abcdef", "fedcba9876543210"),
+        (2, "sha256:0123456789abcdef", "fedcba9876543210"),
+        (2, "hmac-sha256:0123456789abcdef", None),
+        (2, "sha256:0123456789abcdef", None),
+        (3, "sha256:0123456789abcdef", None),
+        (3, "sha256:0123456789abcdef", "fedcba9876543210"),
+    ],
+    ids=[
+        "v1-keyed-hash",
+        "v1-with-key-id",
+        "v2-unkeyed-hash",
+        "v2-no-key-id",
+        "v2-as-v1",
+        "v3-unkeyed-hash",
+        "v3-unkeyed-hash-with-key-id",
+    ],
+)
+def test_import_state_rejects_a_row_whose_fields_disagree(
+    tmp_path, version: int, drift_hash: str, key_id: str | None
+):
+    """Each known hash version has one shape, and an unkeyed ``sha256:`` hash
+    is version 1 only. Under any other version it would be a value this mms
+    can neither re-key nor print, and every later write would keep it in the
+    sidecar."""
+    target = tmp_path / "import_state.toml"
+    lines = [
+        "schema_version = 2",
+        "[entries.foo]",
+        f'drift_hash = "{drift_hash}"',
+        f"drift_hash_version = {version}",
+        'last_imported = "2026-05-01T13:24:03Z"',
+        'source_label = "test"',
+    ]
+    if key_id is not None:
+        lines.append(f'drift_key_id = "{key_id}"')
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(state.CorruptedConfig) as exc_info:
+        state.load_import_state(target)
+    # Location and error type only: no stored value is quoted.
+    assert "0123456789abcdef" not in str(exc_info.value)
+    assert "fedcba9876543210" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("drift_hash", "key_id"),
+    [
+        ("hmac-sha256:0123456789abcdef", None),
+        ("hmac-sha256:0123456789abcdef", "fedcba9876543210"),
+    ],
+)
+def test_import_state_loads_a_keyed_row_of_an_unknown_hash_version(tmp_path, drift_hash, key_id):
+    """A newer mms may have its own rule for its rows; this one only has to
+    load them (and report ``no_baseline``), not reject the whole sidecar."""
+    target = tmp_path / "import_state.toml"
+    lines = [
+        "schema_version = 2",
+        "[entries.foo]",
+        f'drift_hash = "{drift_hash}"',
+        "drift_hash_version = 3",
+        'last_imported = "2026-05-01T13:24:03Z"',
+        'source_label = "test"',
+    ]
+    if key_id is not None:
+        lines.append(f'drift_key_id = "{key_id}"')
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert state.load_import_state(target).entries["foo"].drift_hash_version == 3
+
+
+@pytest.mark.parametrize("bad_key_id", ["", "abc", "FEDCBA9876543210", "g" * 16, "0" * 17])
+def test_import_state_rejects_malformed_drift_key_id(tmp_path, bad_key_id: str):
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        "schema_version = 2\n[entries.foo]\n"
+        'drift_hash = "hmac-sha256:0123456789abcdef"\n'
+        "drift_hash_version = 2\n"
+        f'drift_key_id = "{bad_key_id}"\n'
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(state.CorruptedConfig):
+        state.load_import_state(target)
 
 
 # ---------------------------------------------------------------------------

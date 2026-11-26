@@ -44,7 +44,7 @@ not be confirmed leaves a selection with no execution, which is also what an
 in-flight call or a redacted execution produces, and replay already joins
 left-outer.
 
-## Schema v1
+## Schema v2
 
 Every record is preceded by a blank line: the writer emits the newline in the
 same append as the record, so a record frames itself atomically whatever
@@ -62,7 +62,8 @@ on disk, which also brings `max_bytes` rotation forward by that much.
 
 One JSON object per line, keys sorted, every record self-describing via
 `schema_version` (bumped on any shape change — the exact key sets are pinned
-by `tests/test_selection_log.py`) and `ranker_version`, a per-call cohort
+by `tests/test_selection_log.py`; readers accept 1 and 2, see
+[v1 records](#v1-records)) and `ranker_version`, a per-call cohort
 marker stamped on both halves of a pair: `"v0-passthrough"` when no ranking
 informed the call (the client model picked from the full advertised set
 unaided — the unranked baseline), `"v1-bm25-tool-relevance"` when the #466
@@ -76,9 +77,18 @@ applies in every profile, the native review penalty only under `review`), so
 replay must not pool them. An all-zero penalty map is v1 math and keeps the v1
 stamp.
 
+### v1 records
+
+Schema v1 records also carried `args_sha256` (sha256 of the call arguments'
+canonical JSON) and `candidate_features.query_sha256` (sha256 of the ranking
+query). Both were unkeyed digests of values that can be short and guessable,
+so v2 dropped them (#1381); nothing else changed. Every reader — replay,
+`selection_stats`, `mms selection feedback` — accepts v1 and v2 records alike,
+so a log that spans the upgrade replays and labels as one.
+
 ### `selection` — one per proxied call
 
-| field | v1 value |
+| field | value |
 |---|---|
 | `selection_id` | joins the paired `execution` record |
 | `trace_id` | joins `proxy_metrics.db` for per-stage diagnostics |
@@ -87,12 +97,12 @@ stamp.
 | `reject_reasons` | prefixed tool → reason code for every tool missing from that advertisement — withheld by the #465 filter, or declined by registration (see [Reject reasons](#reject-reasons-465-892-908)); `{}` when nothing was rejected |
 | `candidate_features` | ranking output object when #466 ranking ran (shape below); `null` otherwise |
 | `graph_generation` | the external tool-graph generation the advertisement was filtered under (#465), pinning replay to a graph state; `null` when the `toolgraph` provider is disabled, unconsulted, or the consult failed without a usable verdict (unreachable / protocol error). On an agent-not-found degrade the graph still responded, so the generation is recorded |
-| `args_sha256`, `args_chars` | canonical-JSON hash + length of the call arguments |
+| `args_chars` | length of the call arguments' canonical JSON |
 | `ts` | unix seconds |
 
 ### `execution` — paired outcome
 
-| field | v1 value |
+| field | value |
 |---|---|
 | `selection_id`, `trace_id`, `server`, `selected_tool` | mirror the paired selection |
 | `ok` | `true`/`false` |
@@ -160,7 +170,6 @@ query signal and recorded in `candidate_features`:
 ```json
 {
   "query_source": "context_query | args",
-  "query_sha256": "…",
   "query_chars": 42,
   "ranked_candidates": [
     {"tool": "gh__create_issue", "rank": 1, "relevance_score": 2.41,
@@ -184,7 +193,7 @@ query signal and recorded in `candidate_features`:
 - **Query signal**: `_context_query` when the caller attaches one, else the
   call's top-level string argument values (sorted by key, capped); no
   signal → no ranking, and the pair keeps the `v0-passthrough` baseline.
-  The raw query never enters the log — `query_source`/sha256/length only.
+  The raw query never enters the log — `query_source`/length only.
 - `risk_penalty` demotes a tool without removing it: `final_score =
   relevance_score * (1 - risk_penalty)` (ordering follows `final_score`),
   multiplicative because BM25 scores are unbounded. Two sources feed it,
@@ -276,8 +285,10 @@ replay tooling should treat unknown codes as opaque.
 
 Redaction is **structural**, not filter-based: no field ever carries raw
 arguments, results, prompts, resource URIs, or error message strings.
-Argument payloads appear only as a sha256 over their canonical JSON plus a
-char count; error detail beyond the exception class name lives in
+Argument payloads appear only as the char count of their canonical JSON, and
+the ranking query only as its char count — no digest of either, since an
+unkeyed hash of a short value lets anyone holding the log confirm a guess
+offline; error detail beyond the exception class name lives in
 `proxy_metrics.db` and is reachable through the `trace_id` join instead of
 being duplicated into this log.
 
