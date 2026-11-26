@@ -596,7 +596,11 @@ def test_cli_managed_runtime_flags_are_scoped_and_order_timeouts(
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "77")
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS", "88")
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT", "true")
-    before = dict(os.environ)
+
+    def stm_environ() -> dict[str, str]:
+        return {k: v for k, v in os.environ.items() if k.lower().startswith("memtomem_stm")}
+
+    before = stm_environ()
     seen: dict[str, Any] = {}
 
     async def capture(*_args, **_kwargs):
@@ -608,7 +612,11 @@ def test_cli_managed_runtime_flags_are_scoped_and_order_timeouts(
             surfacing_timeout=config.surfacing.timeout_seconds,
             daemon_timeout=config.hook.daemon_timeout_seconds,
             persist=config.surfacing.persist_query_text,
-            environ_unchanged=dict(os.environ) == before,
+            changed=sorted(
+                k
+                for k in before.keys() | stm_environ().keys()
+                if before.get(k) != stm_environ().get(k)
+            ),
         )
         return {}
 
@@ -635,7 +643,7 @@ def test_cli_managed_runtime_flags_are_scoped_and_order_timeouts(
         "surfacing_timeout": 12.0,
         "daemon_timeout": 13.0,
         "persist": False,
-        "environ_unchanged": True,
+        "changed": [],
     }
     # CliRunner/embedders reuse this process: nothing of the call outlives it.
     assert load_env_stm_config().config.surfacing.timeout_seconds == 77.0
