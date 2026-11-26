@@ -4397,6 +4397,19 @@ class ProxyManager:
             return text
         return DefaultContentCleaner(cleaning_cfg).clean(text)
 
+    def _clean_shaped_text(self, shaped: ShapedResponse, cleaning_cfg: CleaningConfig) -> str:
+        """Clean the normal path's joined text blocks into the string it compresses.
+
+        Disabled cleaning returns ``shaped.original_text`` itself. Enabled
+        cleaning keeps every removal match inside one block and runs the
+        whole-response rules on the join (``DefaultContentCleaner.clean_parts``).
+        """
+        if not cleaning_cfg.enabled:
+            return shaped.original_text
+        return DefaultContentCleaner(cleaning_cfg).clean_parts(
+            shaped.original_text, shaped.text_part_lengths
+        )
+
     async def _compress_maybe_offthread(
         self,
         compressor: Any,
@@ -6814,15 +6827,19 @@ class ProxyManager:
                     # non-text blocks keep their relative positions.
                     non_text_before_first_text = len(non_text_content)
                     first_text_content = content
-                remaining = max_upstream - total_chars
-                if remaining <= 0:
-                    oversize = True
-                    continue
                 # ``content.text or ""`` tolerates spec-noncompliant upstreams
                 # that return ``None`` for a TextContent's ``text`` field.
                 # MCP spec requires ``text: str`` but mirrors the same gap
                 # that PR #114 fixed for ``result.content`` itself.
                 text = content.text or ""
+                remaining = max_upstream - total_chars
+                if remaining <= 0:
+                    # A block that exactly filled the cap leaves no room, but
+                    # only a block with text loses anything; an empty one is
+                    # skipped without claiming an oversized payload.
+                    if text:
+                        oversize = True
+                    continue
                 if len(text) > remaining:
                     text_parts.append(text[:remaining])
                     total_chars += remaining
@@ -6848,11 +6865,13 @@ class ProxyManager:
         if not text_parts:
             return ShapedResponse(
                 original_text="",
+                text_part_lengths=(),
                 non_text_content=non_text_content,
                 passthrough=ShapePassthrough(has_non_text=bool(non_text_content)),
             )
         return ShapedResponse(
             original_text="\n".join(text_parts),
+            text_part_lengths=tuple(len(part) for part in text_parts),
             non_text_content=non_text_content,
             non_text_before_first_text=non_text_before_first_text,
             first_text_content=first_text_content,
@@ -8497,12 +8516,19 @@ class ProxyManager:
             return "[empty response]"
 
         # ── Stage 1: CLEAN ──
+        # The cleaner gets the block lengths with ``original_text``, so markup
+        # removal matches stay within one block: an element that opens in one
+        # block and closes in a later one is no longer removed as one match
+        # with the text of both blocks between its tags (#1531). Fence/generic protection,
+        # paragraph dedup, link-flood collapse and whitespace normalization
+        # still read the joined text — several text blocks reach this stage
+        # only when none carries metadata, and they leave as one merged block.
         with traced(
             "proxy_call_clean",
             metadata={"server": server, "tool": tool},
         ):
             _t0 = _time.monotonic()
-            cleaned = self._clean_content(original_text, tc.cleaning)
+            cleaned = self._clean_shaped_text(shaped, tc.cleaning)
             _clean_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stages 2+3: COMPRESS (or PROGRESSIVE) + SURFACE ──

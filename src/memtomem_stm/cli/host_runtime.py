@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import re
 import shlex
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,26 +74,120 @@ def _policy_words(daemon_flag: str, surfacing: str, daemon: str, persist_flag: s
     ]
 
 
+_SHELL_SPACE = frozenset(" \t\r\n")
+_SHELL_PUNCTUATION = "|&;<>"
+_PLAIN_RUN = re.compile(r"[^ \t\r\n|&;<>'\"\\]+")
+_PUNCTUATION_RUN = re.compile(r"[|&;<>]+")
+_DOUBLE_QUOTED_RUN = re.compile(r'[^"\\]+')
+
+
 def _lenient_shell_tokens(command: str) -> list[str]:
-    """``shlex`` words of any line; on a parse error (an unbalanced quote, a
-    trailing ``\\``), the words read before it, an empty word, then the
-    ``str.split()`` words of the whole line, so neither reading is lost. An
-    approximation of the shell, used only to decide whether a handler that
-    ``mms hook install`` does not own still looks like STM's hook, never to
-    act on it or read settings from it. ``shlex`` is quadratic in a word's
-    length."""
-    lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
-    lexer.whitespace_split = True
-    lexer.commenters = ""
+    """The words ``shlex.shlex(command, posix=True, punctuation_chars="|&;<>")``
+    reads with ``whitespace_split`` on and no comment characters; on a parse
+    error (an unbalanced quote, a trailing ``\\``), the words read before it,
+    an empty word, then the ``str.split()`` words of the whole line, so
+    neither reading is lost. An approximation of the shell, used only to
+    decide whether a handler that ``mms hook install`` does not own still
+    looks like STM's hook, never to act on it or read settings from it.
+
+    Read here in time linear in the line's length: ``shlex`` builds each word
+    one character at a time by concatenation, which is quadratic in a word's
+    length (#1498). The reading is ``shlex``'s:
+
+    * a word ends at a space, tab, CR or LF, or where a run of ``|&;<>``
+      starts, and such a run is a word of its own;
+    * ``'…'`` is literal, and ``"…"`` is literal except that ``\\`` before
+      ``"`` or ``\\`` stands for that character (before any other, both are
+      kept);
+    * outside quotes, ``\\`` stands for the character after it;
+    * a quote pair makes a word even when it is empty (``''``).
+    """
     words: list[str] = []
-    try:
-        for word in lexer:
-            words.append(word)
-    except ValueError:
-        # The empty word keeps a pair from forming across the two readings:
-        # it is neither an executable name nor ``hook``.
-        return [*words, "", *command.split()]
-    return words
+    end = len(command)
+    i = 0
+    while True:
+        while i < end and command[i] in _SHELL_SPACE:
+            i += 1
+        if i == end:
+            return words
+        punctuation = _PUNCTUATION_RUN.match(command, i)
+        if punctuation is not None:
+            words.append(punctuation.group())
+            i = punctuation.end()
+            continue
+        parts: list[str] = []
+        while i < end:
+            char = command[i]
+            if char in _SHELL_SPACE or char in _SHELL_PUNCTUATION:
+                break
+            if char == "'":
+                close = command.find("'", i + 1)
+                if close < 0:
+                    return _unparsed(words, command)
+                parts.append(command[i + 1 : close])
+                i = close + 1
+            elif char == '"':
+                i += 1
+                while True:
+                    run = _DOUBLE_QUOTED_RUN.match(command, i)
+                    if run is not None:
+                        parts.append(run.group())
+                        i = run.end()
+                    if i == end:
+                        return _unparsed(words, command)
+                    if command[i] == '"':
+                        i += 1
+                        break
+                    # A ``\`` inside double quotes.
+                    if i + 1 == end:
+                        return _unparsed(words, command)
+                    escaped = command[i + 1]
+                    parts.append(escaped if escaped in '"\\' else "\\" + escaped)
+                    i += 2
+            elif char == "\\":
+                if i + 1 == end:
+                    return _unparsed(words, command)
+                parts.append(command[i + 1])
+                i += 2
+            else:
+                plain = _PLAIN_RUN.match(command, i)
+                assert plain is not None  # ``char`` is none of the above
+                parts.append(plain.group())
+                i = plain.end()
+        words.append("".join(parts))
+
+
+def _unparsed(words: list[str], command: str) -> list[str]:
+    # The empty word keeps a pair from forming across the two readings: it
+    # is neither an executable name nor ``hook``.
+    return [*words, "", *command.split()]
+
+
+def hook_flag_assignments(environ: Mapping[str, str], overlay: Mapping[str, str]) -> dict[str, str]:
+    """The assignments that make *overlay*'s values the ones a build reads.
+
+    Settings fold names to lower case, so the last spelling of a name in the
+    environment wins, and POSIX allows both ``MEMTOMEM_STM_X`` and
+    ``memtomem_stm_x``. Each *overlay* name is therefore assigned together
+    with every other spelling of it already in *environ*, all to its value:
+    whichever spelling the fold keeps, it carries the command's value (#1503).
+    On Windows the environment folds names itself, so there is only one.
+
+    Here, not in ``config``, because the hook applies it before it reads its
+    payload, and a call that never builds its settings must not import them.
+
+    Only flat spellings are covered. A field of the block's JSON
+    (``MEMTOMEM_STM_SURFACING='{"…": …}'``) repeated in another letter case,
+    or a ``null`` block, can still outrank the flat variable (#1537).
+    """
+    assignments: dict[str, str] = {}
+    for name, value in overlay.items():
+        folded = name.lower()
+        for existing in environ:
+            if existing.lower() == folded:
+                assignments[existing] = value
+        assignments[name] = value
+    return assignments
 
 
 def _parse_bool(raw: str | None) -> bool | None:

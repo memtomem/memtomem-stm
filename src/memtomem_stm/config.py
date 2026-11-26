@@ -827,30 +827,33 @@ A context variable, not ``os.environ``: a build running in another context
 it, and the scope resets it on every exit, a raising build included."""
 
 
+def hook_flag_environ(environ: Mapping[str, str], overlay: Mapping[str, str]) -> dict[str, str]:
+    """*environ* as a build under *overlay* reads it, each variable *overlay*
+    sets named as it sets it: the other spellings carry the same value and
+    are left out, so a reader that names variables names the one set."""
+    folded = {name.lower() for name in overlay}
+    return {
+        **{name: value for name, value in environ.items() if name.lower() not in folded},
+        **overlay,
+    }
+
+
 def _overlaid_env_vars(
     env_settings: EnvSettingsSource, overlay: Mapping[str, str]
 ) -> dict[str, str | None]:
-    """``env_settings.env_vars`` as if *overlay* had been set in ``os.environ``.
-
-    *overlay* holds only :data:`HOOK_FLAG_ENV_NAMES`, upper case as Windows
-    stores every name, so merging it into a copy of ``os.environ`` is what
-    assignment does there too. Setting a variable that is already there
-    replaces it in place, as
-    ``os.environ[name] = value`` does, before names are folded to lower case.
-    So when another spelling of the same name comes later in the environment
-    (POSIX allows both ``MEMTOMEM_STM_X`` and ``memtomem_stm_x``), that one
-    still wins the fold, for the hook that sets the variable and here alike.
-    Values pass through unparsed: ``STMConfig`` sets neither
-    ``env_ignore_empty`` nor ``env_parse_none_str``.
+    """``env_settings.env_vars`` with *overlay*'s values, as the hook's own
+    overlay leaves the environment (``host_runtime.hook_flag_assignments``): every
+    spelling of each name carries the overlay's value, so its folded name
+    does. Only those entries change, so a snapshot a subclass filtered (the
+    proxy retry) stays filtered. Values pass through unparsed: ``STMConfig``
+    sets neither ``env_ignore_empty`` nor ``env_parse_none_str``.
     """
     case_sensitive = env_settings.case_sensitive
 
     def fold(name: str) -> str:
         return name if case_sensitive else name.lower()
 
-    merged = {**os.environ, **overlay}
-    folded = {fold(name): value for name, value in merged.items()}
-    return {**env_settings.env_vars, **{fold(name): folded[fold(name)] for name in overlay}}
+    return {**env_settings.env_vars, **{fold(name): value for name, value in overlay.items()}}
 
 
 @contextmanager

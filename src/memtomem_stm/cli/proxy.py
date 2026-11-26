@@ -10541,20 +10541,6 @@ class _HookAdvice:
     command_deadlines: frozenset[str]
 
 
-def _overlay_value_wins(name: str, overlay: Mapping[str, str]) -> bool:
-    """Whether *name*'s overlay value is the one the build reads.
-
-    Mirrors ``config._overlaid_env_vars``: the overlay replaces the same
-    spelling in place or comes last, and names fold to lower case, so a later
-    case-equivalent spelling in the environment wins instead (#1503).
-    """
-    winner = None
-    for key in {**os.environ, **overlay}:
-        if key.lower() == name.lower():
-            winner = key
-    return winner == name
-
-
 def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _HookAdvice | None:
     """Doctor's advice inputs for a ``found`` view, else ``None``."""
     if view.state != "found":
@@ -10566,8 +10552,13 @@ def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _Ho
             _HOOK_DAEMON_TIMEOUT_ENV: float(built.hook.daemon_timeout_seconds),
         }
         for name, value in effective.items():
+            # Every flat spelling carries the overlay's value
+            # (``host_runtime.hook_flag_assignments``), so an equal value is the
+            # command's. A case variant of the field in the block's JSON, or a
+            # ``null`` block, can still set the build's deadline to the same
+            # number; that limit of #1503 is not checked here.
             raw = view.env.get(name)
-            if raw is None or not _overlay_value_wins(name, view.env):
+            if raw is None:
                 continue
             try:
                 if float(raw) == value:
@@ -10665,6 +10656,8 @@ def _env_overrides_found_row(
     view: _HookCommandView,
     hook_outcome: EnvSTMConfigLoad | Exception,
     bare_outcome: EnvSTMConfigLoad | Exception,
+    *,
+    hook_daemon: bool = False,
 ) -> tuple[str, str, str | None]:
     """The ``env_overrides`` row when doctor read one STM hook command (#1506).
 
@@ -10679,7 +10672,16 @@ def _env_overrides_found_row(
     one included, and an undecodable payload hides any later error. It says
     which clause to act on and, for the hook's build, to rerun doctor. Names
     the handler by location and path, never its command text or values.
+
+    *hook_daemon*: doctor took the hook's daemon route for this command
+    (:func:`_names_hook_command`). When only the bare build fails, its
+    clause then says it describes plain ``mms daemon start``, and the next
+    action also names ``mms daemon start --hook-command claude``, which builds
+    as the hook's command does (#1524). Whether that start would succeed is
+    not judged here: the ``ltm server`` row reports what its probe found (an
+    unusable discovery key, surfacing off).
     """
+    from memtomem_stm.config import hook_flag_environ
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
     def classify(outcome: EnvSTMConfigLoad | Exception) -> tuple[str, Exception | None]:
@@ -10691,12 +10693,12 @@ def _env_overrides_found_row(
 
     hook_kind, hook_exc = classify(hook_outcome)
     bare_kind, bare_exc = classify(bare_outcome)
-    # Each build's hint reads the environment that build read: the overlay
-    # replaces in place or comes last, as ``config._overlaid_env_vars`` merges.
+    # Each build's hint reads the environment that build read, each variable
+    # the command sets named as it sets it (#1503).
     hook_hint = (
         ""
         if hook_exc is None
-        else env_var_hint_for_validation_error(hook_exc, {**os.environ, **view.env})
+        else env_var_hint_for_validation_error(hook_exc, hook_flag_environ(os.environ, view.env))
     )
     bare_hint = "" if bare_exc is None else env_var_hint_for_validation_error(bare_exc)
     hook_says = {
@@ -10709,7 +10711,11 @@ def _env_overrides_found_row(
     }
     bare_says = {
         "ok": "STMConfig() constructs",
-        "fail": "STMConfig() fails — mms daemon start from it exits 1",
+        # ``plain`` only beside a hook build that constructs: that is the case
+        # where the hook's daemon builds and plain start does not.
+        "fail": "STMConfig() fails — "
+        f"{'plain ' if hook_daemon and hook_kind == 'ok' else ''}mms daemon start "
+        "from it exits 1",
         "proxy": "MEMTOMEM_STM_PROXY* is invalid — mms daemon start from it ignores it and "
         "runs with proxy settings at defaults",
     }
@@ -10726,6 +10732,13 @@ def _env_overrides_found_row(
         else:
             actions.append(
                 _ENV_FIX_PROXY_UNDECODABLE if bare_kind == "proxy" else _ENV_FIX_UNDECODABLE
+            )
+        # Only a bare build that fails outright: an invalid proxy variable
+        # reaches the hook's build too, so it never leaves that one ``ok``.
+        if bare_kind == "fail" and hook_kind == "ok" and hook_daemon:
+            actions.append(
+                "or start the hook's daemon as its command builds it: "
+                f"{_daemon_command('start', hook_command=True)}"
             )
     if hook_kind != "ok":
         actions.append(
@@ -12998,10 +13011,18 @@ def doctor(
     except Exception as exc:
         bare_outcome = exc
     if found_view is not None and found_outcome is not None:
+        # The route the surfacing section decided, as the other rows read it;
+        # ``None`` when that section did not run (a missing config file).
+        decided = surfacing_status if hook_build is not None else None
         check(
             "env_overrides",
             "env overrides",
-            *_env_overrides_found_row(found_view, found_outcome, bare_outcome),
+            *_env_overrides_found_row(
+                found_view,
+                found_outcome,
+                bare_outcome,
+                hook_daemon=decided is not None and _names_hook_command(decided),
+            ),
         )
     elif isinstance(bare_outcome, Exception):
         hint = env_var_hint_for_validation_error(bare_outcome)

@@ -49,6 +49,82 @@ changes inline only. See the deprecation policy in
   value is a delivery error that keeps the row. Responses without block
   metadata, and keys written before this version, are unchanged.
 
+- `mms doctor`'s `env_overrides` row now says which daemon command its
+  failing clause for doctor's environment alone describes, and names the
+  one that starts the hook's daemon (issue #1524). When doctor takes the
+  hook's daemon route for the one STM hook command it read and that
+  command's build constructs, that clause says `plain mms daemon start`
+  exits 1, and the next action adds `or start the hook's daemon as its
+  command builds it: mms daemon start --hook-command claude` (the option
+  #1518 added). The addition is left out when the command says
+  `--no-daemon` and when doctor's config file is missing (the route is not
+  decided). The row does not judge whether that start would succeed; the
+  `ltm server` row reports what its probe found, such as an unusable
+  discovery key or surfacing off.
+- A runtime flag of the `mms hook` command (`--surfacing-timeout-seconds`,
+  `--daemon-timeout-seconds`, `--[no-]persist-query-text`, `--use-daemon` /
+  `--no-daemon`) is no longer outranked by another letter-case spelling of
+  its variable later in the environment (issue #1503), such as
+  `memtomem_stm_surfacing__persist_query_text=true` against
+  `--no-persist-query-text`. The hook now sets every spelling of the name to
+  the flag's value for the call and restores each in place afterwards; a
+  daemon it spawns inherits that environment, and `mms daemon …
+  --hook-command claude` and `mms doctor`'s build of the hook's configuration
+  read the same values. **Behavior change**: where such a spelling outranked
+  a flag, the hook, the daemon it spawns and doctor now use the flag's value,
+  and doctor's timeout advice names the command's flag instead of an export.
+  Not covered: a case variant of the field in the block's JSON
+  (`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`)
+  and a `null` block, which can still outrank a flag; when one of them sets
+  a deadline to the flag's own value, doctor's timeout advice still names
+  the flag.
+- The look-alike test of `mms hook install`, `mms hook uninstall`,
+  `mms doctor` and `mms daemon … --hook-command claude` now reads a hook
+  handler's words in time linear in the line's length (issue #1498). For a
+  line the cheaper candidate test does not name, it read the words of the
+  whole line with `shlex`, whose cost is quadratic in a word's length: a
+  handler `echo ` + 160,000 × `x` took about 0.34 s per scan (macOS,
+  CPython 3.14.7), and install and uninstall scan twice. The words are read
+  the way `shlex` reads them, so the same handlers are named as before.
+- Cleaning no longer removes markup as one element across two upstream text
+  blocks (#1538, issue #1531). When a response's text blocks carry no
+  metadata they are joined and cleaned as one string, so a tag or a
+  `<script>`/`<style>` element that opened in one block and closed in a
+  later one was removed together with the text of both blocks between them:
+  `Intro <style>Release notes` and `Rollback instructions</style> end` were
+  delivered as `Intro  end`. Line-ending normalization and markup removal now
+  read one block at a time; code-fence and generic protection, duplicate
+  paragraph removal, link-flood collapse and blank-line normalization still
+  read the joined text, so a fence split across blocks stays protected as
+  before. **Behavior change**: such a reply now keeps that text
+  (`Intro Release notes` / `Rollback instructions end`), and a block ending
+  in a lone `\r` now ends its own line instead of merging with the newline
+  that joins it to the next block; any other reply is unchanged. A cache hit
+  can still serve a reply stored earlier while that entry stays valid
+  (#1540).
+- `mms hook install` and `mms hook uninstall` no longer manage a Claude Code
+  handler whose `shell` field is present and anything but `"bash"` (issue
+  #1497). Install writes a POSIX line; with `"shell": "powershell"`
+  PowerShell reads it, yet install used to read settings from that line,
+  rewrite it and keep the `shell` field, and uninstall deleted it. Such a
+  handler (any other `shell` value, `null` included) is now left in place,
+  and named as a look-alike when its command looks like STM's hook, as
+  `mms doctor` already treated it. Codex
+  handlers are unchanged: what Codex does with a `shell` key is not
+  established. **Behavior change**: a Claude Code handler install wrote, to
+  which a `shell` other than `"bash"` was added by hand, is no longer
+  refreshed or removed; install refreshes the handler it does own, or adds
+  one beside it when it owns none.
+
+- The `max_upstream_chars` guard no longer reports an oversized payload when
+  no text was cut (#1536, issue #1530). A text block that exactly filled the cap
+  followed by an empty text block used to get the "response truncated …
+  upstream returned an oversized payload" notice appended to the joined
+  text, and a truncation warning in the log; the guard now fires only when
+  a block with text loses some or all of it. **Behavior change**: such a
+  reply is now delivered without that notice and no longer logs the
+  warning; a reply that really is cut is unchanged. A cache hit can still
+  serve a notice stored earlier while that entry stays valid.
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
   #1506). When doctor reads exactly one STM hook command `mms hook install`

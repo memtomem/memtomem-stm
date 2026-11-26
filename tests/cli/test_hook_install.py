@@ -392,15 +392,18 @@ def test_recovered_deadlines_are_the_ones_the_hook_runs_with(
     ],
 )
 def test_ownership_never_splits_the_line(line: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """``shlex`` is quadratic in a word's length; the reader re-joins words it
-    finds by position and never tokenizes."""
-    from memtomem_stm.cli import host_runtime
+    """The reader re-joins words it finds by position and never tokenizes:
+    neither with ``shlex``, quadratic in a word's length, nor with the
+    notice's word reader."""
+    from memtomem_stm.cli import hook_hosts, host_runtime
 
     def refuse(*args: object, **kwargs: object) -> None:
         raise AssertionError("ownership tokenized the line")
 
     monkeypatch.setattr(host_runtime.shlex, "shlex", refuse)
     monkeypatch.setattr(host_runtime.shlex, "split", refuse)
+    monkeypatch.setattr(host_runtime, "_lenient_shell_tokens", refuse)
+    monkeypatch.setattr(hook_hosts, "_lenient_shell_tokens", refuse)
 
     assert _owned(line) is line.startswith("uv run")
 
@@ -422,6 +425,23 @@ _CLAUDE = "memtomem-stm hook --host claude"
             True,
         ),
         ("claude", {"type": "command", "command": _CLAUDE, "shell": "bash"}, True),
+        # In Claude Code ``shell`` picks who reads the line: install writes a
+        # POSIX line, so only bash (or no ``shell``) is its own (#1497).
+        ("claude", {"type": "command", "command": _CLAUDE, "shell": "powershell"}, False),
+        ("claude", {"type": "command", "command": _CLAUDE, "shell": "sh"}, False),
+        ("claude", {"type": "command", "command": _CLAUDE, "shell": None}, False),
+        ("claude", {"type": "command", "command": _CLAUDE, "shell": ""}, False),
+        # What Codex does with ``shell`` is not established; ownership there
+        # is left as it was.
+        (
+            "codex",
+            {
+                "type": "command",
+                "command": "memtomem-stm hook --host codex",
+                "shell": "powershell",
+            },
+            True,
+        ),
         # Install writes ``type`` and never ``args``.
         ("claude", {"command": _CLAUDE}, False),
         ("claude", {"type": "prompt", "command": _CLAUDE}, False),
@@ -1655,7 +1675,7 @@ def test_flat_host_uninstall_shifts_the_look_alike(
         _h(_MANAGED),  # owned: install manages it
         _h("echo hi"),
         _h("ruff check hooks.py"),
-        # Unbalanced: ``shlex`` reads ``hook --label mms`` before the error and
+        # Unbalanced: the reader gets ``hook --label mms`` before the error and
         # ``str.split()`` starts with ``hook``; no pair forms across the two.
         _h('hook --label m"m"s #\''),
     ],
@@ -2136,19 +2156,18 @@ def test_windows_names_a_line_it_does_not_own(command: str, on_windows, redirect
 
 
 def _count_splits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record every line handed to the notice's ``shlex`` split."""
-    import shlex as shlex_module
-
-    from memtomem_stm.cli import host_runtime
+    """Record every line handed to the notice's word reader, where the notice
+    looks it up."""
+    from memtomem_stm.cli import hook_hosts
 
     calls: list[str] = []
-    real = shlex_module.shlex
+    real = hook_hosts._lenient_shell_tokens
 
-    def counting(command: str, *args: object, **kwargs: object) -> shlex_module.shlex:
+    def counting(command: str) -> list[str]:
         calls.append(command)
-        return real(command, *args, **kwargs)  # type: ignore[arg-type]
+        return real(command)
 
-    monkeypatch.setattr(host_runtime.shlex, "shlex", counting)
+    monkeypatch.setattr(hook_hosts, "_lenient_shell_tokens", counting)
     return calls
 
 
@@ -2187,8 +2206,8 @@ def test_the_notice_reads_the_words_of_the_whole_line(
 
 
 def test_the_notice_scan_splits_a_line_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """One split per line per scan (``shlex`` is quadratic in a word's
-    length), also past ``is_candidate``'s own limit of 4,096 characters."""
+    """One read of the words per line per scan, also past ``is_candidate``'s
+    own limit of 4,096 characters."""
     from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
 
     calls = _count_splits(monkeypatch)
@@ -2540,6 +2559,95 @@ def test_a_handler_with_args_is_left_and_named(host: str, redirect) -> None:
     assert installed.unmanaged == (location,)
     assert removed.status == "not_installed"
     assert removed.unmanaged == (location,)
+
+
+def _outside_stm_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run from an unrelated project, so install writes the bare launcher."""
+    project = tmp_path / "elsewhere"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nname = "other"\n', encoding="utf-8")
+    monkeypatch.chdir(project)
+
+
+_PINNED_POLICY = HostRuntimePolicy(
+    use_daemon=False,
+    surfacing_timeout_seconds=7.5,
+    daemon_timeout_seconds=9.0,
+    persist_query_text=True,
+)
+
+
+def _flat_handlers(path: Path) -> list[dict]:
+    groups = json.loads(path.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+    return [h for g in groups for h in g["hooks"]]
+
+
+@pytest.mark.parametrize("shell", ["powershell", None])
+def test_cli_leaves_a_claude_handler_another_shell_reads(
+    shell: str | None, redirect, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Claude Code handler with install's own text and a ``shell`` other
+    than bash is not install's: it is kept with its matcher group, named, and
+    nothing is read from it (#1497)."""
+    _outside_stm_project(tmp_path, monkeypatch)
+    path = redirect("claude")
+    seeded = _h(_written("claude", None, _PINNED_POLICY), shell=shell)
+    # A matcher install does not write, so a group install touched shows.
+    seeded_group = {"matcher": "Bash", "hooks": [seeded]}
+    _seed(path, {"hooks": {"PostToolUse": [seeded_group]}})
+    runner = CliRunner()
+
+    installed = runner.invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+
+    assert installed.exit_code == 0, installed.output
+    assert "hooks.PostToolUse[0].hooks[0]" in installed.output
+    groups = json.loads(path.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+    assert groups[0] == seeded_group
+    assert len(groups) == 2
+    assert len(groups[1]["hooks"]) == 1
+    added = owned_handler("claude", groups[1]["hooks"][0])
+    assert added is not None
+    # The defaults, not the seeded line's settings.
+    assert added.settings == PartialHostRuntimePolicy(
+        use_daemon=True,
+        surfacing_timeout_seconds=3.0,
+        daemon_timeout_seconds=4.0,
+        persist_query_text=False,
+    )
+
+    removed = runner.invoke(cli, ["hook", "uninstall", "--host", "claude", "--apply"])
+
+    assert removed.exit_code == 0, removed.output
+    assert json.loads(path.read_text(encoding="utf-8"))["hooks"]["PostToolUse"] == [seeded_group]
+
+
+def test_cli_a_handler_another_shell_reads_does_not_conflict_with_the_owned_one(
+    redirect, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settings that differ from the owned handler's are not a conflict
+    (#1516) when the other handler is not install's own."""
+    _outside_stm_project(tmp_path, monkeypatch)
+    path = redirect("claude")
+    refused = _h(_written("claude", None, _PINNED_POLICY), shell="powershell")
+    owned_policy = HostRuntimePolicy(
+        use_daemon=True,
+        surfacing_timeout_seconds=4.0,
+        daemon_timeout_seconds=6.0,
+        persist_query_text=False,
+    )
+    owned = _h(_written("claude", None, owned_policy))
+    _seed(path, _claude_groups([refused], [owned]))
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+
+    assert result.exit_code == 0, result.output
+    handlers = _flat_handlers(path)
+    assert handlers[0] == refused
+    assert len(handlers) == 2
+    kept = owned_handler("claude", handlers[1])
+    assert kept is not None
+    assert kept.settings.persist_query_text is False
+    assert kept.settings.surfacing_timeout_seconds == 4.0
 
 
 # ── #1470: the reporter's three files ────────────────────────────────────────

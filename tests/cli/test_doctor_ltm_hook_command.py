@@ -391,17 +391,14 @@ def test_a_use_daemon_flag_turns_the_route_on_over_an_ambient_opt_out(home, monk
     assert status["hook_view"]["hook_route"] is True
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Windows folds environment names itself")
 def test_the_commands_daemon_flag_decides_over_the_build(home, monkeypatch):
-    # #1501: the hook routes on its command's flag directly, because a later
-    # spelling of the variable can outrank the overlay in the build. Here the
-    # build reads ``hook.use_daemon`` false, and the ``--use-daemon`` command
-    # still routes through the daemon.
-    lower = HOOK_GATE.lower()
+    # #1501: the hook routes on its command's flag directly, because the
+    # build can read the opposite: a case variant of the field in the block's
+    # JSON still outranks the flat variable the overlay sets (#1503 covers
+    # flat spellings only). Here the build reads ``hook.use_daemon`` false,
+    # and the ``--use-daemon`` command still routes through the daemon.
     monkeypatch.delenv(HOOK_GATE, raising=False)
-    monkeypatch.delenv(lower, raising=False)
-    monkeypatch.setenv(HOOK_GATE, "false")
-    monkeypatch.setenv(lower, "false")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": true, "USE_DAEMON": false}')
     _settings(home, _cmd(_installed()))
     assert load_env_stm_config({HOOK_GATE: "true"}).config.hook.use_daemon is False
     hook_fp = _installed_fp(monkeypatch)
@@ -543,8 +540,20 @@ def test_a_command_install_did_not_write_is_not_read(home, monkeypatch, command)
         ({"type": "command", "command": "__INSTALLED__", "shell": "powershell"}, "unreadable"),
         (_cmd(f"{HOOK_GATE}=false mms hook --host claude"), "unreadable"),
         (_cmd("mms hook --host claude --surfacing-timeout-seconds 3 # pinned"), "unreadable"),
+        # Only the notice's word reader names this one: the raw search misses
+        # the quoted name and the ``#`` keeps the candidate test's own split
+        # away (#1498).
+        (_cmd('m"m"s hook --host claude # pinned'), "unreadable"),
     ],
-    ids=["two-recognized", "exec-form", "args-field", "shell-field", "bare-assignment", "comment"],
+    ids=[
+        "two-recognized",
+        "exec-form",
+        "args-field",
+        "shell-field",
+        "bare-assignment",
+        "comment",
+        "quoted-name",
+    ],
 )
 def test_a_second_handler_that_may_run_the_hook_keeps_the_bare_view(
     home, monkeypatch, other, state
@@ -829,30 +838,31 @@ def test_the_overlay_names_are_the_ones_the_hook_sets():
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows folds environment names itself")
 @pytest.mark.parametrize("later", ["true", "not-a-bool"])
-def test_a_later_spelling_of_the_name_wins_as_it_does_for_the_hook(monkeypatch, later):
-    # POSIX keeps both spellings; pydantic folds names to lower case and the later
-    # one wins. The hook sets the variable in place, so its flag loses to a later
-    # spelling, and doctor must build what the hook builds.
+def test_a_later_spelling_of_the_name_does_not_outrank_the_command(monkeypatch, later):
+    # POSIX keeps both spellings; pydantic folds names to lower case and the
+    # later one wins the fold. The hook gives every spelling the command's
+    # value (#1503), so neither a valid nor an invalid later spelling is read,
+    # and doctor builds what the hook builds.
+    from memtomem_stm.cli.hook_cmd import _runtime_registration_env
+
     lower = PERSIST.lower()
     monkeypatch.delenv(PERSIST, raising=False)
     monkeypatch.delenv(lower, raising=False)
     monkeypatch.setenv(PERSIST, "true")
     monkeypatch.setenv(lower, later)
     assert [k for k in os.environ if k.lower() == lower] == [PERSIST, lower]
-
-    def hook_build() -> Any:
-        with monkeypatch.context() as patch:
-            patch.setenv(PERSIST, "false")  # in place, as the hook sets it
-            return STMConfig()
-
+    # Positive control: without the command, the later spelling is read.
     if later == "true":
-        assert load_env_stm_config({PERSIST: "false"}).config.surfacing.persist_query_text is True
-        assert hook_build().surfacing.persist_query_text is True
+        assert STMConfig().surfacing.persist_query_text is True
     else:
         with pytest.raises(ValidationError):
-            load_env_stm_config({PERSIST: "false"})
-        with pytest.raises(ValidationError):
-            hook_build()
+            STMConfig()
+
+    with _runtime_registration_env({PERSIST: "false"}):
+        hook_build = STMConfig()
+
+    assert hook_build.surfacing.persist_query_text is False
+    assert load_env_stm_config({PERSIST: "false"}).config.surfacing.persist_query_text is False
 
 
 # --- nothing from the command reaches output ----------------------------------
@@ -1203,8 +1213,21 @@ def test_a_key_failure_after_the_samples_is_not_reported_as_a_measurement_that_n
     assert "cnryKeyPath" not in output
 
 
-def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, tmp_path):
+_POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows folds environment names itself"
+)
+
+
+@pytest.mark.parametrize("case", ["plain", pytest.param("later-spellings", marks=_POSIX_ONLY)])
+def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, tmp_path, case):
     _settings(home, _cmd(_installed(surfacing=3.0)))
+    if case == "later-spellings":
+        # A later lower-case spelling, with another value, no longer outranks
+        # the command's variable (#1503): the command still sets the deadline.
+        monkeypatch.setenv(SURFACING_TIMEOUT, "1")
+        monkeypatch.setenv(SURFACING_TIMEOUT.lower(), "2")
+        monkeypatch.setenv(DAEMON_TIMEOUT, "1")
+        monkeypatch.setenv(DAEMON_TIMEOUT.lower(), "2")
     _install(monkeypatch, AnswerEveryDaemon(_telemetry()))
 
     checks, output = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
@@ -1222,30 +1245,13 @@ def test_timeout_advice_names_the_commands_flags(home, proxy_file, monkeypatch, 
     assert "_hook_advice" not in output
 
 
-_POSIX_ONLY = pytest.mark.skipif(
-    sys.platform == "win32", reason="Windows folds environment names itself"
-)
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["no-hook-command", "standalone-fallback", pytest.param("shadowed", marks=_POSIX_ONLY)],
-)
+@pytest.mark.parametrize("case", ["no-hook-command", "standalone-fallback"])
 def test_timeout_advice_keeps_the_export_when_the_command_does_not_set_it(
     home, proxy_file, monkeypatch, tmp_path, case
 ):
     if case == "standalone-fallback":
         _settings(home, _cmd(_installed(use_daemon=False, surfacing=3.0)))
         monkeypatch.setenv(STANDALONE_GATE, "1")
-    elif case == "shadowed":
-        # A later lower-case spelling wins the fold over the command's variable
-        # (#1503), here with the command's own value: equal values alone would
-        # wrongly credit the command.
-        _settings(home, _cmd(_installed(surfacing=3.0, daemon=4.0)))
-        monkeypatch.setenv(SURFACING_TIMEOUT, "1")
-        monkeypatch.setenv(SURFACING_TIMEOUT.lower(), "3")
-        monkeypatch.setenv(DAEMON_TIMEOUT, "1")
-        monkeypatch.setenv(DAEMON_TIMEOUT.lower(), "4")
     else:
         monkeypatch.setenv(SURFACING_TIMEOUT, "3")
     _install(monkeypatch, AnswerEveryDaemon(_telemetry()))
@@ -1291,6 +1297,9 @@ _PROXY_BREAK = {"MEMTOMEM_STM_PROXY__ENABLED": "maybe"}
 
 
 _BARE_ADVICE = "unset or fix the MEMTOMEM_STM_* variable(s) named for doctor's environment alone"
+_START_HOOKED = (
+    "or start the hook's daemon as its command builds it: mms daemon start --hook-command claude"
+)
 
 
 def _command_advice(location: str = FIRST) -> str:
@@ -1338,9 +1347,66 @@ def test_env_row_says_the_hook_commands_build_succeeds_when_a_flag_shadows_the_v
         f"with the options of the STM hook command at {FIRST} in {path} "
         "(Claude Code user settings): STMConfig() constructs"
     ), row
-    assert _DAEMON_EXITS in bare and name in bare, row
+    # The bare clause is plain ``mms daemon start``; the hook's daemon builds
+    # as the command does, so the row names how to start that one (#1524).
+    assert bare == (
+        f": STMConfig() fails — plain mms daemon start from it exits 1"
+        f" (env var(s) implicated: {name})"
+    ), row
     assert "through" not in row["detail"] and "degrade" not in row["detail"], row
-    assert row["next_action"] == _BARE_ADVICE, row
+    assert row["next_action"] == f"{_BARE_ADVICE}; {_START_HOOKED}", row
+
+
+def _bad_discovery_key() -> None:
+    from memtomem_stm.daemon import discovery
+
+    data_dir = Path(os.environ["MEMTOMEM_STM_DATA_DIR"])
+    data_dir.mkdir(parents=True, exist_ok=True)
+    discovery.discovery_key_path(data_dir).write_bytes(b"not a key\n")
+
+
+_BARE_FAILS = ": STMConfig() fails — mms daemon start from it exits 1"
+_PLAIN_BARE_FAILS = ": STMConfig() fails — plain mms daemon start from it exits 1"
+
+
+@pytest.mark.parametrize(
+    ("case", "clause", "next_action"),
+    [
+        # The command runs without the daemon: no daemon of the hook to start.
+        ("no-daemon", _BARE_FAILS, _BARE_ADVICE),
+        # On the hook's daemon route the row names the command that builds as
+        # the hook does, whatever the ``ltm server`` probe found: that row
+        # reports an unusable key or surfacing off itself, and this one does
+        # not judge whether the start would succeed.
+        ("key-unusable", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
+        ("surfacing-off-key-unusable", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
+        ("surfacing-off", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
+        ("probe-error", _PLAIN_BARE_FAILS, f"{_BARE_ADVICE}; {_START_HOOKED}"),
+    ],
+)
+def test_env_row_names_the_hooks_daemon_start_on_its_route(
+    home, proxy_file, monkeypatch, tmp_path, case, clause, next_action
+):
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    _settings(home, _cmd(_installed(use_daemon=case != "no-daemon")))
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setenv(PERSIST, "not-a-bool")
+    if case in ("key-unusable", "surfacing-off-key-unusable"):
+        _bad_discovery_key()
+    if case in ("surfacing-off", "surfacing-off-key-unusable"):
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    if case == "probe-error":
+
+        def broken(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("probe failed")
+
+        monkeypatch.setattr(proxy_mod, "_ltm_status", broken)
+
+    row, _hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert bare == f"{clause} (env var(s) implicated: {PERSIST})", row
+    assert row["next_action"] == next_action, row
 
 
 def test_env_row_reports_a_hook_build_only_the_commands_options_break(
@@ -1374,6 +1440,8 @@ def test_env_row_keeps_each_builds_cause_when_both_fail(home, proxy_file, monkey
     assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in hook, row
     assert DAEMON_TIMEOUT not in bare, row
     assert "MEMTOMEM_STM_SURFACING__MAX_RESULTS" in bare, row
+    # A hook build that fails: no ``plain``, and no start of the hook's daemon.
+    assert bare.startswith(f"{_BARE_FAILS} (env var(s) implicated: "), row
     assert row["next_action"] == f"{_BARE_ADVICE}; {_command_advice()}", row
 
 
@@ -1403,6 +1471,9 @@ def test_env_row_never_copies_one_builds_outcome_into_the_other(
     assert claims[others[expected_hook]][0] not in hook, row
     assert claims[expected_bare][1] in bare, row
     assert claims[others[expected_bare]][1] not in bare, row
+    if expected_bare == "fail":
+        # Beside a hook build that is not ``ok``, the clause is unchanged.
+        assert bare.startswith(f"{_BARE_FAILS} (env var(s) implicated: "), row
     assert "MEMTOMEM_STM_PROXY__ENABLED" in hook and "MEMTOMEM_STM_PROXY__ENABLED" in bare, row
     # Each clause carries its own build's variables, never the other's.
     deadline = DAEMON_TIMEOUT
@@ -1557,7 +1628,10 @@ def test_env_row_reads_the_command_when_the_config_file_is_missing(home, monkeyp
     assert checks["config_file"]["status"] == "FAIL", checks["config_file"]
     row = checks["env_overrides"]
     assert row["detail"].startswith("with the options of the STM hook command at "), row
-    assert _DAEMON_EXITS in row["detail"], row
+    # The section that decides the hook's route did not run, so the row names
+    # no daemon of the hook's.
+    assert row["detail"].endswith(f"{_BARE_FAILS} (env var(s) implicated: {PERSIST})"), row
+    assert row["next_action"] == _BARE_ADVICE, row
 
 
 def test_env_row_reports_the_build_the_section_failed_on(home, proxy_file, monkeypatch, tmp_path):
