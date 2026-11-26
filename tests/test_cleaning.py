@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner, _merge_spans
+from memtomem_stm.proxy.config import CleaningConfig
 
 
 def _clean(text: str) -> str:
@@ -289,3 +290,107 @@ class TestInjectionDetection:
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.cleaning"):
             _clean(text)
         assert not any("injection" in r.message.lower() for r in caplog.records)
+
+
+class TestCleanParts:
+    """``clean_parts`` — the normal path's text blocks, delivered as one string.
+
+    Line-ending normalization and markup removal read one block; everything
+    else reads the join (#1531). Each section
+    names the design its cases reject: joined removal (what main did) or
+    cleaning each block on its own.
+    """
+
+    @staticmethod
+    def _blocks(*texts: str, config: CleaningConfig | None = None) -> str:
+        cleaner = DefaultContentCleaner(config)
+        return cleaner.clean_parts("\n".join(texts), [len(text) for text in texts])
+
+    @pytest.mark.parametrize(
+        "lengths",
+        [
+            [2, 3],  # too long
+            [2, 1],  # too short
+            [-1, 5],  # adds up, but a negative length would duplicate text
+            [1, 3],  # adds up, but "b" sits where the separator should be
+        ],
+    )
+    def test_lengths_that_do_not_partition_the_text_are_refused(self, lengths):
+        with pytest.raises(ValueError):
+            DefaultContentCleaner().clean_parts("ab\ncd", lengths)
+
+    def test_no_blocks_is_empty_text(self):
+        assert DefaultContentCleaner().clean_parts("", ()) == ""
+
+    # ── removal stays inside a block (joined removal deleted these) ──
+
+    def test_style_element_split_across_blocks_keeps_both_blocks_text(self):
+        out = self._blocks("Intro <style>Release notes", "Rollback instructions</style> end")
+        assert out == "Intro Release notes\nRollback instructions end"
+
+    def test_open_tag_split_across_blocks_is_left(self):
+        assert self._blocks('Intro <a href="x', 'y">tail') == 'Intro <a href="x\ny">tail'
+
+    def test_close_tag_split_across_blocks_is_left(self):
+        assert self._blocks("left </div", "> right") == "left </div\n> right"
+
+    def test_close_tag_exposed_by_an_earlier_pass_does_not_span_blocks(self):
+        # Removing <b> turns block one into "left </div"; joined, the close-tag
+        # pass then read "</div\n>" across the boundary.
+        assert self._blocks("left </<b>div", "> right") == "left </div\n> right"
+
+    # ── line endings are normalized per block ──
+
+    def test_carriage_return_ending_a_block_is_that_block_s_line_end(self):
+        # Joined, "\r" + the separator read as one CRLF.
+        assert self._blocks("a\r", "b") == "a\n\nb"
+
+    def test_crlf_shortening_a_block_moves_the_later_blocks_offsets(self):
+        # Normalizing "\r\n" makes block one a character shorter, so block
+        # two's tags are found only at its new offset. Joined cleaning gives
+        # the same output; this pins the offsets, not the old defect.
+        assert self._blocks("a\r\nb", "<i>c</i>") == "a\nb\nc"
+
+    # ── keeping and whole-response rules read the join (per-block lost these) ──
+
+    def test_fence_split_across_blocks_stays_protected(self):
+        assert self._blocks("```\n<div>a", "b</div>\n```") == "```\n<div>a\nb</div>\n```"
+
+    def test_generic_split_across_blocks_stays_protected(self):
+        assert self._blocks("List<intro", "<b>bold</b> end>") == "List<intro\n<b>bold end>"
+
+    def test_paragraph_repeated_in_another_block_is_deduplicated(self):
+        assert self._blocks("same\n\n", "\n\nsame") == "same"
+
+    def test_link_flood_formed_across_blocks_collapses(self):
+        first = "\n".join(f"- [a{i}](https://e.com/{i})" for i in range(6))
+        second = "\n".join(f"- [b{i}](https://e.com/{i})" for i in range(6))
+        assert self._blocks(first, second) == "[12 links omitted]"
+
+    def test_blank_line_run_across_blocks_is_normalized(self):
+        # Dedup and link-flood collapse also rejoin paragraphs with one blank
+        # line, so both are off: only the whitespace pass can fix this run.
+        config = CleaningConfig(deduplicate=False, collapse_links=False)
+        assert self._blocks("a\n\n", "\nb", config=config) == "a\n\nb"
+
+    # ── protected spans clipped at a block edge ──
+
+    def test_tags_around_a_fence_spanning_blocks_go_and_its_inside_stays(self):
+        out = self._blocks("<b>x</b>\n```\n<i>in", "</i>\n```\n<u>y</u>")
+        assert out == "x\n```\n<i>in\n</i>\n```\ny"
+
+    def test_raw_nul_run_is_not_spliced_as_a_clipped_block_s_region(self):
+        # Block four holds a raw NUL run as long as the inline-code span the
+        # script removal deletes, so a run-count/length check alone would
+        # align and splice "`b`" back in. The empty block sits inside the
+        # fence that spans blocks one to four.
+        blocks = (
+            "<b>l</b>```",
+            "",
+            "<style>keep</style>",
+            "```x\x00\x00\x00<script>`b`</script><i>r</i>",
+        )
+        assert self._blocks(*blocks) == "l```\n\n<style>keep</style>\n```x\x00\x00\x00r"
+
+    def test_empty_blocks_keep_only_their_separators(self):
+        assert self._blocks("", "<b>a</b>", "", "", "b") == "a\n\nb"

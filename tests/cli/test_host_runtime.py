@@ -398,3 +398,107 @@ def test_hook_args_refuses_a_deadline_the_hook_would_drop(
         policy.hook_args()
 
     assert excinfo.value.field == field
+
+
+# --- the look-alike notice's word reader (#1498) -----------------------------
+
+
+def _shlex_words(command: str) -> list[str]:
+    """The reading the notice used before #1498, kept as the oracle: ``shlex``
+    words, and on a parse error the words read before it, an empty word, then
+    the ``str.split()`` words of the whole line."""
+    import shlex
+
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    words: list[str] = []
+    try:
+        for word in lexer:
+            words.append(word)
+    except ValueError:
+        return [*words, "", *command.split()]
+    return words
+
+
+_WORD_CORPUS = [
+    "",
+    " ",
+    " \t\r\n ",
+    "mms hook --host claude",
+    'm"m"s hook --host claude # pinned',
+    "m'm's hook",
+    "m\\ms hook",
+    "mms\\ hook",
+    "a|b&&c;d<e>f",
+    "a||b",
+    "| & ; < >",
+    "|'x'",
+    "|\\x",
+    "'single \\ literal'",
+    '"double \\" quote"',
+    '"double \\\\ escape"',
+    '"double \\a keeps"',
+    '"double \\$ keeps"',
+    "'' ''",
+    "''",
+    '""',
+    "a''b",
+    "unbalanced 'single",
+    'unbalanced "double',
+    'unbalanced "double \\',
+    "trailing \\",
+    'hook m"m"s \'',
+    'm"m"s\rho"ok"',
+    'm"m"s\u00a0ho"ok"',
+    'm"m"s \'\' ho"ok" # note',
+    'echo done\nm"m"s hook',
+    "café mms hook ünïcode",
+    "\x0bmms\x0chook",
+    "x" * 300 + ' "y z" ' + "|" * 7,
+]
+
+
+@pytest.mark.parametrize("command", _WORD_CORPUS)
+def test_the_word_reader_reads_as_shlex_reads(command: str) -> None:
+    from memtomem_stm.cli.host_runtime import _lenient_shell_tokens
+
+    assert _lenient_shell_tokens(command) == _shlex_words(command)
+
+
+def test_the_word_reader_reads_random_lines_as_shlex_reads() -> None:
+    import random
+
+    from memtomem_stm.cli.host_runtime import _lenient_shell_tokens
+
+    rng = random.Random(1498)
+    alphabet = [*"ab '\"\\|&;<>#\t\n\r", "mms", "hook", " ", "\u00a0"]
+    for _ in range(5000):
+        command = "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 24)))
+        assert _lenient_shell_tokens(command) == _shlex_words(command), repr(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo " + "x" * 1_000_000,
+        "echo " + "|" * 1_000_000,
+        'echo "' + " " * 1_000_000 + '"',
+        "echo " + "\\x" * 1_000_000,
+        "echo " + "'a'" * 1_000_000,
+        'echo "' + '\\"' * 1_000_000 + '"',
+    ],
+    ids=["plain", "punctuation", "quoted-space", "escapes", "quote-pairs", "quoted-escapes"],
+)
+def test_the_notice_reads_a_long_word_in_linear_time(command: str) -> None:
+    """``shlex`` builds a word one character at a time by concatenation, so
+    a long word in any handler made every install and uninstall plan slow."""
+    import time
+
+    from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
+
+    data = {"hooks": {"PostToolUse": [{"hooks": [{"type": "command", "command": command}]}]}}
+
+    started = time.perf_counter()
+    assert unmanaged_stm_like("claude", data) == ()
+    assert time.perf_counter() - started < 3.0

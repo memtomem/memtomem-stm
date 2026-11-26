@@ -540,8 +540,20 @@ def test_a_command_install_did_not_write_is_not_read(home, monkeypatch, command)
         ({"type": "command", "command": "__INSTALLED__", "shell": "powershell"}, "unreadable"),
         (_cmd(f"{HOOK_GATE}=false mms hook --host claude"), "unreadable"),
         (_cmd("mms hook --host claude --surfacing-timeout-seconds 3 # pinned"), "unreadable"),
+        # Only the notice's word reader names this one: the raw search misses
+        # the quoted name and the ``#`` keeps the candidate test's own split
+        # away (#1498).
+        (_cmd('m"m"s hook --host claude # pinned'), "unreadable"),
     ],
-    ids=["two-recognized", "exec-form", "args-field", "shell-field", "bare-assignment", "comment"],
+    ids=[
+        "two-recognized",
+        "exec-form",
+        "args-field",
+        "shell-field",
+        "bare-assignment",
+        "comment",
+        "quoted-name",
+    ],
 )
 def test_a_second_handler_that_may_run_the_hook_keeps_the_bare_view(
     home, monkeypatch, other, state
