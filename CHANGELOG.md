@@ -13,7 +13,8 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
-- `mms stats` reports how many proxied responses carried `_context_query`.
+- `mms stats` reports how many proxied responses carried `_context_query`
+  (#1542).
   Query-aware compression needs the agent to supply that argument, and
   `proxy_metrics` did not record whether it did. A proxied call whose
   upstream result is successful and has a text block now stores `agent` or `none` in a new
