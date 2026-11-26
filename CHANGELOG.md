@@ -38,7 +38,9 @@ changes inline only. See the deprecation policy in
   first progressive, selective or hybrid response already did (issue #1529).
   Text an upstream addressed to `audience: ["assistant"]` no longer loses that
   hint from the second chunk on. The metadata is stored with the pending
-  entry, in both pending stores. **Behavior change**: a structured
+  entry, in both pending stores, up to 64 KiB serialized; larger metadata
+  stays on the first response only, and its continuations go out without it
+  as before. **Behavior change**: a structured
   continuation's frame now reserves room for that metadata, so it holds
   less content and a selection that fit before can return `budget_exceeded`;
   a read at or past the end carries none. With a SQLite pending store, a

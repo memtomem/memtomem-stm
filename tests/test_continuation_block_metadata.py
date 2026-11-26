@@ -382,7 +382,7 @@ async def test_expiry_passes_do_not_decode_block_metadata(tmp_path, monkeypatch,
     import memtomem_stm.proxy.pending_store as pending_store
 
     proxy, session = _manager(tmp_path, "progressive", "legacy", sqlite=sqlite)
-    big = {"blob": "z" * 500_000}
+    big = {"blob": "z" * 60_000}  # under the 64 KiB retention cap
     for i in range(3):
         await _publish(
             proxy, session, "progressive", "legacy", _block(text=SOURCE + str(i), meta=big)
@@ -554,5 +554,29 @@ async def test_one_read_decodes_the_block_metadata_once(tmp_path, monkeypatch, f
         monkeypatch.setattr(compression.json, "loads", real_loads)
         assert more.content[0].meta == BLOCK_META
         assert len(validated) == 1, strategy
-        if strategy == "selective":
-            assert sum('"text_block"' in s for s in loads if isinstance(s, str)) == 1
+        # ``json.loads`` is the one module object both readers use, so this
+        # counts every decode of the container holding the block metadata.
+        assert sum('"text_block"' in s for s in loads if isinstance(s, str)) == 1, strategy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["progressive", "selective"])
+async def test_oversized_block_metadata_is_not_retained(tmp_path, strategy):
+    """Pending stores bound entries by count only; block metadata past 64 KiB
+    serialized stays on the first response and is not kept for continuations."""
+    from memtomem_stm.proxy.manager import _MAX_CONTINUED_TEXT_BLOCK_BYTES
+
+    proxy, session = _manager(tmp_path, strategy, "legacy", sqlite=True)
+    fits = {"blob": "z" * (_MAX_CONTINUED_TEXT_BLOCK_BYTES - 100)}
+    over = {"blob": "z" * (_MAX_CONTINUED_TEXT_BLOCK_BYTES + 1)}
+
+    key, offset = await _publish(proxy, session, strategy, "legacy", _block(meta=fits))
+    assert _continue(proxy, strategy, key, offset).content[0].meta == fits
+
+    session.call_tool.return_value = CallToolResult(content=[_block(text=SOURCE + "!", meta=over)])
+    initial = await proxy.call_tool("srv", "read", {})
+    assert initial.content[0].meta == over
+    key, offset = _key(initial, strategy, "legacy")
+    more = _continue(proxy, strategy, key, offset)
+    assert more.content[0].meta is None and more.content[0].annotations is None
+    assert "z" * 1000 not in "".join(str(r) for r in _rows(tmp_path / "pending.db")[-1:])

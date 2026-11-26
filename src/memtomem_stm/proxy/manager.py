@@ -212,6 +212,7 @@ from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.display import _disp
 from memtomem_stm.utils.local_key import LocalKeyError
 from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
+from memtomem_stm.utils.json_out import dumps as surrogate_safe_dumps
 from memtomem_stm.utils.json_size import json_utf8_size_async
 from memtomem_stm.utils.keyed_locks import KeyedLocks
 from memtomem_stm.utils.mcp_transport import (
@@ -698,19 +699,37 @@ def _text_block_metadata(block: Any) -> dict[str, Any]:
     return block.model_dump(by_alias=True, exclude={"type", "text"}, exclude_none=True)
 
 
+# Largest serialized text block metadata a pending entry keeps for its
+# continuations. The stores bound entries by count only, and ``_meta`` is not
+# under ``max_upstream_chars``, so without this one entry could hold tens of
+# MiB beyond its text for its whole TTL.
+_MAX_CONTINUED_TEXT_BLOCK_BYTES = 64 * 1024
+
+
 def _continued_text_block(block: Any) -> dict[str, Any] | None:
     """The metadata a pending entry stores for its continuations (#1529).
 
     In JSON form, as the client receives the first chunk: a Python-mode dump
     keeps a non-finite float in ``_meta``, which the selective row's
-    ``allow_nan=False`` serialization would refuse.
+    ``allow_nan=False`` serialization would refuse. Metadata larger than
+    ``_MAX_CONTINUED_TEXT_BLOCK_BYTES`` serialized is not stored: the first
+    response still carries it, and its continuations go out without it, as
+    they did before.
     """
     if not isinstance(block, mcp_types.TextContent):
         return None
-    return (
-        block.model_dump(mode="json", by_alias=True, exclude={"type", "text"}, exclude_none=True)
-        or None
-    )
+    meta = block.model_dump(mode="json", by_alias=True, exclude={"type", "text"}, exclude_none=True)
+    if not meta:
+        return None
+    size = len(surrogate_safe_dumps(meta, ensure_ascii=False).encode("utf-8"))
+    if size > _MAX_CONTINUED_TEXT_BLOCK_BYTES:
+        logger.debug(
+            "Text block metadata of %d bytes exceeds %d; continuations will not repeat it",
+            size,
+            _MAX_CONTINUED_TEXT_BLOCK_BYTES,
+        )
+        return None
+    return meta
 
 
 def _scrub_surrogates_in(value: Any) -> Any:
