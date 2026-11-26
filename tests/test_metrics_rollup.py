@@ -154,6 +154,7 @@ def _strip_rollup(path: Path) -> None:
         db.execute(f"DROP TRIGGER IF EXISTS {_TRIGGER}")
         db.execute(f"DROP TABLE IF EXISTS {_STATUS_DAILY}")
         db.execute(f"DROP TABLE IF EXISTS {_DAILY}")
+        db.execute(f"DROP TABLE IF EXISTS {_CACHE_DAILY}")
         db.execute("DELETE FROM metrics_meta")
         db.commit()
     finally:
@@ -546,6 +547,24 @@ class TestReader:
         # The retained reader is unaffected.
         assert read_compression_summary(path)["total_calls"] == 15
 
+    def test_coverage_and_totals_come_from_one_snapshot(self, tmp_path, monkeypatch):
+        """A write committed after the coverage check must not reach the totals:
+        a rebuild landing in between would pair old markers with new rows."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _insert_raw(path, created_at=1_000_000.0)
+        real = metrics_store_module._rollup_coverage
+
+        def _then_write(db: sqlite3.Connection) -> Any:
+            coverage = real(db)
+            _insert_raw(path, created_at=1_000_001.0)  # another connection, committed
+            return coverage
+
+        monkeypatch.setattr(metrics_store_module, "_rollup_coverage", _then_write)
+        assert read_compression_all_time(path)["total_calls"] == 1
+        monkeypatch.undo()
+        assert read_compression_all_time(path)["total_calls"] == 2, "positive control"
+
     @pytest.mark.parametrize("drop", ["trigger", "marker", "table"])
     def test_partial_installation_is_not_installed(self, tmp_path, drop):
         path = tmp_path / "m.db"
@@ -683,17 +702,17 @@ class TestCoverage:
         db.commit()
         db.close()
         _open(path).close()
-        db = sqlite3.connect(str(path))
-        db.execute(
-            "UPDATE metrics_meta SET value = ? WHERE key = 'rollup_installed_at'",
-            (str(installed_at),),
+        # A first installation writes one timestamp as both markers.
+        _sql(
+            path,
+            f"UPDATE metrics_meta SET value = '{installed_at!r}' "
+            "WHERE key IN ('rollup_installed_at', 'rollup_complete_from')",
         )
-        db.commit()
-        db.close()
 
     def test_warning_does_not_change_when_a_post_install_row_is_trimmed(self, tmp_path):
-        """Install at noon, record at 13:00, trim that row. A coverage check that
-        reconstructed the rolled-up row's time as midnight would start warning."""
+        """Install at noon, record at 13:00, trim that row. The warning is about
+        the rows lost before noon, so neither the trim nor a filter changes it,
+        and trimming does not move the earliest timestamp."""
         path = tmp_path / "m.db"
         noon = 1_798_200_000.0 - (1_798_200_000.0 % DAY) + DAY / 2
         self._pre_install_db_with_loss(path, noon)
@@ -701,7 +720,7 @@ class TestCoverage:
 
         live = read_compression_all_time(path)["rollup"]
         assert live["lost_before_install"] == 1, "positive control: there was loss"
-        assert live["incomplete_before"] is None
+        assert live["incomplete_before"] == noon
 
         db = sqlite3.connect(str(path))
         db.execute("DELETE FROM proxy_metrics")
@@ -709,7 +728,7 @@ class TestCoverage:
         db.close()
         for kwargs in ({}, {"tool": "late"}):
             rolled = read_compression_all_time(path, **kwargs)["rollup"]
-            assert rolled["incomplete_before"] is None, kwargs
+            assert rolled["incomplete_before"] == noon, kwargs
             assert rolled["earliest_created_at"] == noon + 3600
 
     def test_same_day_pre_install_row_warns(self, tmp_path):
@@ -720,7 +739,59 @@ class TestCoverage:
         _insert_raw(path, created_at=noon - 3600, tool="morning")
         rollup = read_compression_all_time(path, tool="morning")["rollup"]
         assert rollup["incomplete_before"] == noon
-        assert read_compression_all_time(path, tool="other")["rollup"]["incomplete_before"] is None
+        assert read_compression_all_time(path, tool="other")["rollup"]["incomplete_before"] == noon
+
+    def test_the_warning_is_database_wide(self, tmp_path):
+        """Which tool, source or day a lost row had is unknowable (#1527): no
+        filter and no set of counted rows can rule the loss out."""
+        path = tmp_path / "m.db"
+        noon = 1_798_200_000.0 - (1_798_200_000.0 % DAY) + DAY / 2
+        self._pre_install_db_with_loss(path, noon)
+        _insert_raw(path, created_at=noon + 3600, tool="late")
+        for kwargs in (
+            {},
+            {"tool": "late"},
+            {"tool": "absent"},
+            {"source": "hook"},
+            {"tool": "\ud800"},
+        ):
+            result = read_compression_all_time(path, **kwargs)
+            assert result["available"] is True, kwargs
+            assert result["rollup"]["lost_before_install"] == 1, kwargs
+            assert result["rollup"]["incomplete_before"] == noon, kwargs
+        assert read_compression_all_time(path, tool="absent")["total_calls"] == 0
+
+    def test_unknown_loss_warns_with_no_counted_rows(self, tmp_path):
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _sql(path, "DELETE FROM metrics_meta")
+        _open(path).close()  # re-created on a running rollup: the loss is unknown
+        result = read_compression_all_time(path)
+        assert result["total_calls"] == 0, "positive control: nothing is counted"
+        rollup = result["rollup"]
+        assert rollup["lost_before_install"] is None
+        assert rollup["incomplete_before"] is not None
+        assert rollup["incomplete_before"] == float(_meta(path)["rollup_complete_from"])
+
+    def test_pre_source_db_with_a_hook_filter_still_warns(self, tmp_path):
+        """The reader's pre-``source`` exit returns before the totals."""
+        path = tmp_path / "m.db"
+        m = metrics_store_module
+        _sql(
+            path,
+            "CREATE TABLE proxy_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT, "
+            "tool TEXT, original_chars INTEGER, compressed_chars INTEGER, created_at REAL, "
+            "is_error INTEGER)",
+            m._META_CREATE,
+            m._DAILY_CREATE,
+            m._ROLLUP_TRIGGER_DDL,
+            "INSERT INTO metrics_meta VALUES ('rollup_installed_at', '1000.0'), "
+            "('rollup_rows_lost_before_install', '3'), ('rollup_complete_from', '1000.0')",
+        )
+        result = read_compression_all_time(path, source="hook")
+        assert (result["available"], result["rollup"]["installed"]) == (True, True)
+        assert result["total_calls"] == 0
+        assert result["rollup"]["incomplete_before"] == 1000.0
 
     def test_no_loss_means_no_warning_even_for_old_rows(self, tmp_path):
         path = tmp_path / "m.db"
@@ -884,6 +955,281 @@ class TestMarkerRepair:
         _open(path).close()
 
         assert _meta(path)["rollup_rows_lost_before_install"] == "2"
+
+
+class TestRollupDamageRepair:
+    """A rollup that missed deletes must never read as complete again (#1527).
+
+    The rollup is whole only when its trigger is exactly this version's and
+    its markers are valid and consistent. Anything less, on a file that shows
+    any trace of an earlier installation, is rebuilt on the next stale-stamp
+    open with the loss recorded as unknown and the boundary moved to then.
+    """
+
+    @staticmethod
+    def _running(path: Path) -> dict[str, str]:
+        """Three rows, one trimmed AFTER installation: nothing was ever lost."""
+        _open(path).close()
+        for i in range(3):
+            _insert_raw(path, created_at=1_000_000.0 + i)
+        _sql(path, "DELETE FROM proxy_metrics WHERE id = 1")
+        rollup = read_compression_all_time(path)["rollup"]
+        assert (rollup["lost_before_install"], rollup["incomplete_before"]) == (0, None), (
+            "positive control: a complete history"
+        )
+        return _meta(path)
+
+    @staticmethod
+    def _assert_repaired(path: Path, before: dict[str, str], reopened_at: float) -> None:
+        meta = _meta(path)
+        assert meta["rollup_rows_lost_before_install"] == "unknown"
+        assert float(meta["rollup_complete_from"]) >= reopened_at
+        if "rollup_installed_at" in before:
+            assert meta["rollup_installed_at"] == before["rollup_installed_at"]
+        assert _TRIGGER in _triggers(path)
+        result = read_compression_all_time(path)
+        assert result["rollup"]["installed"] is True
+        assert result["rollup"]["lost_before_install"] is None
+        assert result["rollup"]["incomplete_before"] == float(meta["rollup_complete_from"])
+        # The rebuilt trigger feeds the table the reader counts.
+        calls = result["total_calls"]
+        _insert_raw(path, created_at=2_000_000.0)
+        _sql(path, "DELETE FROM proxy_metrics")
+        assert read_compression_all_time(path)["total_calls"] == calls + 1
+
+    @pytest.mark.parametrize(
+        "stale",
+        [
+            "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'",
+            # What an older binary's restamp looks like to this one.
+            "UPDATE metrics_meta SET value = 'older' WHERE key = 'schema_fingerprint'",
+        ],
+    )
+    def test_a_dropped_trigger_records_an_unknown_loss(self, tmp_path, stale):
+        path = tmp_path / "m.db"
+        before = self._running(path)
+        _sql(path, f"DROP TRIGGER {_TRIGGER}")
+        _insert_raw(path, created_at=1_000_010.0)
+        _sql(path, "DELETE FROM proxy_metrics WHERE created_at = 1000010.0")  # not rolled up
+        _sql(path, stale)
+
+        reopened_at = time.time()
+        _open(path).close()
+
+        self._assert_repaired(path, before, reopened_at)
+
+    @pytest.mark.parametrize("damage", ["rename", "drop_table", "drop_both"])
+    def test_a_damaged_daily_table_records_an_unknown_loss(self, tmp_path, damage):
+        """Renaming the daily table rewrites the trigger into the renamed one,
+        where it feeds nothing the reader counts; dropping it loses the rows
+        already rolled up."""
+        path = tmp_path / "m.db"
+        before = self._running(path)
+        statements = {
+            "rename": [f"ALTER TABLE {_DAILY} RENAME TO {_DAILY}_aside"],
+            "drop_table": [f"DROP TABLE {_DAILY}"],
+            "drop_both": [f"DROP TRIGGER {_TRIGGER}", f"DROP TABLE {_DAILY}"],
+        }[damage]
+        _sql(path, *statements, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+
+        reopened_at = time.time()
+        _open(path).close()
+
+        self._assert_repaired(path, before, reopened_at)
+
+    def test_a_corrupted_boundary_never_falls_back_to_the_installation(self, tmp_path):
+        path = tmp_path / "m.db"
+        before = self._running(path)
+        _sql(path, f"DROP TRIGGER {_TRIGGER}")
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        _open(path).close()
+        assert _meta(path)["rollup_rows_lost_before_install"] == "unknown", "positive control"
+
+        _sql(path, "UPDATE metrics_meta SET value = 'x' WHERE key = 'rollup_complete_from'")
+        assert read_compression_all_time(path)["rollup"]["installed"] is False
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        reopened_at = time.time()
+        _open(path).close()
+
+        self._assert_repaired(path, before, reopened_at)
+
+    def test_a_later_installation_time_than_the_boundary_is_not_whole(self, tmp_path):
+        """An older binary that finds the marker erased writes a new installation
+        time, leaving a repair's earlier boundary in place: the gap it could
+        have missed lies after that boundary."""
+        path = tmp_path / "m.db"
+        self._running(path)
+        _sql(path, f"DROP TRIGGER {_TRIGGER}")
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        _open(path).close()
+        boundary = float(_meta(path)["rollup_complete_from"])
+        _sql(
+            path,
+            f"UPDATE metrics_meta SET value = '{boundary + 100!r}' "
+            "WHERE key = 'rollup_installed_at'",
+        )
+
+        assert read_compression_all_time(path)["rollup"]["installed"] is False
+
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        _open(path).close()
+        meta = _meta(path)
+        assert float(meta["rollup_complete_from"]) >= float(meta["rollup_installed_at"])
+        assert read_compression_all_time(path)["rollup"]["installed"] is True
+
+    @pytest.mark.parametrize(
+        "kept",
+        [
+            "rollup_complete_from",
+            "cache_rollup_installed_at",
+            _STATUS_DAILY,
+            _STATUS_TRIGGER,
+            _CACHE_DAILY,
+        ],
+    )
+    def test_a_surviving_trace_is_not_a_first_installation(self, tmp_path, kept):
+        """``seq - COUNT(*)`` would count the rows already rolled up as lost.
+
+        Each case keeps exactly one trace. The status reset trigger is not a
+        case of its own: it lives on the daily table and goes with it."""
+        path = tmp_path / "m.db"
+        self._running(path)
+        objects = {
+            _STATUS_TRIGGER: f"DROP TRIGGER {_STATUS_TRIGGER}",
+            _STATUS_DAILY: f"DROP TABLE {_STATUS_DAILY}",
+            _CACHE_DAILY: f"DROP TABLE {_CACHE_DAILY}",
+        }
+        statements = [f"DROP TRIGGER {_TRIGGER}"]
+        statements += [sql for name, sql in objects.items() if name != kept]
+        statements.append(f"DROP TABLE {_DAILY}")
+        statements.append(
+            f"DELETE FROM metrics_meta WHERE key <> '{kept}'"
+            if kept in ("rollup_complete_from", "cache_rollup_installed_at")
+            else "DELETE FROM metrics_meta"
+        )
+        _sql(path, *statements)
+        names = {name for _, name in _objects(path)} | set(_meta(path))
+        traces = {
+            "rollup_complete_from",
+            "cache_rollup_installed_at",
+            _DAILY,
+            _TRIGGER,
+            _STATUS_DAILY,
+            _STATUS_TRIGGER,
+            _STATUS_RESET_TRIGGER,
+            _CACHE_DAILY,
+        }
+        assert names & traces == {kept}, "positive control: exactly one trace survives"
+
+        _open(path).close()
+
+        assert _meta(path)["rollup_rows_lost_before_install"] == "unknown"
+
+    def test_a_boundary_never_moves_back(self, tmp_path, monkeypatch):
+        """A second rebuild after the clock went back keeps the later boundary."""
+        path = tmp_path / "m.db"
+        self._running(path)
+        _sql(path, f"DROP TRIGGER {_TRIGGER}")
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        _open(path).close()
+        boundary = _meta(path)["rollup_complete_from"]
+
+        real_time = time.time
+        monkeypatch.setattr(metrics_store_module.time, "time", lambda: real_time() - 3600)
+        _sql(path, f"DROP TRIGGER {_TRIGGER}")
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        _open(path).close()
+        monkeypatch.undo()
+
+        assert _meta(path)["rollup_complete_from"] == boundary
+        assert read_compression_all_time(path)["rollup"]["incomplete_before"] == float(boundary)
+
+    def test_a_daily_table_renamed_in_another_case_is_rebuilt_once(self, tmp_path):
+        """SQLite resolves names regardless of ASCII case: ``PROXY_METRICS_DAILY``
+        is the daily table, so the rebuild must not wait for a table it cannot
+        create, and the next stale open finds the rollup whole."""
+        path = tmp_path / "m.db"
+        before = self._running(path)
+        _sql(
+            path,
+            f"ALTER TABLE {_DAILY} RENAME TO daily_tmp",
+            f"ALTER TABLE daily_tmp RENAME TO {_DAILY.upper()}",
+            "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'",
+        )
+        reopened_at = time.time()
+        _open(path).close()
+        self._assert_repaired(path, before, reopened_at)
+
+        repaired = _meta(path)
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        _open(path).close()
+        assert _meta(path)["rollup_complete_from"] == repaired["rollup_complete_from"]
+
+    def test_a_stamp_alone_is_a_first_installation(self, tmp_path):
+        """Builds before the rollup created ``metrics_meta`` for their stamp."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _strip_rollup(path)
+        _sql(path, "INSERT INTO metrics_meta VALUES ('schema_fingerprint', 'older')")
+        for i in range(4):
+            _insert_raw(path, created_at=1_000_000.0 + i)
+        _sql(path, "DELETE FROM proxy_metrics WHERE id <= 2")
+
+        _open(path).close()
+
+        assert _meta(path)["rollup_rows_lost_before_install"] == "2"
+
+    def test_a_first_installation_writes_one_time_as_both_markers(self, tmp_path):
+        path = tmp_path / "m.db"
+        _open(path).close()
+        meta = _meta(path)
+        assert meta["rollup_complete_from"] == meta["rollup_installed_at"]
+
+    def test_an_installation_from_before_the_boundary_marker(self, tmp_path):
+        """A DB this version has not rebuilt yet has no ``rollup_complete_from``:
+        its history is complete from the installation, and the next rebuild
+        records that rather than a loss."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _strip_rollup(path)
+        _insert_raw(path, created_at=1_000_000.0)
+        _sql(path, "DELETE FROM proxy_metrics")
+        _open(path).close()
+        _insert_raw(path, created_at=1_000_001.0)
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'rollup_complete_from'")
+        installed_at = float(_meta(path)["rollup_installed_at"])
+
+        rollup = read_compression_all_time(path)["rollup"]
+        assert (rollup["lost_before_install"], rollup["incomplete_before"]) == (1, installed_at)
+
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        _open(path).close()
+        meta = _meta(path)
+        assert meta["rollup_rows_lost_before_install"] == "1"
+        assert meta["rollup_complete_from"] == meta["rollup_installed_at"]
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("rollup_complete_from", "'x'"),
+            ("rollup_complete_from", "'inf'"),
+            ("rollup_installed_at", "'inf'"),
+            ("rollup_installed_at", "CAST(X'FF' AS TEXT)"),
+            ("rollup_rows_lost_before_install", "'-1'"),
+        ],
+    )
+    def test_an_invalid_marker_reads_as_not_installed_until_repaired(self, tmp_path, key, value):
+        path = tmp_path / "m.db"
+        self._running(path)
+        _sql(path, f"UPDATE metrics_meta SET value = {value} WHERE key = '{key}'")
+
+        assert read_compression_all_time(path)["rollup"]["installed"] is False
+
+        _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+        reopened_at = time.time()
+        _open(path).close()  # does not fail on the undecodable value
+
+        self._assert_repaired(path, {}, reopened_at)
 
 
 # ── Hook status rollup (#1442) ──────────────────────────────────────────────

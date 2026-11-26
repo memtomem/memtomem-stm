@@ -1601,7 +1601,8 @@ class TestMmsStatsAllTime:
             "UPDATE metrics_meta SET value = '7' WHERE key = 'rollup_rows_lost_before_install'"
         )
         raw.execute(
-            "UPDATE metrics_meta SET value = '4102444800.0' WHERE key = 'rollup_installed_at'"
+            "UPDATE metrics_meta SET value = '4102444800.0' "
+            "WHERE key IN ('rollup_installed_at', 'rollup_complete_from')"
         )
         raw.commit()
         raw.close()
@@ -1609,7 +1610,35 @@ class TestMmsStatsAllTime:
         result = runner.invoke(cli, ["stats", "--all-time"])
 
         assert result.exit_code == 0, result.output
-        assert "Incomplete before 2100-01-01 00:00 UTC: 7 rows were trimmed" in result.output
+        assert (
+            "Incomplete before 2100-01-01 00:00 UTC: 7 rows (database-wide) were trimmed"
+            in result.output
+        )
+
+    def test_an_empty_selection_still_shows_the_loss(self, runner, tmp_path, monkeypatch):
+        """Which tool a lost row had is unknown (#1527), so a filter that matches
+        nothing must not read as a complete history."""
+        set_home(monkeypatch, tmp_path)
+        db = self._seed_trimmed(tmp_path)
+        raw = sqlite3.connect(str(db))
+        raw.execute(
+            "UPDATE metrics_meta SET value = '7' WHERE key = 'rollup_rows_lost_before_install'"
+        )
+        raw.execute(
+            "UPDATE metrics_meta SET value = '4102444800.0' "
+            "WHERE key IN ('rollup_installed_at', 'rollup_complete_from')"
+        )
+        raw.commit()
+        raw.close()
+
+        result = runner.invoke(cli, ["stats", "--all-time", "--tool", "absent"])
+
+        assert result.exit_code == 0, result.output
+        assert "No proxy metrics recorded yet." in result.output
+        assert (
+            "Incomplete before 2100-01-01 00:00 UTC: 7 rows (database-wide) were trimmed"
+            in result.output
+        )
 
     def test_unknown_loss_is_not_reported_as_a_loss(self, runner, tmp_path, monkeypatch):
         """Markers erased from a running rollup and re-created (#1348): whether any
@@ -1628,7 +1657,8 @@ class TestMmsStatsAllTime:
             "SELECT value FROM metrics_meta WHERE key = 'rollup_rows_lost_before_install'"
         ).fetchone() == ("unknown",), "positive control: the re-created count is unknown"
         raw.execute(
-            "UPDATE metrics_meta SET value = '4102444800.0' WHERE key = 'rollup_installed_at'"
+            "UPDATE metrics_meta SET value = '4102444800.0' "
+            "WHERE key IN ('rollup_installed_at', 'rollup_complete_from')"
         )
         raw.commit()
         raw.close()
@@ -1637,8 +1667,8 @@ class TestMmsStatsAllTime:
 
         assert result.exit_code == 0, result.output
         assert "Possibly incomplete before 2100-01-01 00:00 UTC" in result.output
-        assert "is unknown" in result.output
-        assert "rows were trimmed" not in result.output
+        assert "an unknown number of rows" in result.output
+        assert "were trimmed" not in result.output
         assert "Incomplete before" not in result.output
 
     def test_coverage_outside_pythons_date_range_renders(self, runner, tmp_path, monkeypatch):

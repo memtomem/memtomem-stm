@@ -2660,16 +2660,18 @@ def _all_time_coverage_lines(rollup: dict[str, Any]) -> list[str]:
         when = _utc_text(float(incomplete), "%Y-%m-%d %H:%M")
         if isinstance(lost, int):
             lines.append(
-                f"  Incomplete before {when} UTC: {lost:,} rows were trimmed\n"
+                f"  Incomplete before {when} UTC: {lost:,} rows (database-wide) were trimmed\n"
                 "    before the rollup was installed, so rows created before then may be missing."
             )
         else:
-            # No count recorded (or the markers were re-created on a running
-            # rollup): loss is possible, not established, so don't assert it.
+            # No count recorded: the rollup was rebuilt after damage, or its
+            # markers re-created on a running rollup. Loss is possible, not
+            # established, so don't assert it — and the boundary may be the
+            # rebuild, not the installation.
             lines.append(
-                f"  Possibly incomplete before {when} UTC: the number of rows trimmed\n"
-                "    before the rollup was installed is unknown, so rows created before then"
-                " may be missing."
+                f"  Possibly incomplete before {when} UTC: an unknown number of rows trimmed\n"
+                "    before then may be missing; the loss is database-wide, so it may include\n"
+                "    rows of the selection shown."
             )
     undated = rollup.get("unknown_date_calls") or 0
     if undated:
@@ -2881,14 +2883,21 @@ def _render_compression_block(
         return
     if rollup is not None and not rollup.get("installed"):
         click.echo(
-            "  All-time totals unavailable: this metrics DB has no daily rollup yet.\n"
-            "    It is installed the next time this STM version opens the DB (the MCP\n"
-            "    server, `mms tune` or `mms hook`); rows trimmed before then are not\n"
-            "    recoverable. Without --all-time this command reports the retained rows."
+            "  All-time totals unavailable: this metrics DB has no complete daily rollup.\n"
+            "    A DB without one gets it the next time this STM version opens it (the\n"
+            "    MCP server, `mms tune` or `mms hook`); rows trimmed before then are not\n"
+            "    recoverable. A damaged one is rebuilt, with its loss recorded as unknown,\n"
+            "    once the schema stamp is cleared:\n"
+            "    DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'\n"
+            "    Without --all-time this command reports the retained rows."
         )
         return
     if not summary.get("available") or not summary.get("total_calls"):
         click.echo("  No proxy metrics recorded yet.")
+        if rollup is not None and summary.get("available"):
+            # The loss is file-wide: an empty selection can still be missing rows.
+            for line in _all_time_coverage_lines(rollup):
+                click.echo(line)
         return
     if summary.get("schema_outdated"):
         click.echo(f"  {_warn('schema outdated')} — error counts unavailable (pre-migration DB).")
@@ -3018,10 +3027,9 @@ def _render_cache_block(summary: dict[str, Any], *, collecting: bool) -> None:
 def _progressive_coverage_lines(rollup: dict[str, Any]) -> list[str]:
     """Coverage lines for the ``rollup`` of an all-time progressive summary.
 
-    Not :func:`_all_time_coverage_lines`: here the boundary is when the history
-    became complete, which after a repair of a damaged rollup is later than the
-    installation, so the loss is not described as "before the rollup was
-    installed".
+    Not :func:`_all_time_coverage_lines`: the units differ (reads purged, not
+    rows trimmed). Both boundaries are when the history became complete, which
+    after a repair of a damaged rollup is later than the installation.
     """
     earliest = rollup.get("earliest_created_at")
     if earliest is not None:
