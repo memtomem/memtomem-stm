@@ -382,8 +382,9 @@ class CallMetrics:
     hook_compression_status: str | None = None
     # ``context_query_source(...)`` for the two MCP success rows that carry a
     # ``compression_accounting`` stamp. ``None`` on every other row — errors,
-    # a response with no text, ``mms hook`` rows, rows written before the
-    # column — which a reader leaves out rather than counts as "no query".
+    # an upstream result with no text block, ``mms hook`` rows, rows written
+    # before the column — which a reader leaves out rather than counts as
+    # "no query".
     # Only the fact is kept; this row never holds the query's text.
     context_query_source: str | None = None
 

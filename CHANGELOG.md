@@ -15,13 +15,13 @@ changes inline only. See the deprecation policy in
 
 - `mms stats` reports how many proxied responses carried `_context_query`.
   Query-aware compression needs the agent to supply that argument, and
-  nothing recorded whether it did. A proxied call that returns a successful
-  response with a text block now stores `agent` or `none` in a new
+  `proxy_metrics` did not record whether it did. A proxied call whose
+  upstream result is successful and has a text block now stores `agent` or `none` in a new
   `context_query_source` column of `proxy_metrics`; the row does not store
   the query's text. The compression block prints `Context query supplied on N of M
   observed live MCP responses` under the MCP figures, and `--json` carries
   the two counts as `context_query` inside `compression` and inside the
-  `mcp` entry of `compression_by_source` (`null` in the `hook` entry). Failed calls, responses with no text
+  `mcp` entry of `compression_by_source` (`null` in the `hook` entry). Failed calls, upstream results with no text
   block, cache hits, `mms hook` rows and rows written before this version
   are not counted, and the figure covers the retained rows only, so it is
   absent under `--all-time`. See

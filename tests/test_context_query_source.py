@@ -126,6 +126,19 @@ class TestStampedRows:
         assert (source, is_error) == (expected, 0)
         assert accounting is not None
 
+    async def test_an_empty_text_block_is_stamped(self, build):
+        """The stamp follows the upstream result's text blocks, not their
+        text: one empty block is observed, no block is not (see
+        ``TestUnstampedRows.test_response_without_text``)."""
+        mgr, store = build()
+        mgr._connections["srv"].session.call_tool.return_value = _text_result("")
+
+        await mgr.call_tool("srv", "read", {"_context_query": QUERY})
+
+        ((source, accounting, _strategy, is_error),) = _rows(store, "read")
+        assert (source, is_error) == ("agent", 0)
+        assert accounting is not None
+
     async def test_structured_delivery_frame(self, build):
         mgr, store = build(
             compression="progressive",
@@ -374,9 +387,21 @@ class TestSummary:
         assert summary["total_calls"] == 6
         assert summary["context_query"] is None
 
-    def test_the_counts_come_from_the_statement_that_reads_the_totals(self, tmp_path, monkeypatch):
-        """One SELECT over ``proxy_metrics``, so no row can land between the
-        totals and the counts printed under them."""
+    @pytest.mark.parametrize(
+        ("filters", "expected"),
+        [
+            ({}, {"observed": 4, "agent": 2}),
+            ({"source": "mcp"}, {"observed": 4, "agent": 2}),
+            ({"tool": "read"}, {"observed": 3, "agent": 1}),
+        ],
+        ids=["unfiltered", "source-mcp", "tool"],
+    )
+    def test_the_counts_come_from_the_statement_that_reads_the_totals(
+        self, tmp_path, monkeypatch, filters, expected
+    ):
+        """Exactly one statement reads the column, and it is the one that
+        reads the totals, so no row can land between the totals and the
+        counts printed under them."""
         path = tmp_path / "m.db"
         self._seed(path)
         statements: list[str] = []
@@ -389,12 +414,16 @@ class TestSummary:
 
         monkeypatch.setattr(sqlite3, "connect", _traced)
 
-        summary = read_compression_summary(path, source="mcp")
+        summary = read_compression_summary(path, **filters)
 
-        assert summary["context_query"] == {"observed": 4, "agent": 2}
-        reads = [s for s in statements if "FROM proxy_metrics" in s]
+        assert summary["context_query"] == expected
+        # Matched on the column's name, which any read of it has to spell,
+        # however that statement names the table.
+        reads = [s for s in statements if "context_query_source" in s]
         assert len(reads) == 1
-        assert "context_query_observed" in reads[0] and "classified_calls" in reads[0]
+        (read,) = reads
+        assert "context_query_observed" in read and "context_query_agent" in read
+        assert "classified_calls" in read and "legacy_compressed_chars" in read
 
     def test_a_db_without_the_column_reads_zero_and_is_left_alone(self, tmp_path):
         path = tmp_path / "legacy.db"
