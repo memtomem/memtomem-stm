@@ -580,3 +580,38 @@ async def test_oversized_block_metadata_is_not_retained(tmp_path, strategy):
     more = _continue(proxy, strategy, key, offset)
     assert more.content[0].meta is None and more.content[0].annotations is None
     assert "z" * 1000 not in "".join(str(r) for r in _rows(tmp_path / "pending.db")[-1:])
+
+
+@pytest.mark.asyncio
+async def test_the_cap_counts_utf8_as_the_client_receives_it(tmp_path):
+    """The cap is in UTF-8 JSON bytes (4 per emoji), not the stored row's
+    ``ensure_ascii`` form, which can be up to three times larger."""
+    proxy, session = _manager(tmp_path, "progressive", "legacy")
+    under = {"blob": "😀" * 16_000}  # 64,000 bytes of UTF-8
+    over = {"blob": "😀" * 16_400}  # 65,600 bytes, past 64 KiB
+    for meta, kept in ((under, True), (over, False)):
+        session.call_tool.return_value = CallToolResult(content=[_block(meta=meta)])
+        initial = await proxy.call_tool("srv", "read", {})
+        key, offset = _key(initial, "progressive", "legacy")
+        more = _continue(proxy, "progressive", key, offset)
+        assert (more.content[0].meta == meta) is kept
+
+
+@pytest.mark.asyncio
+async def test_block_metadata_is_prepared_only_for_a_published_key(tmp_path, monkeypatch):
+    import memtomem_stm.proxy.manager as manager
+
+    calls = []
+    real = manager._continued_text_block
+    monkeypatch.setattr(
+        manager, "_continued_text_block", lambda block: calls.append(block) or real(block)
+    )
+    proxy, session = _manager(tmp_path, "progressive", "legacy")
+
+    session.call_tool.return_value = CallToolResult(content=[_block(text="short reply")])
+    small = await proxy.call_tool("srv", "read", {})
+    assert small.content[0].meta == BLOCK_META
+    assert calls == []
+
+    await _publish(proxy, session, "progressive", "legacy", _block())
+    assert len(calls) == 1

@@ -29,12 +29,32 @@ _CONTINUATION_BUDGET: contextvars.ContextVar[int] = contextvars.ContextVar(
 _READ_FORMAT: contextvars.ContextVar[DeliveryFormat | None] = contextvars.ContextVar(
     "stm_read_format", default=None
 )
-_TEXT_BLOCK: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+_TEXT_BLOCK: contextvars.ContextVar[_LazyTextBlock | None] = contextvars.ContextVar(
     "stm_text_block", default=None
 )
 _WIRE_PROJECTOR: contextvars.ContextVar[Callable[[dict[str, Any]], dict[str, Any]] | None] = (
     contextvars.ContextVar("stm_wire_projector", default=None)
 )
+
+
+class _LazyTextBlock:
+    """Text block metadata prepared on the first publisher's request, once.
+
+    Most responses publish no continuation key, so they never pay for it.
+    """
+
+    __slots__ = ("_prepare", "_ready", "_value")
+
+    def __init__(self, prepare: Callable[[], dict[str, Any] | None]) -> None:
+        self._prepare = prepare
+        self._ready = False
+        self._value: dict[str, Any] | None = None
+
+    def get(self) -> dict[str, Any] | None:
+        if not self._ready:
+            self._value = self._prepare() or None
+            self._ready = True
+        return self._value
 
 
 @contextmanager
@@ -128,20 +148,21 @@ def delivery_scope(
     budget: int = 16000,
     *,
     continuation_budget: int | None = None,
-    text_block: dict[str, Any] | None = None,
+    text_block: Callable[[], dict[str, Any] | None] | None = None,
 ) -> Iterator[None]:
     """Delivery settings for one response's publishers.
 
-    *text_block* is the metadata of the upstream text block being published,
-    as :func:`text_block_overhead` and :func:`stored_text_block` read it; the
-    publishers store it with the pending entry so continuations repeat it.
+    *text_block* prepares the metadata of the upstream text block being
+    published, as :func:`text_block_overhead` and :func:`stored_text_block`
+    read it; the publishers store it with the pending entry so continuations
+    repeat it. It runs only when a publisher asks, at most once.
     """
     token = _FORMAT.set(value)
     budget_token = _BUDGET.set(budget)
     continuation_token = _CONTINUATION_BUDGET.set(
         budget if continuation_budget is None else continuation_budget
     )
-    block_token = _TEXT_BLOCK.set(text_block or None)
+    block_token = _TEXT_BLOCK.set(_LazyTextBlock(text_block) if text_block else None)
     try:
         yield
     finally:
@@ -167,7 +188,8 @@ def continuation_budget() -> int:
 
 def text_block_metadata() -> dict[str, Any] | None:
     """The text block metadata of the response being published, if any."""
-    return _TEXT_BLOCK.get()
+    lazy = _TEXT_BLOCK.get()
+    return lazy.get() if lazy is not None else None
 
 
 def stored_text_block(meta: dict[str, Any]) -> dict[str, Any] | None:
