@@ -180,26 +180,65 @@ def test_start_spawns_a_child_that_builds_the_hook_fingerprint(home, monkeypatch
 
 
 @_POSIX_ONLY
-def test_a_later_spelling_folds_as_it_does_for_the_hook(home, monkeypatch):
-    # The canonical name is set first, so the command's value replaces it in
-    # place and the later lower-case spelling still wins the fold (#1503);
-    # the query-text flag still moves the fingerprint off the bare build.
+def test_a_later_spelling_does_not_outrank_the_commands_value(home, monkeypatch):
+    # The canonical name is set first and a lower-case spelling after it,
+    # which wins the fold; the command's value still is the one read, here
+    # and in doctor's build alike (#1503).
     monkeypatch.setenv(SURFACING_TIMEOUT, "2")
     monkeypatch.setenv(SURFACING_TIMEOUT.lower(), "4")
     _settings(home, _cmd(_installed(surfacing=7.25)))
-    expected = _doctors_fp()
-    assert expected != _fp(monkeypatch)
     with monkeypatch.context() as patch:
-        # Positive control: had the command's value won the fold, the
-        # fingerprint would differ.
+        # The build with the command's values and no other spelling.
         patch.delenv(SURFACING_TIMEOUT.lower())
-        assert expected != _fp(monkeypatch, **{PERSIST: "false", SURFACING_TIMEOUT: "7.25"})
+        expected = _fp(monkeypatch, **{PERSIST: "false", SURFACING_TIMEOUT: "7.25"})
+    # Positive control: the later spelling moves the bare build.
+    assert expected != _fp(monkeypatch, **{PERSIST: "false"})
+    assert _doctors_fp() == expected
     daemons = Daemons(monkeypatch)
 
     result = _run("status", "--json", "--hook-command", "claude")
 
     assert result.exit_code == 0, result.output
     assert daemons.pinged == [expected]
+
+
+@_POSIX_ONLY
+def test_start_spawns_a_child_that_reads_every_flag_over_later_spellings(home, monkeypatch):
+    # All four variables the command sets, each with a canonical spelling and
+    # a later lower-case one of another value (#1503). What a spawned daemon
+    # rebuilds from the inherited environment carries the command's values,
+    # including the two the fingerprint leaves out.
+    daemon_timeout = "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"
+    for name, canonical, later in [
+        (PERSIST, "false", "true"),
+        (SURFACING_TIMEOUT, "4.5", "1.5"),
+        (daemon_timeout, "6", "1"),
+        (HOOK_GATE, "true", "false"),
+    ]:
+        monkeypatch.setenv(name, canonical)
+        monkeypatch.setenv(name.lower(), later)
+    _settings(home, _cmd(_installed(surfacing=7.25)))
+    daemons = Daemons(monkeypatch)
+    children: list[tuple[bool, float, float, bool]] = []
+
+    def spawn_child() -> None:
+        config = load_env_stm_config().config
+        children.append(
+            (
+                config.surfacing.persist_query_text,
+                config.surfacing.timeout_seconds,
+                config.hook.daemon_timeout_seconds,
+                config.hook.use_daemon,
+            )
+        )
+        daemons.live.add(config_fingerprint(config, create_key=False))
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn._spawn_detached", spawn_child)
+
+    result = _run("start", "--hook-command", "claude")
+
+    assert result.exit_code == 0, result.output
+    assert children == [(False, 7.25, 8.25, True)]
 
 
 def test_stop_shuts_down_only_the_hook_daemon(home, monkeypatch):
@@ -297,16 +336,19 @@ def test_a_failed_restart_names_the_option_and_leaks_nothing(home, monkeypatch):
         (True, "false", True, "yes"),
         (False, "true", False, f"no (the STM hook command at {FIRST} sets --no-daemon)"),
     ],
-    ids=["use-daemon-over-a-later-false", "no-daemon-over-a-later-true"],
+    ids=["use-daemon-over-a-json-false", "no-daemon-over-a-json-true"],
 )
-@_POSIX_ONLY
 def test_status_follows_the_commands_daemon_flag(home, monkeypatch, flag, ambient, uses, reason):
-    # The command's flag decides the hook's route (#1501), even where a later
-    # case-equivalent spelling makes the build read the opposite.
+    # The command's flag decides the hook's route (#1501), even where the
+    # build reads the opposite: a case variant of the field in the block's
+    # JSON still outranks the flat variable the overlay sets (#1503 covers
+    # flat spellings only).
     from memtomem_stm.cli.proxy import _hook_command_view
 
-    monkeypatch.setenv(HOOK_GATE, "true" if ambient == "false" else "false")
-    monkeypatch.setenv(HOOK_GATE.lower(), ambient)
+    opposite = "true" if ambient == "false" else "false"
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_HOOK", f'{{"use_daemon": {opposite}, "USE_DAEMON": {ambient}}}'
+    )
     _settings(home, _cmd(_installed(use_daemon=flag)))
     # Positive control: the build itself reads the opposite of the flag.
     view = _hook_command_view()

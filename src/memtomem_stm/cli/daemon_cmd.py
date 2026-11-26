@@ -1279,8 +1279,8 @@ def status_cmd(as_json: bool) -> None:
     # surfacing-off means it never will — regardless of the use_daemon knob.
     surfacing_on = config.surfacing.enabled
     # A hook command's --use-daemon/--no-daemon decides its route directly
-    # (#1501), even where a later case-equivalent spelling of the variable it
-    # sets makes the build read the opposite.
+    # (#1501), even where a case variant of the field in the block's JSON
+    # makes the build read the opposite.
     view = _HOOK_VIEW.get()
     hook_flag = None if view is None else view.use_daemon
     use_daemon = (config.hook.use_daemon if hook_flag is None else hook_flag) and surfacing_on

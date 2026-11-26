@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import re
 import shlex
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,6 +161,33 @@ def _unparsed(words: list[str], command: str) -> list[str]:
     # The empty word keeps a pair from forming across the two readings: it
     # is neither an executable name nor ``hook``.
     return [*words, "", *command.split()]
+
+
+def hook_flag_assignments(environ: Mapping[str, str], overlay: Mapping[str, str]) -> dict[str, str]:
+    """The assignments that make *overlay*'s values the ones a build reads.
+
+    Settings fold names to lower case, so the last spelling of a name in the
+    environment wins, and POSIX allows both ``MEMTOMEM_STM_X`` and
+    ``memtomem_stm_x``. Each *overlay* name is therefore assigned together
+    with every other spelling of it already in *environ*, all to its value:
+    whichever spelling the fold keeps, it carries the command's value (#1503).
+    On Windows the environment folds names itself, so there is only one.
+
+    Here, not in ``config``, because the hook applies it before it reads its
+    payload, and a call that never builds its settings must not import them.
+
+    Only flat spellings are covered. A field of the block's JSON
+    (``MEMTOMEM_STM_SURFACING='{"…": …}'``) repeated in another letter case,
+    or a ``null`` block, can still outrank the flat variable (#1537).
+    """
+    assignments: dict[str, str] = {}
+    for name, value in overlay.items():
+        folded = name.lower()
+        for existing in environ:
+            if existing.lower() == folded:
+                assignments[existing] = value
+        assignments[name] = value
+    return assignments
 
 
 def _parse_bool(raw: str | None) -> bool | None:
