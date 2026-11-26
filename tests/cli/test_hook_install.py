@@ -392,15 +392,18 @@ def test_recovered_deadlines_are_the_ones_the_hook_runs_with(
     ],
 )
 def test_ownership_never_splits_the_line(line: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """``shlex`` is quadratic in a word's length; the reader re-joins words it
-    finds by position and never tokenizes."""
-    from memtomem_stm.cli import host_runtime
+    """The reader re-joins words it finds by position and never tokenizes:
+    neither with ``shlex``, quadratic in a word's length, nor with the
+    notice's word reader."""
+    from memtomem_stm.cli import hook_hosts, host_runtime
 
     def refuse(*args: object, **kwargs: object) -> None:
         raise AssertionError("ownership tokenized the line")
 
     monkeypatch.setattr(host_runtime.shlex, "shlex", refuse)
     monkeypatch.setattr(host_runtime.shlex, "split", refuse)
+    monkeypatch.setattr(host_runtime, "_lenient_shell_tokens", refuse)
+    monkeypatch.setattr(hook_hosts, "_lenient_shell_tokens", refuse)
 
     assert _owned(line) is line.startswith("uv run")
 
@@ -1672,7 +1675,7 @@ def test_flat_host_uninstall_shifts_the_look_alike(
         _h(_MANAGED),  # owned: install manages it
         _h("echo hi"),
         _h("ruff check hooks.py"),
-        # Unbalanced: ``shlex`` reads ``hook --label mms`` before the error and
+        # Unbalanced: the reader gets ``hook --label mms`` before the error and
         # ``str.split()`` starts with ``hook``; no pair forms across the two.
         _h('hook --label m"m"s #\''),
     ],
@@ -2153,19 +2156,18 @@ def test_windows_names_a_line_it_does_not_own(command: str, on_windows, redirect
 
 
 def _count_splits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record every line handed to the notice's ``shlex`` split."""
-    import shlex as shlex_module
-
-    from memtomem_stm.cli import host_runtime
+    """Record every line handed to the notice's word reader, where the notice
+    looks it up."""
+    from memtomem_stm.cli import hook_hosts
 
     calls: list[str] = []
-    real = shlex_module.shlex
+    real = hook_hosts._lenient_shell_tokens
 
-    def counting(command: str, *args: object, **kwargs: object) -> shlex_module.shlex:
+    def counting(command: str) -> list[str]:
         calls.append(command)
-        return real(command, *args, **kwargs)  # type: ignore[arg-type]
+        return real(command)
 
-    monkeypatch.setattr(host_runtime.shlex, "shlex", counting)
+    monkeypatch.setattr(hook_hosts, "_lenient_shell_tokens", counting)
     return calls
 
 
@@ -2204,8 +2206,8 @@ def test_the_notice_reads_the_words_of_the_whole_line(
 
 
 def test_the_notice_scan_splits_a_line_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """One split per line per scan (``shlex`` is quadratic in a word's
-    length), also past ``is_candidate``'s own limit of 4,096 characters."""
+    """One read of the words per line per scan, also past ``is_candidate``'s
+    own limit of 4,096 characters."""
     from memtomem_stm.cli.hook_hosts import unmanaged_stm_like
 
     calls = _count_splits(monkeypatch)

@@ -33,6 +33,14 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The look-alike test of `mms hook install`, `mms hook uninstall`,
+  `mms doctor` and `mms daemon … --hook-command claude` now reads a hook
+  handler's words in time linear in the line's length (issue #1498). For a
+  line the cheaper candidate test does not name, it read the words of the
+  whole line with `shlex`, whose cost is quadratic in a word's length: a
+  handler `echo ` + 160,000 × `x` took about 0.34 s per scan (macOS,
+  CPython 3.14.7), and install and uninstall scan twice. The words are read
+  the way `shlex` reads them, so the same handlers are named as before.
 - Cleaning no longer removes markup as one element across two upstream text
   blocks (#1538, issue #1531). When a response's text blocks carry no
   metadata they are joined and cleaned as one string, so a tag or a
@@ -49,7 +57,6 @@ changes inline only. See the deprecation policy in
   that joins it to the next block; any other reply is unchanged. A cache hit
   can still serve a reply stored earlier while that entry stays valid
   (#1540).
-
 - `mms hook install` and `mms hook uninstall` no longer manage a Claude Code
   handler whose `shell` field is present and anything but `"bash"` (issue
   #1497). Install writes a POSIX line; with `"shell": "powershell"`
