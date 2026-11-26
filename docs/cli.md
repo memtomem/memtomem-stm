@@ -1093,8 +1093,13 @@ others. A handler is install's own when all three hold:
   (Cursor), or a `[[hooks]]` entry whose `event` is `PostToolUse` (Kimi). A
   Kimi entry on another event is not install's.
 - **Fields.** For Claude Code and Codex, `type` is `command` and there is no
-  `args` key. Other fields, such as a timeout or a status message, do not
-  matter and are kept when the handler is updated.
+  `args` key. For Claude Code, there is also no `shell` key, or it is exactly
+  `"bash"`: install writes a POSIX line, and `"shell": "powershell"` has
+  PowerShell read it. A handler with any other `shell` value, `null`
+  included, is left in place, and named as a look-alike when its command
+  looks like STM's hook. Codex's `shell` key is not read. Other
+  fields, such as a timeout or a status message, do not matter and are kept
+  when the handler is updated.
 - **Text.** The `command` is `memtomem-stm hook --host <that host>`, alone or
   after `uv run --directory <absolute dir>`, followed by nothing or by the six
   runtime-setting words in the order install writes them. It is spelled as
