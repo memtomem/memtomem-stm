@@ -10656,6 +10656,8 @@ def _env_overrides_found_row(
     view: _HookCommandView,
     hook_outcome: EnvSTMConfigLoad | Exception,
     bare_outcome: EnvSTMConfigLoad | Exception,
+    *,
+    hook_daemon: bool = False,
 ) -> tuple[str, str, str | None]:
     """The ``env_overrides`` row when doctor read one STM hook command (#1506).
 
@@ -10670,6 +10672,14 @@ def _env_overrides_found_row(
     one included, and an undecodable payload hides any later error. It says
     which clause to act on and, for the hook's build, to rerun doctor. Names
     the handler by location and path, never its command text or values.
+
+    *hook_daemon*: doctor took the hook's daemon route for this command
+    (:func:`_names_hook_command`). When only the bare build fails, its
+    clause then says it describes plain ``mms daemon start``, and the next
+    action also names ``mms daemon start --hook-command claude``, which builds
+    as the hook's command does (#1524). Whether that start would succeed is
+    not judged here: the ``ltm server`` row reports what its probe found (an
+    unusable discovery key, surfacing off).
     """
     from memtomem_stm.config import hook_flag_environ
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
@@ -10701,7 +10711,11 @@ def _env_overrides_found_row(
     }
     bare_says = {
         "ok": "STMConfig() constructs",
-        "fail": "STMConfig() fails — mms daemon start from it exits 1",
+        # ``plain`` only beside a hook build that constructs: that is the case
+        # where the hook's daemon builds and plain start does not.
+        "fail": "STMConfig() fails — "
+        f"{'plain ' if hook_daemon and hook_kind == 'ok' else ''}mms daemon start "
+        "from it exits 1",
         "proxy": "MEMTOMEM_STM_PROXY* is invalid — mms daemon start from it ignores it and "
         "runs with proxy settings at defaults",
     }
@@ -10718,6 +10732,13 @@ def _env_overrides_found_row(
         else:
             actions.append(
                 _ENV_FIX_PROXY_UNDECODABLE if bare_kind == "proxy" else _ENV_FIX_UNDECODABLE
+            )
+        # Only a bare build that fails outright: an invalid proxy variable
+        # reaches the hook's build too, so it never leaves that one ``ok``.
+        if bare_kind == "fail" and hook_kind == "ok" and hook_daemon:
+            actions.append(
+                "or start the hook's daemon as its command builds it: "
+                f"{_daemon_command('start', hook_command=True)}"
             )
     if hook_kind != "ok":
         actions.append(
@@ -12990,10 +13011,18 @@ def doctor(
     except Exception as exc:
         bare_outcome = exc
     if found_view is not None and found_outcome is not None:
+        # The route the surfacing section decided, as the other rows read it;
+        # ``None`` when that section did not run (a missing config file).
+        decided = surfacing_status if hook_build is not None else None
         check(
             "env_overrides",
             "env overrides",
-            *_env_overrides_found_row(found_view, found_outcome, bare_outcome),
+            *_env_overrides_found_row(
+                found_view,
+                found_outcome,
+                bare_outcome,
+                hook_daemon=decided is not None and _names_hook_command(decided),
+            ),
         )
     elif isinstance(bare_outcome, Exception):
         hint = env_var_hint_for_validation_error(bare_outcome)

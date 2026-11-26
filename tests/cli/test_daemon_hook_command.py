@@ -179,6 +179,35 @@ def test_start_spawns_a_child_that_builds_the_hook_fingerprint(home, monkeypatch
     assert PERSIST not in os.environ and SURFACING_TIMEOUT not in os.environ
 
 
+def test_start_with_the_option_starts_where_the_bare_build_fails(home, monkeypatch):
+    # What doctor's env_overrides row now advises when only its bare build
+    # fails (#1524): an invalid ambient value the command's flag shadows stops
+    # plain ``start`` and not ``start --hook-command claude``.
+    _settings(home, _cmd(_installed(surfacing=7.25)))
+    expected = _doctors_fp()  # before the ambient value breaks the bare build
+    monkeypatch.setenv(PERSIST, "not-a-bool")
+    daemons = Daemons(monkeypatch)
+    children: list[str] = []
+
+    def spawn_child() -> None:
+        fp = config_fingerprint(load_env_stm_config().config, create_key=False)
+        children.append(fp)
+        daemons.live.add(fp)
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn._spawn_detached", spawn_child)
+
+    bare = _run("start")
+
+    assert bare.exit_code == 1, bare.output
+    assert children == []
+
+    hooked = _run("start", "--hook-command", "claude")
+
+    assert hooked.exit_code == 0, hooked.output
+    assert children == [expected]
+    assert os.environ[PERSIST] == "not-a-bool"
+
+
 @_POSIX_ONLY
 def test_a_later_spelling_does_not_outrank_the_commands_value(home, monkeypatch):
     # The canonical name is set first and a lower-case spelling after it,

@@ -33,6 +33,18 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms doctor`'s `env_overrides` row now says which daemon command its
+  failing clause for doctor's environment alone describes, and names the
+  one that starts the hook's daemon (issue #1524). When doctor takes the
+  hook's daemon route for the one STM hook command it read and that
+  command's build constructs, that clause says `plain mms daemon start`
+  exits 1, and the next action adds `or start the hook's daemon as its
+  command builds it: mms daemon start --hook-command claude` (the option
+  #1518 added). The addition is left out when the command says
+  `--no-daemon` and when doctor's config file is missing (the route is not
+  decided). The row does not judge whether that start would succeed; the
+  `ltm server` row reports what its probe found, such as an unusable
+  discovery key or surfacing off.
 - A runtime flag of the `mms hook` command (`--surfacing-timeout-seconds`,
   `--daemon-timeout-seconds`, `--[no-]persist-query-text`, `--use-daemon` /
   `--no-daemon`) is no longer outranked by another letter-case spelling of
