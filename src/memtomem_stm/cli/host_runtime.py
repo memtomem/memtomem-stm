@@ -16,10 +16,13 @@ variables remain the source of truth at runtime.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import shlex
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -163,31 +166,77 @@ def _unparsed(words: list[str], command: str) -> list[str]:
     return [*words, "", *command.split()]
 
 
-def hook_flag_assignments(environ: Mapping[str, str], overlay: Mapping[str, str]) -> dict[str, str]:
-    """The assignments that make *overlay*'s values the ones a build reads.
+HOOK_FLAG_NAMES = frozenset(
+    {_USE_DAEMON_ENV, _SURFACING_TIMEOUT_ENV, _DAEMON_TIMEOUT_ENV, _PERSIST_QUERY_TEXT_ENV}
+)
+"""The variables :func:`runtime_env_overrides` names, spelled as it spells them."""
 
-    Settings fold names to lower case, so the last spelling of a name in the
-    environment wins, and POSIX allows both ``MEMTOMEM_STM_X`` and
-    ``memtomem_stm_x``. Each *overlay* name is therefore assigned together
-    with every other spelling of it already in *environ*, all to its value:
-    whichever spelling the fold keeps, it carries the command's value (#1503).
-    On Windows the environment folds names itself, so there is only one.
+HOOK_FLAGS_CHANNEL_ENV = "MEMTOMEM_STM_HOOK_FLAGS"
+"""How a detached daemon receives the flags of the process that spawned it.
 
-    Here, not in ``config``, because the hook applies it before it reads its
+``daemon.spawn`` writes it into the child's environment only, and only
+``mms daemon run --detached`` reads it: no settings build reads it, so an
+inherited copy changes nothing anywhere else. It is not a settings field (it
+has no ``__``), like ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``."""
+
+_HOOK_FLAGS: ContextVar[Mapping[str, str] | None] = ContextVar("_HOOK_FLAGS", default=None)
+
+
+@contextmanager
+def hook_flags_scope(flags: Mapping[str, str]) -> Iterator[None]:
+    """Apply *flags* to every ``STMConfig`` built in this context (#1537).
+
+    *flags* maps :data:`HOOK_FLAG_NAMES` to the strings
+    :func:`runtime_env_overrides` returns; ``{}`` means no flags, also over an
+    enclosing scope. ``STMConfig`` lays them over what the environment source
+    read, so no spelling of a variable, no case variant of the field in the
+    block's JSON and no ``null`` block outranks them. A context variable, not
+    the environment: a build in another context (a thread started without a
+    copy of this one) does not see it, and calls that overlap in one process
+    do not change each other's builds. The scope resets on every exit.
+
+    Here, not in ``config``, because the hook enters it before it reads its
     payload, and a call that never builds its settings must not import them.
-
-    Only flat spellings are covered. A field of the block's JSON
-    (``MEMTOMEM_STM_SURFACING='{"…": …}'``) repeated in another letter case,
-    or a ``null`` block, can still outrank the flat variable (#1537).
     """
-    assignments: dict[str, str] = {}
-    for name, value in overlay.items():
-        folded = name.lower()
-        for existing in environ:
-            if existing.lower() == folded:
-                assignments[existing] = value
-        assignments[name] = value
-    return assignments
+    token = _HOOK_FLAGS.set(dict(flags))
+    try:
+        yield
+    finally:
+        _HOOK_FLAGS.reset(token)
+
+
+def active_hook_flags() -> dict[str, str]:
+    """The flags of the innermost :func:`hook_flags_scope`, or ``{}``."""
+    return dict(_HOOK_FLAGS.get() or {})
+
+
+def encode_hook_flags_channel(flags: Mapping[str, str]) -> str:
+    """:data:`HOOK_FLAGS_CHANNEL_ENV`'s value for *flags*."""
+    return json.dumps(dict(flags), sort_keys=True)
+
+
+class HookFlagsChannelError(ValueError):
+    """:data:`HOOK_FLAGS_CHANNEL_ENV` is not what ``daemon.spawn`` writes. The
+    message names the variable, never its value."""
+
+
+def decode_hook_flags_channel(raw: str) -> dict[str, str]:
+    """Read :data:`HOOK_FLAGS_CHANNEL_ENV` back: a JSON object whose keys are
+    :data:`HOOK_FLAG_NAMES` and whose values are strings, or
+    :class:`HookFlagsChannelError`."""
+    try:
+        flags = json.loads(raw)
+    except (ValueError, RecursionError):  # deep nesting exhausts the decoder's stack
+        flags = None
+    if (
+        not isinstance(flags, dict)
+        or not set(flags) <= HOOK_FLAG_NAMES
+        or not all(isinstance(value, str) for value in flags.values())
+    ):
+        raise HookFlagsChannelError(
+            f"{HOOK_FLAGS_CHANNEL_ENV} is not a JSON object of the hook's flag variables"
+        )
+    return flags
 
 
 def _parse_bool(raw: str | None) -> bool | None:
@@ -319,8 +368,8 @@ class OwnedHookCommand:
     """The command's six setting words as written, or none."""
 
     def env_overrides(self) -> dict[str, str]:
-        """The environment overlay ``mms hook`` applies from the command's
-        flags, before its build validates them."""
+        """The flags ``mms hook`` applies from the command
+        (:func:`hook_flags_scope`), before its build validates them."""
         return _hook_overlay(self.policy_words)
 
 
@@ -525,11 +574,18 @@ def runtime_env_overrides(
 
 __all__ = [
     "HOOK_ENTRY_POINT",
+    "HOOK_FLAGS_CHANNEL_ENV",
+    "HOOK_FLAG_NAMES",
+    "HookFlagsChannelError",
     "HostRuntimePolicy",
     "OwnedHookCommand",
     "PartialHostRuntimePolicy",
     "UnwritableDeadlineError",
+    "active_hook_flags",
+    "decode_hook_flags_channel",
+    "encode_hook_flags_channel",
     "format_seconds",
+    "hook_flags_scope",
     "hook_command_words",
     "hook_launcher",
     "owned_hook_command",

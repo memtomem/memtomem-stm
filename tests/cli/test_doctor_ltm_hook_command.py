@@ -392,15 +392,15 @@ def test_a_use_daemon_flag_turns_the_route_on_over_an_ambient_opt_out(home, monk
 
 
 def test_the_commands_daemon_flag_decides_over_the_build(home, monkeypatch):
-    # #1501: the hook routes on its command's flag directly, because the
-    # build can read the opposite: a case variant of the field in the block's
-    # JSON still outranks the flat variable the overlay sets (#1503 covers
-    # flat spellings only). Here the build reads ``hook.use_daemon`` false,
-    # and the ``--use-daemon`` command still routes through the daemon.
+    # #1501: the hook routes on its command's flag. Here the environment
+    # reads ``hook.use_daemon`` false through a case variant of the field in
+    # the block's JSON, which the flag outranks in the build too (#1537), and
+    # the ``--use-daemon`` command routes through the daemon.
     monkeypatch.delenv(HOOK_GATE, raising=False)
     monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": true, "USE_DAEMON": false}')
     _settings(home, _cmd(_installed()))
-    assert load_env_stm_config({HOOK_GATE: "true"}).config.hook.use_daemon is False
+    assert load_env_stm_config().config.hook.use_daemon is False  # positive control
+    assert load_env_stm_config({HOOK_GATE: "true"}).config.hook.use_daemon is True
     hook_fp = _installed_fp(monkeypatch)
     daemons = LiveDaemons(hook_fp)
     _install(monkeypatch, daemons)
@@ -787,7 +787,7 @@ def test_an_env_overlay_wins_over_the_environment_without_setting_it(monkeypatch
 def test_an_env_overlay_is_not_seen_by_a_build_on_another_thread(monkeypatch):
     import threading
 
-    from memtomem_stm.config import _env_overlay
+    from memtomem_stm.cli.host_runtime import hook_flags_scope
 
     monkeypatch.delenv(PERSIST, raising=False)
     seen: list[bool] = []
@@ -801,7 +801,7 @@ def test_an_env_overlay_is_not_seen_by_a_build_on_another_thread(monkeypatch):
     # while the overlay is in effect here.
     worker = threading.Thread(target=build)
     worker.start()
-    with _env_overlay({PERSIST: "false"}):
+    with hook_flags_scope({PERSIST: "false"}):
         assert STMConfig().surfacing.persist_query_text is False  # positive control
         go.set()
         worker.join(timeout=10)
@@ -1664,8 +1664,9 @@ def test_env_row_reports_the_build_the_section_failed_on(home, proxy_file, monke
 def test_env_row_does_not_advise_unsetting_a_valid_block_the_hint_names(
     home, proxy_file, monkeypatch, tmp_path
 ):
-    # The hint names every variable under the failing field: a valid
-    # ``MEMTOMEM_STM_HOOK`` block is named next to the command's deadline.
+    # The command's deadline is the only value rejected at its field, so the
+    # hint names it alone, not the valid ``MEMTOMEM_STM_HOOK`` block above it
+    # (#1537), and the advice does not ask to unset that block either.
     _settings(home, _cmd(_written(_EXTREME, "4")))
     monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"compression": {"enabled": true}}')
     _install(monkeypatch, LiveDaemons())
@@ -1673,8 +1674,8 @@ def test_env_row_does_not_advise_unsetting_a_valid_block_the_hint_names(
 
     row, hook, bare = _env_row(monkeypatch, tmp_path, "--config", str(proxy_file))
 
-    # The premise: the valid block is named next to the command's deadline.
-    assert f"MEMTOMEM_STM_HOOK, {DAEMON_TIMEOUT}" in hook, row
+    assert f"(env var(s) implicated: {DAEMON_TIMEOUT})" in hook, row
+    assert "MEMTOMEM_STM_HOOK," not in hook, row
     assert bare.endswith("STMConfig() constructs"), row
     assert row["next_action"] == _command_advice(), row
 

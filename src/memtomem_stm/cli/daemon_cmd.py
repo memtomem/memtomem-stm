@@ -298,14 +298,14 @@ def _found_hook_command(host: str) -> _HookCommandView:
 def _hook_command_option(fn: Callable[..., None]) -> Callable[..., None]:
     """Add ``--hook-command claude``: build as the registered hook command does.
 
-    The hook sets the variables its command's flags name in ``os.environ``
-    before it builds its config, and a daemon it spawns inherits them
-    (``hook_cmd._runtime_registration_env``). This applies the same variables
-    the same way for the whole run, so the fingerprint looked up, and the one
-    a spawned daemon rebuilds, are the ones doctor probes for that command
-    (#1515). The environment and the view are restored when the run ends. A
-    call without the option (``restart``'s own ``stop`` and ``start``) leaves
-    both as they are.
+    The hook applies its command's flags to every settings build of its call,
+    and a daemon it spawns receives them from ``daemon.spawn``
+    (``hook_cmd._runtime_registration_env``, #1537). This applies the same
+    flags the same way for the whole run, so the fingerprint looked up, and
+    the one a spawned daemon rebuilds, are the ones doctor probes for that
+    command (#1515). The flags' scope and the view end with the run. A call
+    without the option (``restart``'s own ``stop`` and ``start``) leaves both
+    as they are.
     """
 
     @click.option(
@@ -533,7 +533,36 @@ def daemon_group() -> None:
     help="Run in the foreground (default). Kept for symmetry/clarity.",
 )
 def run_cmd(detached: bool, foreground: bool) -> None:
-    """Run the daemon server loop — this is the long-lived process."""
+    """Run the daemon server loop — this is the long-lived process.
+
+    Detached, it builds under the hook's runtime flags that its spawner passed
+    in ``HOOK_FLAGS_CHANNEL_ENV`` (``daemon.spawn``), so it rebuilds the
+    configuration — and the fingerprint — that spawner built (#1537). A value
+    that is not what ``daemon.spawn`` writes ends the run with exit 1 and a
+    line on stderr naming the variable, never its value; a spawned daemon's
+    stderr is discarded, so that is visible only when run by hand. The
+    configuration is built once, here, and handed to the server.
+    """
+    from memtomem_stm.cli.host_runtime import (
+        HOOK_FLAGS_CHANNEL_ENV,
+        HookFlagsChannelError,
+        decode_hook_flags_channel,
+        hook_flags_scope,
+    )
+
+    flags: dict[str, str] = {}
+    raw = os.environ.get(HOOK_FLAGS_CHANNEL_ENV) if detached else None
+    if raw is not None:
+        try:
+            flags = decode_hook_flags_channel(raw)
+        except HookFlagsChannelError as exc:
+            click.echo(_warn(str(exc)), err=True)
+            raise SystemExit(1) from None
+    with hook_flags_scope(flags):
+        _run_daemon(detached)
+
+
+def _run_daemon(detached: bool) -> None:
     from memtomem_stm.daemon.server import run as run_daemon
 
     load = _load_env_config()
