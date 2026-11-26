@@ -11,6 +11,26 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms stats --all-time` now covers the **Progressive delivery** block too
+  (issue #1328, part B of #1316). Reads removed by the
+  `proxy.progressive_reads.retention_days` purge at server start were lost,
+  so its produced and delivered chars covered only that window (90 days by
+  default). A database trigger now folds every deleted `progressive_reads`
+  row into a never-pruned `progressive_reads_rollup` table in
+  `stm_feedback.db`, one row per response and tool, so a response purged in
+  part is still counted once. It is installed when the MCP server of this
+  version starts with progressive-read collection enabled, before that
+  start's purge; reads purged earlier are counted as lost, not recovered.
+  Until then `--all-time` reports the progressive totals as unavailable.
+  `--json` adds `progressive_scope`, and a `rollup` coverage object under
+  `progressive` in all-time mode. Without `--all-time` the text output is
+  unchanged; the JSON gains `progressive_scope: "retained"` and a `scope` key
+  in `progressive`. To reset the history, delete from `progressive_reads` and
+  then from `progressive_reads_rollup` in one transaction; never `DROP` the
+  rollup table while its trigger exists.
+
 ### Fixed
 
 - `mms hook install` and `mms hook uninstall` no longer manage a Claude Code
@@ -26,6 +46,15 @@ changes inline only. See the deprecation policy in
   which a `shell` other than `"bash"` was added by hand, is no longer
   refreshed or removed; install refreshes the handler it does own, or adds
   one beside it when it owns none.
+- The `max_upstream_chars` guard no longer reports an oversized payload when
+  no text was cut (#1536, issue #1530). A text block that exactly filled the cap
+  followed by an empty text block used to get the "response truncated …
+  upstream returned an oversized payload" notice appended to the joined
+  text, and a truncation warning in the log; the guard now fires only when
+  a block with text loses some or all of it. **Behavior change**: such a
+  reply is now delivered without that notice and no longer logs the
+  warning; a reply that really is cut is unchanged. A cache hit can still
+  serve a notice stored earlier while that entry stays valid.
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
   #1506). When doctor reads exactly one STM hook command `mms hook install`
@@ -43,6 +72,26 @@ changes inline only. See the deprecation policy in
   break (such as #1508's extreme deadline) now WARNs where the row passed.
   Without such a command (none, several, unreadable, Windows, or a settings
   error) the row is unchanged.
+
+- A proxied call whose upstream reply fails the MCP SDK's result checks is now
+  recorded with the `protocol` error category instead of `programming`
+  (issue #1131). The checks matched are a reply outside the negotiated schema
+  (for example a list `structuredContent`, or `resultType: "input_required"`
+  on a 2025-11-25 connection), an `InputRequiredResult` on a 2026-07-28
+  connection (valid there, but STM cannot relay it yet), a result that
+  breaks the tool's own `outputSchema` or omits the structured content it
+  declares, and an `outputSchema` the SDK cannot resolve. A failure these
+  checks do not match keeps the category it had before. Such a call is
+  still not retried, and it now resets the circuit breaker's failure count,
+  since a reply arrived. **Behavior change**: tool health counts
+  `programming` rows as calls but not as errors; these rows now count as
+  upstream errors too.
+  Health is evaluated at proxy startup, so once a tool that keeps sending
+  such replies crosses the health thresholds, the `strict` exposure profile
+  withholds it on a later startup and `review` gives it a risk penalty. Known
+  limit: a malformed `tools/list` reply to the SDK's output-schema refresh
+  during the call is still `programming`.
+
 - `mms doctor --measure-ltm` no longer advises `mms daemon start` when the
   daemon discovery key (`stm-discovery.key` under `data_dir`) cannot be used
   (#1520, issue #1519). `start` reads the same key and exits 1 on it. The
