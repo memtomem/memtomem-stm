@@ -10417,8 +10417,8 @@ class _HookCommandView:
     registration`` row does not read it either) or ``settings_error``.
     ``locations`` name the handlers (``hooks.PostToolUse[i].hooks[j]``), never
     their command text, which can hold credentials. ``env`` and ``use_daemon``
-    are only set for ``found``: the variables the hook sets from that
-    command's flags, and its ``--use-daemon``/``--no-daemon`` (``None`` for
+    are only set for ``found``: the flags the hook applies from that command
+    (``host_runtime.hook_flags_scope``), and its ``--use-daemon``/``--no-daemon`` (``None`` for
     neither), which the hook routes on directly (#1501).
     """
 
@@ -10441,9 +10441,9 @@ def _hook_command_view() -> _HookCommandView:
     Reads the file ``mms hook install --host claude`` writes, as the ``hook
     registration`` row does. A handler is recognized when install owns it
     (``hook_hosts.owned_handler``: install's own words, ``"type": "command"``,
-    no ``args``) and it has no ``shell`` other than Bash. The variables the
-    hook sets from its flags are then known exactly, computed from the flag
-    words as the hook computes them. Any other ``command`` handler that may
+    no ``args``) and it has no ``shell`` other than Bash. The flags the hook
+    applies are then known exactly, computed from the flag words as the hook
+    computes them. Any other ``command`` handler that may
     run STM's hook (install's look-alike test, ``unmanaged_stm_like``) makes
     the view ``unreadable``: it runs too, and what it would build is unknown.
     A handler ``mms hook`` would not run as the bridge (``--help``, a
@@ -10571,24 +10571,12 @@ def _hook_advice(view: _HookCommandView, built: Any, *, hook_route: bool) -> _Ho
         return None
     deadlines: set[str] = set()
     if built is not None and hook_route:
-        effective = {
-            _SURFACING_TIMEOUT_ENV: float(built.surfacing.timeout_seconds),
-            _HOOK_DAEMON_TIMEOUT_ENV: float(built.hook.daemon_timeout_seconds),
-        }
-        for name, value in effective.items():
-            # Every flat spelling carries the overlay's value
-            # (``host_runtime.hook_flag_assignments``), so an equal value is the
-            # command's. A case variant of the field in the block's JSON, or a
-            # ``null`` block, can still set the build's deadline to the same
-            # number; that limit of #1503 is not checked here.
-            raw = view.env.get(name)
-            if raw is None:
-                continue
-            try:
-                if float(raw) == value:
-                    deadlines.add(name)
-            except ValueError:
-                continue
+        for name in (_SURFACING_TIMEOUT_ENV, _HOOK_DAEMON_TIMEOUT_ENV):
+            # The command's flags are laid over everything the environment
+            # gives the field (#1537), so in a build that succeeded, a deadline
+            # the command sets is the one in effect.
+            if name in view.env:
+                deadlines.add(name)
     return _HookAdvice(
         location=view.locations[0],
         hook_route=hook_route,
@@ -10705,7 +10693,7 @@ def _env_overrides_found_row(
     not judged here: the ``ltm server`` row reports what its probe found (an
     unusable discovery key, surfacing off).
     """
-    from memtomem_stm.config import hook_flag_environ
+    from memtomem_stm.config import hook_flags_hint
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
     def classify(outcome: EnvSTMConfigLoad | Exception) -> tuple[str, Exception | None]:
@@ -10717,13 +10705,9 @@ def _env_overrides_found_row(
 
     hook_kind, hook_exc = classify(hook_outcome)
     bare_kind, bare_exc = classify(bare_outcome)
-    # Each build's hint reads the environment that build read, each variable
-    # the command sets named as it sets it (#1503).
-    hook_hint = (
-        ""
-        if hook_exc is None
-        else env_var_hint_for_validation_error(hook_exc, hook_flag_environ(os.environ, view.env))
-    )
+    # Each build's hint reads the environment that build read, each flag the
+    # command sets named as it sets it (#1503, #1537).
+    hook_hint = "" if hook_exc is None else hook_flags_hint(hook_exc, view.env)
     bare_hint = "" if bare_exc is None else env_var_hint_for_validation_error(bare_exc)
     hook_says = {
         "ok": "STMConfig() constructs",
@@ -10817,13 +10801,14 @@ def _surfacing_bootstrap_status(
     Doctor also reads the STM hook command in Claude Code's user settings
     (:func:`_hook_command_view`, #1494). When it finds exactly one that
     ``mms hook install`` owns, and nothing else that may run the hook, the
-    hook's build reads the variables the hook sets from that command's flags
-    over doctor's environment, and the command's daemon flag decides the
-    route, as both do in the hook: ``--no-daemon`` sends doctor to the
+    hook's build applies that command's flags over doctor's environment, as
+    the hook applies them (a settings layer over every form the environment
+    gives the same field, #1537), and the command's daemon flag decides the
+    route directly, as in the hook: ``--no-daemon`` sends doctor to the
     standalone route, and the fingerprint takes the query-text persistence
-    and surfacing deadline that build resolves. The variables are passed to
-    the build, never set in ``os.environ``: the probe and the standalone
-    build read the environment as it is. Otherwise the hook view is built
+    and surfacing deadline that build resolves. The flags are scoped to that
+    build, never set in ``os.environ``: the probe and the standalone build
+    read the environment as it is. Otherwise the hook view is built
     from doctor's environment alone. The result's ``hook_view`` says which.
     """
     hook_view: dict[str, Any] | None = None
@@ -11934,6 +11919,23 @@ def _hook_settings_read_failure(exc: Exception) -> tuple[str, str]:
     )
 
 
+def _without_hook_flags(fn: Callable[..., None]) -> Callable[..., None]:
+    """Run *fn* with no hook runtime flags in effect (#1537).
+
+    Doctor's builds of its own environment must not pick up the flags of a
+    hook call it runs inside (an embedder); its build of the hook's
+    configuration applies the command's flags itself. The caller's scope is
+    back in effect when *fn* returns."""
+    from memtomem_stm.cli.host_runtime import hook_flags_scope
+
+    @wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> None:
+        with hook_flags_scope({}):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 @cli.command()
 @click.option(
     "--config",
@@ -11962,6 +11964,7 @@ def _hook_settings_read_failure(exc: Exception) -> tuple[str, str]:
         "to refresh warm-LTM latency advice. Never starts a missing daemon."
     ),
 )
+@_without_hook_flags
 def doctor(
     config_path: str | None,
     *,

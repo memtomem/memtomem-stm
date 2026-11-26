@@ -47,6 +47,25 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `stm_proxy_read_more` and `stm_proxy_select_chunks` continuations now
+  carry the upstream text block's `annotations` and block `_meta`, as the
+  first progressive, selective or hybrid response already did (issue #1529).
+  Text an upstream addressed to `audience: ["assistant"]` no longer loses that
+  hint from the second chunk on. The metadata is stored with the pending
+  entry, in both pending stores, up to about 64 KiB of UTF-8 JSON (counted
+  before the SDK serializes it, so approximate near the limit); larger metadata
+  stays on the first response only, and its continuations go out without it
+  as before. **Behavior change**: a structured
+  continuation's frame now reserves room for that metadata, so it holds
+  less content and a selection that fit before can return `budget_exceeded`;
+  a read at or past the end carries none. With a SQLite pending store, a
+  credential in that metadata now refuses the persistent write the way one
+  in the text does: progressive falls back to passthrough (in structured
+  delivery, to a truncation fitted to the budget when the passthrough would
+  not fit), selective and hybrid to truncation. A present but invalid stored
+  value is a delivery error that keeps the row. Responses without block
+  metadata, and keys written before this version, are unchanged.
+
 - `mms doctor`'s `env_overrides` row now says which daemon command its
   failing clause for doctor's environment alone describes, and names the
   one that starts the hook's daemon (issue #1524). When doctor takes the
@@ -64,18 +83,43 @@ changes inline only. See the deprecation policy in
   `--no-daemon`) is no longer outranked by another letter-case spelling of
   its variable later in the environment (issue #1503), such as
   `memtomem_stm_surfacing__persist_query_text=true` against
-  `--no-persist-query-text`. The hook now sets every spelling of the name to
-  the flag's value for the call and restores each in place afterwards; a
-  daemon it spawns inherits that environment, and `mms daemon …
-  --hook-command claude` and `mms doctor`'s build of the hook's configuration
-  read the same values. **Behavior change**: where such a spelling outranked
-  a flag, the hook, the daemon it spawns and doctor now use the flag's value,
-  and doctor's timeout advice names the command's flag instead of an export.
-  Not covered: a case variant of the field in the block's JSON
+  `--no-persist-query-text`. The hook applies the flag over what the
+  environment gives the same setting (see the entry for issue #1537 below
+  for how), and a daemon it spawns, `mms daemon … --hook-command claude` and
+  `mms doctor`'s build of the hook's configuration read the same values.
+  **Behavior change**: where such a spelling outranked a flag, the hook, the
+  daemon it spawns and doctor now use the flag's value, and when that build
+  succeeds and doctor takes the hook's daemon route, doctor's timeout advice
+  names the command's flag instead of an export.
+  A case variant of the field in the block's JSON and a `null` block are
+  covered by the entry for issue #1537 below.
+- A runtime flag of the `mms hook` command is no longer outranked by the
+  field repeated under another letter case in its block's JSON
   (`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`)
-  and a `null` block, which can still outrank a flag; when one of them sets
-  a deadline to the flag's own value, doctor's timeout advice still names
-  the flag.
+  or dropped by a `null` block (`MEMTOMEM_STM_HOOK=null`) (issue #1537). With
+  `MEMTOMEM_STM_SURFACING=null`, `--no-persist-query-text` was read as
+  `persist_query_text` true. The hook now applies its flags while it builds
+  its settings, over what the environment gives the same field, instead of
+  setting variables in its environment; a `null` block still hides its other
+  variables, and a block that is not a JSON object still fails the build. A
+  daemon the hook or `mms daemon start --hook-command claude` spawns
+  receives the flags in its environment as `MEMTOMEM_STM_HOOK_FLAGS`, which
+  only `mms daemon run --detached` reads; a value that is not a JSON object
+  of the flags' variables with string values ends that run with exit 1 and a
+  stderr line naming the variable (discarded for a spawned daemon), and a
+  spawn without flags passes none on. `mms doctor`'s build of the hook's
+  configuration applies them the same way, and when that build succeeds and
+  doctor takes the hook's daemon route, its timeout advice names the
+  command's flag whenever the command sets that deadline. When the command's
+  own value is the one rejected, the hint of the hook's build, in its log
+  line and in doctor's `env_overrides` row, names the flag's variable for
+  that error, not a block above it that set nothing there. **Behavior
+  change**: where one of those forms outranked a flag, the hook, its daemon and doctor now use the
+  flag's value; the hook no longer sets the flags' variables in its
+  environment, so a process it starts other than the daemon (the LTM server)
+  no longer sees them. An MCP server registration still carries its policy
+  as plain variables, so under one of those forms the server can build a
+  daemon configuration other than the hook's.
 - The look-alike test of `mms hook install`, `mms hook uninstall`,
   `mms doctor` and `mms daemon … --hook-command claude` now reads a hook
   handler's words in time linear in the line's length (issue #1498). For a
@@ -196,12 +240,13 @@ changes inline only. See the deprecation policy in
   environment alone, could address another daemon (a default install writes
   `--no-persist-query-text`). `mms daemon start`, `stop`, `status` and
   `restart` accept a new `--hook-command claude`: it reads the STM hook command
-  `mms hook install --host claude` wrote, sets the variables its options name
-  in the command's environment as the hook does (a daemon it starts inherits
-  them), and exits 1 when there is not exactly one such command, or on
-  Windows. The hints those subcommands print during such a run name the option
-  too, and none suggests `stop --all`, which targets every daemon under
-  `data_dir`, the hook's own included.
+  `mms hook install --host claude` wrote, applies its options to the
+  command's settings builds as the hook does (a daemon it starts receives
+  them at launch, as `MEMTOMEM_STM_HOOK_FLAGS`; issue #1537), and exits 1
+  when there is not exactly one such command, or on Windows. The hints
+  those subcommands print during such a run name the option too, and none
+  suggests `stop --all`, which targets every daemon under `data_dir`, the
+  hook's own included.
   **Behavior change**: when doctor reads exactly one such command and
   takes the hook's daemon route, the next action of the `ltm server` (`ltm`),
   `ltm measurement` and `surfacing outcomes` rows, and the `ltm` row's

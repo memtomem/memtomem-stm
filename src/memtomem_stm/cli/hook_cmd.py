@@ -94,7 +94,7 @@ import sys
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, TextIO
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, TextIO
 
 import click
 
@@ -112,8 +112,9 @@ from memtomem_stm.cli.host_runtime import (
     UnwritableDeadlineError,
     _parse_bool,
     format_seconds,
+    _SURFACING_TIMEOUT_ENV,
     hook_command_words,
-    hook_flag_assignments,
+    hook_flags_scope,
     resolve_host_runtime_policy,
     runtime_env_overrides,
     writable_seconds,
@@ -227,16 +228,18 @@ def _surface_tools() -> frozenset[str]:
     return frozenset() if saw_token else _DEFAULT_SURFACE_TOOLS
 
 
-def _hook_budget_seconds() -> float:
+def _hook_budget_seconds(overrides: Mapping[str, str]) -> float:
     """Outer wall-clock backstop for the whole hook call.
 
     ``SurfacingEngine`` bounds its own LTM search via
     ``surfacing.timeout_seconds``; this only guards against a hang *outside*
     that window (e.g. tearing down a wedged LTM subprocess). Sized to sit above
     the configured surfacing timeout so raising that env to beat LTM cold start
-    isn't silently clipped.
+    isn't silently clipped. *overrides* is the command's flags
+    (:func:`runtime_env_overrides`): its surfacing deadline is the build's, so
+    it is read first; the variable is read only without one.
     """
-    raw = os.environ.get("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS")
+    raw = overrides.get(_SURFACING_TIMEOUT_ENV) or os.environ.get(_SURFACING_TIMEOUT_ENV)
     try:
         configured = float(raw) if raw else 3.0
     except ValueError:
@@ -740,7 +743,7 @@ async def _run_hook(
     then for *this* call either
     return ``{}`` (default ``fallback=skip`` — the daemon exists precisely to
     avoid the ~6s cold start) or take the cold path (``fallback=cold``). The
-    whole call runs inside ``_hook_budget_seconds()`` in :func:`hook_command`.
+    whole call runs inside ``_hook_budget_seconds(overrides)`` in :func:`hook_command`.
     ``config`` is reused from :func:`_orchestrate` when given, on both routes,
     so one tool call loads the environment once; ``None`` loads it before
     either route, and a settings error that load does not recover from
@@ -748,10 +751,11 @@ async def _run_hook(
 
     The route is ``hook.use_daemon`` as the settings read it, in any form they
     accept (#1495), unless *use_daemon* carries the hook command's explicit
-    ``--use-daemon``/``--no-daemon``. That flag reaches the settings only
-    through one variable of an environment overlay, which a case variant of
-    the field in the block's JSON (``MEMTOMEM_STM_HOOK``) can still outrank,
-    so it decides here directly.
+    ``--use-daemon``/``--no-daemon``, which decides here directly. The flag
+    also reaches the settings, laid over everything the environment gives
+    ``hook.use_daemon`` (``host_runtime.hook_flags_scope``, #1537), so the two
+    agree whenever the build succeeds; reading it here keeps the route the
+    command's even for a caller that passes a config built without the flag.
     """
     if not _hook_eligible(call):
         return {}
@@ -1042,32 +1046,19 @@ def _resolve_host_tag(host: str, payload: dict[str, Any] | None) -> str:
 
 @contextmanager
 def _runtime_registration_env(overrides: dict[str, str]) -> Iterator[None]:
-    """Temporarily apply registration flags through the existing env bindings.
+    """Apply the command's runtime flags to every settings build of this call.
 
-    ``STMConfig`` already has the authoritative parsing and the detached daemon
-    deliberately inherits the hook process environment.  A short-lived overlay
-    therefore keeps both consumers aligned without adding a second config path.
-    Restoring every value matters for ``CliRunner`` and embedders that invoke
-    multiple commands in one Python process.
-
-    Every spelling of each variable already in the environment is assigned
-    the command's value too (``host_runtime.hook_flag_assignments``), so a
-    later case-variant spelling cannot outrank it (#1503). Assigning an
-    existing name keeps its place in the environment, and so does restoring
-    it. Nothing here imports the settings: the hook enters this before it has
-    read its payload.
+    *overrides* is what :func:`runtime_env_overrides` returned; ``{}`` (a
+    command without flags) builds with none. The flags are a settings layer
+    over the environment (``host_runtime.hook_flags_scope``), not variables
+    set in it, so no spelling of a variable, no case variant of the field in
+    the block's JSON and no ``null`` block outranks them (#1503, #1537), and
+    the environment is left as it is. A daemon this call spawns receives them
+    from ``daemon.spawn`` in its own environment. Nothing here imports the
+    settings: the hook enters this before it has read its payload.
     """
-    assignments = hook_flag_assignments(os.environ, overrides)
-    previous = {key: os.environ.get(key) for key in assignments}
-    os.environ.update(assignments)
-    try:
+    with hook_flags_scope(overrides):
         yield
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 @click.group(name="hook", invoke_without_command=True)
@@ -1233,7 +1224,7 @@ def hook_command(
                                 notices=notices,
                                 use_daemon=_parse_bool(runtime_use_daemon),
                             ),
-                            timeout=_hook_budget_seconds(),
+                            timeout=_hook_budget_seconds(overrides),
                         )
                     )
                 except Exception:

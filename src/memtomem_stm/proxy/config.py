@@ -1025,6 +1025,25 @@ def env_var_hint_for_validation_error(
 ) -> str:
     """Name the ``MEMTOMEM_STM_*`` var(s) implicated in an ``STMConfig`` error.
 
+    The rendered form of :func:`implicated_env_vars`, ``""`` when none is."""
+    implicated = implicated_env_vars(exc, environ)
+    if not implicated:
+        return ""
+    return " (env var(s) implicated: " + ", ".join(sorted(implicated)) + ")"
+
+
+def implicated_env_vars(
+    exc: Exception,
+    environ: Mapping[str, str] | None = None,
+    *,
+    skip_locs: frozenset[tuple[str, ...]] = frozenset(),
+) -> set[str]:
+    """The ``MEMTOMEM_STM_*`` var(s) implicated in an ``STMConfig`` error.
+
+    *skip_locs*: error locations another source supplied the value for (the
+    hook's runtime flags, ``config.hook_flags_hint``); no variable is
+    attributed for an error there.
+
     The sibling of ``_env_override_hint`` for the OTHER failure point: that one
     explains a merged-config failure inside the load path, which owns an env
     overlay to attribute against; this one explains ``STMConfig()`` itself
@@ -1056,7 +1075,7 @@ def env_var_hint_for_validation_error(
     names, never values, are rendered (cf. ``hide_input_in_errors``).
     """
     if not isinstance(exc, ValidationError):
-        return ""
+        return set()
     env = os.environ if environ is None else environ
     prefix = "memtomem_stm_"
     var_paths: dict[tuple[str, ...], str] = {}
@@ -1147,7 +1166,7 @@ def env_var_hint_for_validation_error(
     implicated: set[str] = set()
     for err in exc.errors():
         loc = tuple(str(part) for part in err.get("loc", ()))
-        if not loc:
+        if not loc or loc in skip_locs:
             continue  # no path to attribute; naming every var would be noise
         for name, path in live:
             if err.get("type") == "missing":
@@ -1162,9 +1181,7 @@ def env_var_hint_for_validation_error(
                     implicated.add(name)
             elif _starts_with(loc, path) or _starts_with(path, loc):
                 implicated.add(name)
-    if not implicated:
-        return ""
-    return " (env var(s) implicated: " + ", ".join(sorted(implicated)) + ")"
+    return implicated
 
 
 class CompressionStrategy(StrEnum):

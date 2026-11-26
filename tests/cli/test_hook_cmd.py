@@ -596,16 +596,28 @@ def test_cli_managed_runtime_flags_are_scoped_and_order_timeouts(
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "77")
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS", "88")
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT", "true")
-    seen: dict[str, str | None] = {}
+
+    def stm_environ() -> dict[str, str]:
+        return {k: v for k, v in os.environ.items() if k.lower().startswith("memtomem_stm")}
+
+    before = stm_environ()
+    seen: dict[str, Any] = {}
 
     async def capture(*_args, **_kwargs):
-        for key in (
-            "MEMTOMEM_STM_HOOK__USE_DAEMON",
-            "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
-            "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
-            "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
-        ):
-            seen[key] = os.environ.get(key)
+        # The flags are a settings layer for the call (#1537): the build reads
+        # them, and the environment is left as it was.
+        config = load_env_stm_config().config
+        seen.update(
+            use_daemon=config.hook.use_daemon,
+            surfacing_timeout=config.surfacing.timeout_seconds,
+            daemon_timeout=config.hook.daemon_timeout_seconds,
+            persist=config.surfacing.persist_query_text,
+            changed=sorted(
+                k
+                for k in before.keys() | stm_environ().keys()
+                if before.get(k) != stm_environ().get(k)
+            ),
+        )
         return {}
 
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", capture)
@@ -627,12 +639,14 @@ def test_cli_managed_runtime_flags_are_scoped_and_order_timeouts(
 
     assert result.exit_code == 0, result.output
     assert seen == {
-        "MEMTOMEM_STM_HOOK__USE_DAEMON": "true",
-        "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS": "12",
-        "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS": "13",
-        "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT": "false",
+        "use_daemon": True,
+        "surfacing_timeout": 12.0,
+        "daemon_timeout": 13.0,
+        "persist": False,
+        "changed": [],
     }
-    # CliRunner/embedders reuse this process: every ambient value is restored.
+    # CliRunner/embedders reuse this process: nothing of the call outlives it.
+    assert load_env_stm_config().config.surfacing.timeout_seconds == 77.0
     assert os.environ["MEMTOMEM_STM_HOOK__USE_DAEMON"] == "false"
     assert os.environ["MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS"] == "77"
     assert os.environ["MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"] == "88"
@@ -788,21 +802,24 @@ def test_the_nested_form_loses_to_the_flat_key_as_the_settings_decide(
     cold.assert_not_called()
 
 
-def _parsed_use_daemon_under(monkeypatch: pytest.MonkeyPatch, flat_value: str) -> bool:
-    """``hook.use_daemon`` as the settings read it once the hook's flag overlay
-    has set ``MEMTOMEM_STM_HOOK__USE_DAEMON`` (a new key, appended last)."""
-    with monkeypatch.context() as patch:
-        patch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", flat_value)
-        return load_env_stm_config().config.hook.use_daemon
+def _ambient_and_flagged_use_daemon(flag_value: str) -> tuple[bool, bool]:
+    """``hook.use_daemon`` as the environment alone reads it, and as the hook's
+    build reads it under its daemon flag (#1537)."""
+    from memtomem_stm.cli.hook_cmd import _runtime_registration_env
+
+    ambient = load_env_stm_config().config.hook.use_daemon
+    with _runtime_registration_env({"MEMTOMEM_STM_HOOK__USE_DAEMON": flag_value}):
+        flagged = load_env_stm_config().config.hook.use_daemon
+    return ambient, flagged
 
 
 def test_cli_no_daemon_flag_wins_over_an_environment_that_parses_to_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Case-equivalent members of the nested payload outrank the flat key the
-    # flag's overlay sets, so the settings alone would say "on" here.
+    # A case-equivalent member of the nested payload makes the environment
+    # alone say "on" here; the flag outranks it in the build too (#1537).
     monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": false, "USE_DAEMON": true}')
-    assert _parsed_use_daemon_under(monkeypatch, "false") is True  # the conflict is real
+    assert _ambient_and_flagged_use_daemon("false") == (True, False)  # the conflict is real
     surface, spawns, cold = _record_routes(monkeypatch)
 
     result = CliRunner().invoke(
@@ -820,7 +837,7 @@ def test_cli_use_daemon_flag_wins_over_an_environment_that_parses_to_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"use_daemon": true, "USE_DAEMON": false}')
-    assert _parsed_use_daemon_under(monkeypatch, "true") is False  # the conflict is real
+    assert _ambient_and_flagged_use_daemon("true") == (False, True)  # the conflict is real
     surface, spawns, cold = _record_routes(monkeypatch, daemon_out=_WARM_OUT)
 
     result = CliRunner().invoke(
@@ -2371,7 +2388,7 @@ def test_surfacing_timeout_keeps_the_refusal_notice(
         await asyncio.sleep(30)
 
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", stalled)
-    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda: 0.2)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda _overrides: 0.2)
     stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
 
     with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
@@ -2395,7 +2412,7 @@ def test_surfacing_timeout_without_a_refusal_still_passes_through(
         await asyncio.sleep(30)
 
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", stalled)
-    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda: 0.2)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda _overrides: 0.2)
     stdin = json.dumps(_bash_payload({"stdout": "short"}))
 
     with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):

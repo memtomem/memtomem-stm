@@ -702,7 +702,7 @@ Checks, in order:
 | `host registration` | Codex, Claude Code, and project `.mcp.json` discovery | WARN: STM registration not detected |
 | `cache policy` | the `config validate` advisory predicate | WARN: cache enabled but `tool_annotation_policy` unset (conservative default caches unclassified tools) |
 | `compression tuning` | proxy metrics sample inventory | PASS with readiness or collection status; never writes tuning |
-| `ltm server` | the `health` LTM probe, except when doctor's build of the hook's configuration (below) selects the hook's daemon: then that daemon, looked up under that build's fingerprint. Doctor first reads Claude Code's user settings (the file `mms hook install --host claude` writes). When they hold exactly one handler `mms hook install` owns (its own command words, `"type": "command"`, no `args`, no `shell` other than Bash) and nothing else that may run STM's hook, the variables the hook sets from that command's flags (`--use-daemon`/`--no-daemon`, `--surfacing-timeout-seconds`, `--daemon-timeout-seconds`, `--[no-]persist-query-text`) are applied over doctor's environment for the build, as the hook applies them. Otherwise (no owned handler, several, a handler install does not own that may still run the hook, such as a hand-written `mms hook --host claude` or an `env MEMTOMEM_STM_…` prefix, an unreadable file, or any handler on Windows) the build reads doctor's environment alone. As in the hook, the command's `--use-daemon`/`--no-daemon`, when doctor read one, decides the route; without one, `hook.use_daemon` in that build does (true, the default — however it is set: `MEMTOMEM_STM_HOOK__USE_DAEMON`, `use_daemon` in `MEMTOMEM_STM_HOOK`, any letter case). Handlers that may run the hook are found with the look-alike test `mms hook install` uses, leaving out those `mms hook` would not run as the bridge (`--help`, a subcommand): one behind a wrapper script or spelled with shell syntax can be missed, and some that cannot run the hook (a comment, an exec-form `--help` with a quoted argument) are counted, which only falls back to doctor's environment. The build ignores `--config` and is not stopped by an invalid `MEMTOMEM_STM_PROXY*` variable, which the `env_overrides` row reports instead; the surfacing checks below read the same build. When that build rejects any other variable (a setting that does not decode or validate), this section reports the error of the build doctor makes with `--config`, which carries none of the hook command's flags. Doctor makes that build of the hook's configuration from its own environment (with the registered command's flags when it read them), not the host's, so it can fail where the hook's does not, or the reverse. With the hook's daemon off, the standalone route is probed with the `--config` view, without the hook command's settings. The detail ends with the route chosen, whether a probe ran, and what doctor chose it from (the command's options over its environment, or its environment alone and why the command was not used), naming the handler by location, never its text; it does not say why the registered hook behaves as it does. Not read: project, local and managed Claude Code settings, other hosts' hook configurations, and the host's own environment | WARN: LTM unconfigured/unreachable — **never FAIL**; only LTM-dependent features are disabled |
+| `ltm server` | the `health` LTM probe, except when doctor's build of the hook's configuration (below) selects the hook's daemon: then that daemon, looked up under that build's fingerprint. Doctor first reads Claude Code's user settings (the file `mms hook install --host claude` writes). When they hold exactly one handler `mms hook install` owns (its own command words, `"type": "command"`, no `args`, no `shell` other than Bash) and nothing else that may run STM's hook, that command's flags (`--use-daemon`/`--no-daemon`, `--surfacing-timeout-seconds`, `--daemon-timeout-seconds`, `--[no-]persist-query-text`) are applied over doctor's environment for the build, as the hook applies them: over every form that environment gives the same setting. Otherwise (no owned handler, several, a handler install does not own that may still run the hook, such as a hand-written `mms hook --host claude` or an `env MEMTOMEM_STM_…` prefix, an unreadable file, or any handler on Windows) the build reads doctor's environment alone. As in the hook, the command's `--use-daemon`/`--no-daemon`, when doctor read one, decides the route; without one, `hook.use_daemon` in that build does (true, the default — however it is set: `MEMTOMEM_STM_HOOK__USE_DAEMON`, `use_daemon` in `MEMTOMEM_STM_HOOK`, any letter case). Handlers that may run the hook are found with the look-alike test `mms hook install` uses, leaving out those `mms hook` would not run as the bridge (`--help`, a subcommand): one behind a wrapper script or spelled with shell syntax can be missed, and some that cannot run the hook (a comment, an exec-form `--help` with a quoted argument) are counted, which only falls back to doctor's environment. The build ignores `--config` and is not stopped by an invalid `MEMTOMEM_STM_PROXY*` variable, which the `env_overrides` row reports instead; the surfacing checks below read the same build. When that build rejects any other variable (a setting that does not decode or validate), this section reports the error of the build doctor makes with `--config`, which carries none of the hook command's flags. Doctor makes that build of the hook's configuration from its own environment (with the registered command's flags when it read them), not the host's, so it can fail where the hook's does not, or the reverse. With the hook's daemon off, the standalone route is probed with the `--config` view, without the hook command's settings. The detail ends with the route chosen, whether a probe ran, and what doctor chose it from (the command's options over its environment, or its environment alone and why the command was not used), naming the handler by location, never its text; it does not say why the registered hook behaves as it does. Not read: project, local and managed Claude Code settings, other hosts' hook configurations, and the host's own environment | WARN: LTM unconfigured/unreachable — **never FAIL**; only LTM-dependent features are disabled |
 | `ltm runtime profile` / `dependencies` | Core runtime-profile schema 1 | FAIL when active dense/rerank dependencies are missing or Core cannot read effective config; older Core is WARN |
 | `ltm retrieval mode` | Core configured/effective search mode | FAIL on disabled or unexpected dense-to-BM25 degradation; intentional BM25-only is WARN |
 | `ltm RRF boundary` | Core fusion settings and configured STM floors | PASS when the configured floor lies inside both theoretical RRF intervals; otherwise WARN with a conditional pin suggestion or a reason no pin is available. See [RRF boundary diagnostics](surfacing.md#rrf-boundary-diagnostics) for the Core requirement and assumptions |
@@ -1043,15 +1043,25 @@ instead, in any form the settings read (`MEMTOMEM_STM_HOOK__USE_DAEMON=0`, or
 `use_daemon` in `MEMTOMEM_STM_HOOK`). The daemon choice, both deadlines and query-text persistence
 can also arrive as the runtime flags `install` writes into the host command;
 see [the hook CLI reference](reference/cli-hooks.md#mms-hook) for the list.
-The hook applies each flag by setting its variable, and every other spelling
-of that name already in its environment, to the flag's value for the call,
-so a lower-case spelling such as `memtomem_stm_surfacing__timeout_seconds`
-does not outrank the flag. The settings build has two known limits: the
-field repeated under another letter case in the block's JSON
-(`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`)
-and a `null` block (`MEMTOMEM_STM_SURFACING=null`) still outrank the flag's
-variable there. The route is not affected: an explicit `--use-daemon` or
-`--no-daemon` decides it directly.
+The hook applies the flags while it builds its settings, over everything the
+environment gives the same field, and leaves its environment as it is. So
+neither another spelling of the variable
+(`memtomem_stm_surfacing__timeout_seconds`), nor the field repeated under
+another letter case in the block's JSON
+(`MEMTOMEM_STM_SURFACING='{"timeout_seconds": 1, "TIMEOUT_SECONDS": 9}'`),
+nor a `null` block (`MEMTOMEM_STM_SURFACING=null`) outranks a flag; a block
+that is not a JSON object (`MEMTOMEM_STM_SURFACING=[]`) still fails the
+build. A daemon the hook spawns receives the flags in its own environment,
+as `MEMTOMEM_STM_HOOK_FLAGS`, which only `mms daemon run --detached` reads.
+A value that is not a JSON object of the flags' variables with string values
+ends that run with exit 1 and a stderr line naming the variable; a daemon the
+hook spawns has its stderr discarded, so the line shows only in a run started
+by hand. An MCP server
+registration still carries its policy as plain variables, so there one of
+those environment forms can still outrank them, and the server can then
+build a daemon configuration other than the hook's. The route is not
+affected either way: an explicit `--use-daemon` or `--no-daemon` decides it
+directly.
 
 ### `install` / `uninstall` — per-host registration
 
@@ -1267,12 +1277,13 @@ checked ("could not check the previous daemon's lock").
 `start`, `stop`, `status` and `restart` accept `--hook-command claude`, which
 builds the daemon's configuration the way the STM hook command that
 `mms hook install --host claude` wrote in Claude Code's user settings does.
-The hook sets the variables its options name (`--surfacing-timeout-seconds`,
-`--[no-]persist-query-text`, …) in its environment before it builds, and a
-daemon it spawns inherits them. Two of them enter the daemon's fingerprint,
-so a bare command run from a shell can address a daemon other than the hook's
-(a default install writes `--no-persist-query-text`). With the option, the
-command sets the same variables the same way for its run. So when `mms doctor`
+The hook applies its options (`--surfacing-timeout-seconds`,
+`--[no-]persist-query-text`, …) while it builds its settings, and a daemon
+it spawns receives them at launch. Two of them enter the daemon's
+fingerprint, so a bare command run from a shell can address a daemon other
+than the hook's (a default install writes `--no-persist-query-text`). With
+the option, the command applies the same options the same way for its run,
+and a daemon `start` launches receives them too. So when `mms doctor`
 takes the hook's daemon route for that command, the option acts on the daemon
 doctor probed, and doctor names it in its advice for that daemon. `status` then
 reports whether the hook uses the daemon from the command's

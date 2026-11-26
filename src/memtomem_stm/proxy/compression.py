@@ -44,6 +44,10 @@ from memtomem_stm.proxy.delivery import (
     fit_toc,
     metadata_format,
     plain_result_fits,
+    stored_text_block,
+    text_block_metadata,
+    text_block_overhead,
+    with_text_block,
 )
 from memtomem_stm.proxy.markdown_structure import (
     Heading,
@@ -1046,6 +1050,34 @@ def payload_has_credentials(text: str) -> bool:
     return contains_sensitive_content(text, CREDENTIAL_PATTERNS)
 
 
+def text_block_has_credentials(block: dict[str, Any] | None) -> bool:
+    """Whether a text block's metadata (#1529) carries a credential.
+
+    The same real-bytes verdict as :func:`payload_has_credentials`, over the
+    metadata as the client receives it (serialized once) and over every key
+    and string value as it is. The store's own row scan sees only a
+    serialization, where a quote inside a key or value is escaped, so it
+    cannot see a credential written there.
+    """
+    if not block:
+        return False
+    if payload_has_credentials(surrogate_safe_dumps(block, ensure_ascii=False)):
+        return True
+    stack: list[Any] = [block]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(key, str) and payload_has_credentials(key):
+                    return True
+                stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(value)
+        elif isinstance(value, str) and payload_has_credentials(value):
+            return True
+    return False
+
+
 def _store_persists(store: object) -> bool:
     return bool(getattr(store, "persists_to_disk", False))
 
@@ -1064,6 +1096,22 @@ class PendingSelection:
     # (#1370). ``None``: a row written before that, which expires by the
     # caller's TTL. Progressive rows keep theirs in ``__meta__`` instead.
     ttl_seconds: float | None = None
+
+
+def _decoded_selection_metadata(metadata_json: str | None) -> dict[str, Any] | None:
+    """A selective row's ``metadata_json`` decoded once, or ``None``.
+
+    ``None`` also for a container that does not decode or is not an object:
+    a legacy read serves such rows without validating their presentation, so
+    they yield no text block metadata (#1529) and the text is served as
+    before. :func:`metadata_format` then decodes *metadata_json* itself and
+    refuses it wherever it did before.
+    """
+    try:
+        data = json.loads(metadata_json) if metadata_json else None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class ChunkMap(dict[str, str]):
@@ -1272,11 +1320,15 @@ class SelectiveCompressor:
         # installs on the event loop wait for; a retarget onto a persisting
         # store from a non-persisting one evaluates it under the lock instead.
         sources = (text,) if sensitivity_source is None else (text, sensitivity_source)
+        block = text_block_metadata()
         verdict: list[bool] = []
 
         def sensitive() -> bool:
             if not verdict:
-                verdict.append(any(payload_has_credentials(s) for s in sources))
+                verdict.append(
+                    any(payload_has_credentials(s) for s in sources)
+                    or text_block_has_credentials(block)
+                )
             return verdict[0]
 
         if _store_persists(self._store):
@@ -1324,6 +1376,7 @@ class SelectiveCompressor:
             "source_offset": source_offset,
             "chunks": records,
             "metadata_complete": bool(getattr(chunks, "records", {})),
+            **({"text_block": block} if block else {}),
         }
         ttl = self._ttl
         # Once per entry, not per ``build``: a JSON chunk's type comes from
@@ -1461,7 +1514,10 @@ class SelectiveCompressor:
         if pending is None:
             return None
 
-        mode = metadata_format(pending.metadata_json, response_format)
+        data = _decoded_selection_metadata(pending.metadata_json)
+        mode = metadata_format(pending.metadata_json, response_format, decoded=data)
+        # Whatever the format: only a present, invalid value is refused.
+        block = stored_text_block(data) if data is not None else None
 
         selected_parts: list[str] = []
         for section in sections:
@@ -1477,11 +1533,7 @@ class SelectiveCompressor:
             available = list(pending.chunks.keys())
             return f"No matching sections found. Available: {available}"
 
-        raw = (
-            json.loads(pending.metadata_json)
-            if pending.metadata_json and mode == "structured"
-            else {}
-        )
+        raw = data if data is not None and mode == "structured" else {}
         records = raw.get("chunks", {})
         descriptor = envelope(
             "selection",
@@ -1497,14 +1549,14 @@ class SelectiveCompressor:
                 ],
             },
         )
-        if mode == "structured" and delivery_size(descriptor, owned=True) > raw.get(
-            "budget", 16000
-        ):
+        if mode == "structured" and delivery_size(descriptor, owned=True) + text_block_overhead(
+            block
+        ) > raw.get("budget", 16000):
             raise DeliveryBudgetExceeded("Select fewer sections or request legacy output.")
         self._store.touch(key)
         result = DeliveryText("\n\n".join(selected_parts), descriptor)
         result.response_format = mode
-        return result
+        return with_text_block(result, block)
 
     def begin_use(self) -> None:
         """Register an in-flight ``compress()`` before the manager lock drops.
