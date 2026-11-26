@@ -138,6 +138,8 @@ class TestStampedRows:
         ((source, accounting, _strategy, is_error),) = _rows(store, "read")
         assert (source, is_error) == ("agent", 0)
         assert accounting is not None
+        summary = read_compression_summary(store._db_path)
+        assert summary["context_query"] == {"observed": 1, "agent": 1}
 
     async def test_structured_delivery_frame(self, build):
         mgr, store = build(
@@ -388,42 +390,37 @@ class TestSummary:
         assert summary["context_query"] is None
 
     @pytest.mark.parametrize(
-        ("filters", "expected"),
-        [
-            ({}, {"observed": 4, "agent": 2}),
-            ({"source": "mcp"}, {"observed": 4, "agent": 2}),
-            ({"tool": "read"}, {"observed": 3, "agent": 1}),
-        ],
+        "filters",
+        [{}, {"source": "mcp"}, {"tool": "read"}],
         ids=["unfiltered", "source-mcp", "tool"],
     )
-    def test_the_counts_come_from_the_statement_that_reads_the_totals(
-        self, tmp_path, monkeypatch, filters, expected
-    ):
-        """Exactly one statement reads the column, and it is the one that
-        reads the totals, so no row can land between the totals and the
-        counts printed under them."""
+    def test_the_counts_and_the_totals_see_the_same_rows(self, tmp_path, monkeypatch, filters):
+        """A row is written each time the reader starts a statement. Every row
+        here is a stamped ``agent`` row, so a reader that takes the counts and
+        the totals from one snapshot reports the same number three times,
+        however many rows landed first; one that reads them apart does not."""
         path = tmp_path / "m.db"
-        self._seed(path)
-        statements: list[str] = []
-        real = sqlite3.connect
+        store = MetricsStore(path)
+        store.initialize()
+        try:
+            for _ in range(3):
+                _record(store, "read", "agent")
+            real = sqlite3.connect
 
-        def _traced(*args, **kwargs):
-            db = real(*args, **kwargs)
-            db.set_trace_callback(statements.append)
-            return db
+            def _writer_on_every_statement(*args, **kwargs):
+                db = real(*args, **kwargs)
+                db.set_trace_callback(lambda _sql: _record(store, "read", "agent"))
+                return db
 
-        monkeypatch.setattr(sqlite3, "connect", _traced)
+            monkeypatch.setattr(sqlite3, "connect", _writer_on_every_statement)
+            summary = read_compression_summary(path, **filters)
+        finally:
+            store.close()
 
-        summary = read_compression_summary(path, **filters)
-
-        assert summary["context_query"] == expected
-        # Matched on the column's name, which any read of it has to spell,
-        # however that statement names the table.
-        reads = [s for s in statements if "context_query_source" in s]
-        assert len(reads) == 1
-        (read,) = reads
-        assert "context_query_observed" in read and "context_query_agent" in read
-        assert "classified_calls" in read and "legacy_compressed_chars" in read
+        seen = summary["total_calls"]
+        assert summary["context_query"] == {"observed": seen, "agent": seen}
+        # Rows did land while the reader ran: it saw more than were seeded.
+        assert seen > 3
 
     def test_a_db_without_the_column_reads_zero_and_is_left_alone(self, tmp_path):
         path = tmp_path / "legacy.db"
