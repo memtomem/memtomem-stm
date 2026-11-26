@@ -406,21 +406,33 @@ class TestSummary:
             for _ in range(3):
                 _record(store, "read", "agent")
             real = sqlite3.connect
+            started: list[str] = []
+
+            def _write(sql: str) -> None:
+                started.append(sql)
+                _record(store, "read", "agent")
 
             def _writer_on_every_statement(*args, **kwargs):
                 db = real(*args, **kwargs)
-                db.set_trace_callback(lambda _sql: _record(store, "read", "agent"))
+                db.set_trace_callback(_write)
                 return db
 
             monkeypatch.setattr(sqlite3, "connect", _writer_on_every_statement)
             summary = read_compression_summary(path, **filters)
+            monkeypatch.undo()
+            (written,) = store._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()
         finally:
             store.close()
 
+        # A failure inside a trace callback does not reach the reader, so the
+        # writes are checked here: one row landed for each statement started.
+        assert len(started) >= 2
+        assert written == 3 + len(started)
         seen = summary["total_calls"]
         assert summary["context_query"] == {"observed": seen, "agent": seen}
-        # Rows did land while the reader ran: it saw more than were seeded.
-        assert seen > 3
+        # The reader's last statement is the one that reads the rows, and it
+        # saw every row written up to its own start.
+        assert seen == written
 
     def test_a_db_without_the_column_reads_zero_and_is_left_alone(self, tmp_path):
         path = tmp_path / "legacy.db"
