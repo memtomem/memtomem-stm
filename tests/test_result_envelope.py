@@ -24,6 +24,7 @@ from mcp.types import Annotations, CallToolResult, ImageContent, TextContent
 from memtomem_stm.proxy.cache import ProxyCache
 from memtomem_stm.proxy.config import (
     CacheConfig,
+    CleaningConfig,
     CompressionStrategy,
     ProxyConfig,
     UpstreamServerConfig,
@@ -443,6 +444,35 @@ class TestEnvelopePreservation:
         _set_upstream(mgr, CallToolResult(content=blocks))
         res = await mgr.call_tool("srv", "tool", {})
         assert [b.text for b in res.content] == ["same para\n\nother", "same para"]
+
+    async def test_unannotated_blocks_keep_markup_from_pairing_across_them(self, make_mgr):
+        # The normal path delivers one merged block, but an element that opens
+        # in one upstream block and closes in a later one is not removed as one
+        # element: that deleted text from both blocks (#1531).
+        mgr, store, _ = make_mgr()
+        blocks = [
+            TextContent(type="text", text="Intro <style>Release notes"),
+            TextContent(type="text", text="Rollback instructions</style> end"),
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert res == "Intro Release notes\nRollback instructions end"
+        row = store._db.execute(
+            "SELECT original_chars, cleaned_chars FROM proxy_metrics ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert tuple(row) == (60, len(res))
+
+    async def test_disabled_cleaning_returns_the_joined_text_without_a_copy(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        blocks = [TextContent(type="text", text=t) for t in ("<b>a</b>", "b")]
+        shaped = mgr._shape_response(
+            CallToolResult(content=blocks), "srv", "tool", cfg_snap=mgr._config
+        )
+        assert shaped.text_part_lengths == (8, 1)
+        assert mgr._clean_shaped_text(shaped, CleaningConfig(enabled=False)) is (
+            shaped.original_text
+        )
+        assert mgr._clean_shaped_text(shaped, CleaningConfig()) == "a\nb"
 
     async def test_annotated_cap_applies_to_cleaned_text(self, make_mgr):
         mgr, store, _ = make_mgr()

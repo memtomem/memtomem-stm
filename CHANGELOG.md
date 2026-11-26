@@ -41,6 +41,22 @@ changes inline only. See the deprecation policy in
   handler `echo ` + 160,000 × `x` took about 0.34 s per scan (macOS,
   CPython 3.14.7), and install and uninstall scan twice. The words are read
   the way `shlex` reads them, so the same handlers are named as before.
+- Cleaning no longer removes markup as one element across two upstream text
+  blocks (#1538, issue #1531). When a response's text blocks carry no
+  metadata they are joined and cleaned as one string, so a tag or a
+  `<script>`/`<style>` element that opened in one block and closed in a
+  later one was removed together with the text of both blocks between them:
+  `Intro <style>Release notes` and `Rollback instructions</style> end` were
+  delivered as `Intro  end`. Line-ending normalization and markup removal now
+  read one block at a time; code-fence and generic protection, duplicate
+  paragraph removal, link-flood collapse and blank-line normalization still
+  read the joined text, so a fence split across blocks stays protected as
+  before. **Behavior change**: such a reply now keeps that text
+  (`Intro Release notes` / `Rollback instructions end`), and a block ending
+  in a lone `\r` now ends its own line instead of merging with the newline
+  that joins it to the next block; any other reply is unchanged. A cache hit
+  can still serve a reply stored earlier while that entry stays valid
+  (#1540).
 - `mms hook install` and `mms hook uninstall` no longer manage a Claude Code
   handler whose `shell` field is present and anything but `"bash"` (issue
   #1497). Install writes a POSIX line; with `"shell": "powershell"`
@@ -54,6 +70,7 @@ changes inline only. See the deprecation policy in
   which a `shell` other than `"bash"` was added by hand, is no longer
   refreshed or removed; install refreshes the handler it does own, or adds
   one beside it when it owns none.
+
 - The `max_upstream_chars` guard no longer reports an oversized payload when
   no text was cut (#1536, issue #1530). A text block that exactly filled the cap
   followed by an empty text block used to get the "response truncated …

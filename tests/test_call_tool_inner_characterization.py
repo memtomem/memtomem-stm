@@ -157,7 +157,7 @@ class TestCompressedCharsInitialResponse:
         )
         # Pin cleaned == upstream so both metric columns are anchored to a known
         # length, not merely compared to each other.
-        mgr._clean_content = lambda text, cfg: text
+        mgr._clean_shaped_text = lambda shaped, cfg: shaped.original_text
         text = "content paragraph. " * 200  # 3800 chars, single line → no cleaning collapse
         mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(text)
         result = await mgr.call_tool("srv", "tool", {})
@@ -451,7 +451,8 @@ class TestSourceResponseCharsForwarding:
             max_result_chars=500,
             min_retention=0.0,
         )
-        mgr._clean_content = lambda text, cfg: text  # pin cleaned == upstream
+        # pin cleaned == upstream
+        mgr._clean_shaped_text = lambda shaped, cfg: shaped.original_text
         engine = _CapturingSurfacingEngine()
         mgr._surfacing_engine = engine
         text = "word " * 1000  # 5000 chars, TRUNCATEd well below 500
@@ -493,7 +494,7 @@ class TestSourceResponseCharsForwarding:
         )
         engine = SurfacingEngine(_make_config(min_response_chars=1000), mcp_adapter=adapter)
         mgr._surfacing_engine = engine
-        mgr._clean_content = lambda text, cfg: text
+        mgr._clean_shaped_text = lambda shaped, cfg: shaped.original_text
         session = mgr._connections["srv"].session
         session.call_tool.return_value = fake_tool_result("word " * 1000)
         try:
@@ -512,7 +513,7 @@ class TestSourceResponseCharsForwarding:
             compression=CompressionStrategy.PROGRESSIVE,
             progressive=ProgressiveConfig(chunk_size=500),
         )
-        mgr._clean_content = lambda text, cfg: text
+        mgr._clean_shaped_text = lambda shaped, cfg: shaped.original_text
         engine = _CapturingSurfacingEngine()
         mgr._surfacing_engine = engine
         text = "content paragraph. " * 200  # 3800 chars, first chunk = 500

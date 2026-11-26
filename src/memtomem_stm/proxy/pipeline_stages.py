@@ -51,8 +51,13 @@ class ShapedResponse:
     """Stage 3 output: the text/non-text split of an upstream tool result.
 
     ``original_text`` is the joined text payload (``""`` when ``passthrough`` is
-    set). ``non_text_content`` is the preserved non-text content list (consumed
-    by the cache-store gate and the final return shape). When ``passthrough`` is
+    set): the text parts joined with ``"\\n"``. ``text_part_lengths`` are those
+    parts' lengths — each upstream text block as bounded by
+    ``max_upstream_chars``, plus that guard's notice as a part of its own when
+    it cut — so CLEAN can keep every removal match inside one block (#1531)
+    without a second copy of the text; ``()`` when ``passthrough`` is set.
+    ``non_text_content`` is the preserved non-text content list (consumed by the
+    cache-store gate and the final return shape). When ``passthrough`` is
     non-None the caller short-circuits.
 
     ``non_text_before_first_text`` is the number of non-text blocks that
@@ -64,6 +69,7 @@ class ShapedResponse:
     """
 
     original_text: str
+    text_part_lengths: tuple[int, ...]
     non_text_content: list[Any]
     passthrough: ShapePassthrough | None = None
     non_text_before_first_text: int = 0
