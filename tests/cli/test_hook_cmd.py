@@ -1444,11 +1444,14 @@ def test_orchestrate_records_the_compression_status(
     db = sqlite3.connect(str(metrics_db))
     try:
         rows = db.execute(
-            "SELECT hook_compression_status, compression_strategy FROM proxy_metrics"
+            "SELECT hook_compression_status, compression_strategy, context_query_source "
+            "FROM proxy_metrics"
         ).fetchall()
     finally:
         db.close()
-    assert rows == [(status, "truncate" if replaced else None)]
+    # A native tool call has no ``_context_query``, so the hook leaves that
+    # column unset rather than recording "none".
+    assert rows == [(status, "truncate" if replaced else None, None)]
 
 
 def test_every_compression_status_is_a_recorded_status(monkeypatch: pytest.MonkeyPatch):

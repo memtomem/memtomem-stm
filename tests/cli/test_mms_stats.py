@@ -1860,3 +1860,171 @@ class TestStatsCache:
         result = runner.invoke(cli, ["stats"])
         assert result.exit_code == 0, result.output
         assert "Coverage: since an unknown start" in result.output
+
+
+def _seed_query_rows(db: Path, rows: list[tuple[str, str, str | None]]) -> None:
+    """``(source, tool, context_query_source)`` rows."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    store = MetricsStore(db)
+    store.initialize()
+    try:
+        for source, tool, value in rows:
+            store.record(
+                CallMetrics(
+                    server="builtin:claude" if source == "hook" else "c7",
+                    tool=tool,
+                    original_chars=1000,
+                    compressed_chars=600,
+                    source=source,
+                    context_query_source=value,
+                )
+            )
+    finally:
+        store.close()
+
+
+_MCP_ROWS = [("mcp", "query-docs", "agent"), ("mcp", "query-docs", "none"), ("mcp", "x", "none")]
+_QUERY_LINE = "Context query supplied on 1 of 3 observed live MCP responses (33.3%)"
+
+
+def _only_query_line(lines: list[str]) -> int:
+    """The index of the query line, which a block prints at most once."""
+    (at,) = [i for i, line in enumerate(lines) if "Context query supplied" in line]
+    return at
+
+
+class TestContextQueryLine:
+    """The line counts the MCP rows that record whether ``_context_query`` was
+    supplied, and hangs under the total it was read with."""
+
+    def _db(self, home: Path) -> Path:
+        return home / ".memtomem" / "proxy_metrics.db"
+
+    def test_mcp_only_db_shows_it_under_the_total(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), _MCP_ROWS)
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        at = _only_query_line(lines)
+        assert lines[at] == f"    {_QUERY_LINE}"
+        assert at > lines.index("  calls: 3  (errors: 0)")
+
+    def test_source_mcp_shows_it_under_the_total(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [*_MCP_ROWS, ("hook", "Bash", None)])
+
+        lines = runner.invoke(cli, ["stats", "--source", "mcp"]).output.splitlines()
+
+        at = _only_query_line(lines)
+        assert lines[at] == f"    {_QUERY_LINE}"
+        assert at > lines.index("  calls: 3  (errors: 0)")
+
+    def test_two_sources_show_it_under_the_mcp_line(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [*_MCP_ROWS, ("hook", "Bash", None)])
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        at = _only_query_line(lines)
+        assert lines[at] == f"      {_QUERY_LINE}"
+        assert lines[at - 1].startswith("    mcp   calls: 3")
+
+    def test_tool_filter_narrows_both_numbers(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        # The other tool's row is an ``agent`` one, so a numerator that ignored
+        # the filter would read 2.
+        rows = [*_MCP_ROWS[:2], ("mcp", "x", "agent"), ("hook", "query-docs", "agent")]
+        _seed_query_rows(self._db(tmp_path), rows)
+
+        result = runner.invoke(cli, ["stats", "--tool", "query-docs", "--json"])
+
+        data = json.loads(result.output)
+        assert data["compression"]["context_query"] == {"observed": 2, "agent": 1}
+
+    def test_json_carries_the_counts_per_summary(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [*_MCP_ROWS, ("hook", "Bash", "agent")])
+
+        data = json.loads(runner.invoke(cli, ["stats", "--json"]).output)
+
+        assert data["compression"]["context_query"] == {"observed": 3, "agent": 1}
+        assert data["compression_by_source"]["mcp"]["context_query"] == {
+            "observed": 3,
+            "agent": 1,
+        }
+        assert data["compression_by_source"]["hook"]["context_query"] is None
+
+    @pytest.mark.parametrize("args", [["--source", "hook"], ["--all-time"]])
+    def test_absent_where_the_figure_does_not_exist(self, runner, tmp_path, monkeypatch, args):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [*_MCP_ROWS, ("hook", "Bash", "agent")])
+
+        text = runner.invoke(cli, ["stats", *args])
+        data = json.loads(runner.invoke(cli, ["stats", *args, "--json"]).output)
+
+        assert text.exit_code == 0, text.output
+        assert "calls:" in text.output  # the block rendered; only the line is absent
+        assert "Context query" not in text.output
+        assert data["compression"]["total_calls"] > 0
+        assert data["compression"]["context_query"] is None
+
+    def test_no_line_when_no_call_was_observed(self, runner, tmp_path, monkeypatch):
+        set_home(monkeypatch, tmp_path)
+        _seed_query_rows(self._db(tmp_path), [("mcp", "query-docs", None)])
+
+        result = runner.invoke(cli, ["stats"])
+
+        assert "  calls: 1  (errors: 0)" in result.output.splitlines()
+        assert "Context query" not in result.output
+
+    def _write_after_first_read(self, monkeypatch, db: Path) -> list:
+        from memtomem_stm.proxy import metrics_store
+
+        real = metrics_store.read_compression_summary
+        reads: list = []
+
+        def _read(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not reads:
+                _seed_query_rows(db, [("mcp", "query-docs", "agent")])
+            reads.append(kwargs.get("source"))
+            return result
+
+        monkeypatch.setattr(metrics_store, "read_compression_summary", _read)
+        return reads
+
+    def test_under_the_total_it_keeps_the_totals_snapshot(self, runner, tmp_path, monkeypatch):
+        """MCP only: a row committed after the total was read is in neither
+        the total nor the line under it."""
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_query_rows(db, [("mcp", "query-docs", "none")])
+        reads = self._write_after_first_read(monkeypatch, db)
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        assert reads[0] is None
+        at = _only_query_line(lines)
+        assert lines[at] == (
+            "    Context query supplied on 0 of 1 observed live MCP responses (0.0%)"
+        )
+        assert at > lines.index("  calls: 1  (errors: 0)")
+
+    def test_under_the_mcp_line_it_follows_that_lines_snapshot(self, runner, tmp_path, monkeypatch):
+        """Two sources: the MCP line is read after the total, so it and the
+        line under it both include the row the total missed."""
+        set_home(monkeypatch, tmp_path)
+        db = self._db(tmp_path)
+        _seed_query_rows(db, [("mcp", "query-docs", "none"), ("hook", "Bash", None)])
+        reads = self._write_after_first_read(monkeypatch, db)
+
+        lines = runner.invoke(cli, ["stats"]).output.splitlines()
+
+        assert reads[0] is None
+        assert "  calls: 2  (errors: 0)" in lines  # the total, read first
+        at = _only_query_line(lines)
+        assert lines[at] == (
+            "      Context query supplied on 1 of 2 observed live MCP responses (50.0%)"
+        )
+        assert lines[at - 1].startswith("    mcp   calls: 2")

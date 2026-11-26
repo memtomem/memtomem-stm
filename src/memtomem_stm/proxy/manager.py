@@ -127,6 +127,7 @@ from memtomem_stm.proxy.metrics import (
     CallMetrics,
     ErrorCategory,
     TokenTracker,
+    context_query_source,
     format_error_message_from_exc,
 )
 from memtomem_stm.proxy.pipeline_stages import (
@@ -8432,6 +8433,7 @@ class ProxyManager:
                     ),
                     strategy_auto_selected=False,
                     compression_accounting="initial_response_v1",
+                    context_query_source=context_query_source(context_query),
                 )
             )
             self._invalidate_disabled_cache(
@@ -8750,6 +8752,7 @@ class ProxyManager:
                 extract_error=extract_error,
                 surfacing_on_progressive_ok=surfacing_on_progressive_ok,
                 surface_error=surface_error,
+                context_query_source=context_query_source(context_query),
             )
         )
         if pending_cache_write is not None:
