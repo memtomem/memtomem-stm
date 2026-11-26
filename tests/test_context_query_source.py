@@ -7,7 +7,6 @@ other row stays ``NULL`` and out of the count. The query's text is never stored.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -141,6 +140,11 @@ class TestStampedRows:
         ((source, accounting, _strategy, _is_error),) = _rows(store, "read")
         assert accounting == "initial_structured_v1"  # a structured frame was delivered
         assert source == "agent"
+        # …and the reader counts it: structured rows are sized apart from text
+        # rows, but they are observed like any other stamped response.
+        summary = read_compression_summary(store._db_path)
+        assert summary["structured_delivery"]["calls"] == 1
+        assert summary["context_query"] == {"observed": 1, "agent": 1}
 
     @pytest.mark.parametrize(
         ("arguments", "expected"),
@@ -370,35 +374,27 @@ class TestSummary:
         assert summary["total_calls"] == 6
         assert summary["context_query"] is None
 
-    def test_the_documented_window_query(self, tmp_path):
-        """The read-only statement docs/compression.md gives for measuring the
-        calls after a point in time."""
+    def test_the_counts_come_from_the_statement_that_reads_the_totals(self, tmp_path, monkeypatch):
+        """One SELECT over ``proxy_metrics``, so no row can land between the
+        totals and the counts printed under them."""
         path = tmp_path / "m.db"
         self._seed(path)
-        conn = sqlite3.connect(path)
-        # Seeded "now"; move the first stamped row to before the window.
-        conn.execute(
-            "UPDATE proxy_metrics SET created_at = strftime('%s', '2026-11-30 00:00:00') "
-            "WHERE id = (SELECT MIN(id) FROM proxy_metrics)"
-        )
-        conn.execute(
-            "UPDATE proxy_metrics SET created_at = strftime('%s', '2026-12-02 00:00:00') "
-            "WHERE id > (SELECT MIN(id) FROM proxy_metrics)"
-        )
-        conn.commit()
-        # The statement as the page prints it, so the two cannot drift apart.
-        page = (Path(__file__).parent.parent / "docs" / "compression.md").read_text()
-        (statement,) = re.findall(
-            r'sqlite3 "file:[^"]+" \\\n\s+"(SELECT SUM\(context_query_source.+?)"\n```',
-            page,
-            flags=re.DOTALL,
-        )
-        row = conn.execute(statement).fetchone()
-        empty = conn.execute(statement.replace("2026-12-01", "2027-01-01")).fetchone()
-        conn.close()
-        # Of the four stamped MCP rows, the first (an ``agent`` one) is outside.
-        assert row == (1, 3)
-        assert empty == (None, 0)
+        statements: list[str] = []
+        real = sqlite3.connect
+
+        def _traced(*args, **kwargs):
+            db = real(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+
+        monkeypatch.setattr(sqlite3, "connect", _traced)
+
+        summary = read_compression_summary(path, source="mcp")
+
+        assert summary["context_query"] == {"observed": 4, "agent": 2}
+        reads = [s for s in statements if "FROM proxy_metrics" in s]
+        assert len(reads) == 1
+        assert "context_query_observed" in reads[0] and "classified_calls" in reads[0]
 
     def test_a_db_without_the_column_reads_zero_and_is_left_alone(self, tmp_path):
         path = tmp_path / "legacy.db"

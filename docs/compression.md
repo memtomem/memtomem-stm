@@ -432,7 +432,7 @@ When an agent provides `_context_query` in tool arguments, compression allocates
 
 ### Measuring whether queries arrive
 
-Query-aware compression does nothing for a call that carries no query, so the proxy records whether one arrived. A proxied call that returns a successful response with at least one text block — compressed, or passed through with its blocks kept apart — stores `agent` or `none` in the `context_query_source` column of `proxy_metrics`: `agent` when the call's `_context_query` was a string with something other than whitespace in it, `none` otherwise. Only that fact is stored, never the query's text. `mms stats` reports it under the MCP figures:
+Query-aware compression does nothing for a call that carries no query, so the proxy records whether one arrived. A proxied call that returns a successful response with at least one text block — compressed, or passed through with its blocks kept apart — stores `agent` or `none` in the `context_query_source` column of `proxy_metrics`: `agent` when the call's `_context_query` was a string with something other than whitespace in it, `none` otherwise. The row stores only that fact, not the query's text. `mms stats` reports it under the MCP figures:
 
 ```text
 Context query supplied on 3 of 120 observed live MCP responses (2.5%)
@@ -443,16 +443,7 @@ Context query supplied on 3 of 120 observed live MCP responses (2.5%)
 - **It says a query arrived, not that it was used.** Whether a scorer ran depends on the path the response took; a response within its budget, for one, runs none.
 - **It is not in `--all-time`.** The figure covers the retained rows only (`proxy.metrics.max_history`).
 
-The line accumulates over every retained row, including calls made before the client received a tool list that advertises the argument (`advertise_context_query`). To measure only the calls after that, bound the rows by time. Use the time the client received the refreshed tool list, not the time the config was edited: the argument is advertised when the tools are registered, so a client connected before the change still holds the old schema.
-
-```bash
-sqlite3 "file:$HOME/.memtomem/proxy_metrics.db?mode=ro" \
-  "SELECT SUM(context_query_source = 'agent'), COUNT(*) FROM proxy_metrics
-   WHERE source = 'mcp' AND context_query_source IS NOT NULL
-     AND created_at >= strftime('%s', '2026-12-01 09:00:00')"
-```
-
-It returns two numbers for the retained rows in that window: the observed responses that carried a query, and the observed responses. Divide the first by the second when the second is above zero (the first is empty when it is not). `strftime` reads the timestamp as UTC. The path is the default one; use `proxy.metrics.db_path` if it is set, and a DB that this version has opened, since the column is added then.
+The line accumulates over every retained row from every client that writes to this metrics DB, including calls made before a client received a tool list that advertises the argument (`advertise_context_query`). It is not a rate for one client or for the period since a setting changed.
 
 `RelevanceScorer` protocol (`proxy/relevance.py`) enables custom scorer implementations. `EmbeddingScorer` uses sync httpx to call embedding APIs with automatic BM25 fallback on error.
 

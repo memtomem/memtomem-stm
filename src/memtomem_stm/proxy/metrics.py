@@ -384,7 +384,7 @@ class CallMetrics:
     # ``compression_accounting`` stamp. ``None`` on every other row — errors,
     # a response with no text, ``mms hook`` rows, rows written before the
     # column — which a reader leaves out rather than counts as "no query".
-    # Only the fact is kept; the query's text is never stored here.
+    # Only the fact is kept; this row never holds the query's text.
     context_query_source: str | None = None
 
 
