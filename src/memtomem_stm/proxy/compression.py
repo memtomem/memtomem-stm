@@ -1098,22 +1098,20 @@ class PendingSelection:
     ttl_seconds: float | None = None
 
 
-def _pending_text_block(metadata_json: str | None) -> dict[str, Any] | None:
-    """The text block metadata a selective row stores (#1529), validated.
+def _decoded_selection_metadata(metadata_json: str | None) -> dict[str, Any] | None:
+    """A selective row's ``metadata_json`` decoded once, or ``None``.
 
-    Read apart from the presentation metadata and whatever the requested
-    format: a legacy read serves rows whose presentation it does not validate,
-    so an unreadable container, or one that is not an object, yields no block
-    metadata and the text is served as before. Only a present, invalid value
-    is refused.
+    ``None`` also for a container that does not decode or is not an object:
+    a legacy read serves such rows without validating their presentation, so
+    they yield no text block metadata (#1529) and the text is served as
+    before. :func:`metadata_format` then decodes *metadata_json* itself and
+    refuses it wherever it did before.
     """
     try:
         data = json.loads(metadata_json) if metadata_json else None
     except (TypeError, ValueError, RecursionError):
         return None
-    if not isinstance(data, dict):
-        return None
-    return stored_text_block(data)
+    return data if isinstance(data, dict) else None
 
 
 class ChunkMap(dict[str, str]):
@@ -1516,8 +1514,10 @@ class SelectiveCompressor:
         if pending is None:
             return None
 
-        mode = metadata_format(pending.metadata_json, response_format)
-        block = _pending_text_block(pending.metadata_json)
+        data = _decoded_selection_metadata(pending.metadata_json)
+        mode = metadata_format(pending.metadata_json, response_format, decoded=data)
+        # Whatever the format: only a present, invalid value is refused.
+        block = stored_text_block(data) if data is not None else None
 
         selected_parts: list[str] = []
         for section in sections:
@@ -1533,11 +1533,7 @@ class SelectiveCompressor:
             available = list(pending.chunks.keys())
             return f"No matching sections found. Available: {available}"
 
-        raw = (
-            json.loads(pending.metadata_json)
-            if pending.metadata_json and mode == "structured"
-            else {}
-        )
+        raw = data if data is not None and mode == "structured" else {}
         records = raw.get("chunks", {})
         descriptor = envelope(
             "selection",

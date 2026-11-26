@@ -519,3 +519,40 @@ async def test_legacy_continuations_do_not_need_the_sdk_projector(tmp_path, stra
         key, offset = await _publish(proxy, session, strategy, "legacy", _block())
         more = _continue(proxy, strategy, key, offset)
     assert more.content[0].annotations == ANNOTATIONS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["legacy", "structured"])
+@pytest.mark.parametrize("sqlite", [False, True])
+async def test_one_read_decodes_the_block_metadata_once(tmp_path, monkeypatch, fmt, sqlite):
+    import memtomem_stm.proxy.compression as compression
+    import memtomem_stm.proxy.delivery as delivery
+
+    validated: list[object] = []
+    real = delivery.stored_text_block
+
+    def counting(meta):
+        validated.append(meta)
+        return real(meta)
+
+    for module in (delivery, compression):
+        monkeypatch.setattr(module, "stored_text_block", counting)
+    for strategy in ("progressive", "selective"):
+        proxy, session = _manager(tmp_path / strategy, strategy, fmt, sqlite=sqlite)
+        key, offset = await _publish(proxy, session, strategy, fmt, _block())
+        validated.clear()
+        loads: list[str] = []
+        real_loads = compression.json.loads
+        monkeypatch.setattr(
+            compression.json,
+            "loads",
+            lambda s, *a, **k: loads.append(s) or real_loads(s, *a, **k),
+        )
+
+        more = _continue(proxy, strategy, key, offset)
+
+        monkeypatch.setattr(compression.json, "loads", real_loads)
+        assert more.content[0].meta == BLOCK_META
+        assert len(validated) == 1, strategy
+        if strategy == "selective":
+            assert sum('"text_block"' in s for s in loads if isinstance(s, str)) == 1

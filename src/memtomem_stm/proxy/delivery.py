@@ -292,14 +292,23 @@ def delivery_format() -> DeliveryFormat:
     return _FORMAT.get()
 
 
-def metadata_format(raw: str | None, override: DeliveryFormat | None = None) -> DeliveryFormat:
-    """Validate presentation metadata independently of expiry. Never deletes rows."""
+def metadata_format(
+    raw: str | None,
+    override: DeliveryFormat | None = None,
+    *,
+    decoded: dict[str, Any] | None = None,
+) -> DeliveryFormat:
+    """Validate presentation metadata independently of expiry. Never deletes rows.
+
+    *decoded* is *raw* already decoded by the caller, which then is not
+    decoded again; it is read, never changed.
+    """
     if override == "legacy":
         return override
     if raw is None:
         return override or "legacy"
     try:
-        data = json.loads(raw)
+        data = decoded if decoded is not None else json.loads(raw)
     except (TypeError, ValueError, RecursionError) as exc:
         raise DeliveryError("Invalid delivery metadata.") from exc
     if not isinstance(data, dict):

@@ -16,7 +16,6 @@ from memtomem_stm.proxy.delivery import (
     DeliveryFormat,
     read_delivery_scope,
     progressive_metadata_format,
-    progressive_text_block,
     stored_progressive_format,
 )
 from memtomem_stm.proxy.markdown_structure import headings
@@ -193,8 +192,8 @@ class ProgressiveStoreAdapter:
             heading_index=entry.heading_index,
             delivery_format=mode,
             delivery_budget=budget,
-            # The store validated it before renewing the row; this reads it.
-            text_block=progressive_text_block(sel.metadata_json),
+            # Validated by the store before it renewed the row.
+            text_block=entry.text_block,
         )
 
     def touch(self, key: str) -> None:
