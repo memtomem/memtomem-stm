@@ -38,7 +38,8 @@ changes inline only. See the deprecation policy in
   first progressive, selective or hybrid response already did (issue #1529).
   Text an upstream addressed to `audience: ["assistant"]` no longer loses that
   hint from the second chunk on. The metadata is stored with the pending
-  entry, in both pending stores, up to 64 KiB of UTF-8 JSON; larger metadata
+  entry, in both pending stores, up to about 64 KiB of UTF-8 JSON (counted
+  before the SDK serializes it, so approximate near the limit); larger metadata
   stays on the first response only, and its continuations go out without it
   as before. **Behavior change**: a structured
   continuation's frame now reserves room for that metadata, so it holds

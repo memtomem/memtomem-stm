@@ -582,8 +582,10 @@ continuation can also fit a progressing response. Result-level upstream metadata
 uses the initial budget only. The text block's `annotations` and `_meta` are
 repeated on each continuation that serves upstream text (not on a read at or
 past the end), so such a structured continuation reserves their serialized size
-from the full derived tool budget it retains. Metadata over 64 KiB of UTF-8 JSON
-is not kept for continuations: the first response carries it, the rest do not.
+from the full derived tool budget it retains. Metadata over about 64 KiB of UTF-8
+JSON is not kept for continuations: the first response carries it, the rest do
+not. The bound is approximate near the limit, since it is counted before the SDK
+serializes the metadata.
 With `max_result_tokens` and `token_estimation_mode: "unicode"`, the cleaned
 response's estimated token density derives one character cap before any retention
 floor. Structured frames use the smaller of that cap and the configured static

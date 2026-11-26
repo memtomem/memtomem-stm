@@ -698,11 +698,16 @@ def _text_block_metadata(block: Any) -> dict[str, Any]:
     return block.model_dump(by_alias=True, exclude={"type", "text"}, exclude_none=True)
 
 
-# Largest text block metadata a pending entry keeps for its continuations, in
-# UTF-8 JSON bytes as the client receives it. The stores bound entries by count
-# only, and ``_meta`` is not under ``max_upstream_chars``, so without this one
-# entry could hold tens of MiB beyond its text for its whole TTL. The rows are
-# written with ``ensure_ascii=True``, which can hold up to three times this.
+# Approximate largest text block metadata a pending entry keeps for its
+# continuations, in UTF-8 JSON bytes. The stores bound entries by count only,
+# and ``_meta`` is not under ``max_upstream_chars``, so without this one entry
+# could hold tens of MiB beyond its text for its whole TTL. It is a bound on
+# memory, not an exact wire limit: the bounded walk below counts the raw fields
+# with Python's JSON spellings, which can differ from the SDK's serialization
+# by a few percent either way near the cap (a float such as ``1e-05`` is
+# shorter than the SDK's ``0.00001``; unset annotation fields are counted). The
+# rows are written with ``ensure_ascii=True``, which can hold up to three times
+# this.
 _MAX_CONTINUED_TEXT_BLOCK_BYTES = 64 * 1024
 
 
