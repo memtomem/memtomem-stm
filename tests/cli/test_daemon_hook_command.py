@@ -1,11 +1,11 @@
 """``mms daemon … --hook-command claude`` builds as the registered hook command does (#1515).
 
-The hook sets the variables its command's flags name in ``os.environ`` before
-it builds its config, and a daemon it spawns inherits them
-(``hook_cmd._runtime_registration_env``). Two of them enter the daemon
+The hook applies its command's flags to every settings build of its call, and
+a daemon it spawns receives them from ``daemon.spawn``
+(``hook_cmd._runtime_registration_env``, #1537). Two of them enter the daemon
 fingerprint, so a bare ``mms daemon`` command run from a shell addresses
 another daemon. ``--hook-command claude`` reads the handler doctor reads
-(``proxy._hook_command_view``) and applies the same variables the same way.
+(``proxy._hook_command_view``) and applies the same flags the same way.
 These tests stand fake ``ping`` / ``shutdown`` calls in for "a daemon answers
 under fingerprint X" and check which fingerprint each subcommand acts on.
 """
@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from helpers import set_home
+from helpers import detached_daemon_config, set_home
 from memtomem_stm.cli.host_runtime import HostRuntimePolicy, hook_command_words, hook_launcher
 from memtomem_stm.cli.proxy import cli
 from memtomem_stm.config import STMConfig, load_env_stm_config
@@ -164,8 +164,9 @@ def test_start_spawns_a_child_that_builds_the_hook_fingerprint(home, monkeypatch
     children: list[str] = []
 
     def spawn_child() -> None:
-        # What the detached ``mms daemon run`` rebuilds: the inherited environment.
-        fp = config_fingerprint(load_env_stm_config().config, create_key=False)
+        # What the detached ``mms daemon run`` rebuilds from the environment
+        # ``daemon.spawn`` hands it.
+        fp = config_fingerprint(detached_daemon_config(), create_key=False)
         children.append(fp)
         daemons.live.add(fp)
 
@@ -190,7 +191,7 @@ def test_start_with_the_option_starts_where_the_bare_build_fails(home, monkeypat
     children: list[str] = []
 
     def spawn_child() -> None:
-        fp = config_fingerprint(load_env_stm_config().config, create_key=False)
+        fp = config_fingerprint(detached_daemon_config(), create_key=False)
         children.append(fp)
         daemons.live.add(fp)
 
@@ -235,8 +236,8 @@ def test_a_later_spelling_does_not_outrank_the_commands_value(home, monkeypatch)
 def test_start_spawns_a_child_that_reads_every_flag_over_later_spellings(home, monkeypatch):
     # All four variables the command sets, each with a canonical spelling and
     # a later lower-case one of another value (#1503). What a spawned daemon
-    # rebuilds from the inherited environment carries the command's values,
-    # including the two the fingerprint leaves out.
+    # rebuilds from the environment ``daemon.spawn`` hands it carries the
+    # command's values, including the two the fingerprint leaves out.
     daemon_timeout = "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"
     for name, canonical, later in [
         (PERSIST, "false", "true"),
@@ -251,7 +252,7 @@ def test_start_spawns_a_child_that_reads_every_flag_over_later_spellings(home, m
     children: list[tuple[bool, float, float, bool]] = []
 
     def spawn_child() -> None:
-        config = load_env_stm_config().config
+        config = detached_daemon_config()
         children.append(
             (
                 config.surfacing.persist_query_text,
@@ -319,7 +320,7 @@ def test_restart_acts_on_the_hook_fingerprint_throughout(home, data_dir, monkeyp
     children: list[str] = []
 
     def spawn_child() -> None:
-        fp = config_fingerprint(load_env_stm_config().config, create_key=False)
+        fp = config_fingerprint(detached_daemon_config(), create_key=False)
         children.append(fp)
         daemons.live.add(fp)
 
@@ -368,10 +369,9 @@ def test_a_failed_restart_names_the_option_and_leaks_nothing(home, monkeypatch):
     ids=["use-daemon-over-a-json-false", "no-daemon-over-a-json-true"],
 )
 def test_status_follows_the_commands_daemon_flag(home, monkeypatch, flag, ambient, uses, reason):
-    # The command's flag decides the hook's route (#1501), even where the
-    # build reads the opposite: a case variant of the field in the block's
-    # JSON still outranks the flat variable the overlay sets (#1503 covers
-    # flat spellings only).
+    # The command's flag decides the hook's route (#1501). The environment
+    # reads the opposite through a case variant of the field in the block's
+    # JSON, which the flag outranks in the build too (#1537).
     from memtomem_stm.cli.proxy import _hook_command_view
 
     opposite = "true" if ambient == "false" else "false"
@@ -379,10 +379,11 @@ def test_status_follows_the_commands_daemon_flag(home, monkeypatch, flag, ambien
         "MEMTOMEM_STM_HOOK", f'{{"use_daemon": {opposite}, "USE_DAEMON": {ambient}}}'
     )
     _settings(home, _cmd(_installed(use_daemon=flag)))
-    # Positive control: the build itself reads the opposite of the flag.
+    # Positive control: the environment alone reads the opposite of the flag.
     view = _hook_command_view()
     assert view.use_daemon is flag
-    assert load_env_stm_config(view.env).config.hook.use_daemon is not flag
+    assert load_env_stm_config().config.hook.use_daemon is not flag
+    assert load_env_stm_config(view.env).config.hook.use_daemon is flag
     Daemons(monkeypatch)
 
     as_json = _run("status", "--json", "--hook-command", "claude")

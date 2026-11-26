@@ -28,12 +28,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _child_env() -> dict[str, str]:
+    """This process's environment, with the hook's runtime flags as the child
+    reads them (#1537).
+
+    Under a ``host_runtime.hook_flags_scope`` with flags, the child gets them
+    in ``HOOK_FLAGS_CHANNEL_ENV``, which ``mms daemon run --detached`` reads;
+    without one, an inherited copy is removed, so a spawn without flags never
+    passes another process's on."""
+    from memtomem_stm.cli.host_runtime import (
+        HOOK_FLAGS_CHANNEL_ENV,
+        active_hook_flags,
+        encode_hook_flags_channel,
+    )
+
+    env = {name: value for name, value in os.environ.items() if name != HOOK_FLAGS_CHANNEL_ENV}
+    flags = active_hook_flags()
+    if flags:
+        env[HOOK_FLAGS_CHANNEL_ENV] = encode_hook_flags_channel(flags)
+    return env
+
+
 def _spawn_detached() -> None:
     """Launch ``mms daemon run --detached`` as a background process.
 
     The child inherits this process's working directory, which under the hook
     is the user's project; ``safe_module_argv`` keeps that directory off the
-    child's import path.
+    child's import path. Its environment is this one's, with the hook's flags
+    (:func:`_child_env`).
     """
     cmd = safe_module_argv("memtomem_stm", "daemon", "run", "--detached")
     kwargs: dict[str, Any] = {
@@ -41,6 +63,7 @@ def _spawn_detached() -> None:
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "close_fds": True,
+        "env": _child_env(),
     }
     if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
         flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(

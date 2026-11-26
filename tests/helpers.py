@@ -408,3 +408,70 @@ GIT_FILE_LAYOUTS = {
     "not-a-pointer": _prefixed_dotgit("garbage "),
     "symlinked-dotgit": _symlinked_dotgit,
 }
+
+
+def _real_spawn_detached() -> Any:
+    from memtomem_stm.daemon.spawn import _spawn_detached
+
+    return _spawn_detached
+
+
+# Taken at import, before a test stands in for ``_spawn_detached`` and calls
+# this helper from the stand-in.
+_REAL_SPAWN_DETACHED = _real_spawn_detached()
+
+
+def detached_daemon_config() -> Any:
+    """The ``STMConfig`` a daemon spawned from here now would start with.
+
+    Runs the real ``daemon.spawn._spawn_detached`` with ``Popen`` stood in for,
+    takes the argv and environment it was handed, and runs that argv's
+    ``mms daemon run --detached`` in a fresh context with exactly that
+    environment, so nothing of this process's settings scope reaches the
+    child except through what ``Popen`` received (#1537). The server and the
+    log file are stood in for.
+    """
+    import contextvars
+    import os
+    from unittest import mock
+
+    from memtomem_stm.cli.proxy import cli
+    from memtomem_stm.daemon import spawn
+
+    launched: list[tuple[list[str], dict[str, str]]] = []
+
+    class _Child:
+        pid = 2**22 + 7
+
+        def wait(self) -> int:
+            return 0
+
+    def fake_popen(cmd: list[str], **kwargs: Any) -> _Child:
+        assert "env" in kwargs, "the child must be handed its environment explicitly"
+        launched.append((list(cmd), dict(kwargs["env"])))
+        return _Child()
+
+    with mock.patch.object(spawn.subprocess, "Popen", fake_popen):
+        _REAL_SPAWN_DETACHED()
+    assert len(launched) == 1
+    cmd, env = launched[0]
+    assert cmd[-3:] == ["daemon", "run", "--detached"], cmd
+    started: list[Any] = []
+
+    def run() -> None:
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch(
+                "memtomem_stm.daemon.server.run", lambda config: started.append(config) or 0
+            ),
+            mock.patch("memtomem_stm.cli.daemon_cmd._configure_logging", lambda *a, **k: None),
+        ):
+            # Through the root command, as the child's argv is dispatched.
+            try:
+                cli.main(args=cmd[-3:], prog_name="mms", standalone_mode=False)
+            except SystemExit as exc:
+                assert exc.code == 0, exc.code
+
+    contextvars.Context().run(run)
+    assert len(started) == 1
+    return started[0]

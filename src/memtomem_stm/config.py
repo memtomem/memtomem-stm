@@ -6,13 +6,12 @@ import ipaddress
 import logging
 import os
 import re
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from contextvars import ContextVar
+from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_settings import (
@@ -23,6 +22,7 @@ from pydantic_settings import (
     SettingsError,
 )
 
+from memtomem_stm.cli.host_runtime import HOOK_FLAG_NAMES, active_hook_flags, hook_flags_scope
 from memtomem_stm.proxy.config import ProxyConfig, UpstreamServerCompletionSource
 from memtomem_stm.surfacing.config import SurfacingConfig
 
@@ -656,16 +656,17 @@ class STMConfig(BaseSettings):
         those server names to the merge, below the environment, so env fields
         still win — see ``UpstreamServerCompletionSource`` for its scope.
 
-        A :func:`load_env_stm_config` ``env_overlay`` is applied to the env
-        source's own snapshot here, so the build reads it as it would read the
-        same variables set in ``os.environ``, which stays untouched.
+        The hook's runtime flags (``host_runtime.hook_flags_scope``) are laid
+        over the environment source's data here (:class:`_HookFlagsOverEnv`),
+        so they outrank every form the environment can give the same field
+        (#1537). The completion source still reads the environment source
+        itself: the flags never touch ``proxy``.
         """
-        overlay = _ENV_OVERLAY.get()
-        if overlay and isinstance(env_settings, EnvSettingsSource):
-            env_settings.env_vars = _overlaid_env_vars(env_settings, overlay)
+        flags = active_hook_flags()
+        env_source = _HookFlagsOverEnv(settings_cls, env_settings, flags) if flags else env_settings
         return (
             init_settings,
-            env_settings,
+            env_source,
             dotenv_settings,
             file_secret_settings,
             UpstreamServerCompletionSource(settings_cls, init_settings, env_settings),
@@ -736,8 +737,10 @@ def log_stm_config_failure(
     itself rather than ``True``: ``True`` captures whatever exception is
     ambient at call time — ``None`` outside an ``except`` block — not the
     one this line is reporting.
+
+    Under the hook's runtime flags the hint names a flag the way its command
+    sets it (:func:`hook_flags_hint`).
     """
-    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
     from memtomem_stm.utils.display import _disp
 
     logger.warning(
@@ -745,7 +748,7 @@ def log_stm_config_failure(
         context,
         # The names are the operator's own variables, and one can carry a
         # newline or a bidi control that would forge or reorder the line (#1166).
-        _disp(env_var_hint_for_validation_error(exc)),
+        _disp(hook_flags_hint(exc, active_hook_flags())),
         exc_info=exc if exc_info else None,
     )
 
@@ -804,65 +807,104 @@ class EnvSTMConfigLoad:
     proxy_error: ValidationError | SettingsError | None = None
 
 
-HOOK_FLAG_ENV_NAMES = frozenset(
-    {
-        "MEMTOMEM_STM_HOOK__USE_DAEMON",
-        "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
-        "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
-        "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
-    }
-)
-"""The variables ``mms hook`` sets from its command's flags
-(``host_runtime.runtime_env_overrides``), spelled as it sets them: the only
-names a :func:`load_env_stm_config` ``env_overlay`` accepts. Doctor's hook
-route reads them only through that build; the route itself follows the
-command's daemon flag directly when it has one, as the hook does (#1501). The
-hook's own deadline backstop reads one directly, in the hook process."""
-
-_ENV_OVERLAY: ContextVar[Mapping[str, str] | None] = ContextVar("_ENV_OVERLAY", default=None)
-"""Variables :func:`load_env_stm_config` lays over the environment for one build.
-
-A context variable, not ``os.environ``: a build running in another context
-(another thread, unless it was started with a copy of this one) does not see
-it, and the scope resets it on every exit, a raising build included."""
+HOOK_FLAG_ENV_NAMES = HOOK_FLAG_NAMES
+"""The variables ``mms hook`` names from its command's flags
+(``host_runtime.runtime_env_overrides``), spelled as it spells them: the only
+names a :func:`load_env_stm_config` ``env_overlay`` and a
+``host_runtime.hook_flags_scope`` carry. Doctor's hook route reads them only
+through that build; the route itself follows the command's daemon flag
+directly when it has one, as the hook does (#1501)."""
 
 
-def hook_flag_environ(environ: Mapping[str, str], overlay: Mapping[str, str]) -> dict[str, str]:
-    """*environ* as a build under *overlay* reads it, each variable *overlay*
-    sets named as it sets it: the other spellings carry the same value and
-    are left out, so a reader that names variables names the one set."""
-    folded = {name.lower() for name in overlay}
+def _flag_path(name: str) -> tuple[str, str]:
+    """``MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`` → ``("surfacing", "timeout_seconds")``."""
+    block, _, field = name[len("MEMTOMEM_STM_") :].lower().partition("__")
+    return block, field
+
+
+class _HookFlagsOverEnv(PydanticBaseSettingsSource):
+    """The environment source's data with the hook's flags laid over it (#1537).
+
+    The environment source has already folded names and decoded each block's
+    JSON when this runs, so a flag replaces the field however the environment
+    spelled it: a later flat spelling, a case variant of the field in the
+    block's JSON, or a ``null`` block (which the source drops, flat children
+    included) all lose to it. A ``null`` stays a ``null`` for every other child:
+    only the flag's own field is added. A block that decoded to something other
+    than an object (``[]``, a string) is left as it is, so its error stands.
+    Values stay strings, as a flat variable's would.
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        env_settings: PydanticBaseSettingsSource,
+        flags: Mapping[str, str],
+    ) -> None:
+        super().__init__(settings_cls)
+        self._env_settings = env_settings
+        self._flags = dict(flags)
+
+    def _set_current_state(self, state: dict[str, Any]) -> None:
+        super()._set_current_state(state)
+        self._env_settings._set_current_state(state)
+
+    def _set_settings_sources_data(self, states: dict[str, dict[str, Any]]) -> None:
+        super()._set_settings_sources_data(states)
+        self._env_settings._set_settings_sources_data(states)
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        data = dict(self._env_settings())
+        for name, value in self._flags.items():
+            block, field = _flag_path(name)
+            current = data.get(block)
+            if current is None:
+                data[block] = {field: value}
+            elif isinstance(current, dict):
+                data[block] = {**current, field: value}
+        return data
+
+
+def hook_flag_environ(environ: Mapping[str, str], flags: Mapping[str, str]) -> dict[str, str]:
+    """*environ* as a build under *flags* reads it for naming variables: each
+    flag named as the command spells it, its other spellings left out because
+    the flag outranks them."""
+    folded = {name.lower() for name in flags}
     return {
         **{name: value for name, value in environ.items() if name.lower() not in folded},
-        **overlay,
+        **flags,
     }
 
 
-def _overlaid_env_vars(
-    env_settings: EnvSettingsSource, overlay: Mapping[str, str]
-) -> dict[str, str | None]:
-    """``env_settings.env_vars`` with *overlay*'s values, as the hook's own
-    overlay leaves the environment (``host_runtime.hook_flag_assignments``): every
-    spelling of each name carries the overlay's value, so its folded name
-    does. Only those entries change, so a snapshot a subclass filtered (the
-    proxy retry) stays filtered. Values pass through unparsed: ``STMConfig``
-    sets neither ``env_ignore_empty`` nor ``env_parse_none_str``.
-    """
-    case_sensitive = env_settings.case_sensitive
+def hook_flags_hint(
+    exc: Exception, flags: Mapping[str, str], environ: Mapping[str, str] | None = None
+) -> str:
+    """:func:`~memtomem_stm.proxy.config.env_var_hint_for_validation_error` for a
+    build under the hook's *flags*, names only.
 
-    def fold(name: str) -> str:
-        return name if case_sensitive else name.lower()
+    Each error is attributed on its own. One at a flag's own field names that
+    flag alone: the flag supplied the rejected value, and a ``null`` or JSON
+    parent block that supplied nothing there is not named. Any other error is
+    attributed to the environment as the build read it
+    (:func:`hook_flag_environ`), so a model-level error under a flag's block
+    names the flag as the command spells it, not a spelling it outranked."""
+    from memtomem_stm.proxy.config import implicated_env_vars
 
-    return {**env_settings.env_vars, **{fold(name): value for name, value in overlay.items()}}
-
-
-@contextmanager
-def _env_overlay(values: Mapping[str, str] | None) -> Iterator[None]:
-    token = _ENV_OVERLAY.set(values)
-    try:
-        yield
-    finally:
-        _ENV_OVERLAY.reset(token)
+    env = os.environ if environ is None else environ
+    paths = {_flag_path(name): name for name in flags}
+    named: set[str] = set()
+    if isinstance(exc, ValidationError):
+        for err in exc.errors():
+            loc = tuple(str(part) for part in err.get("loc", ()))
+            if len(loc) == 2 and (loc[0], loc[1]) in paths:
+                named.add(paths[(loc[0], loc[1])])
+    named |= implicated_env_vars(exc, hook_flag_environ(env, flags), skip_locs=frozenset(paths))
+    if not named:
+        return ""
+    return " (env var(s) implicated: " + ", ".join(sorted(named)) + ")"
 
 
 def load_env_stm_config(env_overlay: Mapping[str, str] | None = None) -> EnvSTMConfigLoad:
@@ -883,16 +925,19 @@ def load_env_stm_config(env_overlay: Mapping[str, str] | None = None) -> EnvSTMC
     propagates as it is. Commands that serialize or serve the proxy subtree
     (registration, the MCP server) keep the strict construction.
 
-    ``env_overlay`` builds as if those variables were also set in the
-    environment, without setting them: ``mms doctor`` builds the hook's config
-    this way from the variables the hook sets from its command's flags
-    (#1494). It accepts only :data:`HOOK_FLAG_ENV_NAMES`, and raises
+    ``env_overlay`` builds with those flags applied as the hook applies its
+    command's (``host_runtime.hook_flags_scope``), without touching the
+    environment: ``mms doctor`` builds the hook's config this way (#1494).
+    ``{}`` builds with no flags, also inside an enclosing scope; ``None``
+    keeps whatever scope is active, which is how the hook's own builds get
+    theirs. It accepts only :data:`HOOK_FLAG_ENV_NAMES`, and raises
     ``ValueError`` for any other name.
     """
     unknown = sorted(set(env_overlay or ()) - HOOK_FLAG_ENV_NAMES)
     if unknown:
         raise ValueError(f"env_overlay accepts only the hook's flag variables, not {unknown}")
-    with _env_overlay(env_overlay):
+    scope = nullcontext() if env_overlay is None else hook_flags_scope(env_overlay)
+    with scope:
         try:
             return EnvSTMConfigLoad(STMConfig())
         except (ValidationError, SettingsError) as exc:
@@ -914,12 +959,11 @@ def log_proxy_env_ignored(
     does, names only. No traceback by default: nothing failed, and the hook
     would otherwise print one per tool call.
     """
-    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
     from memtomem_stm.utils.display import _disp
 
     logger.warning(
         "invalid MEMTOMEM_STM_PROXY* configuration ignored while %s; proxy settings at defaults%s",
         context,
-        _disp(env_var_hint_for_validation_error(exc)),
+        _disp(hook_flags_hint(exc, active_hook_flags())),
         exc_info=exc if exc_info else None,
     )
