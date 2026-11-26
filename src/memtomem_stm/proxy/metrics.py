@@ -92,6 +92,22 @@ def hook_host_of(server: str) -> str | None:
     return server[len(_HOOK_SERVER_PREFIX) :] or None
 
 
+# The values of ``CallMetrics.context_query_source``.
+CONTEXT_QUERY_AGENT = "agent"
+CONTEXT_QUERY_NONE = "none"
+
+
+def context_query_source(context_query: str | None) -> str:
+    """Whether the caller supplied a usable ``_context_query`` on this call.
+
+    ``agent`` for a string with something other than whitespace in it, ``none``
+    for everything else: the same test the compressors apply before they score
+    with it. It says a query arrived, not that anything used it: whether a
+    scorer ran depends on the path the response took.
+    """
+    return CONTEXT_QUERY_AGENT if context_query and context_query.strip() else CONTEXT_QUERY_NONE
+
+
 # Every value ``mms hook`` stores in ``hook_compression_status``: what the
 # native output-compression stage decided for that call. Readers render only
 # these names and fold anything else into "other", so a value written by
@@ -364,6 +380,13 @@ class CallMetrics:
     # ``compression_strategy``, which names a strategy that ran — a call the
     # gate passed over ran none. Last, so no positional caller shifts.
     hook_compression_status: str | None = None
+    # ``context_query_source(...)`` for the two MCP success rows that carry a
+    # ``compression_accounting`` stamp. ``None`` on every other row — errors,
+    # an upstream result with no text block, ``mms hook`` rows, rows written
+    # before the column — which a reader leaves out rather than counts as
+    # "no query".
+    # Only the fact is kept; this row never holds the query's text.
+    context_query_source: str | None = None
 
 
 class RPSTracker:

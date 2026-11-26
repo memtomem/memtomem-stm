@@ -93,8 +93,12 @@ def _mixed_metrics() -> list[CallMetrics]:
 
 
 def _comparable(summary: dict[str, Any]) -> dict[str, Any]:
-    """The keys both readers share, with per-tool rows order-independent."""
-    out = {k: v for k, v in summary.items() if k not in ("path", "rollup")}
+    """The keys both readers share, with per-tool rows order-independent.
+
+    ``context_query`` is left out like ``tuner_calls`` below: it is counted
+    from the retained rows only and is not rolled up.
+    """
+    out = {k: v for k, v in summary.items() if k not in ("path", "rollup", "context_query")}
     out["by_tool"] = sorted(
         ({k: v for k, v in row.items() if k != "tuner_calls"} for row in out["by_tool"]),
         key=lambda row: (row["server"], row["tool"]),

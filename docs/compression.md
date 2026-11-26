@@ -430,6 +430,21 @@ When an agent provides `_context_query` in tool arguments, compression allocates
 
 > **Disabling the scan (`privacy_scan_enabled: false`) sends that text to the endpoint unscanned.** Turn it off only for an endpoint you trust with it, such as a local Ollama. When `scorer` is `embedding`, the scan is off and `embedding_base_url` is not a loopback host, the proxy logs a **WARNING** naming the destination — at startup and again whenever a config edit rebuilds the scorer into that state. A local endpoint stays silent, whatever `embedding_provider` says.
 
+### Measuring whether queries arrive
+
+Query-aware compression does nothing for a call that carries no query, so the proxy records whether one arrived. A live proxied call that the proxy records as successful, and whose upstream result has at least one text block (an empty block counts), stores `agent` or `none` in the `context_query_source` column of `proxy_metrics`: `agent` when the call's `_context_query` was a string with something other than whitespace in it, `none` otherwise. The row stores only that fact, not the query's text. `mms stats` reports it under the MCP figures:
+
+```text
+Context query supplied on 3 of 120 observed live MCP responses (2.5%)
+```
+
+- **Observed** means a retained MCP row that carries the value. A response delivered as a structured delivery frame and one whose text blocks bypassed compression carry it. A call recorded as an error (whether the upstream failed or the proxy did while handling the result), an upstream result with no text block (an empty, image-only or `structuredContent`-only result) and a row written by a version before the column do not, and `mms hook` rows never do. The number can therefore be lower than the block's `calls`.
+- **Only live responses count.** A cache hit writes no row. `_context_query` is part of the cache key, so the same arguments under a different query are a different cache entry.
+- **It says a query arrived, not that it was used.** Whether a scorer ran depends on the path the response took; a response within its budget, for one, runs none.
+- **It is not in `--all-time`.** The figure covers the retained rows only (`proxy.metrics.max_history`).
+
+The line counts the observed rows of every client that writes to this metrics DB (`--tool` narrows it to a tool name, across servers), including calls made before a client received a tool list that advertises the argument (`advertise_context_query`). It is not a rate for one client or for the period since a setting changed.
+
 `RelevanceScorer` protocol (`proxy/relevance.py`) enables custom scorer implementations. `EmbeddingScorer` uses sync httpx to call embedding APIs with automatic BM25 fallback on error.
 
 > **OpenAI provider requires `OPENAI_API_KEY`.** When `embedding_provider: "openai"`, `EmbeddingScorer` reads the API key from the `OPENAI_API_KEY` environment variable. Missing or empty keys produce HTTP 401 from the OpenAI endpoint and trigger the BM25 fallback. Ollama (the default) needs no key.

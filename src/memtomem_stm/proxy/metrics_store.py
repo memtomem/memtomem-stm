@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from memtomem_stm.proxy.metrics import (
+    CONTEXT_QUERY_AGENT,
     HOOK_COMPRESSION_STATUSES,
     METADATA_BYPASS_STRATEGY,
     STRUCTURED_BYPASS_STRATEGY,
@@ -128,6 +129,12 @@ _MIGRATIONS: dict[str, str] = {
     # as "not recorded" rather than guess.
     "hook_compression_status": (
         "ALTER TABLE proxy_metrics ADD COLUMN hook_compression_status TEXT DEFAULT NULL"
+    ),
+    # ``CallMetrics.context_query_source``. Nullable for the reason
+    # ``strategy_auto_selected`` is: a default of ``'none'`` would claim that
+    # calls recorded before the column carried no query.
+    "context_query_source": (
+        "ALTER TABLE proxy_metrics ADD COLUMN context_query_source TEXT DEFAULT NULL"
     ),
 }
 
@@ -975,6 +982,12 @@ def _read_compression(
             "serialized_base_chars": 0,
             "wire_bytes": 0,
         },
+        # ``{"observed": n, "agent": m}`` over the retained ``source='mcp'``
+        # rows among these totals: the rows that record whether the caller
+        # supplied ``_context_query``, and how many did. ``None`` where the
+        # figure does not exist — all time (it is not rolled up) and a hook
+        # summary — or was not read.
+        "context_query": None,
     }
     rollup: dict[str, object] = {
         "installed": False,
@@ -1084,6 +1097,7 @@ def _read_compression(
             )
             inner_params = [*params, *params]
             extra = "0, MIN(min_created_at), {agg}(unknown_date_calls)"
+            context_query = "0, 0"
         else:
             # The calls the tuner's profiles count: every row but a
             # metadata/native bypass, which ``get_tool_profiles`` drops (#1122).
@@ -1097,9 +1111,27 @@ def _read_compression(
                 inner_params = [METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY]
             else:
                 live.append("1 AS tuner_calls")
+            # Counted in the statement that counts the calls, so a line printed
+            # under a total cannot describe rows that total has not seen. Only
+            # MCP rows: ``mms hook`` never stamps the column, and a hook row
+            # carrying a value anyway is not a proxied call.
+            if "context_query_source" in cols:
+                proxied = "source = 'mcp' AND " if has_source else ""
+                live.append(
+                    f"CASE WHEN {proxied}context_query_source IS NOT NULL "
+                    "THEN 1 ELSE 0 END AS context_query_observed"
+                )
+                live.append(
+                    f"CASE WHEN {proxied}context_query_source = '{CONTEXT_QUERY_AGENT}' "
+                    "THEN 1 ELSE 0 END AS context_query_agent"
+                )
+            else:
+                live.append("0 AS context_query_observed")
+                live.append("0 AS context_query_agent")
             inner = f"SELECT server, tool, {', '.join(live)} FROM proxy_metrics{where}"
             inner_params = [*inner_params, *params]
             extra = "{agg}(tuner_calls), NULL, 0"
+            context_query = "{agg}(context_query_observed), {agg}(context_query_agent)"
         # One statement, so the provenance counts and size totals share a
         # snapshot while the server appends rows.
         statement = (
@@ -1107,7 +1139,8 @@ def _read_compression(
             "{agg}(legacy_compressed_chars), {agg}(errors), {agg}(classified_calls), "
             f"{{agg}}(unclassified_calls), {extra}, {{agg}}(structured_calls), "
             "{agg}(structured_original_chars), {agg}(structured_base_chars), "
-            f"{{agg}}(structured_wire_bytes) FROM ({inner}) GROUP BY server, tool "
+            f"{{agg}}(structured_wire_bytes), {context_query} "
+            f"FROM ({inner}) GROUP BY server, tool "
             "ORDER BY {agg}(calls) DESC"
         )
         try:
@@ -1131,6 +1164,7 @@ def _read_compression(
     by_tool: list[dict[str, object]] = []
     total_calls = total_error = total_orig = total_comp = 0
     classified = unclassified = unknown_dates = 0
+    query_observed = query_agent = 0
     earliest: float | None = None
     structured_totals = {
         "calls": 0,
@@ -1154,6 +1188,8 @@ def _read_compression(
         structured_orig,
         structured_base,
         structured_wire,
+        group_query_observed,
+        group_query_agent,
     ) in rows:
         for k, v in zip(
             structured_totals, (structured_calls, structured_orig, structured_base, structured_wire)
@@ -1161,6 +1197,8 @@ def _read_compression(
             structured_totals[k] += _count(v)
         classified += _count(known_calls)
         unclassified += _count(unknown_calls)
+        query_observed += _count(group_query_observed)
+        query_agent += _count(group_query_agent)
         unknown_dates += _count(group_unknown_dates)
         if group_earliest is not None and (earliest is None or group_earliest < earliest):
             earliest = float(group_earliest)
@@ -1197,6 +1235,8 @@ def _read_compression(
     summary["saved_chars"] = total_orig - total_comp
     summary["saved_ratio"] = _saved_ratio(total_orig, total_comp)
     summary["by_tool"] = by_tool
+    if not all_time and source != "hook":
+        summary["context_query"] = {"observed": query_observed, "agent": query_agent}
     if with_hook_status:
         summary["hook_status"] = hook_status
     if all_time:
@@ -1615,6 +1655,7 @@ class MetricsStore:
         require_utf8_identifier(metrics.source, "source")
         require_utf8_identifier(metrics.compression_accounting, "compression_accounting")
         require_utf8_identifier(metrics.hook_compression_status, "hook_compression_status")
+        require_utf8_identifier(metrics.context_query_source, "context_query_source")
         now = time.time()
         with self._lock:
             # The INSERT is under the rollback guard too: a statement-level
@@ -1632,9 +1673,9 @@ class MetricsStore:
                     "extract_ok, extract_error, "
                     "surfacing_on_progressive_ok, surface_error, source, created_at, "
                     "compression_accounting, delivery_format, wire_bytes, "
-                    "hook_compression_status) "
+                    "hook_compression_status, context_query_source) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         metrics.server,
                         metrics.tool,
@@ -1679,6 +1720,7 @@ class MetricsStore:
                         metrics.delivery_format,
                         metrics.wire_bytes,
                         metrics.hook_compression_status,
+                        metrics.context_query_source,
                     ),
                 )
             except Exception:

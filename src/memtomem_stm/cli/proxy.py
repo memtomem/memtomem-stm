@@ -2841,6 +2841,26 @@ def _hook_host_lines(
     return lines
 
 
+def _context_query_line(summary: dict[str, Any], indent: str) -> str | None:
+    """How many of *summary*'s MCP responses carried ``_context_query``.
+
+    The counts were read in the statement that read *summary*'s totals, so the
+    caller passes the summary whose line this one hangs under. ``None`` when
+    the summary has no such figure or observed no call.
+    """
+    counts = summary.get("context_query")
+    if not isinstance(counts, dict):
+        return None
+    observed = counts.get("observed") or 0
+    agent = counts.get("agent") or 0
+    if not observed:
+        return None
+    return (
+        f"{indent}Context query supplied on {agent} of {observed} observed live MCP "
+        f"responses ({agent / observed * 100:.1f}%)"
+    )
+
+
 def _render_compression_block(
     summary: dict[str, Any],
     by_source: dict[str, dict[str, Any]] | None = None,
@@ -2907,6 +2927,8 @@ def _render_compression_block(
                     hook_by_host, "      ", hook_status, rollup is not None
                 ):
                     click.echo(host_line)
+            elif query_line := _context_query_line(s, "      "):
+                click.echo(query_line)
     else:
         # No per-source lines (``--source hook``, or the hook is the only
         # source with rows), so the hosts hang off the total.
@@ -2914,6 +2936,8 @@ def _render_compression_block(
             hook_by_host, "    ", hook_status, rollup is not None, lone_status=total_hook_status
         ):
             click.echo(host_line)
+        if query_line := _context_query_line(summary, "    "):
+            click.echo(query_line)
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
     if rollup is not None:
         for line in _all_time_coverage_lines(rollup):
