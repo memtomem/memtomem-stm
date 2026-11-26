@@ -6796,15 +6796,19 @@ class ProxyManager:
                     # non-text blocks keep their relative positions.
                     non_text_before_first_text = len(non_text_content)
                     first_text_content = content
-                remaining = max_upstream - total_chars
-                if remaining <= 0:
-                    oversize = True
-                    continue
                 # ``content.text or ""`` tolerates spec-noncompliant upstreams
                 # that return ``None`` for a TextContent's ``text`` field.
                 # MCP spec requires ``text: str`` but mirrors the same gap
                 # that PR #114 fixed for ``result.content`` itself.
                 text = content.text or ""
+                remaining = max_upstream - total_chars
+                if remaining <= 0:
+                    # A block that exactly filled the cap leaves no room, but
+                    # only a block with text loses anything; an empty one is
+                    # skipped without claiming an oversized payload.
+                    if text:
+                        oversize = True
+                    continue
                 if len(text) > remaining:
                     text_parts.append(text[:remaining])
                     total_chars += remaining
