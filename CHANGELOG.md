@@ -33,6 +33,25 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `stm_proxy_read_more` and `stm_proxy_select_chunks` continuations now
+  carry the upstream text block's `annotations` and block `_meta`, as the
+  first progressive, selective or hybrid response already did (issue #1529).
+  Text an upstream addressed to `audience: ["assistant"]` no longer loses that
+  hint from the second chunk on. The metadata is stored with the pending
+  entry, in both pending stores, up to about 64 KiB of UTF-8 JSON (counted
+  before the SDK serializes it, so approximate near the limit); larger metadata
+  stays on the first response only, and its continuations go out without it
+  as before. **Behavior change**: a structured
+  continuation's frame now reserves room for that metadata, so it holds
+  less content and a selection that fit before can return `budget_exceeded`;
+  a read at or past the end carries none. With a SQLite pending store, a
+  credential in that metadata now refuses the persistent write the way one
+  in the text does: progressive falls back to passthrough (in structured
+  delivery, to a truncation fitted to the budget when the passthrough would
+  not fit), selective and hybrid to truncation. A present but invalid stored
+  value is a delivery error that keeps the row. Responses without block
+  metadata, and keys written before this version, are unchanged.
+
 - `mms doctor`'s `env_overrides` row now says which daemon command its
   failing clause for doctor's environment alone describes, and names the
   one that starts the hook's daemon (issue #1524). When doctor takes the

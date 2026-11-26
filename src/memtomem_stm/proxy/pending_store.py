@@ -19,7 +19,11 @@ from memtomem_stm.proxy.compression import (
     SensitivePayloadNotStored,
     payload_has_credentials,
 )
-from memtomem_stm.proxy.delivery import progressive_metadata_format, stored_progressive_format
+from memtomem_stm.proxy.delivery import (
+    progressive_metadata_format,
+    progressive_text_block,
+    stored_progressive_format,
+)
 from memtomem_stm.proxy.heading_index import HeadingIndex, ensure_heading_index
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
@@ -140,6 +144,8 @@ class ProgressiveEntry:
     selection: PendingSelection
     metadata: dict[str, Any]
     heading_index: HeadingIndex | None = None
+    # The row's text block metadata (#1529), validated before renewal.
+    text_block: dict[str, Any] | None = None
 
 
 class PendingStore(Protocol):
@@ -243,6 +249,7 @@ class InMemoryPendingStore:
                 self._order.remove(key)
                 return None
             progressive_metadata_format(meta)
+            text_block = progressive_text_block(sel.metadata_json)
             _classify_progressive_content(sel, meta, classify_content)
             index = None
             if meta.get("include_structure_hint", True):
@@ -251,7 +258,7 @@ class InMemoryPendingStore:
                 sel.created_at = now
                 self._order.remove(key)
                 self._order.append(key)
-            return ProgressiveEntry(replace(sel, chunks=dict(sel.chunks)), meta, index)
+            return ProgressiveEntry(replace(sel, chunks=dict(sel.chunks)), meta, index, text_block)
 
     def evict_progressive_expired(self) -> None:
         with self._lock:
@@ -587,6 +594,7 @@ class SQLitePendingStore:
                     db.execute("DELETE FROM pending_selections WHERE key = ?", (key,))
                     return None
                 progressive_metadata_format(meta)
+                text_block = progressive_text_block(sel.metadata_json)
                 index = None
                 repaired = _classify_progressive_content(sel, meta, classify_content)
                 if meta.get("include_structure_hint", True):
@@ -606,7 +614,7 @@ class SQLitePendingStore:
                         (now, key),
                     )
                     sel.created_at = now
-                return ProgressiveEntry(sel, meta, index)
+                return ProgressiveEntry(sel, meta, index, text_block)
 
     def evict_progressive_expired(self) -> None:
         with self._lock:

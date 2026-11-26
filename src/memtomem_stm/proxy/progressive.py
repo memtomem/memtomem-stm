@@ -10,6 +10,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from memtomem_stm.proxy.delivery import (
     DeliveryFormat,
@@ -67,6 +68,10 @@ class ProgressiveResponse:
     heading_index: HeadingIndex | None = None
     delivery_format: DeliveryFormat = "legacy"
     delivery_budget: int = 16000
+    # The upstream text block's ``annotations`` / ``_meta`` in JSON form, which
+    # every continuation repeats (#1529). ``None``: the block had none, or the
+    # row was written before this field existed.
+    text_block: dict[str, Any] | None = None
 
 
 class ProgressiveStoreAdapter:
@@ -126,6 +131,13 @@ class ProgressiveStoreAdapter:
             format="progressive",
             created_at=resp.created_at,
             total_chars=resp.total_chars,
+            # Not in ``__meta__``, which every expiry pass decodes for each live
+            # row: only a read of this key decodes it (#1529).
+            metadata_json=(
+                json.dumps({"text_block": resp.text_block}, ensure_ascii=True, allow_nan=False)
+                if resp.text_block
+                else None
+            ),
         )
         if resp.heading_index is not None:
             selection.chunks[INDEX_KEY] = encode_heading_index(resp.heading_index)
@@ -180,6 +192,8 @@ class ProgressiveStoreAdapter:
             heading_index=entry.heading_index,
             delivery_format=mode,
             delivery_budget=budget,
+            # Validated by the store before it renewed the row.
+            text_block=entry.text_block,
         )
 
     def touch(self, key: str) -> None:
