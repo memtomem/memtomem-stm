@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _DAEMON_GRACE_SECONDS = 1.0
 
@@ -171,13 +172,35 @@ HOOK_FLAG_NAMES = frozenset(
 )
 """The variables :func:`runtime_env_overrides` names, spelled as it spells them."""
 
+MCP_FLAG_NAMES = frozenset(
+    {_SURFACING_USE_DAEMON_ENV, _SURFACING_TIMEOUT_ENV, _PERSIST_QUERY_TEXT_ENV}
+)
+"""The variables :meth:`HostRuntimePolicy.mcp_env` names, spelled as it spells
+them: the keys of :data:`SERVER_FLAGS_CHANNEL_ENV`."""
+
+RUNTIME_FLAG_NAMES = HOOK_FLAG_NAMES | MCP_FLAG_NAMES
+"""Every variable a :func:`hook_flags_scope` carries: the hook's flags, or the
+MCP server's registration policy (#1544)."""
+
 HOOK_FLAGS_CHANNEL_ENV = "MEMTOMEM_STM_HOOK_FLAGS"
 """How a detached daemon receives the flags of the process that spawned it.
 
 ``daemon.spawn`` writes it into the child's environment only, and only
 ``mms daemon run --detached`` reads it: no settings build reads it, so an
 inherited copy changes nothing anywhere else. It is not a settings field (it
-has no ``__``), like ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``."""
+has no ``__``), like ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``. Its keys are
+:data:`RUNTIME_FLAG_NAMES`: a daemon the MCP server spawns is handed the
+server's flags the same way."""
+
+SERVER_FLAGS_CHANNEL_ENV = "MEMTOMEM_STM_SERVER_FLAGS"
+"""How the MCP server receives its registration's runtime policy (#1544).
+
+:meth:`HostRuntimePolicy.mcp_env` writes it beside the flat variables, with
+the same values, and only ``server.main`` reads it: it applies the policy
+through :func:`hook_flags_scope`, so neither a ``null`` parent block nor a
+case variant of the field in the block's JSON outranks it. Not a settings
+field (no ``__``). ``daemon.spawn`` leaves it out of a daemon's environment,
+and the SDK starts upstream servers with an allowlist environment."""
 
 _HOOK_FLAGS: ContextVar[Mapping[str, str] | None] = ContextVar("_HOOK_FLAGS", default=None)
 
@@ -187,7 +210,9 @@ def hook_flags_scope(flags: Mapping[str, str]) -> Iterator[None]:
     """Apply *flags* to every ``STMConfig`` built in this context (#1537).
 
     *flags* maps :data:`HOOK_FLAG_NAMES` to the strings
-    :func:`runtime_env_overrides` returns; ``{}`` means no flags, also over an
+    :func:`runtime_env_overrides` returns, or :data:`MCP_FLAG_NAMES` to the
+    strings :meth:`HostRuntimePolicy.mcp_env` writes (the MCP server,
+    #1544); ``{}`` means no flags, also over an
     enclosing scope. ``STMConfig`` lays them over what the environment source
     read, so no spelling of a variable, no case variant of the field in the
     block's JSON and no ``null`` block outranks them. A context variable, not
@@ -211,32 +236,61 @@ def active_hook_flags() -> dict[str, str]:
 
 
 def encode_hook_flags_channel(flags: Mapping[str, str]) -> str:
-    """:data:`HOOK_FLAGS_CHANNEL_ENV`'s value for *flags*."""
+    """A flags channel's value for *flags*: :data:`HOOK_FLAGS_CHANNEL_ENV`'s
+    and :data:`SERVER_FLAGS_CHANNEL_ENV`'s."""
     return json.dumps(dict(flags), sort_keys=True)
 
 
 class HookFlagsChannelError(ValueError):
-    """:data:`HOOK_FLAGS_CHANNEL_ENV` is not what ``daemon.spawn`` writes. The
+    """A flags channel (:data:`HOOK_FLAGS_CHANNEL_ENV`,
+    :data:`SERVER_FLAGS_CHANNEL_ENV`) is not what its writer writes. The
     message names the variable, never its value."""
 
 
-def decode_hook_flags_channel(raw: str) -> dict[str, str]:
-    """Read :data:`HOOK_FLAGS_CHANNEL_ENV` back: a JSON object whose keys are
-    :data:`HOOK_FLAG_NAMES` and whose values are strings, or
-    :class:`HookFlagsChannelError`."""
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads``'s ``object_pairs_hook`` that refuses a repeated member,
+    which would otherwise let the later one win."""
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("repeated member")
+    return members
+
+
+def _decode_flags_channel(
+    raw: str, *, variable: str, names: frozenset[str], exact: bool
+) -> dict[str, str]:
     try:
-        flags = json.loads(raw)
+        flags = json.loads(raw, object_pairs_hook=_unique_members)
     except (ValueError, RecursionError):  # deep nesting exhausts the decoder's stack
         flags = None
     if (
         not isinstance(flags, dict)
-        or not set(flags) <= HOOK_FLAG_NAMES
+        or not (set(flags) == names if exact else set(flags) <= names)
         or not all(isinstance(value, str) for value in flags.values())
     ):
-        raise HookFlagsChannelError(
-            f"{HOOK_FLAGS_CHANNEL_ENV} is not a JSON object of the hook's flag variables"
-        )
+        what = "exactly the MCP registration's" if exact else "the runtime"
+        raise HookFlagsChannelError(f"{variable} is not a JSON object of {what} flag variables")
     return flags
+
+
+def decode_hook_flags_channel(raw: str) -> dict[str, str]:
+    """Read :data:`HOOK_FLAGS_CHANNEL_ENV` back: a JSON object whose keys are
+    some of :data:`RUNTIME_FLAG_NAMES`, each once, and whose values are
+    strings, or :class:`HookFlagsChannelError`."""
+    return _decode_flags_channel(
+        raw, variable=HOOK_FLAGS_CHANNEL_ENV, names=RUNTIME_FLAG_NAMES, exact=False
+    )
+
+
+def decode_server_flags_channel(raw: str) -> dict[str, str]:
+    """Read :data:`SERVER_FLAGS_CHANNEL_ENV` back: a JSON object whose keys are
+    exactly :data:`MCP_FLAG_NAMES`, each once, and whose values are strings,
+    or :class:`HookFlagsChannelError`. Exactly, because a key left out would
+    leave its field to the environment — for ``persist_query_text``, the raw
+    query text the registration asked to hash."""
+    return _decode_flags_channel(
+        raw, variable=SERVER_FLAGS_CHANNEL_ENV, names=MCP_FLAG_NAMES, exact=True
+    )
 
 
 def _parse_bool(raw: str | None) -> bool | None:
@@ -325,12 +379,20 @@ class HostRuntimePolicy:
         )
 
     def mcp_env(self) -> dict[str, str]:
-        """Environment values managed for a newly-created MCP registration."""
-        return {
+        """Environment values managed for a newly-created MCP registration.
+
+        The policy twice: as flat variables, which an older release run from
+        the same registration still reads, and in
+        :data:`SERVER_FLAGS_CHANNEL_ENV`, which the server applies over a
+        ``null`` parent block and a case variant of the field in its JSON
+        (#1544). The channel wins, so a flat variable edited alone changes
+        nothing."""
+        flat = {
             _SURFACING_USE_DAEMON_ENV: "true" if self.use_daemon else "false",
             _SURFACING_TIMEOUT_ENV: format_seconds(self.surfacing_timeout_seconds),
             _PERSIST_QUERY_TEXT_ENV: "true" if self.persist_query_text else "false",
         }
+        return {**flat, SERVER_FLAGS_CHANNEL_ENV: encode_hook_flags_channel(flat)}
 
     def hook_args(self) -> list[str]:
         """Cross-platform flags managed in a native hook command.
@@ -576,6 +638,9 @@ __all__ = [
     "HOOK_ENTRY_POINT",
     "HOOK_FLAGS_CHANNEL_ENV",
     "HOOK_FLAG_NAMES",
+    "MCP_FLAG_NAMES",
+    "RUNTIME_FLAG_NAMES",
+    "SERVER_FLAGS_CHANNEL_ENV",
     "HookFlagsChannelError",
     "HostRuntimePolicy",
     "OwnedHookCommand",
@@ -583,6 +648,7 @@ __all__ = [
     "UnwritableDeadlineError",
     "active_hook_flags",
     "decode_hook_flags_channel",
+    "decode_server_flags_channel",
     "encode_hook_flags_channel",
     "format_seconds",
     "hook_flags_scope",

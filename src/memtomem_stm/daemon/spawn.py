@@ -35,14 +35,18 @@ def _child_env() -> dict[str, str]:
     Under a ``host_runtime.hook_flags_scope`` with flags, the child gets them
     in ``HOOK_FLAGS_CHANNEL_ENV``, which ``mms daemon run --detached`` reads;
     without one, an inherited copy is removed, so a spawn without flags never
-    passes another process's on."""
+    passes another process's on. The MCP server's flags (from
+    ``SERVER_FLAGS_CHANNEL_ENV``) reach the child the same way, and that
+    variable itself is left out: only the server reads it (#1544)."""
     from memtomem_stm.cli.host_runtime import (
         HOOK_FLAGS_CHANNEL_ENV,
+        SERVER_FLAGS_CHANNEL_ENV,
         active_hook_flags,
         encode_hook_flags_channel,
     )
 
-    env = {name: value for name, value in os.environ.items() if name != HOOK_FLAGS_CHANNEL_ENV}
+    dropped = {HOOK_FLAGS_CHANNEL_ENV, SERVER_FLAGS_CHANNEL_ENV}
+    env = {name: value for name, value in os.environ.items() if name not in dropped}
     flags = active_hook_flags()
     if flags:
         env[HOOK_FLAGS_CHANNEL_ENV] = encode_hook_flags_channel(flags)

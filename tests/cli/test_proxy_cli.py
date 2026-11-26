@@ -156,6 +156,28 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+_POLICY_FLAT = (
+    "MEMTOMEM_STM_SURFACING__USE_DAEMON",
+    "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+    "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
+)
+
+
+def _assert_registration_channel(env: dict[str, str]) -> None:
+    """The registration as written carries ``MEMTOMEM_STM_SERVER_FLAGS``, and
+    it decodes to the flat policy values beside it (#1544)."""
+    from memtomem_stm.cli.host_runtime import decode_server_flags_channel
+
+    assert "MEMTOMEM_STM_SERVER_FLAGS" in env, sorted(env)
+    channel = decode_server_flags_channel(env["MEMTOMEM_STM_SERVER_FLAGS"])
+    assert channel == {name: env[name] for name in _POLICY_FLAT}
+
+
+def _cli_env(args: list[str], flag: str) -> dict[str, str]:
+    """``KEY=VALUE`` pairs that follow *flag* in a host CLI command."""
+    return dict(args[i + 1].split("=", 1) for i, word in enumerate(args) if word == flag)
+
+
 def _cfg_args(config: Path) -> list[str]:
     """Shared ``--config`` flag for sub-tests."""
     return ["--config", str(config)]
@@ -6374,6 +6396,7 @@ class TestRegisterCommand:
         assert "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=false" in add_cmd
         assert "MEMTOMEM_STM_SURFACING__USE_DAEMON=true" in add_cmd
         assert "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=3" in add_cmd
+        _assert_registration_channel(_cli_env(add_cmd[: add_cmd.index("--")], "-e"))
 
     def test_register_client_codex_uses_official_cli(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -6393,6 +6416,7 @@ class TestRegisterCommand:
         assert calls[0][:4] == ["codex", "mcp", "get", "memtomem-stm"]
         assert calls[1][:4] == ["codex", "mcp", "add", "memtomem-stm"]
         assert "--env" in calls[1]
+        _assert_registration_channel(_cli_env(calls[1][: calls[1].index("--")], "--env"))
 
     def test_register_json_keeps_existing_until_explicit_replace(
         self, runner, config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -6434,6 +6458,7 @@ class TestRegisterCommand:
         assert entry["hostExtension"] is True
         assert entry["env"]["OPERATOR_FLAG"] == "keep"
         assert entry["env"]["MEMTOMEM_STM_SURFACING__USE_DAEMON"] == "true"
+        _assert_registration_channel(entry["env"])
 
     def test_register_client_codex_add_failure_is_nonzero(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod

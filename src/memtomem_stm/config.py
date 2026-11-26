@@ -810,8 +810,9 @@ class EnvSTMConfigLoad:
 HOOK_FLAG_ENV_NAMES = HOOK_FLAG_NAMES
 """The variables ``mms hook`` names from its command's flags
 (``host_runtime.runtime_env_overrides``), spelled as it spells them: the only
-names a :func:`load_env_stm_config` ``env_overlay`` and a
-``host_runtime.hook_flags_scope`` carry. Doctor's hook route reads them only
+names a :func:`load_env_stm_config` ``env_overlay`` carries (a
+``host_runtime.hook_flags_scope`` may also carry the MCP server's,
+``host_runtime.RUNTIME_FLAG_NAMES``). Doctor's hook route reads them only
 through that build; the route itself follows the command's daemon flag
 directly when it has one, as the hook does (#1501)."""
 
@@ -891,6 +892,28 @@ def hook_flags_hint(
     attributed to the environment as the build read it
     (:func:`hook_flag_environ`), so a model-level error under a flag's block
     names the flag as the command spells it, not a spelling it outranked."""
+    return _implicated_hint(_flag_names_implicated(exc, flags, environ))
+
+
+def server_flags_hint(
+    exc: Exception, flags: Mapping[str, str], environ: Mapping[str, str] | None = None
+) -> str:
+    """:func:`hook_flags_hint` for the MCP server's build under the flags of
+    ``host_runtime.SERVER_FLAGS_CHANNEL_ENV`` (#1544): a flag is named as the
+    channel's key (``MEMTOMEM_STM_SERVER_FLAGS[<name>]``), because the flat
+    variable of that name is outranked and editing it changes nothing. Every
+    other variable is named as :func:`hook_flags_hint` names it."""
+    from memtomem_stm.cli.host_runtime import SERVER_FLAGS_CHANNEL_ENV
+
+    named = _flag_names_implicated(exc, flags, environ)
+    return _implicated_hint(
+        {f"{SERVER_FLAGS_CHANNEL_ENV}[{name}]" if name in flags else name for name in named}
+    )
+
+
+def _flag_names_implicated(
+    exc: Exception, flags: Mapping[str, str], environ: Mapping[str, str] | None
+) -> set[str]:
     from memtomem_stm.proxy.config import implicated_env_vars
 
     env = os.environ if environ is None else environ
@@ -902,6 +925,10 @@ def hook_flags_hint(
             if len(loc) == 2 and (loc[0], loc[1]) in paths:
                 named.add(paths[(loc[0], loc[1])])
     named |= implicated_env_vars(exc, hook_flag_environ(env, flags), skip_locs=frozenset(paths))
+    return named
+
+
+def _implicated_hint(named: set[str]) -> str:
     if not named:
         return ""
     return " (env var(s) implicated: " + ", ".join(sorted(named)) + ")"
