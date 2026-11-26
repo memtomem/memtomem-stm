@@ -751,10 +751,11 @@ async def _run_hook(
 
     The route is ``hook.use_daemon`` as the settings read it, in any form they
     accept (#1495), unless *use_daemon* carries the hook command's explicit
-    ``--use-daemon``/``--no-daemon``. That flag reaches the settings only
-    through one variable of an environment overlay, which a case variant of
-    the field in the block's JSON (``MEMTOMEM_STM_HOOK``) can still outrank,
-    so it decides here directly.
+    ``--use-daemon``/``--no-daemon``, which decides here directly. The flag
+    also reaches the settings, laid over everything the environment gives
+    ``hook.use_daemon`` (``host_runtime.hook_flags_scope``, #1537), so the two
+    agree whenever the build succeeds; reading it here keeps the route the
+    command's even for a caller that passes a config built without the flag.
     """
     if not _hook_eligible(call):
         return {}

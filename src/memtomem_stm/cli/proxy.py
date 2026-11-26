@@ -10393,8 +10393,8 @@ class _HookCommandView:
     registration`` row does not read it either) or ``settings_error``.
     ``locations`` name the handlers (``hooks.PostToolUse[i].hooks[j]``), never
     their command text, which can hold credentials. ``env`` and ``use_daemon``
-    are only set for ``found``: the variables the hook sets from that
-    command's flags, and its ``--use-daemon``/``--no-daemon`` (``None`` for
+    are only set for ``found``: the flags the hook applies from that command
+    (``host_runtime.hook_flags_scope``), and its ``--use-daemon``/``--no-daemon`` (``None`` for
     neither), which the hook routes on directly (#1501).
     """
 
@@ -10417,9 +10417,9 @@ def _hook_command_view() -> _HookCommandView:
     Reads the file ``mms hook install --host claude`` writes, as the ``hook
     registration`` row does. A handler is recognized when install owns it
     (``hook_hosts.owned_handler``: install's own words, ``"type": "command"``,
-    no ``args``) and it has no ``shell`` other than Bash. The variables the
-    hook sets from its flags are then known exactly, computed from the flag
-    words as the hook computes them. Any other ``command`` handler that may
+    no ``args``) and it has no ``shell`` other than Bash. The flags the hook
+    applies are then known exactly, computed from the flag words as the hook
+    computes them. Any other ``command`` handler that may
     run STM's hook (install's look-alike test, ``unmanaged_stm_like``) makes
     the view ``unreadable``: it runs too, and what it would build is unknown.
     A handler ``mms hook`` would not run as the bridge (``--help``, a
@@ -10777,13 +10777,14 @@ def _surfacing_bootstrap_status(
     Doctor also reads the STM hook command in Claude Code's user settings
     (:func:`_hook_command_view`, #1494). When it finds exactly one that
     ``mms hook install`` owns, and nothing else that may run the hook, the
-    hook's build reads the variables the hook sets from that command's flags
-    over doctor's environment, and the command's daemon flag decides the
-    route, as both do in the hook: ``--no-daemon`` sends doctor to the
+    hook's build applies that command's flags over doctor's environment, as
+    the hook applies them (a settings layer over every form the environment
+    gives the same field, #1537), and the command's daemon flag decides the
+    route directly, as in the hook: ``--no-daemon`` sends doctor to the
     standalone route, and the fingerprint takes the query-text persistence
-    and surfacing deadline that build resolves. The variables are passed to
-    the build, never set in ``os.environ``: the probe and the standalone
-    build read the environment as it is. Otherwise the hook view is built
+    and surfacing deadline that build resolves. The flags are scoped to that
+    build, never set in ``os.environ``: the probe and the standalone build
+    read the environment as it is. Otherwise the hook view is built
     from doctor's environment alone. The result's ``hook_view`` says which.
     """
     hook_view: dict[str, Any] | None = None

@@ -368,8 +368,8 @@ class OwnedHookCommand:
     """The command's six setting words as written, or none."""
 
     def env_overrides(self) -> dict[str, str]:
-        """The environment overlay ``mms hook`` applies from the command's
-        flags, before its build validates them."""
+        """The flags ``mms hook`` applies from the command
+        (:func:`hook_flags_scope`), before its build validates them."""
         return _hook_overlay(self.policy_words)
 
 
