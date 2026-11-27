@@ -47,6 +47,31 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms stats --all-time` no longer reports a complete compression history in
+  two cases where rows were known to be lost, or may have been, from the
+  daily rollup (#1527). The **Incomplete
+  before** line was shown only when a counted row predated the installation,
+  so `--tool` or `--source` on rows recorded later, or a selection with no
+  rows, hid a loss that had happened; it is now shown whenever the loss is
+  not known to be 0. And when the rollup's trigger had been dropped and was
+  re-created on the next schema rebuild, the loss count kept its earlier
+  value (often 0), so the rows trimmed in between were lost silently. The
+  rollup now counts as installed only when `proxy_metrics_daily`, its trigger
+  exactly as this version creates it, and valid, consistent markers in
+  `metrics_meta` are all there, as the progressive-reads rollup already
+  requires (#1328). When part of it is missing or not this version's, the
+  rebuild records the loss as unknown and moves the coverage boundary to the
+  time of the rebuild, in a new marker, `rollup_complete_from`; a DB
+  installed before that marker existed has none and is complete from its
+  installation. Not detected: an older STM version re-creating a dropped
+  trigger or daily table before this version sees the gap, and a copy of the
+  trigger under another name. **Behavior change**: the coverage
+  line can now appear under a filter or on an empty result where it did
+  not; a damaged rollup reads as unavailable under `--all-time` until the
+  schema is rebuilt (clear the stamp: `DELETE FROM metrics_meta WHERE key =
+  'schema_fingerprint'`), where some damaged states were read as installed
+  before; and a rebuild after any such damage records the loss as unknown,
+  including where it used to keep a count.
 - An MCP server registration's runtime policy now holds against a `null`
   parent block and against the field repeated under another letter case in
   the block's JSON (issue #1544), as the hook's flags already do (#1537).

@@ -21,10 +21,16 @@ import threading
 import time
 from pathlib import Path
 
-import math
 from typing import Any
 
-from memtomem_stm.proxy.metrics_store import _count, _finite, _finite_total
+from memtomem_stm.proxy.metrics_store import (
+    _count,
+    _decoded,
+    _finite,
+    _finite_float,
+    _finite_total,
+    _lost_count,
+)
 from memtomem_stm.utils.json_out import require_utf8_identifier
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
@@ -181,41 +187,10 @@ _ROLLUP_TRIGGER_STORED_SQL = _ROLLUP_TRIGGER_DDL.replace(
 _ROLLUP_STORED_SQL = _ROLLUP_CREATE.replace("CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ", 1)
 
 
-def _finite_float(value: object) -> float | None:
-    """A marker timestamp, or None unless it is a finite number."""
-    if not isinstance(value, str | int | float):
-        return None
-    try:
-        parsed = float(value)
-    except ValueError:
-        return None
-    return parsed if math.isfinite(parsed) else None
-
-
-def _lost_count(value: object) -> int | None:
-    """The recorded pre-install loss, or None when unknown or unreadable."""
-    # ``isdigit`` alone accepts digits ``int()`` rejects, such as ``'²'``, and
-    # the length cap keeps ``int()`` below Python's digit limit: a row count
-    # never needs more than an int64's 19 digits.
-    if not isinstance(value, str) or not (len(value) <= 19 and value.isascii() and value.isdigit()):
-        return None
-    return int(value)
-
-
 def _marker_valid(key: str, value: object) -> bool:
     if key == _LOST_KEY:
         return value == _LOST_UNKNOWN or _lost_count(value) is not None
     return _finite_float(value) is not None
-
-
-def _decoded(value: object) -> object:
-    """A marker read as bytes, as text — or None when it is not valid UTF-8."""
-    if not isinstance(value, bytes):
-        return value
-    try:
-        return value.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
 
 
 def _rollup_state(db: sqlite3.Connection) -> tuple[set[str], dict[str, object], set[str]]:
