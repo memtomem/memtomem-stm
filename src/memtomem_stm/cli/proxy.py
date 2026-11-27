@@ -3223,8 +3223,9 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     help="Report compression over all rows ever recorded since the daily rollup was "
     "installed (retained rows plus rolled-up trimmed rows), instead of retained rows only. "
     "The hook status counts include trimmed rows only while the status rollup's triggers "
-    "are this version's and its counts match the daily rollup for every day, server and "
-    "tool; otherwise they cover retained rows only. Progressive delivery likewise counts "
+    "are this version's, its table has the columns the read uses, and its counts match the "
+    "daily rollup for every day, server and tool; otherwise they cover retained rows only. "
+    "Progressive delivery likewise counts "
     "purged reads since its rollup was installed; surfacing stays retained.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")

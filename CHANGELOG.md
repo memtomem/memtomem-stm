@@ -63,7 +63,9 @@ changes inline only. See the deprecation policy in
   no longer makes the totals unavailable). The rebuild now
   replaces a status trigger whose SQL is not this version's (a rename left
   the reset trigger on the old table, so a documented reset kept the status
-  rows); it never rewrites the status rows. Not detected: a status
+  rows); it never rewrites the rows of an existing status table (a missing
+  one is still created and seeded with `status not kept` rows, as before).
+  Not detected: a status
   attributed wrongly, or misses that cancel out, within a bucket whose count
   still matches, and some edits to the status table's definition or values
   from outside STM. **Behavior change**: a database

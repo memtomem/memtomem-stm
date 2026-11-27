@@ -1524,6 +1524,11 @@ def _stored_status_triggers(path: Path) -> dict[str, str]:
     return dict(rows)
 
 
+# Written out rather than taken from the guard, so a column dropped from the
+# guard keeps its case here.
+_STATUS_COLUMNS = ["calls", "day", "kind", "original_chars", "server", "status", "tool"]
+
+
 def _canonical_status_trigger_sql() -> str:
     return metrics_store_module._STATUS_ROLLUP_TRIGGER_DDL
 
@@ -1561,6 +1566,24 @@ class TestHookStatusInStep:
         _sql(path, f"DROP TRIGGER {_STATUS_TRIGGER}", "DELETE FROM proxy_metrics WHERE id = 1")
         _sql(path, _canonical_status_trigger_sql())
         assert _status_scope(path) == ("retained", 1, 2)
+
+    def test_an_older_installer_restoring_the_compression_trigger_keeps_the_surplus(self, tmp_path):
+        """The case the writer keeps status rows for: v0.7.10/v0.7.11 re-create a
+        dropped compression trigger without moving the markers, so the totals read
+        complete, and the status surplus is the only trace of the lost call."""
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed"), _hook("error")], max_history=1_000_000)
+        _sql(path, f"DROP TRIGGER {_TRIGGER}", "DELETE FROM proxy_metrics WHERE id = 1")
+        _sql(path, metrics_store_module._ROLLUP_TRIGGER_DDL)  # as the older installer does
+        before = _status_table(path)
+        result = read_compression_all_time(path, source="hook", with_hook_status=True)
+        assert result["rollup"]["incomplete_before"] is None, "the loss is hidden"
+        assert result["total_calls"] == 1
+        assert result["hook_status"]["scope"] == "retained"
+        _clear_stamp(path)
+        _open(path).close()  # this version's rebuild: both rollups look whole
+        assert _status_table(path) == before == [("Bash", 0, "compressed", 1, 100)]
+        assert _status_scope(path)[0] == "retained"
 
     def test_a_diverged_db_with_a_current_stamp_reads_the_retained_rows(self, tmp_path):
         """Upgrade path: the installer never runs on a current stamp."""
@@ -1604,21 +1627,31 @@ class TestHookStatusInStep:
         )
         assert _status_scope(path) == ("retained", 0, 1)
 
-    def test_differences_that_cancel_across_tools_still_read_retained(self, tmp_path):
-        """Per bucket, not file-wide sums: 2+1 daily calls against 1+2 statuses."""
+    @pytest.mark.parametrize(
+        "pair",
+        [
+            (("2026-01-01", "builtin:claude", "Bash"), ("2026-01-01", "builtin:claude", "Read")),
+            (("2026-01-01", "builtin:claude", "Bash"), ("2026-01-02", "builtin:claude", "Bash")),
+            (("2026-01-01", "builtin:claude", "Bash"), ("2026-01-01", "builtin:codex", "Bash")),
+        ],
+        ids=["tool", "day", "server"],
+    )
+    def test_differences_that_cancel_across_one_key_still_read_retained(self, tmp_path, pair):
+        """Per bucket, not file-wide sums: 2+1 daily calls against 1+2 statuses,
+        the two buckets differing in one key only."""
         path = tmp_path / "m.db"
         _open(path).close()
+        (a, b), grep = pair, ("2026-01-01", "builtin:claude", "Grep")
         _sql(
             path,
             *(
                 f"INSERT INTO {_DAILY} (day, source, server, tool, calls, legacy_calls) "
-                f"VALUES ('2026-01-01', 'hook', 'builtin:claude', '{tool}', {n}, {n})"
-                for tool, n in (("Bash", 2), ("Read", 1), ("Grep", 1))
+                f"VALUES ('{d}', 'hook', '{s}', '{t}', {n}, {n})"
+                for (d, s, t), n in ((a, 2), (b, 1), (grep, 1))
             ),
             *(
-                f"INSERT INTO {_STATUS_DAILY} VALUES ('2026-01-01', 'builtin:claude', "
-                f"'{tool}', 0, 'compressed', {n}, 10)"
-                for tool, n in (("Bash", 1), ("Read", 2), ("Grep", 1))
+                f"INSERT INTO {_STATUS_DAILY} VALUES ('{d}', '{s}', '{t}', 0, 'compressed', {n}, 10)"
+                for (d, s, t), n in ((a, 1), (b, 2), (grep, 1))
             ),
         )
         assert _status_scope(path) == ("retained", 0, 4)
@@ -1730,16 +1763,14 @@ class TestHookStatusInStep:
         assert result["total_calls"] == 2
         assert result["hook_status"]["scope"] == "retained"
 
-    @pytest.mark.parametrize("column", sorted(metrics_store_module._STATUS_READ_COLUMNS))
+    @pytest.mark.parametrize("column", _STATUS_COLUMNS)
     def test_a_status_table_missing_a_read_column_keeps_the_totals(self, tmp_path, column):
         """Counts that agree are not enough: the all-time status read needs
         every column, and failing it would fail the totals too."""
         path = tmp_path / "m.db"
         _record_all(path, [_hook("compressed"), _hook("error")], max_history=1_000_000)
         _sql(path, "DELETE FROM proxy_metrics WHERE id = 1")
-        kept = ", ".join(
-            c for c in sorted(metrics_store_module._STATUS_READ_COLUMNS) if c != column
-        )
+        kept = ", ".join(c for c in _STATUS_COLUMNS if c != column)
         _sql(
             path,
             f"ALTER TABLE {_STATUS_DAILY} RENAME TO status_old",
