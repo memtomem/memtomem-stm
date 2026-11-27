@@ -216,14 +216,31 @@ _SCHEMA_EPOCH = 2
 #
 # Changing the trigger body later needs a new trigger name (the ``_v1``
 # suffix) plus a DROP of the old one: ``CREATE TRIGGER IF NOT EXISTS`` keeps an
-# existing trigger as it is.
+# existing trigger as it is. The installer also compares the trigger's stored
+# SQL with this version's (below), so a changed body under the same name would
+# read as damage on every DB.
+#
+# Three markers in ``metrics_meta`` describe coverage (#1527): when the rollup
+# was installed, how many rows had already been trimmed then (``'unknown'``
+# when that cannot be established), and from when the history is known
+# complete. The rollup is whole only when the daily table, the trigger exactly
+# as this version creates it, and valid, consistent markers are all there; a
+# DB installed before the third marker existed lacks it and is complete from
+# its installation. When the file shows any trace of an earlier installation
+# but the rollup is not whole, something outside STM removed or changed part
+# of it, and rows may have been trimmed unrolled at any time: the next
+# stale-stamp open rebuilds it, records the loss as unknown and moves the
+# "complete from" boundary to then, rather than trying to tell the damage
+# cases apart. This is the rule of ``progressive_reads_store`` (#1328).
 
 _DAILY_TABLE = "proxy_metrics_daily"
 _ROLLUP_TRIGGER = "proxy_metrics_rollup_on_delete_v1"
 _ROLLUP_INSTALLED_KEY = "rollup_installed_at"
 _ROLLUP_LOST_KEY = "rollup_rows_lost_before_install"
-# Stored when the markers are re-created on a rollup that was already running:
-# not an int, so ``_rollup_markers`` reads it as an unknown count.
+_ROLLUP_COMPLETE_FROM_KEY = "rollup_complete_from"
+_ROLLUP_MARKER_KEYS = (_ROLLUP_INSTALLED_KEY, _ROLLUP_LOST_KEY, _ROLLUP_COMPLETE_FROM_KEY)
+# Stored when the loss cannot be established: not an int, so the reader
+# reports it as an unknown count.
 _ROLLUP_LOST_UNKNOWN = "unknown"
 _UNKNOWN_DAY = "unknown"
 
@@ -283,6 +300,37 @@ def _count(value: Any) -> Any:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return value or 0
+
+
+def _finite_float(value: object) -> float | None:
+    """A marker timestamp, or None unless it is a finite number."""
+    if not isinstance(value, str | int | float):
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _lost_count(value: object) -> int | None:
+    """The recorded pre-install loss, or None when unknown or unreadable."""
+    # ``isdigit`` alone accepts digits ``int()`` rejects, such as ``'²'``, and
+    # the length cap keeps ``int()`` below Python's digit limit: a row count
+    # never needs more than an int64's 19 digits.
+    if not isinstance(value, str) or not (len(value) <= 19 and value.isascii() and value.isdigit()):
+        return None
+    return int(value)
+
+
+def _decoded(value: object) -> object:
+    """A marker read as bytes, as text — or None when it is not valid UTF-8."""
+    if not isinstance(value, bytes):
+        return value
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _row_terms(cols: Collection[str], prefix: str = "") -> dict[str, str]:
@@ -399,6 +447,11 @@ def _rollup_trigger_ddl() -> str:
 
 
 _ROLLUP_TRIGGER_DDL = _rollup_trigger_ddl()
+# What SQLite keeps in ``sqlite_master.sql`` for it: the statement as written,
+# minus ``IF NOT EXISTS``. Renaming either table rewrites that text.
+_ROLLUP_TRIGGER_STORED_SQL = _ROLLUP_TRIGGER_DDL.replace(
+    "CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ", 1
+)
 
 # ── Hook status rollup (#1442) ──────────────────────────────────────────────
 #
@@ -671,21 +724,24 @@ def read_compression_all_time(
     Same read-only contract, filters and keys as :func:`read_compression_summary`
     with three differences:
 
-    - ``available`` is ``False`` unless the rollup is installed — the daily
-      table, its trigger AND the installation marker all present — so a DB this
-      version has not opened yet never reports its retained window under an
-      all-time label;
+    - ``available`` is ``False`` unless the rollup is whole — the daily table,
+      this version's trigger and valid, consistent markers (see the notes at
+      ``_ROLLUP_TRIGGER``) — so a DB this version has not opened yet, or one
+      whose rollup was damaged and not yet rebuilt, never reports a partial
+      history under an all-time label;
     - ``by_tool`` entries have no ``tuner_calls``: the tuner reads a time window,
       and a deleted row's tuner eligibility is not kept;
     - a ``rollup`` key describes coverage: ``installed``, ``installed_at``
       (epoch), ``lost_before_install`` (rows already trimmed when the trigger
-      was created; ``None`` if unreadable, or unknown because the markers were
-      re-created on a rollup that was already running), ``earliest_created_at`` (the
-      earliest real timestamp among the counted rows, after filters),
-      ``incomplete_before`` (``installed_at`` when rows were lost before
-      installation and the counted rows reach back before it, else ``None``)
-      and ``unknown_date_calls`` (rows whose ``created_at`` was not a
-      convertible timestamp; counted, but undated).
+      was created; ``None`` when unknown — the rollup was rebuilt after damage,
+      or its markers re-created on a rollup that was already running),
+      ``earliest_created_at`` (the earliest real timestamp among the counted
+      rows, after filters), ``incomplete_before`` (from when the history is
+      known complete — the installation, or the rebuild after damage —
+      whenever the loss is not known to be 0, else ``None``; the loss is
+      file-wide, so this holds under every filter and on an empty result) and
+      ``unknown_date_calls`` (rows whose ``created_at`` was not a convertible
+      timestamp; counted, but undated).
 
     ``with_hook_status`` behaves as in :func:`read_compression_summary`, and
     once the hook status rollup (#1442) is installed it also counts the
@@ -808,46 +864,121 @@ def read_cache_summary(db_path: Path, *, tool: str | None = None) -> dict[str, o
     return summary
 
 
-def _rollup_markers(db: sqlite3.Connection) -> tuple[float, int | None] | None:
-    """``(installed_at, lost_before_install)`` if the rollup is installed, else None.
+# Objects only a version that installs the daily rollup creates, all in the
+# transaction that installs it: any of them left in a file means the rollup
+# was installed there before, so its rows cannot be counted afresh. Taken from
+# the fingerprint's list, so an object added there is a trace too.
+_ROLLUP_TRACE_NAMES = _ROLLUP_OBJECT_NAMES
 
-    Installed means all three objects exist: the daily table, the trigger that
-    feeds it, and the installation marker. They are created in one transaction,
-    so only external damage separates them — and a table with no trigger is
-    exactly the state that would under-count while looking complete.
+
+def _rollup_state(db: sqlite3.Connection) -> tuple[set[str], dict[str, object], bool]:
+    """``(objects, markers, traced)`` for the daily rollup (see the notes above).
+
+    ``objects`` holds ``metrics_meta``, the daily table and the trigger when
+    they exist — the trigger only when its stored SQL is exactly this
+    version's: renaming ``proxy_metrics`` or the daily table rewrites it, and
+    it then feeds nothing the reader counts. ``markers`` holds the rollup keys
+    present in ``metrics_meta``, read with ``text_factory = bytes`` (SQLite
+    hands them over as UTF-8 whatever the DB's encoding), so a value that is
+    not valid UTF-8 reads as ``None`` rather than failing the read.
+    ``traced`` is whether anything shows an earlier installation: a rollup
+    marker, valid or not, ``cache_rollup_installed_at``, or any of
+    ``_ROLLUP_TRACE_NAMES`` in whatever form.
+    ``metrics_meta`` itself is not a trace: older builds create it for the
+    schema stamp.
     """
-    names = {
-        row[0]
-        for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE (type = 'table' AND name IN (?, ?)) "
-            "OR (type = 'trigger' AND name = ?)",
-            ("metrics_meta", _DAILY_TABLE, _ROLLUP_TRIGGER),
-        )
-    }
-    if names != {"metrics_meta", _DAILY_TABLE, _ROLLUP_TRIGGER}:
-        return None
-    meta = dict(
-        db.execute(
-            "SELECT key, value FROM metrics_meta WHERE key IN (?, ?)",
-            (_ROLLUP_INSTALLED_KEY, _ROLLUP_LOST_KEY),
-        ).fetchall()
+    # SQLite matches these names without regard to ASCII case, so a table
+    # renamed to ``PROXY_METRICS_DAILY`` still occupies the daily table's name.
+    names = ("metrics_meta", *_ROLLUP_TRACE_NAMES)
+    found = db.execute(
+        "SELECT type, lower(name), sql FROM sqlite_master WHERE lower(name) IN "
+        f"({', '.join('?' for _ in names)})",
+        names,
+    ).fetchall()
+    objects: set[str] = set()
+    for kind, name, sql in found:
+        if name == _ROLLUP_TRIGGER:
+            if kind == "trigger" and sql == _ROLLUP_TRIGGER_STORED_SQL:
+                objects.add(name)
+        elif name in ("metrics_meta", _DAILY_TABLE) and kind == "table":
+            objects.add(name)
+    markers: dict[str, object] = {}
+    cache_marker = False
+    if "metrics_meta" in objects:
+        previous = db.text_factory
+        db.text_factory = bytes
+        try:
+            rows = db.execute(
+                "SELECT key, value FROM metrics_meta WHERE key IN (?, ?, ?)", _ROLLUP_MARKER_KEYS
+            ).fetchall()
+            # Written in the transaction that installed the daily rollup.
+            cache_marker = (
+                db.execute(
+                    "SELECT 1 FROM metrics_meta WHERE key = ?", (_CACHE_INSTALLED_KEY,)
+                ).fetchone()
+                is not None
+            )
+        finally:
+            db.text_factory = previous
+        markers = {str(_decoded(key)): _decoded(value) for key, value in rows}
+    traced = (
+        bool(markers) or cache_marker or any(name in _ROLLUP_TRACE_NAMES for _, name, _ in found)
     )
-    try:
-        installed_at = float(meta[_ROLLUP_INSTALLED_KEY])
-    except (KeyError, TypeError, ValueError):
+    return objects, markers, traced
+
+
+def _rollup_whole(objects: set[str], markers: dict[str, object]) -> bool:
+    """Whether the daily rollup is installed and has missed no delete since.
+
+    The daily table, this version's trigger and ``metrics_meta`` must exist;
+    the installation time must be a finite number and the loss a count or
+    ``'unknown'``. ``rollup_complete_from`` is either absent — an installation
+    from before that marker, complete from its installation — or a finite
+    number no earlier than the installation (a repair keeps the installation
+    time and moves only the boundary). A loss *count* is written only by a
+    first installation, with one timestamp as both markers, so any other
+    pairing with a count was not written by STM.
+    """
+    if not {"metrics_meta", _DAILY_TABLE, _ROLLUP_TRIGGER} <= objects:
+        return False
+    installed_at = _finite_float(markers.get(_ROLLUP_INSTALLED_KEY))
+    lost = markers.get(_ROLLUP_LOST_KEY)
+    if installed_at is None or not (lost == _ROLLUP_LOST_UNKNOWN or _lost_count(lost) is not None):
+        return False
+    if _ROLLUP_COMPLETE_FROM_KEY not in markers:
+        return True
+    complete_from = _finite_float(markers[_ROLLUP_COMPLETE_FROM_KEY])
+    if complete_from is None or complete_from < installed_at:
+        return False
+    if _lost_count(lost) is not None:
+        return markers[_ROLLUP_COMPLETE_FROM_KEY] == markers[_ROLLUP_INSTALLED_KEY]
+    return True
+
+
+def _rollup_coverage(
+    db: sqlite3.Connection,
+) -> tuple[float, int | None, float] | None:
+    """``(installed_at, lost_before_install, complete_from)`` if whole, else None.
+
+    ``complete_from`` is the installation time on a DB installed before the
+    boundary marker existed. The installer's own test, so a state it would
+    rebuild never reads as installed.
+    """
+    objects, markers, _ = _rollup_state(db)
+    if not _rollup_whole(objects, markers):
         return None
-    try:
-        lost: int | None = int(meta[_ROLLUP_LOST_KEY])
-    except (KeyError, TypeError, ValueError):
-        lost = None
-    return installed_at, lost
+    installed_at = _finite_float(markers[_ROLLUP_INSTALLED_KEY])
+    complete_from = _finite_float(markers.get(_ROLLUP_COMPLETE_FROM_KEY, installed_at))
+    if installed_at is None or complete_from is None:  # excluded by _rollup_whole
+        return None
+    return installed_at, _lost_count(markers[_ROLLUP_LOST_KEY]), complete_from
 
 
 def _status_rollup_installed(db: sqlite3.Connection) -> bool:
     """Whether the hook status rollup (#1442) is wired: its table AND triggers.
 
     A table with no trigger feeding it would under-count while looking
-    complete, as for ``_rollup_markers``; without the one that follows daily
+    complete, as for ``_rollup_whole``; without the one that follows daily
     deletes, a reset could leave counts the totals no longer have. No marker
     is needed: the calls trimmed before the table existed are rows of the
     table itself (``_STATUS_KIND_NOT_KEPT``), written in the transaction that
@@ -1015,9 +1146,10 @@ def _read_compression(
         return summary
 
     try:
-        if want_status:
-            # One read transaction, so the status groups below see the same
-            # rows as the totals even while a writer appends or trims.
+        if want_status or all_time:
+            # One read transaction, so the status groups and the rollup's
+            # coverage below describe the same rows as the totals even while
+            # a writer appends, trims or rebuilds the rollup.
             db.execute("BEGIN")
         cols = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
         if "original_chars" not in cols:
@@ -1034,11 +1166,18 @@ def _read_compression(
         summary["schema_outdated"] = not has_is_error
 
         if all_time:
-            markers = _rollup_markers(db)
-            if markers is None:
+            coverage = _rollup_coverage(db)
+            if coverage is None:
                 return summary
+            installed_at, lost, complete_from = coverage
             rollup["installed"] = True
-            rollup["installed_at"], rollup["lost_before_install"] = markers
+            rollup["installed_at"] = installed_at
+            rollup["lost_before_install"] = lost
+            # Rows can be missing only from before the boundary, and only if
+            # the loss is not known to be zero (unknown counts as "some"). A
+            # lost row's tool, source and date are unknown, so neither a filter
+            # nor the rows still counted can rule it out (#1527).
+            rollup["incomplete_before"] = complete_from if lost != 0 else None
 
         if (tool is not None and has_lone_surrogate(tool)) or (
             source is not None and has_lone_surrogate(source)
@@ -1242,17 +1381,6 @@ def _read_compression(
     if all_time:
         rollup["earliest_created_at"] = earliest
         rollup["unknown_date_calls"] = unknown_dates
-        installed_at = rollup["installed_at"]
-        lost = rollup["lost_before_install"]
-        # Rows can be missing only from before installation, and only if some
-        # were already trimmed then (an unreadable count is treated as "some").
-        if (
-            isinstance(installed_at, float)
-            and lost != 0
-            and earliest is not None
-            and earliest < installed_at
-        ):
-            rollup["incomplete_before"] = installed_at
     return summary
 
 
@@ -1313,9 +1441,13 @@ class MetricsStore:
           only symptom is that its ``COUNT``/``ORDER BY`` scans and the reader
           aggregations get slower. Accepted knowingly: an index nothing drops
           is not worth a per-invocation check.
-        - a deleted *rollup marker* is not restored either while the stamp
-          stands; ``read_compression_all_time`` then reports the rollup as not
-          installed, or its loss count as unknown.
+        - a damaged *daily rollup* — its table or trigger dropped, renamed or
+          replaced, a marker deleted or made invalid — is not rebuilt either
+          while the stamp stands; ``read_compression_all_time`` reports it as
+          not installed until then, and the rebuild records the loss as
+          unknown from that moment (see ``_install_rollup_and_stamp``). A
+          deleted ``rollup_complete_from`` alone reads as an installation from
+          before that marker existed.
 
         Repair is to clear the stamp alone
         (``DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'``) and
@@ -1396,57 +1528,81 @@ class MetricsStore:
         complete history. Under the transaction, the table, the trigger, the
         installation marker and the stamp land together or not at all.
 
-        The markers are first-writer-wins (``DO NOTHING``): an older binary
-        re-stamping the DB with its own fingerprint sends the next opener back
-        through here, and that pass must not move the installation time.
-        ``rollup_rows_lost_before_install`` counts rows deleted before the
-        trigger existed: AUTOINCREMENT ids are never reused once committed, so
-        ``sqlite_sequence.seq - COUNT(*)`` is how many rows already left the
-        table. Zero means the history is complete from the first row.
+        The daily rollup's state is read first, under the same transaction, and
+        decides what happens to it (see the notes at ``_ROLLUP_TRIGGER``):
 
-        That count is only taken on a FIRST installation — when the daily table
-        did not exist before this transaction. Writing the installation marker
-        while the table is already there means the markers were erased from a
-        DB whose rollup has been running (an older binary's restamp or a second
-        opener finds the marker present and writes nothing), and then no
-        formula over what is left can say how many rows predate the trigger:
-        ``seq - COUNT(*)`` would count every rolled-up row as lost, subtracting
-        the daily ``calls`` would still count rows cleared by a history reset,
-        and a reset or a dropped ``sqlite_sequence`` row skews both. The loss is
-        recorded as unknown instead, which the reader reports as ``None`` and
-        treats conservatively as "some".
+        - whole: nothing, so an older binary's restamp, which sends the next
+          opener back through here, never moves a marker. An installation from
+          before ``rollup_complete_from`` existed gets that marker, equal to
+          its installation time.
+        - no trace of an earlier installation: a first installation.
+          ``rollup_rows_lost_before_install`` counts rows deleted before the
+          trigger existed: AUTOINCREMENT ids are never reused once committed,
+          so ``sqlite_sequence.seq - COUNT(*)`` is how many rows already left
+          the table. Zero means the history is complete from the first row.
+          One timestamp is written as both the installation time and the start
+          of the complete history.
+        - anything in between — a trigger missing or not this version's, a
+          missing daily table, a marker missing, invalid or inconsistent: rows
+          may have been trimmed unrolled at any time, and no formula over what
+          is left can say how many (``seq - COUNT(*)`` would count every
+          rolled-up row as lost, subtracting the daily ``calls`` would still
+          count rows cleared by a history reset). The trigger is re-created,
+          the loss is recorded as unknown — which the reader reports as
+          ``None`` and treats as "some" — and the history is complete only from
+          now. A valid installation time is kept; the boundary is never
+          written earlier than it or than a valid earlier boundary, so a clock
+          that went back can neither make the markers inconsistent nor shrink
+          a period already known to be uncertain.
         """
         db.execute("BEGIN IMMEDIATE")
         try:
+            objects, markers, traced = _rollup_state(db)
+            whole = _rollup_whole(objects, markers)
+            first_install = not whole and not traced
+            if not whole:
+                db.execute(f"DROP TRIGGER IF EXISTS {_ROLLUP_TRIGGER}")
             db.execute(_META_CREATE)
-            first_install = (
-                db.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-                    (_DAILY_TABLE,),
-                ).fetchone()
-                is None
-            )
             db.execute(_DAILY_CREATE)
             db.execute(_ROLLUP_TRIGGER_DDL)
             MetricsStore._install_status_rollup(db)
             MetricsStore._install_cache_rollup(db)
-            installed = db.execute(
-                "INSERT INTO metrics_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
-                (_ROLLUP_INSTALLED_KEY, str(time.time())),
-            ).rowcount
-            if installed:
-                lost_value = _ROLLUP_LOST_UNKNOWN
-                if first_install:
-                    lost = db.execute(
-                        "SELECT max(0, COALESCE((SELECT seq FROM sqlite_sequence "
-                        "WHERE name = 'proxy_metrics'), 0) - (SELECT COUNT(*) FROM proxy_metrics))"
-                    ).fetchone()[0]
-                    lost_value = str(int(lost))
-                db.execute(
-                    "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO NOTHING",
-                    (_ROLLUP_LOST_KEY, lost_value),
-                )
+            values: dict[str, str] = {}
+            if whole:
+                if _ROLLUP_COMPLETE_FROM_KEY not in markers:
+                    values[_ROLLUP_COMPLETE_FROM_KEY] = str(markers[_ROLLUP_INSTALLED_KEY])
+            elif first_install:
+                lost = db.execute(
+                    "SELECT max(0, COALESCE((SELECT seq FROM sqlite_sequence "
+                    "WHERE name = 'proxy_metrics'), 0) - (SELECT COUNT(*) FROM proxy_metrics))"
+                ).fetchone()[0]
+                now = str(time.time())
+                values = {
+                    _ROLLUP_INSTALLED_KEY: now,
+                    _ROLLUP_LOST_KEY: str(int(lost)),
+                    _ROLLUP_COMPLETE_FROM_KEY: now,
+                }
+            else:
+                now_at = time.time()
+                old = markers.get(_ROLLUP_INSTALLED_KEY)
+                installed = str(old) if _finite_float(old) is not None else str(now_at)
+                # Never earlier than a boundary already recorded: after a clock
+                # went back, an earlier one would declare part of a period
+                # already known to be uncertain complete.
+                candidates = [str(now_at), installed]
+                previous_boundary = markers.get(_ROLLUP_COMPLETE_FROM_KEY)
+                if _finite_float(previous_boundary) is not None:
+                    candidates.append(str(previous_boundary))
+                values = {
+                    _ROLLUP_INSTALLED_KEY: installed,
+                    _ROLLUP_LOST_KEY: _ROLLUP_LOST_UNKNOWN,
+                    _ROLLUP_COMPLETE_FROM_KEY: max(candidates, key=float),
+                }
+            db.executemany(
+                "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                list(values.items()),
+            )
             db.execute(
                 "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
