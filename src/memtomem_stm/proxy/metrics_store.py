@@ -560,6 +560,16 @@ _STATUS_RESET_TRIGGER_DDL = (
     "WHERE day = OLD.day AND server = OLD.server AND tool = OLD.tool; END"
 )
 
+# What ``sqlite_master.sql`` holds for each status trigger, as for
+# ``_ROLLUP_TRIGGER_STORED_SQL``: renaming a table they name rewrites it.
+_STATUS_TRIGGER_STORED_SQL = {
+    name: ddl.replace("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ", 1)
+    for name, ddl in (
+        (_STATUS_ROLLUP_TRIGGER, _STATUS_ROLLUP_TRIGGER_DDL),
+        (_STATUS_RESET_TRIGGER, _STATUS_RESET_TRIGGER_DDL),
+    )
+}
+
 # One copy per daily row: ``proxy_metrics_daily`` has exactly one row per
 # ``(day, 'hook', server, tool)``, so nothing is aggregated and nothing can
 # overflow into an error that would fail the installation. The ``WHERE`` also
@@ -744,10 +754,14 @@ def read_compression_all_time(
       timestamp; counted, but undated).
 
     ``with_hook_status`` behaves as in :func:`read_compression_summary`, and
-    once the hook status rollup (#1442) is installed it also counts the
-    trimmed hook rows, under ``"scope": "all_time"`` — including ``not_kept``
-    rows for trimmed calls whose status was not kept. A DB whose status
-    rollup is missing reports the retained rows, under ``"scope": "retained"``.
+    while the hook status rollup (#1442) passes ``_status_rollup_whole`` —
+    its triggers this version's and its counts equal to the daily hook calls
+    of every day, server and tool, file-wide — it also counts the trimmed
+    hook rows, under ``"scope": "all_time"``, including ``not_kept`` rows for
+    trimmed calls whose status was not kept. Otherwise, when the all-time
+    totals themselves are available, it reports the retained rows, under
+    ``"scope": "retained"``, which can then count fewer calls than the totals
+    beside them.
     """
     return _read_compression(
         db_path, tool=tool, source=source, all_time=True, with_hook_status=with_hook_status
@@ -974,25 +988,59 @@ def _rollup_coverage(
     return installed_at, _lost_count(markers[_ROLLUP_LOST_KEY]), complete_from
 
 
-def _status_rollup_installed(db: sqlite3.Connection) -> bool:
-    """Whether the hook status rollup (#1442) is wired: its table AND triggers.
+def _status_rollup_whole(db: sqlite3.Connection) -> bool:
+    """Whether the hook status rollup (#1442) adds up to the daily rollup now.
 
-    A table with no trigger feeding it would under-count while looking
-    complete, as for ``_rollup_whole``; without the one that follows daily
-    deletes, a reset could leave counts the totals no longer have. No marker
-    is needed: the calls trimmed before the table existed are rows of the
-    table itself (``_STATUS_KIND_NOT_KEPT``), written in the transaction that
-    created it.
+    Three checks, all inside the caller's read snapshot:
+
+    - the table exists, and both triggers exist with this version's stored SQL.
+      A table with no trigger feeding it would under-count while looking
+      complete, as for ``_rollup_whole``; a reset trigger a rename re-pointed
+      would leave counts the totals no longer have after a reset.
+    - every ``(day, server, tool)`` has as many status calls as the daily hook
+      bucket has calls, counted as the totals count them
+      (``legacy_calls + structured_calls``), in both directions. The objects
+      alone cannot show this (#1547): a trigger dropped and later re-created
+      with the same SQL — by this version's rebuild or an older one's — leaves
+      the two tables apart by every delete one of them missed.
+
+    In normal operation the counts always agree: both triggers fire on the same
+    delete with the same day and key fallbacks, the seed copies each daily hook
+    bucket, and the reset trigger deletes a bucket's status rows with it.
+    Any SQLite error in the comparison — ``SUM`` overflowing int64, or an
+    outside table without the columns it reads — means the rollup cannot be
+    shown to agree, so it reads as not whole rather than failing the totals.
+
+    Not detected: a status attributed wrongly inside a bucket whose count
+    matches, and misses that cancel out within one bucket.
     """
-    names = {
-        row[0]
-        for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE (type = 'table' AND name = ?) "
-            "OR (type = 'trigger' AND name IN (?, ?))",
-            (_STATUS_DAILY_TABLE, _STATUS_ROLLUP_TRIGGER, _STATUS_RESET_TRIGGER),
-        )
-    }
-    return names == {_STATUS_DAILY_TABLE, _STATUS_ROLLUP_TRIGGER, _STATUS_RESET_TRIGGER}
+    found = db.execute(
+        "SELECT type, lower(name), sql FROM sqlite_master WHERE lower(name) IN (?, ?, ?)",
+        (_STATUS_DAILY_TABLE, *_STATUS_TRIGGER_STORED_SQL),
+    ).fetchall()
+    if not any(kind == "table" and name == _STATUS_DAILY_TABLE for kind, name, _ in found):
+        return False
+    for trigger, stored in _STATUS_TRIGGER_STORED_SQL.items():
+        if not any(
+            kind == "trigger" and name == trigger and sql == stored for kind, name, sql in found
+        ):
+            return False
+    daily = (
+        f"SELECT day, server, tool, "
+        f"{_finite_total('legacy_calls')} + {_finite_total('structured_calls')} "
+        f"FROM {_DAILY_TABLE} WHERE source = 'hook' COLLATE BINARY"
+    )
+    status = (
+        f"SELECT day, server, tool, SUM({_finite_total('calls')}) "
+        f"FROM {_STATUS_DAILY_TABLE} GROUP BY day, server, tool"
+    )
+    try:
+        for left, right in ((daily, status), (status, daily)):
+            if db.execute(f"SELECT 1 FROM ({left} EXCEPT {right}) LIMIT 1").fetchone():
+                return False
+    except sqlite3.Error:
+        return False
+    return True
 
 
 def _fold_status(expr: str) -> str:
@@ -1014,9 +1062,9 @@ def _read_hook_status(
     """``source='hook'`` rows grouped by ``(server, status)``.
 
     Returns ``{"scope": ..., "rows": [...]}``. ``scope`` is ``"all_time"`` when
-    ``all_time`` is asked for and the status rollup is installed — the
-    retained rows plus ``proxy_metrics_hook_status_daily``, in one statement
-    as ``_read_compression`` reads the totals — and ``"retained"`` otherwise.
+    ``all_time`` is asked for and ``_status_rollup_whole`` holds — the
+    retained rows plus ``proxy_metrics_hook_status_daily``, read in the same
+    snapshot as the totals — and ``"retained"`` otherwise.
 
     Each row has ``server``, ``status``, ``not_kept``, ``calls`` and
     ``original_chars``. ``status`` is a name from ``HOOK_COMPRESSION_STATUSES``,
@@ -1033,7 +1081,7 @@ def _read_hook_status(
     on the retained half, the rollup table's BINARY keys on the other — so the
     counts describe the rows of the figure they are printed under.
     """
-    scope = "all_time" if all_time and _status_rollup_installed(db) else "retained"
+    scope = "all_time" if all_time and _status_rollup_whole(db) else "retained"
     result: dict[str, object] = {"scope": scope, "rows": []}
     if "source" not in cols:
         return result
@@ -1644,6 +1692,18 @@ class MetricsStore:
         db.execute(_STATUS_DAILY_CREATE)
         if first:
             db.execute(_STATUS_SEED)
+        # ``IF NOT EXISTS`` keeps a trigger whose SQL a rename rewrote — a reset
+        # trigger still on the renamed daily table would leave status rows
+        # behind on every documented reset — so one that is not this version's
+        # is replaced. Under the caller's transaction no trim lands between the
+        # drop and the create. Rows are left as they are: what they disagree on
+        # is evidence, and ``_status_rollup_whole`` keeps the reader off them.
+        for name, sql in db.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND lower(name) IN (?, ?)",
+            tuple(_STATUS_TRIGGER_STORED_SQL),
+        ).fetchall():
+            if sql != _STATUS_TRIGGER_STORED_SQL.get(str(name).lower()):
+                db.execute(f'DROP TRIGGER IF EXISTS "{str(name).replace(chr(34), chr(34) * 2)}"')
         db.execute(_STATUS_ROLLUP_TRIGGER_DDL)
         db.execute(_STATUS_RESET_TRIGGER_DDL)
 

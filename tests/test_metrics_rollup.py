@@ -1360,8 +1360,12 @@ class TestHookStatusRollup:
             "'compressed', 2, 10)",
             f"INSERT INTO {_STATUS_DAILY} VALUES ('2026-01-01', 'builtin:claude', 'Bash', 9, "
             "'junk', 1, 10)",
+            # The daily bucket those calls belong to, so the counts agree (#1547).
+            f"INSERT INTO {_DAILY} (day, source, server, tool, calls, legacy_calls) "
+            "VALUES ('2026-01-01', 'hook', 'builtin:claude', 'Bash', 3, 3)",
         )
         result = read_compression_all_time(path, source="hook", with_hook_status=True)
+        assert result["hook_status"]["scope"] == "all_time"
         rows = {(r["status"], r["not_kept"]): r["calls"] for r in result["hook_status"]["rows"]}
         assert rows == {("compressed", False): 2, ("other", False): 1}
 
@@ -1491,3 +1495,242 @@ class TestHookStatusRollup:
         assert _triggers(path) == {_TRIGGER}
         assert read_compression_summary(path)["total_calls"] == 1
         assert read_compression_all_time(path)["total_calls"] == 2, "the trim succeeded"
+
+
+# ── Hook status rollup in step with the totals (#1547) ─────────────────────
+
+
+def _clear_stamp(path: Path) -> None:
+    _sql(path, "DELETE FROM metrics_meta WHERE key = 'schema_fingerprint'")
+
+
+def _status_scope(path: Path) -> tuple[str, int, int]:
+    """``(scope, status calls, total calls)`` of an all-time hook read."""
+    result = read_compression_all_time(path, source="hook", with_hook_status=True)
+    assert result["available"] is True, result["error"]
+    status = result["hook_status"]
+    return status["scope"], sum(r["calls"] for r in status["rows"]), result["total_calls"]
+
+
+def _canonical_status_trigger_sql() -> str:
+    return metrics_store_module._STATUS_ROLLUP_TRIGGER_DDL
+
+
+class TestHookStatusInStep:
+    @pytest.mark.parametrize(
+        ("damage", "total"),
+        [
+            # The missed trim is missing from the totals, not from the statuses.
+            (f"DROP TRIGGER {_TRIGGER}", 1),
+            # The other way round: the totals have it, the statuses do not.
+            (f"DROP TRIGGER {_STATUS_TRIGGER}", 2),
+            # The rebuilt daily table starts empty; the status rows stay.
+            (f"ALTER TABLE {_DAILY} RENAME TO daily_old", 1),
+        ],
+        ids=["compression-trigger", "status-trigger", "daily-renamed"],
+    )
+    def test_a_rebuild_after_a_missed_trim_reads_the_retained_rows(self, tmp_path, damage, total):
+        """The rebuild restores every object; the counts stay apart (#1547)."""
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed")], max_history=1_000_000)
+        _sql(path, damage, "DELETE FROM proxy_metrics")
+        _clear_stamp(path)
+        _record_all(path, [_hook("error")], max_history=1_000_000)
+        assert _status_scope(path) == ("retained", 1, total)
+
+    def test_an_older_installer_restoring_the_trigger_reads_the_retained_rows(self, tmp_path):
+        """v0.7.10/v0.7.11 re-create a dropped status trigger with this exact SQL and
+        seed nothing, since the table exists; no rebuild by this version follows."""
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed"), _hook("error")], max_history=1_000_000)
+        _sql(path, f"DROP TRIGGER {_STATUS_TRIGGER}", "DELETE FROM proxy_metrics WHERE id = 1")
+        _sql(path, _canonical_status_trigger_sql())
+        assert _status_scope(path) == ("retained", 1, 2)
+
+    def test_a_diverged_db_with_a_current_stamp_reads_the_retained_rows(self, tmp_path):
+        """Upgrade path: the installer never runs on a current stamp."""
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed"), _hook("error")], max_history=1_000_000)
+        _sql(path, "DELETE FROM proxy_metrics WHERE id = 1")
+        _sql(path, f"UPDATE {_STATUS_DAILY} SET calls = 2")
+        assert _meta(path)["schema_fingerprint"] == metrics_store_module._SCHEMA_FINGERPRINT
+        assert _status_scope(path)[0] == "retained"
+
+    def test_a_status_only_bucket_reads_the_retained_rows(self, tmp_path):
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _sql(
+            path,
+            f"INSERT INTO {_STATUS_DAILY} VALUES ('2026-01-01', 'builtin:claude', 'Bash', 0, "
+            "'compressed', 1, 10)",
+        )
+        assert _status_scope(path) == ("retained", 0, 0)
+
+    def test_a_daily_only_bucket_reads_the_retained_rows(self, tmp_path):
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _sql(
+            path,
+            f"INSERT INTO {_DAILY} (day, source, server, tool, calls, legacy_calls) "
+            "VALUES ('2026-01-01', 'hook', 'builtin:claude', 'Bash', 1, 1)",
+        )
+        assert _status_scope(path) == ("retained", 0, 1)
+
+    def test_the_comparison_uses_the_counters_the_totals_report(self, tmp_path):
+        """``calls`` agreeing is not enough when the reported total differs."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _sql(
+            path,
+            f"INSERT INTO {_DAILY} (day, source, server, tool, calls, legacy_calls, "
+            "structured_calls) VALUES ('2026-01-01', 'hook', 'builtin:claude', 'Bash', 2, 1, 0)",
+            f"INSERT INTO {_STATUS_DAILY} VALUES ('2026-01-01', 'builtin:claude', 'Bash', 0, "
+            "'compressed', 2, 10)",
+        )
+        assert _status_scope(path) == ("retained", 0, 1)
+
+    def test_differences_that_cancel_across_tools_still_read_retained(self, tmp_path):
+        """Per bucket, not file-wide sums: 2+1 daily calls against 1+2 statuses."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _sql(
+            path,
+            *(
+                f"INSERT INTO {_DAILY} (day, source, server, tool, calls, legacy_calls) "
+                f"VALUES ('2026-01-01', 'hook', 'builtin:claude', '{tool}', {n}, {n})"
+                for tool, n in (("Bash", 2), ("Read", 1), ("Grep", 1))
+            ),
+            *(
+                f"INSERT INTO {_STATUS_DAILY} VALUES ('2026-01-01', 'builtin:claude', "
+                f"'{tool}', 0, 'compressed', {n}, 10)"
+                for tool, n in (("Bash", 1), ("Read", 2), ("Grep", 1))
+            ),
+        )
+        assert _status_scope(path) == ("retained", 0, 4)
+        # The check is file-wide: a tool whose own counts agree reads retained too.
+        result = read_compression_all_time(path, source="hook", tool="Grep", with_hook_status=True)
+        assert (result["total_calls"], result["hook_status"]["scope"]) == (1, "retained")
+
+    def test_both_triggers_missing_the_same_trims_keep_the_all_time_detail(self, tmp_path):
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed"), _hook("error")], max_history=1_000_000)
+        _sql(path, "DELETE FROM proxy_metrics WHERE id = 1")
+        _sql(
+            path,
+            f"DROP TRIGGER {_TRIGGER}",
+            f"DROP TRIGGER {_STATUS_TRIGGER}",
+            "DELETE FROM proxy_metrics WHERE id = 2",
+        )
+        _clear_stamp(path)
+        _record_all(path, [_hook("below_threshold")], max_history=1_000_000)
+        assert _status_counts(path) == {("compressed", False): 1, ("below_threshold", False): 1}
+
+    def test_a_replaced_status_trigger_reads_the_retained_rows_before_any_trim(self, tmp_path):
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed")], max_history=1_000_000)
+        _sql(
+            path,
+            f"DROP TRIGGER {_STATUS_TRIGGER}",
+            f"CREATE TRIGGER {_STATUS_TRIGGER} AFTER DELETE ON proxy_metrics BEGIN SELECT 1; END",
+        )
+        assert _status_scope(path) == ("retained", 1, 1)
+
+    def test_the_rebuild_replaces_a_status_trigger_a_rename_re_pointed(self, tmp_path):
+        """Otherwise a documented reset leaves the status rows behind."""
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed")], max_history=1_000_000)
+        _sql(
+            path,
+            "UPDATE proxy_metrics SET created_at = 86400.0",
+            "DELETE FROM proxy_metrics",
+            f"ALTER TABLE {_DAILY} RENAME TO daily_old",
+        )
+        _clear_stamp(path)
+        # A call in the same bucket (same pinned day), so the new daily table
+        # has a row to reset.
+        _record_all(path, [_hook("compressed")], max_history=1_000_000)
+        _sql(path, "UPDATE proxy_metrics SET created_at = 86400.0")
+        db = sqlite3.connect(str(path))
+        try:
+            stored = db.execute(
+                "SELECT sql FROM sqlite_master WHERE name = ?", (_STATUS_RESET_TRIGGER,)
+            ).fetchone()[0]
+        finally:
+            db.close()
+        assert stored == metrics_store_module._STATUS_TRIGGER_STORED_SQL[_STATUS_RESET_TRIGGER]
+        _sql(
+            path,
+            "BEGIN IMMEDIATE",
+            "DELETE FROM proxy_metrics",
+            f"DELETE FROM {_DAILY}",
+            "COMMIT",
+        )
+        assert _status_table(path) == []
+
+    def test_a_reset_keeps_status_rows_the_daily_table_has_no_bucket_for(self, tmp_path):
+        """As documented: the reset follows daily rows, so orphans stay, read retained."""
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed", tool="Read")], max_history=1_000_000)
+        _sql(path, "DELETE FROM proxy_metrics", f"ALTER TABLE {_DAILY} RENAME TO daily_old")
+        _clear_stamp(path)
+        _record_all(path, [_hook("error", tool="Bash")], max_history=1_000_000)
+        _sql(
+            path,
+            "BEGIN IMMEDIATE",
+            "DELETE FROM proxy_metrics",
+            f"DELETE FROM {_DAILY}",
+            "COMMIT",
+        )
+        assert _status_table(path) == [("Read", 0, "compressed", 1, 100)]
+        assert _status_scope(path) == ("retained", 0, 0)
+
+    def test_an_overflowing_status_sum_reads_the_retained_rows(self, tmp_path):
+        path = tmp_path / "m.db"
+        _open(path).close()
+        big = 9_000_000_000_000_000_000
+        _sql(
+            path,
+            f"INSERT INTO {_DAILY} (day, source, server, tool, calls, legacy_calls) "
+            f"VALUES ('2026-01-01', 'hook', 'builtin:claude', 'Bash', 2, 2)",
+            f"INSERT INTO {_STATUS_DAILY} VALUES ('2026-01-01', 'builtin:claude', 'Bash', 0, "
+            f"'compressed', {big}, 10)",
+            f"INSERT INTO {_STATUS_DAILY} VALUES ('2026-01-01', 'builtin:claude', 'Bash', 0, "
+            f"'error', {big}, 10)",
+        )
+        result = read_compression_all_time(path, source="hook", with_hook_status=True)
+        assert result["available"] is True, result["error"]
+        assert result["total_calls"] == 2
+        assert result["hook_status"]["scope"] == "retained"
+
+    def test_a_status_table_without_the_compared_columns_keeps_the_totals(self, tmp_path):
+        path = tmp_path / "m.db"
+        _record_all(path, [_hook("compressed")], max_history=1_000_000)
+        _sql(
+            path,
+            f"ALTER TABLE {_STATUS_DAILY} RENAME TO status_old",
+            f"CREATE TABLE {_STATUS_DAILY} (server TEXT, kind INTEGER, status TEXT, "
+            "calls INTEGER, original_chars INTEGER, tool TEXT)",
+            # Both triggers as this version writes them, so only the comparison
+            # can tell (the rename rewrote them both).
+            f"DROP TRIGGER IF EXISTS {_STATUS_TRIGGER}",
+            f"DROP TRIGGER IF EXISTS {_STATUS_RESET_TRIGGER}",
+            _canonical_status_trigger_sql(),
+            metrics_store_module._STATUS_RESET_TRIGGER_DDL,
+        )
+        result = read_compression_all_time(path, source="hook", with_hook_status=True)
+        assert result["available"] is True, result["error"]
+        assert result["total_calls"] == 1
+        assert result["hook_status"]["scope"] == "retained"
+
+    def test_healthy_trims_and_a_partial_reset_stay_all_time(self, tmp_path):
+        """Control: every STM path keeps the counts equal (passes on main too)."""
+        path = tmp_path / "m.db"
+        early = [_hook("compressed") for _ in range(2)]
+        _record_all(path, early, max_history=1_000_000)
+        _sql(path, "UPDATE proxy_metrics SET created_at = 86400.0")
+        _record_all(path, [_hook(s) for s in _STATUSES], max_history=1)
+        _open(path, max_history=1).close()
+        assert _status_scope(path)[0] == "all_time"
+        _sql(path, f"DELETE FROM {_DAILY} WHERE day = '1970-01-02'")
+        scope, status_calls, total = _status_scope(path)
+        assert (scope, status_calls) == ("all_time", total)

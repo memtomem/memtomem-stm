@@ -47,6 +47,27 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms stats --all-time` no longer labels hook status counts all-time after
+  a trim that one of the two rollups missed had put them out of step with
+  the totals beside them (#1547). The status rollup
+  (`proxy_metrics_hook_status_daily`, #1442) counted as all-time whenever its
+  table and two triggers existed by name, so after a trim that one of the
+  two rollups missed — its trigger dropped, or `proxy_metrics_daily` renamed —
+  the schema rebuild restored every object and the status counts came out
+  under `all_time` with more or fewer calls than the totals. The status
+  counts now cover all time only while, for every day, server and tool, they
+  add up to the hook calls the daily table counts, and both status triggers
+  are exactly as this version creates them; otherwise they cover the
+  retained rows, as when the status rollup is missing. The rebuild now
+  replaces a status trigger whose SQL is not this version's (a rename left
+  the reset trigger on the old table, so a documented reset kept the status
+  rows); it never rewrites the status rows. Not detected: a status
+  attributed wrongly, or misses that cancel out, within a bucket whose count
+  still matches, and some edits to the status table's definition or values
+  from outside STM. **Behavior change**: a database
+  whose status rollup has drifted from the totals shows the status counts as
+  `(retained rows)` under `--all-time`, including one stamped before this
+  version, and a rebuild does not bring the all-time counts back.
 - `mms stats --all-time` no longer reports a complete compression history in
   two cases where rows were known to be lost, or may have been, from the
   daily rollup (#1527). The **Incomplete
