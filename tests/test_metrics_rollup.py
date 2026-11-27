@@ -1512,6 +1512,18 @@ def _status_scope(path: Path) -> tuple[str, int, int]:
     return status["scope"], sum(r["calls"] for r in status["rows"]), result["total_calls"]
 
 
+def _stored_status_triggers(path: Path) -> dict[str, str]:
+    db = sqlite3.connect(str(path))
+    try:
+        rows = db.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
+            (_STATUS_TRIGGER, _STATUS_RESET_TRIGGER),
+        ).fetchall()
+    finally:
+        db.close()
+    return dict(rows)
+
+
 def _canonical_status_trigger_sql() -> str:
     return metrics_store_module._STATUS_ROLLUP_TRIGGER_DDL
 
@@ -1536,7 +1548,10 @@ class TestHookStatusInStep:
         _sql(path, damage, "DELETE FROM proxy_metrics")
         _clear_stamp(path)
         _record_all(path, [_hook("error")], max_history=1_000_000)
+        assert _stored_status_triggers(path) == metrics_store_module._STATUS_TRIGGER_STORED_SQL
         assert _status_scope(path) == ("retained", 1, total)
+        result = read_compression_all_time(path, source="hook", with_hook_status=True)
+        assert [(r["status"], r["calls"]) for r in result["hook_status"]["rows"]] == [("error", 1)]
 
     def test_an_older_installer_restoring_the_trigger_reads_the_retained_rows(self, tmp_path):
         """v0.7.10/v0.7.11 re-create a dropped status trigger with this exact SQL and
@@ -1610,6 +1625,19 @@ class TestHookStatusInStep:
         # The check is file-wide: a tool whose own counts agree reads retained too.
         result = read_compression_all_time(path, source="hook", tool="Grep", with_hook_status=True)
         assert (result["total_calls"], result["hook_status"]["scope"]) == (1, "retained")
+
+    def test_structured_calls_count_toward_the_comparison(self, tmp_path):
+        """Legacy plus structured, as the totals add them — not either alone, not ``calls``."""
+        path = tmp_path / "m.db"
+        _open(path).close()
+        _sql(
+            path,
+            f"INSERT INTO {_DAILY} (day, source, server, tool, calls, legacy_calls, "
+            "structured_calls) VALUES ('2026-01-01', 'hook', 'builtin:claude', 'Bash', 3, 1, 1)",
+            f"INSERT INTO {_STATUS_DAILY} VALUES ('2026-01-01', 'builtin:claude', 'Bash', 0, "
+            "'compressed', 2, 10)",
+        )
+        assert _status_scope(path) == ("all_time", 2, 2)
 
     def test_both_triggers_missing_the_same_trims_keep_the_all_time_detail(self, tmp_path):
         path = tmp_path / "m.db"
@@ -1702,16 +1730,22 @@ class TestHookStatusInStep:
         assert result["total_calls"] == 2
         assert result["hook_status"]["scope"] == "retained"
 
-    def test_a_status_table_without_the_compared_columns_keeps_the_totals(self, tmp_path):
+    @pytest.mark.parametrize("column", sorted(metrics_store_module._STATUS_READ_COLUMNS))
+    def test_a_status_table_missing_a_read_column_keeps_the_totals(self, tmp_path, column):
+        """Counts that agree are not enough: the all-time status read needs
+        every column, and failing it would fail the totals too."""
         path = tmp_path / "m.db"
-        _record_all(path, [_hook("compressed")], max_history=1_000_000)
+        _record_all(path, [_hook("compressed"), _hook("error")], max_history=1_000_000)
+        _sql(path, "DELETE FROM proxy_metrics WHERE id = 1")
+        kept = ", ".join(
+            c for c in sorted(metrics_store_module._STATUS_READ_COLUMNS) if c != column
+        )
         _sql(
             path,
             f"ALTER TABLE {_STATUS_DAILY} RENAME TO status_old",
-            f"CREATE TABLE {_STATUS_DAILY} (server TEXT, kind INTEGER, status TEXT, "
-            "calls INTEGER, original_chars INTEGER, tool TEXT)",
-            # Both triggers as this version writes them, so only the comparison
-            # can tell (the rename rewrote them both).
+            f"CREATE TABLE {_STATUS_DAILY} ({kept})",
+            f"INSERT INTO {_STATUS_DAILY} SELECT {kept} FROM status_old",
+            # Both triggers as this version writes them (the rename rewrote them).
             f"DROP TRIGGER IF EXISTS {_STATUS_TRIGGER}",
             f"DROP TRIGGER IF EXISTS {_STATUS_RESET_TRIGGER}",
             _canonical_status_trigger_sql(),
@@ -1719,8 +1753,9 @@ class TestHookStatusInStep:
         )
         result = read_compression_all_time(path, source="hook", with_hook_status=True)
         assert result["available"] is True, result["error"]
-        assert result["total_calls"] == 1
+        assert result["total_calls"] == 2
         assert result["hook_status"]["scope"] == "retained"
+        assert [(r["status"], r["calls"]) for r in result["hook_status"]["rows"]] == [("error", 1)]
 
     def test_healthy_trims_and_a_partial_reset_stay_all_time(self, tmp_path):
         """Control: every STM path keeps the counts equal (passes on main too)."""
@@ -1730,7 +1765,8 @@ class TestHookStatusInStep:
         _sql(path, "UPDATE proxy_metrics SET created_at = 86400.0")
         _record_all(path, [_hook(s) for s in _STATUSES], max_history=1)
         _open(path, max_history=1).close()
-        assert _status_scope(path)[0] == "all_time"
+        assert _status_scope(path) == ("all_time", 8, 8)
         _sql(path, f"DELETE FROM {_DAILY} WHERE day = '1970-01-02'")
-        scope, status_calls, total = _status_scope(path)
-        assert (scope, status_calls) == ("all_time", total)
+        # The two pinned calls leave both rollups; the other days' statuses stay.
+        assert _status_scope(path) == ("all_time", 6, 6)
+        assert ("compressed", False) in _status_counts(path)

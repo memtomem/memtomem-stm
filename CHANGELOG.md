@@ -56,18 +56,23 @@ changes inline only. See the deprecation policy in
   the schema rebuild restored every object and the status counts came out
   under `all_time` with more or fewer calls than the totals. The status
   counts now cover all time only while, for every day, server and tool, they
-  add up to the hook calls the daily table counts, and both status triggers
-  are exactly as this version creates them; otherwise they cover the
-  retained rows, as when the status rollup is missing. The rebuild now
+  add up to the hook calls the daily table counts, both status triggers
+  are exactly as this version creates them, and the status table has every
+  column the read uses; otherwise they cover the retained rows, as when the
+  status rollup is missing (so a status table missing one of those columns
+  no longer makes the totals unavailable). The rebuild now
   replaces a status trigger whose SQL is not this version's (a rename left
   the reset trigger on the old table, so a documented reset kept the status
   rows); it never rewrites the status rows. Not detected: a status
   attributed wrongly, or misses that cancel out, within a bucket whose count
   still matches, and some edits to the status table's definition or values
   from outside STM. **Behavior change**: a database
-  whose status rollup has drifted from the totals shows the status counts as
-  `(retained rows)` under `--all-time`, including one stamped before this
-  version, and a rebuild does not bring the all-time counts back.
+  whose status rollup has drifted from the totals reports the status counts
+  over the retained rows under `--all-time` (`hook_status.scope` is
+  `retained` in `--json`, and a host's status line, where one is printed,
+  says `(retained rows)`),
+  including one stamped before this version, and a rebuild does not bring
+  the all-time counts back.
 - `mms stats --all-time` no longer reports a complete compression history in
   two cases where rows were known to be lost, or may have been, from the
   daily rollup (#1527). The **Incomplete

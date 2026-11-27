@@ -560,6 +560,11 @@ _STATUS_RESET_TRIGGER_DDL = (
     "WHERE day = OLD.day AND server = OLD.server AND tool = OLD.tool; END"
 )
 
+# The columns ``_read_hook_status`` reads from the status table.
+_STATUS_READ_COLUMNS = frozenset(
+    ("day", "server", "tool", "kind", "status", "calls", "original_chars")
+)
+
 # What ``sqlite_master.sql`` holds for each status trigger, as for
 # ``_ROLLUP_TRIGGER_STORED_SQL``: renaming a table they name rewrites it.
 _STATUS_TRIGGER_STORED_SQL = {
@@ -1007,9 +1012,10 @@ def _status_rollup_whole(db: sqlite3.Connection) -> bool:
     In normal operation the counts always agree: both triggers fire on the same
     delete with the same day and key fallbacks, the seed copies each daily hook
     bucket, and the reset trigger deletes a bucket's status rows with it.
-    Any SQLite error in the comparison — ``SUM`` overflowing int64, or an
-    outside table without the columns it reads — means the rollup cannot be
-    shown to agree, so it reads as not whole rather than failing the totals.
+    A status table without a column the all-time read uses, or any SQLite
+    error in the comparison (``SUM`` overflowing int64, say), means the rollup
+    cannot be shown to agree, so it reads as not whole rather than failing the
+    totals.
 
     Not detected: a status attributed wrongly inside a bucket whose count
     matches, and misses that cancel out within one bucket.
@@ -1019,6 +1025,12 @@ def _status_rollup_whole(db: sqlite3.Connection) -> bool:
         (_STATUS_DAILY_TABLE, *_STATUS_TRIGGER_STORED_SQL),
     ).fetchall()
     if not any(kind == "table" and name == _STATUS_DAILY_TABLE for kind, name, _ in found):
+        return False
+    # Every column the all-time status read uses: without one that read would
+    # fail and take the totals with it, where the retained read never touches
+    # this table.
+    columns = {row[1] for row in db.execute(f"PRAGMA table_info({_STATUS_DAILY_TABLE})")}
+    if not _STATUS_READ_COLUMNS <= columns:
         return False
     for trigger, stored in _STATUS_TRIGGER_STORED_SQL.items():
         if not any(
