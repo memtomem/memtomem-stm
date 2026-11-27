@@ -866,15 +866,9 @@ def read_cache_summary(db_path: Path, *, tool: str | None = None) -> dict[str, o
 
 # Objects only a version that installs the daily rollup creates, all in the
 # transaction that installs it: any of them left in a file means the rollup
-# was installed there before, so its rows cannot be counted afresh.
-_ROLLUP_TRACE_NAMES = (
-    _DAILY_TABLE,
-    _ROLLUP_TRIGGER,
-    _STATUS_DAILY_TABLE,
-    _STATUS_ROLLUP_TRIGGER,
-    _STATUS_RESET_TRIGGER,
-    _CACHE_DAILY_TABLE,
-)
+# was installed there before, so its rows cannot be counted afresh. Taken from
+# the fingerprint's list, so an object added there is a trace too.
+_ROLLUP_TRACE_NAMES = _ROLLUP_OBJECT_NAMES
 
 
 def _rollup_state(db: sqlite3.Connection) -> tuple[set[str], dict[str, object], bool]:
@@ -984,7 +978,7 @@ def _status_rollup_installed(db: sqlite3.Connection) -> bool:
     """Whether the hook status rollup (#1442) is wired: its table AND triggers.
 
     A table with no trigger feeding it would under-count while looking
-    complete, as for ``_rollup_markers``; without the one that follows daily
+    complete, as for ``_rollup_whole``; without the one that follows daily
     deletes, a reset could leave counts the totals no longer have. No marker
     is needed: the calls trimmed before the table existed are rows of the
     table itself (``_STATUS_KIND_NOT_KEPT``), written in the transaction that
