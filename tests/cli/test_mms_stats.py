@@ -1668,6 +1668,8 @@ class TestMmsStatsAllTime:
         assert result.exit_code == 0, result.output
         assert "Possibly incomplete before 2100-01-01 00:00 UTC" in result.output
         assert "an unknown number of rows" in result.output
+        assert "could belong to any tool" in result.output
+        assert "database-wide" not in result.output, "a possible loss is not asserted"
         assert "were trimmed" not in result.output
         assert "Incomplete before" not in result.output
 

@@ -2670,8 +2670,8 @@ def _all_time_coverage_lines(rollup: dict[str, Any]) -> list[str]:
             # rebuild, not the installation.
             lines.append(
                 f"  Possibly incomplete before {when} UTC: an unknown number of rows trimmed\n"
-                "    before then may be missing; the loss is database-wide, so it may include\n"
-                "    rows of the selection shown."
+                "    before then may be missing, and any missing row could belong to any tool\n"
+                "    or source, including those shown."
             )
     undated = rollup.get("unknown_date_calls") or 0
     if undated:
