@@ -3210,6 +3210,42 @@ if _should_advertise_obs_tools():
     _forbid_unknown_admin_arguments(mcp)
 
 
+_ALWAYS_LOAD_META_KEY = "anthropic/alwaysLoad"
+"""Per-tool ``_meta`` key Claude Code reads to load a tool's schema upfront."""
+
+
+def _set_feedback_tool_loading(server: MCPServer, enabled: bool) -> bool:
+    """Publish, or withdraw, the always-load hint on ``stm_surfacing_feedback``.
+
+    Sets the registered entry's ``meta`` in place, so the tool object, its
+    schemas and the registry order are untouched; any other ``meta`` key is
+    kept. Called on every start, so a later start in the same process with
+    the setting off removes the key again. Applied by ``main()`` only: an
+    embedder that runs ``mcp`` directly skips it and keeps whatever state the
+    registry already has.
+
+    Reaches the tool through the same private ``_tool_manager`` as
+    ``_forbid_unknown_admin_arguments``. Returns whether it worked; if the SDK
+    moved it, the hint is not published and, when it was asked for, a warning
+    says so.
+    """
+    try:
+        tool = server._tool_manager._tools["stm_surfacing_feedback"]
+        meta = {k: v for k, v in (tool.meta or {}).items() if k != _ALWAYS_LOAD_META_KEY}
+        if enabled:
+            meta[_ALWAYS_LOAD_META_KEY] = True
+        tool.meta = meta or None
+    except (AttributeError, KeyError):
+        if enabled:
+            logger.warning(
+                "Cannot publish %s on stm_surfacing_feedback — MCPServer internal API "
+                "changed. The tool stays deferred where the client defers tools.",
+                _ALWAYS_LOAD_META_KEY,
+            )
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -3289,6 +3325,7 @@ def _serve(flags: Mapping[str, str] | None) -> None:
         # (#1173). The cause stays attached for an embedding caller.
         raise SystemExit(1) from exc
     configure_server_logging(startup_config)
+    _set_feedback_tool_loading(mcp, startup_config.always_load_feedback_tool)
     # Exception barrier (#209): without this, an unhandled exception from
     # ``mcp.run()`` (e.g. a background task crashing the event loop) ends the
     # process with only stderr output — operators get no ERROR-level log, and

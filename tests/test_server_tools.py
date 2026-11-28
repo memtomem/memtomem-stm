@@ -3948,6 +3948,275 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert _hidden_obs_tools_hint() is None
 
 
+# ── always_load_feedback_tool: the anthropic/alwaysLoad hint (#1033) ──────
+
+_ALWAYS_LOAD_ENV = "MEMTOMEM_STM_ALWAYS_LOAD_FEEDBACK_TOOL"
+_ALWAYS_LOAD = {"anthropic/alwaysLoad": True}
+
+
+async def _listed(server) -> dict[str, dict]:
+    tools = await server.list_tools()
+    return {tool.name: tool.model_dump(mode="json", by_alias=True) for tool in tools}
+
+
+def _without_meta(entry: dict) -> dict:
+    return {key: value for key, value in entry.items() if key != "_meta"}
+
+
+def _bare_feedback_server(*, before: bool = False, after: bool = False):
+    """A fresh server with ``stm_surfacing_feedback`` registered as import does it."""
+    from mcp.server.mcpserver import MCPServer
+
+    server = MCPServer("t")
+
+    def sentinel_before() -> str:
+        return ""
+
+    def sentinel_after() -> str:
+        return ""
+
+    if before:
+        server.add_tool(sentinel_before)
+    server.tool()(stm_surfacing_feedback)
+    if after:
+        server.add_tool(sentinel_after)
+    return server
+
+
+class TestSetFeedbackToolLoading:
+    """In-process: the helper changes the feedback entry's ``_meta`` and nothing else."""
+
+    async def test_enabled_adds_only_the_key(self):
+        from memtomem_stm.server import _set_feedback_tool_loading
+
+        bare = _bare_feedback_server()
+        loaded = _bare_feedback_server()
+        assert _set_feedback_tool_loading(loaded, True) is True
+
+        bare_entry = (await _listed(bare))["stm_surfacing_feedback"]
+        loaded_entry = (await _listed(loaded))["stm_surfacing_feedback"]
+        assert _without_meta(loaded_entry) == _without_meta(bare_entry)
+        assert bare_entry["_meta"] is None
+        assert loaded_entry["_meta"] == _ALWAYS_LOAD
+        assert loaded_entry["_meta"]["anthropic/alwaysLoad"] is True
+
+    async def test_disabled_leaves_a_bare_entry_bare(self):
+        from memtomem_stm.server import _set_feedback_tool_loading
+
+        server = _bare_feedback_server()
+        before = await _listed(server)
+        assert _set_feedback_tool_loading(server, False) is True
+        assert await _listed(server) == before
+
+    async def test_a_later_disabled_start_withdraws_it_and_enabling_is_idempotent(self):
+        from memtomem_stm.server import _set_feedback_tool_loading
+
+        server = _bare_feedback_server()
+        _set_feedback_tool_loading(server, True)
+        _set_feedback_tool_loading(server, True)
+        assert (await _listed(server))["stm_surfacing_feedback"]["_meta"] == _ALWAYS_LOAD
+        _set_feedback_tool_loading(server, False)
+        assert (await _listed(server))["stm_surfacing_feedback"]["_meta"] is None
+
+    async def test_other_meta_keys_survive_both_directions(self):
+        from memtomem_stm.server import _set_feedback_tool_loading
+
+        server = _bare_feedback_server()
+        server._tool_manager._tools["stm_surfacing_feedback"].meta = {"other/key": 1}
+        _set_feedback_tool_loading(server, True)
+        assert (await _listed(server))["stm_surfacing_feedback"]["_meta"] == {
+            "other/key": 1,
+            "anthropic/alwaysLoad": True,
+        }
+        _set_feedback_tool_loading(server, False)
+        assert (await _listed(server))["stm_surfacing_feedback"]["_meta"] == {"other/key": 1}
+
+    async def test_registry_order_and_other_tools_are_untouched(self):
+        from memtomem_stm.server import _set_feedback_tool_loading
+
+        server = _bare_feedback_server(before=True, after=True)
+        original = await _listed(server)
+        assert list(original) == ["sentinel_before", "stm_surfacing_feedback", "sentinel_after"]
+        for enabled in (True, False):
+            _set_feedback_tool_loading(server, enabled)
+            now = await _listed(server)
+            assert list(now) == list(original)
+            for name in ("sentinel_before", "sentinel_after"):
+                assert now[name] == original[name]
+
+    def test_missing_registry_warns_only_when_asked(self, caplog):
+        import logging
+
+        from memtomem_stm.server import _set_feedback_tool_loading
+
+        server = SimpleNamespace()
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
+            assert _set_feedback_tool_loading(server, False) is False  # type: ignore[arg-type]
+            assert not caplog.records
+            assert _set_feedback_tool_loading(server, True) is False  # type: ignore[arg-type]
+        assert any("anthropic/alwaysLoad" in r.getMessage() for r in caplog.records)
+
+    def test_an_entry_without_meta_degrades_instead_of_aborting(self, caplog):
+        import logging
+
+        from memtomem_stm.server import _set_feedback_tool_loading
+
+        entry = SimpleNamespace()  # an SDK that moved the field off the registry entry
+        server = SimpleNamespace(
+            _tool_manager=SimpleNamespace(_tools={"stm_surfacing_feedback": entry})
+        )
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
+            assert _set_feedback_tool_loading(server, False) is False  # type: ignore[arg-type]
+            assert not caplog.records
+            assert _set_feedback_tool_loading(server, True) is False  # type: ignore[arg-type]
+        assert any("anthropic/alwaysLoad" in r.getMessage() for r in caplog.records)
+        assert not hasattr(entry, "meta")
+
+
+class TestAlwaysLoadFeedbackToolOverStdio:
+    """The hint as a real MCP client receives it from ``memtomem_stm.server.main``.
+
+    Fresh interpreters, so the module ``mcp`` this test process imported is never
+    touched. The server child is pinned to this checkout's ``src`` and says where
+    it imported ``memtomem_stm`` from, so another checkout's editable install
+    cannot answer for it.
+    """
+
+    # ASCII-escaped JSON, so a non-ASCII checkout path survives a legacy
+    # Windows code page on the redirected stderr.
+    _SERVER = (
+        "import json, sys, memtomem_stm\n"
+        "print('ORIGIN=' + json.dumps(memtomem_stm.__file__), file=sys.stderr, flush=True)\n"
+        "from memtomem_stm.server import main\n"
+        "main()\n"
+    )
+
+    _CLIENT = """
+import asyncio
+import json
+import os
+import sys
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+async def main():
+    params = StdioServerParameters(
+        command=sys.executable, args=["-c", sys.argv[1]], env=dict(os.environ)
+    )
+    async with stdio_client(params, errlog=sys.stderr) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            result = await session.list_tools()
+            print(json.dumps([t.model_dump(mode="json", by_alias=True) for t in result.tools]))
+
+
+asyncio.run(main())
+"""
+
+    @staticmethod
+    def _env(tmp_path: Path, flag: str | None) -> tuple[dict[str, str], Path]:
+        import os
+
+        src = Path(__file__).resolve().parents[1] / "src"
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MEMTOMEM_STM_")}
+        isolated = tmp_path / ("on" if flag else "off")
+        for key, dirname in (
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "xdg-config"),
+            ("XDG_CACHE_HOME", "xdg-cache"),
+            ("MEMTOMEM_STM_DATA_DIR", "stm-data"),
+        ):
+            path = isolated / dirname
+            path.mkdir(parents=True)
+            env[key] = str(path)
+        # Windows resolves ``~`` through USERPROFILE, and the server reads the
+        # proxy file even with the proxy off: neither may be the developer's.
+        env["USERPROFILE"] = env["HOME"]
+        env["MEMTOMEM_STM_PROXY__CONFIG_PATH"] = str(isolated / "absent" / "stm_proxy.json")
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(src), *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])]
+        )
+        env.update(
+            {
+                "MEMTOMEM_STM_PROXY__ENABLED": "false",
+                "MEMTOMEM_STM_SURFACING__ENABLED": "false",
+                "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS": "true",
+                "MEMTOMEM_STM_FORMATION__ENABLED": "true",
+                "MEMTOMEM_STM_LOG_LEVEL": "ERROR",
+            }
+        )
+        if flag is not None:
+            env[_ALWAYS_LOAD_ENV] = flag
+        return env, src
+
+    def _list(self, tmp_path: Path, flag: str | None) -> list[dict]:
+        import json
+        import subprocess
+
+        env, src = self._env(tmp_path, flag)
+        proc = subprocess.run(
+            [sys.executable, "-c", self._CLIENT, self._SERVER],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        self._assert_origin(proc.stderr, src)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    @staticmethod
+    def _assert_origin(stderr: str, src: Path) -> None:
+        import json
+
+        origins = [
+            json.loads(line.removeprefix("ORIGIN="))
+            for line in stderr.splitlines()
+            if line.startswith("ORIGIN=")
+        ]
+        assert origins and Path(origins[0]).resolve().is_relative_to(src.resolve()), stderr
+
+    def test_only_the_feedback_entry_gains_the_key(self, tmp_path):
+        off = self._list(tmp_path, None)
+        on = self._list(tmp_path, "true")
+
+        assert [t["name"] for t in on] == [t["name"] for t in off]
+        assert {"stm_surfacing_feedback", "stm_admin", "stm_memory_propose"} <= {
+            t["name"] for t in off
+        }
+        off_by_name = {t["name"]: t for t in off}
+        for entry in on:
+            before = off_by_name[entry["name"]]
+            assert before.get("_meta") is None, entry["name"]
+            if entry["name"] == "stm_surfacing_feedback":
+                assert entry["_meta"] == _ALWAYS_LOAD
+                assert entry["_meta"]["anthropic/alwaysLoad"] is True
+                assert _without_meta(entry) == _without_meta(before)
+            else:
+                assert entry == before, entry["name"]
+
+    def test_an_invalid_value_refuses_to_start(self, tmp_path):
+        import subprocess
+
+        env, src = self._env(tmp_path, "anything-else")
+        proc = subprocess.run(
+            [sys.executable, "-c", self._SERVER],
+            cwd=tmp_path,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 1, proc.stderr
+        assert "Invalid MEMTOMEM_STM_* environment configuration" in proc.stderr
+        assert _ALWAYS_LOAD_ENV in proc.stderr
+        self._assert_origin(proc.stderr, src)
+
+
 # ── client-activity instrumentation for the #914 backstop ─────────────────
 
 

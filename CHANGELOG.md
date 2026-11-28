@@ -13,6 +13,15 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `MEMTOMEM_STM_ALWAYS_LOAD_FEEDBACK_TOOL=true` adds
+  `_meta: {"anthropic/alwaysLoad": true}` to `stm_surfacing_feedback` only.
+  Claude Code reads the key as "load this tool upfront" instead of deferring it
+  behind tool search; with tool search active, a server entry with
+  `"alwaysLoad": false` still defers it. Off by default; read once when the
+  server starts. In the owner's #1033 pilot of the same metadata, the initial
+  request's input total (cached input and host overhead included) was 657
+  tokens higher in every pair. Whether it raises rating uptake in practice is
+  not measured (#1033).
 - `mms host scan --from <host>` suggests scanning every host when the
   single-host scan returns no entries from that host's configs (#1581).
   **Behavior change**: in that case the text output has one more line under
@@ -105,6 +114,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook` sizes its outer backstop from the surfacing timeout the settings
+  build, not from the text of `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`
+  (issue #1573). The two could differ: with `MEMTOMEM_STM_SURFACING=null`
+  beside `inf` the build used `3.0` while the backstop was infinite, and a
+  timeout of 60 given in the `MEMTOMEM_STM_SURFACING` JSON, or under a
+  lower-case variable name on POSIX, left the backstop at 12 seconds.
+  **Behavior change**: the backstop follows those spellings, and a flat value
+  that the build ignores no longer lengthens it. It now covers the surfacing
+  call only, so its clock starts after the config load and compression. At
+  expiry it requests cancellation; it is not a ceiling on the hook process.
 - The response cache no longer serves a reply stored by a release whose
   cleaner wrote it differently (#1580, issue #1540). The cache key covers the
   cleaning and compression settings, not what the code does with them, and a
