@@ -282,6 +282,23 @@ The user-facing side of this contract (what compatibility a 0.x release
 promises, how deprecations are staged) lives in the README's
 [Compatibility & deprecation policy](README.md#compatibility--deprecation-policy).
 
+## Changing what the response cache stores
+
+The response-cache key covers the *settings* that shape a stored reply
+(`compression_fingerprint` in `src/memtomem_stm/proxy/manager.py`), not what
+the code does with them, and a cache hit is served before cleaning runs. So a
+change that, with the settings unchanged, alters what a hit would return —
+the stored text, its envelope (`structuredContent`, `_meta`, text-block
+metadata, pre-compression size), or whether a reply may be stored at all —
+must bump `_KEY_SCHEMA_VERSION` in `src/memtomem_stm/proxy/cache.py`.
+Otherwise a row the previous release wrote can still be served for as long as
+it stays in the cache, and a row with no TTL has no time-based expiry. The
+bump empties the response cache once, on its first successful open after the
+upgrade; add a `v<N>:` line saying why, update the tests that pin the version,
+and say so in the CHANGELOG bullet's
+`**Behavior change**:` clause. The full rule, including what needs no bump
+(surfacing, continuation frames), is the comment above the constant.
+
 ## Adding a bench_qa scenario
 
 `bench_qa` is an end-to-end pytest sub-suite that drives the proxy
@@ -338,7 +355,10 @@ The script prints a directional REGRESSION / IMPROVEMENT / NEUTRAL summary of
 what moved; read it, confirm the direction is intended, then commit
 `drift_baseline.json` with a `## Baseline change` callout in the PR body
 explaining each moved field. Never hand-edit the baseline — byte-stability is
-the gate's contract and the regen script is its only writer.
+the gate's contract and the regen script is its only writer. When the baseline
+moved because pipeline code changed, check
+[Changing what the response cache stores](#changing-what-the-response-cache-stores)
+for whether the change also needs a key-schema bump.
 
 ## Contributor License Agreement (CLA)
 

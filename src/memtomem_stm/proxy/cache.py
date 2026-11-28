@@ -521,6 +521,22 @@ class CachedResponse(str):
 # ``initialize()`` can purge rows written under an older scheme (opaque hashes
 # make them unreachable but otherwise immortal for ``ttl_seconds NULL`` rows).
 # Stored in SQLite's ``PRAGMA user_version``.
+#
+# Bump it too when a code change, under an unchanged ``config_fingerprint``,
+# changes what a hit would return for the same key inputs: the stored text,
+# the stored envelope (``structuredContent``, ``_meta``, text-block metadata,
+# pre-compression size), or whether a response may be stored at all (SHAPE
+# rejection, the manager's cache-store gates). That covers the ingest scrub,
+# SHAPE, CLEAN, COMPRESS, and delivery rendering wherever it decides the stored
+# result (``delivery.plain_result_fits``). A change to a fingerprinted setting
+# rotates the key through ``config_fingerprint``; a pipeline behavior change
+# that leaves the fingerprint as it was does not, and a hit is served before
+# CLEAN runs, so without a bump the previous release's output stays servable
+# for as long as its row stays in the cache; a row with no TTL has no
+# time-based expiry.
+# Surfacing is re-applied on every hit, and progressive/selective continuation
+# frames are never stored, so changes to those need no bump.
+#
 # v4: successful text responses may carry JSON-safe ``structuredContent`` and
 # result-level ``_meta`` in ``envelope_json``.
 # v5: framed (length-prefixed) key derivation, args/context_query serialized
@@ -532,7 +548,10 @@ class CachedResponse(str):
 # budget), and a hit is served before any fit check (#1359).
 # v8: keys are an HMAC under the store's sidecar key instead of a plain SHA-256,
 # so a copy of the database cannot confirm a guessed argument set (#1416).
-_KEY_SCHEMA_VERSION = 8
+# v9: markup removal no longer pairs across upstream text blocks (#1531); a v8
+# row may be missing the text an older cleaner removed between two blocks, and
+# a hit served it (#1540).
+_KEY_SCHEMA_VERSION = 9
 
 # HMAC domain for row keys, and the ``proxy_cache_meta`` slot recording which
 # sidecar key wrote the rows (see ``ProxyCache.initialize``).

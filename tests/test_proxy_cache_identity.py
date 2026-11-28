@@ -7,7 +7,12 @@ import pytest
 from mcp.types import CallToolResult, TextContent
 
 from memtomem_stm.proxy.cache import ProxyCache
-from memtomem_stm.proxy.config import CompressionStrategy, ProxyConfig, UpstreamServerConfig
+from memtomem_stm.proxy.config import (
+    CacheConfig,
+    CompressionStrategy,
+    ProxyConfig,
+    UpstreamServerConfig,
+)
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 
@@ -200,3 +205,62 @@ async def test_inactive_transport_fields_do_not_rotate_key(setup_proxy, edit):
     mgr._config_loader.seed(config.model_copy(update={"upstream_servers": {"srv": cfg_b}}))
     assert await mgr.call_tool("srv", "read", {}) == "record from A"
     assert session.call_tool.await_count == 1
+
+
+@pytest.mark.parametrize("ttl", [3600.0, None])
+async def test_rows_written_before_an_output_fix_are_not_served(tmp_path, monkeypatch, ttl):
+    """A release that changes what the pipeline stores retires the older rows.
+
+    The key fingerprint covers settings, not cleaner or compressor behavior, so
+    a hit on a row the previous release wrote would serve that release's
+    output. The seed is written as 0.7.11 wrote it (key schema 8, spelled out
+    rather than derived from the constant, so the test fails while the
+    constant still says 8), and a row with no TTL must go too.
+    """
+    import memtomem_stm.proxy.cache as cache_module
+
+    cfg = UpstreamServerConfig(
+        prefix="srv",
+        transport="sse",
+        url="https://a.example/sse",
+        compression=CompressionStrategy.NONE,
+    )
+    config = ProxyConfig(
+        config_path=tmp_path / "absent.json",
+        upstream_servers={"srv": cfg},
+        cache=CacheConfig(default_ttl_seconds=ttl),
+    )
+    cache = ProxyCache(tmp_path / "cache.db")
+    monkeypatch.setattr(cache_module, "_KEY_SCHEMA_VERSION", 8)
+    cache.initialize()
+    manager = ProxyManager(config, TokenTracker(), cache=cache)
+    session = AsyncMock()
+    session.call_tool.return_value = _result("body the previous release stored")
+    manager._connections["srv"] = UpstreamConnection(
+        name="srv", config=cfg, session=session, tools=[]
+    )
+    try:
+        assert await manager.call_tool("srv", "read", {"id": 1}) == (
+            "body the previous release stored"
+        )
+        (version,) = cache._db.execute("PRAGMA user_version").fetchone()
+        assert version == 8
+        assert cache._db.execute("SELECT ttl_seconds FROM proxy_cache").fetchall() == [(ttl,)]
+        cache.close()
+
+        monkeypatch.undo()
+        cache.initialize()
+        session.call_tool.return_value = _result("corrected body")
+        delivered = await manager.call_tool("srv", "read", {"id": 1})
+        assert delivered == "corrected body"
+        assert session.call_tool.await_count == 2
+        fingerprint = manager._cache_key_fingerprint("srv", "read", cfg_snap=config)
+        assert cache.get("srv", "read", {"id": 1}, config_fingerprint=fingerprint) == (
+            "corrected body"
+        )
+        assert cache._db.execute("SELECT result FROM proxy_cache").fetchall() == [
+            ("corrected body",)
+        ]
+    finally:
+        await manager.stop()
+        cache.close()

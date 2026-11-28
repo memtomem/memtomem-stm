@@ -99,6 +99,22 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The response cache no longer serves a reply stored by a release whose
+  cleaner wrote it differently (issue #1540). The cache key covers the
+  cleaning and compression settings, not what the code does with them, and a
+  hit is served before cleaning runs, so a row from the previous release kept
+  returning its old text for as long as it stayed in the cache, and a row
+  with no TTL has no time-based expiry. The cache key schema moves to v9,
+  which empties the response cache on its first successful open after the
+  upgrade; this retires replies the cleaner of 0.7.11 and earlier stored with
+  markup removed across text blocks (#1538, issue #1531). `CONTRIBUTING.md`
+  now says when a change must bump the schema again.
+  **Behavior change**: the response cache starts empty once after upgrading;
+  metrics and feedback stores are untouched. Stop every proxy of the previous
+  release before starting the new one: one still running can write old-style
+  rows after the purge, which the new release does not read but which count
+  against `max_entries` until they are removed, and which a process of the
+  previous release can still serve while they are valid.
 - An upstream connection's own cancellation no longer cuts a signalled
   shutdown short under anyio 4.16 (#1569, issue #1568). A SIGTERM or SIGINT cancels the
   upstream connection owner tasks, and anyio 4.16 raises that cancellation out
@@ -306,9 +322,9 @@ changes inline only. See the deprecation policy in
   before. **Behavior change**: such a reply now keeps that text
   (`Intro Release notes` / `Rollback instructions end`), and a block ending
   in a lone `\r` now ends its own line instead of merging with the newline
-  that joins it to the next block; any other reply is unchanged. A cache hit
-  can still serve a reply stored earlier while that entry stays valid
-  (#1540).
+  that joins it to the next block; any other reply is unchanged. Replies the
+  response cache stored under the old cleaner are purged on its first
+  successful open after the upgrade (cache key schema v9, issue #1540).
 - `mms hook install` and `mms hook uninstall` no longer manage a Claude Code
   handler whose `shell` field is present and anything but `"bash"` (issue
   #1497). Install writes a POSIX line; with `"shell": "powershell"`

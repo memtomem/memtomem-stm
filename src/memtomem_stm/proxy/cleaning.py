@@ -1,4 +1,10 @@
-"""Content cleaning — noise removal before compression and indexing."""
+"""Content cleaning — noise removal before compression and indexing.
+
+The response cache stores a body compressed from this module's output. A
+change here that alters that stored body for unchanged settings needs a
+``cache._KEY_SCHEMA_VERSION`` bump; the rule is in the comment above that
+constant.
+"""
 
 from __future__ import annotations
 
