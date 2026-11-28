@@ -105,6 +105,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook` sizes its outer backstop from the surfacing timeout the settings
+  build, not from the text of `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`
+  (issue #1573). The two could differ: with `MEMTOMEM_STM_SURFACING=null`
+  beside `inf` the build used `3.0` while the backstop was infinite, and a
+  timeout of 60 given in the `MEMTOMEM_STM_SURFACING` JSON, or under a
+  lower-case variable name on POSIX, left the backstop at 12 seconds.
+  **Behavior change**: the backstop follows those spellings, and a flat value
+  that the build ignores no longer lengthens it. It now covers the surfacing
+  call only, so its clock starts after the config load and compression. At
+  expiry it requests cancellation; it is not a ceiling on the hook process.
 - The response cache no longer serves a reply stored by a release whose
   cleaner wrote it differently (#1580, issue #1540). The cache key covers the
   cleaning and compression settings, not what the code does with them, and a

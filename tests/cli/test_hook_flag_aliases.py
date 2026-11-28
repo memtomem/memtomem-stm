@@ -12,6 +12,7 @@ whatever the environment holds.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -21,8 +22,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
 from memtomem_stm.cli.hook_cmd import _runtime_registration_env
+from memtomem_stm.cli.proxy import cli
 from memtomem_stm.config import load_env_stm_config
 
 _POSIX_ONLY = pytest.mark.skipif(
@@ -493,14 +496,51 @@ def test_overlapping_calls_do_not_change_each_others_builds(monkeypatch):
     assert load_env_stm_config().config.surfacing.persist_query_text is True
 
 
-def test_the_backstop_reads_the_commands_deadline(monkeypatch):
-    from memtomem_stm.cli.hook_cmd import _hook_budget_seconds
+@pytest.mark.parametrize(
+    ("env", "args", "timeout", "budget"),
+    [
+        ({SURFACING_TIMEOUT: "20"}, [], 20.0, 28.0),
+        ({SURFACING_TIMEOUT: "1"}, ["--surfacing-timeout-seconds", "30"], 30.0, 38.0),
+        # A null block drops the flat variable from the build (#1573).
+        ({"MEMTOMEM_STM_SURFACING": "null", SURFACING_TIMEOUT: "inf"}, [], 3.0, 12.0),
+        ({"MEMTOMEM_STM_SURFACING": "null", SURFACING_TIMEOUT: "nan"}, [], 3.0, 12.0),
+        # Spellings the build reads and the flat variable's own text does not.
+        ({"MEMTOMEM_STM_SURFACING": '{"timeout_seconds": 60}'}, [], 60.0, 68.0),
+        ({_lower(SURFACING_TIMEOUT): "60"}, [], 60.0, 68.0),
+    ],
+    ids=["flat", "command-flag", "null-inf", "null-nan", "block-json", "lower-case"],
+)
+def test_the_backstop_follows_the_builds_surfacing_timeout(monkeypatch, env, args, timeout, budget):
+    _no_stm_env(monkeypatch)
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    armed: list[float] = []
+    seen: list[tuple[float, float]] = []
+    reschedule = asyncio.Timeout.reschedule
 
-    monkeypatch.setenv(SURFACING_TIMEOUT, "1")
-    assert _hook_budget_seconds({}) == 12.0  # control: the variable, floored
-    monkeypatch.setenv(SURFACING_TIMEOUT, "20")
-    assert _hook_budget_seconds({}) == 28.0
-    assert _hook_budget_seconds({SURFACING_TIMEOUT: "30"}) == 38.0
+    def record(self: asyncio.Timeout, when: float | None) -> None:
+        loop = asyncio.get_running_loop()
+        armed.append(float("inf") if when is None else when - loop.time())
+        reschedule(self, when)
+
+    async def surfacing(_call: Any, *, config: Any, **_kwargs: Any) -> dict[str, Any]:
+        seen.append((config.surfacing.timeout_seconds, armed[-1]))
+        return {}
+
+    monkeypatch.setattr(asyncio.Timeout, "reschedule", record)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", surfacing)
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "notes.md"},
+        "tool_response": "text",
+    }
+
+    CliRunner().invoke(cli, ["hook", "--host", "claude", *args], input=json.dumps(payload))
+
+    # Asserted out here: the hook swallows what is raised inside it.
+    assert seen == [(timeout, pytest.approx(budget, abs=1.0))]
 
 
 def test_doctor_builds_its_environment_without_an_enclosing_scope(monkeypatch):

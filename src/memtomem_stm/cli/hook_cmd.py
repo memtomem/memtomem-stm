@@ -94,7 +94,7 @@ import sys
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, TextIO
+from typing import TYPE_CHECKING, Any, Iterator, TextIO
 
 import click
 
@@ -112,7 +112,6 @@ from memtomem_stm.cli.host_runtime import (
     UnwritableDeadlineError,
     _parse_bool,
     format_seconds,
-    _SURFACING_TIMEOUT_ENV,
     hook_command_words,
     hook_flags_scope,
     resolve_host_runtime_policy,
@@ -228,23 +227,25 @@ def _surface_tools() -> frozenset[str]:
     return frozenset() if saw_token else _DEFAULT_SURFACE_TOOLS
 
 
-def _hook_budget_seconds(overrides: Mapping[str, str]) -> float:
-    """Outer wall-clock backstop for the whole hook call.
+def _hook_budget_seconds(surfacing_timeout_seconds: float) -> float:
+    """Outer backstop for the hook's whole surfacing call.
 
     ``SurfacingEngine`` bounds its own LTM search via
-    ``surfacing.timeout_seconds``; this only guards against a hang *outside*
-    that window (e.g. tearing down a wedged LTM subprocess). Sized to sit above
-    the configured surfacing timeout so raising that env to beat LTM cold start
-    isn't silently clipped. *overrides* is the command's flags
-    (:func:`runtime_env_overrides`): its surfacing deadline is the build's, so
-    it is read first; the variable is read only without one.
+    ``surfacing.timeout_seconds``; this guards the call around that window too
+    (e.g. tearing down a wedged LTM subprocess), so the eight seconds above
+    that timeout also cover whatever the call spends before and after the
+    search. Sized to sit above the timeout so raising it to beat LTM cold start
+    isn't silently clipped.
+
+    Pass the built config's value, which is positive and finite. The
+    variable's text can differ from what the build reads, so it is not read
+    here (#1573).
+
+    The result is when cancellation is requested, not a ceiling on the process:
+    cleanup the cancelled call runs, and a worker thread it started, can
+    outlast it.
     """
-    raw = overrides.get(_SURFACING_TIMEOUT_ENV) or os.environ.get(_SURFACING_TIMEOUT_ENV)
-    try:
-        configured = float(raw) if raw else 3.0
-    except ValueError:
-        configured = 3.0
-    return max(configured + 8.0, 12.0)
+    return max(surfacing_timeout_seconds + 8.0, 12.0)
 
 
 def _tool_response_to_text(tool_response: Any) -> str:
@@ -742,8 +743,9 @@ async def _run_hook(
     (optionally) fire-and-forget spawn the daemon so the *next* call is warm,
     then for *this* call either
     return ``{}`` (default ``fallback=skip`` — the daemon exists precisely to
-    avoid the ~6s cold start) or take the cold path (``fallback=cold``). The
-    whole call runs inside ``_hook_budget_seconds(overrides)`` in :func:`hook_command`.
+    avoid the ~6s cold start) or take the cold path (``fallback=cold``). A call
+    from :func:`_orchestrate` runs inside the backstop it arms
+    (:func:`_hook_budget_seconds`); a direct caller has none.
     ``config`` is reused from :func:`_orchestrate` when given, on both routes,
     so one tool call loads the environment once; ``None`` loads it before
     either route, and a settings error that load does not recover from
@@ -784,8 +786,7 @@ async def _run_hook(
         # itself comes up detached — and never raises into the hot path. The
         # probe and fork/exec are blocking syscalls (flock; close_fds scan), so
         # they run in a worker thread, awaited only for that brief offloaded
-        # call, keeping the event loop free while the outer wait_for budget
-        # clock runs.
+        # call, keeping the event loop free while the backstop clock runs.
         if config.hook.auto_spawn:
             try:
                 from memtomem_stm.daemon.spawn import request_spawn
@@ -937,12 +938,16 @@ async def _orchestrate(
     The two stages are independent. Surfacing receives the same ``call``;
     ``_run_hook`` caps its ``tool_response_text`` via :func:`_bounded_call`
     (:data:`_SAFE_DAEMON_BUDGET`) so the daemon wire frame stays bounded whether
-    or not compression ran. Surfacing is wrapped so a failure degrades to "no
+    or not compression ran. Surfacing is wrapped so an exception degrades to "no
     memories" while still returning the compression half
-    (``maybe_compress_builtin`` is itself non-raising). The CLI wrapper backstops
-    the whole call. A non-raising metrics row (``source='hook'``) is recorded
-    afterwards via :func:`_record_hook_metrics`, regardless of whether either
-    stage produced output.
+    (``maybe_compress_builtin`` is itself non-raising). Surfacing, the only
+    awaited stage, also runs under a backstop sized from the built config
+    (:func:`_hook_budget_seconds`), whose clock starts after the config load and
+    compression. Unlike an exception, its expiry is not absorbed:
+    ``TimeoutError`` leaves this function, so the compression half is dropped and
+    :func:`_record_hook_metrics` is not reached. When surfacing completes, that
+    non-raising recorder (``source='hook'``) is called whether or not either
+    stage produced output, and skips the row by its own rules.
 
     The daemon receives the *canonical* call over the wire (``_run_hook`` →
     ``client.surface`` → ``CanonicalHookCall.to_wire``), so it needs no host
@@ -991,10 +996,12 @@ async def _orchestrate(
     updated = compression.replacement
     surf_out: dict[str, Any] = {}
     if adapter.can_inject_context:
-        try:
-            surf_out = await _run_hook(call, config=config, use_daemon=use_daemon)
-        except Exception:
-            logger.debug("surfacing failed — keeping the compression half", exc_info=True)
+        # Outside the ``try``: an expired backstop must reach the caller.
+        async with asyncio.timeout(_hook_budget_seconds(config.surfacing.timeout_seconds)):
+            try:
+                surf_out = await _run_hook(call, config=config, use_daemon=use_daemon)
+            except Exception:
+                logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
     _record_hook_metrics(
         call,
@@ -1214,17 +1221,14 @@ def hook_command(
             if payload is not None:
                 try:
                     output = asyncio.run(
-                        asyncio.wait_for(
-                            _orchestrate(
-                                payload,
-                                adapter,
-                                # Automatic/ambiguous routing must never enable the
-                                # sole destructive capability (native output replace).
-                                allow_output_replacement=host_authorizes_replacement(host),
-                                notices=notices,
-                                use_daemon=_parse_bool(runtime_use_daemon),
-                            ),
-                            timeout=_hook_budget_seconds(overrides),
+                        _orchestrate(
+                            payload,
+                            adapter,
+                            # Automatic/ambiguous routing must never enable the
+                            # sole destructive capability (native output replace).
+                            allow_output_replacement=host_authorizes_replacement(host),
+                            notices=notices,
+                            use_daemon=_parse_bool(runtime_use_daemon),
                         )
                     )
                 except Exception:
