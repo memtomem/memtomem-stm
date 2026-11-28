@@ -41,7 +41,12 @@ def _percentile(values: list[float], percentile: float) -> float:
 
 
 def _ceil_half(value: float) -> float:
-    return math.ceil(value * 2.0) / 2.0
+    doubled = value * 2.0
+    if math.isinf(doubled):
+        # ``math.ceil`` cannot take infinity. A finite value this large is
+        # already a whole number, so it is its own ceiling to 0.5 (#1561).
+        return value
+    return math.ceil(doubled) / 2.0
 
 
 def recommendation_from_summary(summary: dict[str, Any]) -> dict[str, Any]:

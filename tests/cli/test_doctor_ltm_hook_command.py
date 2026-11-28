@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 from pydantic import ValidationError
 
 from helpers import set_home
@@ -169,6 +169,12 @@ def _doctor_cli(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str
 ) -> tuple[dict[str, Any], str]:
     """``mms doctor --json`` with upstream probes stubbed: checks by id, raw output."""
+    result = _doctor_cli_result(monkeypatch, tmp_path, *args)
+    return {c["id"]: c for c in json.loads(result.output)["checks"]}, result.output
+
+
+def _doctor_cli_result(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str) -> Result:
+    """``mms doctor --json`` with upstream probes stubbed, as the runner returned it."""
     from memtomem_stm.cli import proxy as proxy_mod
 
     async def fake_probe_servers(servers, timeout):
@@ -178,8 +184,7 @@ def _doctor_cli(
     project = tmp_path / "project"
     project.mkdir(exist_ok=True)
     monkeypatch.chdir(project)
-    result = CliRunner().invoke(cli, ["doctor", "--json", *args])
-    return {c["id"]: c for c in json.loads(result.output)["checks"]}, result.output
+    return CliRunner().invoke(cli, ["doctor", "--json", *args])
 
 
 # --- the issue's cases -------------------------------------------------------
@@ -1285,6 +1290,24 @@ def test_timeout_advice_keeps_the_export_when_the_command_does_not_set_it(
     assert checks["hook_daemon_timeout"]["next_action"] == (
         "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=10"
     ), checks["hook_daemon_timeout"]
+
+
+def test_a_surfacing_deadline_too_large_to_double_still_gets_a_report(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # Finite, so the config accepts it, but doubling it to round to 0.5 s
+    # overflows (#1561).
+    monkeypatch.setenv(SURFACING_TIMEOUT, "9e307")
+    _install(monkeypatch, AnswerEveryDaemon(_telemetry()))
+
+    result = _doctor_cli_result(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert result.exit_code == 0, (result.exception, result.output)
+    row = {c["id"]: c for c in json.loads(result.output)["checks"]}["hook_daemon_timeout"]
+    assert (row["status"], row["next_action"]) == (
+        "WARN",
+        "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=9e+307",
+    ), row
 
 
 def test_an_advice_failure_keeps_the_probe_result(home, proxy_file, monkeypatch, tmp_path):

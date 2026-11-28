@@ -104,6 +104,14 @@ changes inline only. See the deprecation policy in
   debug), as connection setup already does. With the locked anyio 4.15.1 the
   signal-shutdown tests showed no such cleanup error, so their outcome is the
   same there.
+- `mms doctor` no longer aborts with `OverflowError` when the surfacing deadline
+  is above about `9e307` seconds (#1575, issue #1561). Rounding the hook deadline it
+  requires up to 0.5 s doubled the value, which overflowed; a value that large
+  is already whole and is now kept as it is.
+  **Behavior change**: a run that reached the hook deadline check with such a
+  deadline exited 1 before emitting any report; it now emits its normal
+  report, including the `hook daemon timeout` row, and the exit code follows
+  the checks as for any other report.
 - `mms doctor` and `mms health` run with `--config` now name that file in the
   daemon commands for the standalone daemon (#1558, issue #1504). The advised bare
   `mms daemon start` built from the environment alone, which can be a different
