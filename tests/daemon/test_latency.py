@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import sys
+
+import pytest
+
 from memtomem_stm.daemon.latency import (
     DaemonLatencyTracker,
     WINDOW_SIZE,
@@ -78,4 +82,22 @@ def test_hook_timeout_preserves_inner_budget_plus_loopback_margin() -> None:
             surface_summary=surface,
         )
         == 12.5
+    )
+
+
+@pytest.mark.parametrize(
+    ("deadline", "expected"),
+    [
+        (30.0, 30.5),
+        # Doubling these overflows; each is already a multiple of 0.5 (#1561).
+        (9e307, 9e307),
+        (sys.float_info.max, sys.float_info.max),
+    ],
+)
+def test_hook_timeout_rounds_a_deadline_too_large_to_double(
+    deadline: float, expected: float
+) -> None:
+    assert (
+        hook_timeout_recommendation(surfacing_timeout_seconds=deadline, surface_summary=None)
+        == expected
     )
