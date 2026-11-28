@@ -722,13 +722,18 @@ edits STM configuration or LTM content.
 
 When doctor looks up the standalone daemon (the hook's daemon setting is off) and
 `--config` was given, its daemon commands name that file, as
-`MEMTOMEM_STM_PROXY__CONFIG_PATH=<file> mms daemon start` (`status`, `restart`
-likewise). On Windows they say to set that variable to the file given to
-`--config` and do not print the path. A bare
+`env MEMTOMEM_STM_PROXY__CONFIG_PATH=<file> mms daemon start` (`status`, `restart`
+likewise). Settings reads that variable under any letter case, so a
+differently-cased spelling in doctor's environment (such as
+`memtomem_stm_proxy__config_path`) is given the same file in the command too.
+`env` runs the `mms` found on `PATH`, not a shell alias or function. On Windows
+they say to set that variable to the file given to `--config` and do not print
+the path. A bare
 `mms daemon` command builds from the environment alone and can address another
 daemon. The command assumes doctor's environment and working directory otherwise.
 On POSIX, for a path holding characters that cannot be displayed safely, the
-advice gives a note saying so in place of the command.
+advice prints no path: it says, in words, to run the daemon command through
+`env` with each of those spellings set to the file given to `--config`.
 With `--config`, the `--measure-ltm` warning that no daemon route exists names
 no daemon command: after the setting it suggests, it asks you to rerun
 `mms doctor --measure-ltm --config <file>` (on Windows, or where it cannot

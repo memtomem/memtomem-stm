@@ -93,7 +93,7 @@ def _from_config(config: Path, sub: str) -> str:
     """``mms daemon <sub>`` for the standalone daemon built with *config* (#1504)."""
     if sys.platform == "win32":
         return f"set {CONFIG_PATH} to the file given to --config, then run mms daemon {sub}"
-    return f"{CONFIG_PATH}={shlex.quote(str(config.resolve()))} mms daemon {sub}"
+    return f"env {CONFIG_PATH}={shlex.quote(str(config.resolve()))} mms daemon {sub}"
 
 
 def _rerun(config: Path) -> str:

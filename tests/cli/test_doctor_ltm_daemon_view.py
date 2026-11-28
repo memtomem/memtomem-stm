@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -456,10 +457,10 @@ def _standalone_route(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _named(path: Path) -> str:
-    """The POSIX assignment prefix naming *path*, or the Windows prose."""
+    """The POSIX ``env`` prefix naming *path*, or the Windows prose."""
     if sys.platform == "win32":
         return f"{WINDOWS_SET}, then run "
-    return f"{CONFIG_PATH}={shlex.quote(str(path.resolve()))} "
+    return f"env {CONFIG_PATH}={shlex.quote(str(path.resolve()))} "
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the advised form is POSIX shell syntax")
@@ -641,21 +642,150 @@ def test_windows_advice_never_prints_the_config_path(monkeypatch, tmp_path):
 
 
 def test_an_unrenderable_config_path_is_never_wrapped_as_a_command(monkeypatch):
-    from memtomem_stm.cli.proxy import (
-        _HINT_UNRENDERABLE,
-        _daemon_command,
-        _measure_rerun,
-        _run_daemon_command,
-    )
+    # The path is withheld, but the advice still says how to name the file (#1566).
+    from memtomem_stm.cli.proxy import _daemon_command, _measure_rerun, _run_daemon_command
 
     monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "environ", {})
     config = Path("bad\nname.json")
+    by_hand = f"run mms daemon {{}} with env, setting {CONFIG_PATH} to the file given to --config"
 
-    assert _daemon_command("start", hook_command=False, config_file=config) == _HINT_UNRENDERABLE
-    assert (
-        _run_daemon_command("status", hook_command=False, config_file=config) == _HINT_UNRENDERABLE
-    )
+    command = _daemon_command("start", hook_command=False, config_file=config)
+    phrase = _run_daemon_command("status", hook_command=False, config_file=config)
+
+    assert command == "# " + by_hand.format("start")
+    assert phrase == by_hand.format("status")
     assert _measure_rerun(config) == "then rerun mms doctor --measure-ltm with the same --config"
+
+
+# --- a differently-cased spelling of the variable (#1566) ---------------------
+
+SHADOW = "memtomem_stm_proxy__config_path"
+
+
+def test_config_path_spellings_fold_case_as_settings_does():
+    from memtomem_stm.cli.proxy import _config_path_spellings
+
+    environ = {
+        CONFIG_PATH: "a",
+        SHADOW: "b",
+        "Memtomem_Stm_Proxy__Config_Path": "c",
+        f"{CONFIG_PATH}X": "d",
+        "MEMTOMEM_STM_PROXY__CONFIG": "e",
+    }
+
+    assert _config_path_spellings(environ) == [
+        "Memtomem_Stm_Proxy__Config_Path",
+        SHADOW,
+        CONFIG_PATH,
+    ]
+    assert _config_path_spellings({}) == [CONFIG_PATH]
+
+
+def test_a_shadowing_spelling_is_given_the_same_file(monkeypatch, tmp_path):
+    from memtomem_stm.cli.proxy import _daemon_command, _run_daemon_command
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "environ", {SHADOW: "/elsewhere.json", CONFIG_PATH: "/x.json"})
+    config = tmp_path / "it's" / "ghost.json"
+    value = shlex.quote(str(config))
+
+    command = _daemon_command("start", hook_command=False, config_file=config)
+    phrase = _run_daemon_command("status", hook_command=False, config_file=config)
+
+    assert command == f"env {SHADOW}={value} {CONFIG_PATH}={value} mms daemon start"
+    assert phrase == f"run `env {SHADOW}={value} {CONFIG_PATH}={value} mms daemon status`"
+
+
+def test_an_unrenderable_path_names_every_spelling_to_set(monkeypatch):
+    from memtomem_stm.cli.proxy import _daemon_command
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    second = "Memtomem_Stm_Proxy__Config_Path"
+    monkeypatch.setattr(os, "environ", {SHADOW: "/elsewhere.json", second: "/elsewhere.json"})
+
+    command = _daemon_command("start", hook_command=False, config_file=Path("bad\nname.json"))
+
+    assert command == (
+        f"# run mms daemon start with env, setting {second}, {SHADOW} and {CONFIG_PATH} "
+        "to the file given to --config"
+    )
+    # Pasted into zsh with INTERACTIVE_COMMENTS off, the line is parsed: no
+    # character may substitute, redirect, glob, group or chain (#1566 review).
+    assert re.fullmatch(r"# [A-Za-z0-9_ ,-]+", command), command
+
+
+def test_windows_advice_ignores_the_environment(monkeypatch, tmp_path):
+    # Windows names are case-insensitive: there is only one variable to set.
+    from memtomem_stm.cli.proxy import _daemon_command
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(os, "environ", {SHADOW: "/elsewhere.json"})
+
+    command = _daemon_command("start", hook_command=False, config_file=tmp_path / "a.json")
+
+    assert command == f"{WINDOWS_SET}, then run mms daemon start"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="case-distinct names need a POSIX host")
+def test_doctor_advice_names_a_shadowing_spelling(ghost, monkeypatch, tmp_path):
+    _standalone_route(monkeypatch)
+    _install(monkeypatch, LiveDaemons())
+    other = tmp_path / "other.json"
+    monkeypatch.setenv(SHADOW, str(other))
+
+    checks = _doctor_cli(monkeypatch, tmp_path, "--config", str(ghost), "--measure-ltm")
+
+    value = shlex.quote(str(ghost.resolve()))
+    assert checks["ltm_measurement"]["next_action"] == (
+        f"env {SHADOW}={value} {CONFIG_PATH}={value} mms daemon start"
+    )
+
+
+_PROBE = (
+    "import os, sys\n"
+    "from memtomem_stm.config import load_env_stm_config\n"
+    "names = sorted(n for n in os.environ if n.lower() == sys.argv[1].lower())\n"
+    "print(load_env_stm_config().config.proxy.config_path)\n"
+    "for name in names:\n"
+    "    print(name, os.environ[name])\n"
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the advised form is POSIX shell syntax")
+@pytest.mark.parametrize("prelude", ["", f"readonly {SHADOW}; "], ids=["exported", "readonly"])
+def test_the_advised_command_reaches_the_child_under_every_spelling(
+    ghost, monkeypatch, tmp_path, prelude
+):
+    # The shell's own environment order decides between case-equivalent names,
+    # so every spelling must carry the file; ``env`` also passes a readonly one.
+    other = tmp_path / "other.json"
+    second = "Memtomem_Stm_Proxy__Config_Path"
+    shadows = {SHADOW: str(other), second: str(other)}
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "environ", {**os.environ, **shadows})
+    from memtomem_stm.cli.proxy import _daemon_command
+
+    command = _daemon_command("start", hook_command=False, config_file=ghost)
+    stub = tmp_path / "bin" / "mms"
+    stub.parent.mkdir()
+    stub.write_text('#!/bin/sh\nexec "$STM_PY" -c "$STM_PROBE" "$STM_NAME"\n', encoding="utf-8")
+    stub.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{stub.parent}{os.pathsep}{os.environ['PATH']}",
+        "STM_PY": sys.executable,
+        "STM_PROBE": _PROBE,
+        "STM_NAME": CONFIG_PATH,
+    }
+
+    shell = subprocess.run(
+        ["/bin/sh", "-c", prelude + command], env=env, capture_output=True, text=True, check=True
+    )
+
+    resolved, *spellings = shell.stdout.splitlines()
+    assert resolved == str(ghost)
+    assert spellings == [f"{name} {ghost}" for name in sorted([CONFIG_PATH, SHADOW, second])]
 
 
 def test_a_late_bootstrap_failure_does_not_leak_the_private_config_key(ghost, monkeypatch):

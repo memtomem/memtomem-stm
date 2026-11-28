@@ -10176,6 +10176,13 @@ def _daemon_command(sub: str, *, hook_command: bool, config_file: Path | None = 
     variable it builds from. Windows gets prose without the path: cmd.exe and
     PowerShell share neither a one-line assignment nor quoting rules, and the
     operator has just typed it. The two are never both set.
+
+    On POSIX the file goes through ``env`` under every spelling of the variable
+    doctor's environment holds (#1566): settings folds case, and which of two
+    case-equivalent names wins follows the shell's environment order, so each
+    one gets the file. ``env`` rather than a shell assignment, which a readonly
+    variable defeats while still running the command. A path that cannot be
+    displayed safely is withheld; the line then says what to run in words.
     """
     command = f"mms daemon {sub}"
     if hook_command:
@@ -10184,24 +10191,53 @@ def _daemon_command(sub: str, *, hook_command: bool, config_file: Path | None = 
         return command
     if sys.platform == "win32":
         return f"{_WIN_SET_CONFIG_PATH}, then run {command}"
+    names = _config_path_spellings()
     value = _shell_join([str(config_file)])
     if value == _HINT_UNRENDERABLE:
-        return value
-    return f"{_CONFIG_PATH_ENV}={value} {command}"
+        return f"# {_config_path_by_hand(names, command)}"
+    return "env " + " ".join(f"{name}={value}" for name in names) + f" {command}"
+
+
+def _config_path_spellings(environ: Mapping[str, str] | None = None) -> list[str]:
+    """Every name settings reads as ``MEMTOMEM_STM_PROXY__CONFIG_PATH``, canonical last.
+
+    Settings matches environment names by ``str.lower()``. A name that folds onto
+    this ASCII one is itself ASCII letters and ``_``, so it is safe to display;
+    ``isascii`` keeps that true whatever the folding table does.
+    """
+    env = os.environ if environ is None else environ
+    folded = _CONFIG_PATH_ENV.lower()
+    shadows = sorted(
+        name
+        for name in env
+        if name != _CONFIG_PATH_ENV and name.isascii() and name.lower() == folded
+    )
+    return [*shadows, _CONFIG_PATH_ENV]
+
+
+def _config_path_by_hand(names: list[str], command: str) -> str:
+    """What to run when the ``--config`` path cannot be shown (#1566).
+
+    Words only — no backtick, ``<``, parenthesis or other shell syntax: with
+    ``INTERACTIVE_COMMENTS`` off (zsh's interactive default) a pasted ``#`` line
+    is parsed as a command, and a placeholder such as ``<file>`` truncates files.
+    """
+    listed = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+    return f"run {command} with env, setting {listed} to the file given to --config"
 
 
 def _run_daemon_command(sub: str, *, hook_command: bool, config_file: Path | None = None) -> str:
     """:func:`_daemon_command` inside a sentence: ``run `…```.
 
-    The Windows variable stays outside the backticks, and the unrenderable
-    diagnostic is not presented as something to run.
+    The Windows variable stays outside the backticks, and the line for a path
+    that cannot be shown loses the leading ``#`` that marks it as prose on its own.
     """
     command = _daemon_command(sub, hook_command=hook_command, config_file=config_file)
     if config_file is not None:
         if sys.platform == "win32":
             return f"{_WIN_SET_CONFIG_PATH}, then run `mms daemon {sub}`"
-        if command == _HINT_UNRENDERABLE:
-            return command
+        if command.startswith("# "):
+            return command.removeprefix("# ")
     return f"run `{command}`"
 
 

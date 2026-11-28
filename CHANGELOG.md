@@ -104,6 +104,20 @@ changes inline only. See the deprecation policy in
   debug), as connection setup already does. With the locked anyio 4.15.1 the
   signal-shutdown tests showed no such cleanup error, so their outcome is the
   same there.
+- The standalone daemon commands that `mms doctor` and `mms health` advise with
+  `--config` now give the file to every letter-case spelling of
+  `MEMTOMEM_STM_PROXY__CONFIG_PATH` in the environment (issue #1566). Settings
+  reads the variable case-insensitively, so an exported
+  `memtomem_stm_proxy__config_path` naming another file could outrank the
+  advised assignment in `sh` and `bash`, and the command then addressed the
+  other file's daemon.
+  **Behavior change**: on POSIX the command now starts with `env` and lists
+  each spelling doctor's environment holds, canonical last
+  (`env MEMTOMEM_STM_PROXY__CONFIG_PATH=<file> mms daemon start` with none).
+  For a path that cannot be displayed safely, the note that no copy/paste hint
+  is available is replaced by an instruction, in words and without the path,
+  to run the command through `env` with each spelling set to the file given to
+  `--config`. Windows output is unchanged.
 - `mms doctor` and `mms health` run with `--config` now name that file in the
   daemon commands for the standalone daemon (#1558, issue #1504). The advised bare
   `mms daemon start` built from the environment alone, which can be a different
