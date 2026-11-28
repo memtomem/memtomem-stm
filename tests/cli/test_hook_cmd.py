@@ -2648,6 +2648,39 @@ def test_cli_decodes_stdin_as_utf8_under_a_cp1252_locale(monkeypatch: pytest.Mon
     assert seen == [payload]
 
 
+_NESTED_DEPTH = 100_000
+
+
+def _nested_payload_bytes() -> bytes:
+    """A hook payload that is well-formed JSON nested past the decoder's limit."""
+    nested = "[" * _NESTED_DEPTH + "]" * _NESTED_DEPTH
+    return ('{"hook_event_name": "PostToolUse", "tool_name": "Read", "x": ' + nested + "}").encode()
+
+
+def test_read_payload_too_deeply_nested_is_none():
+    # json.loads raises RecursionError here, which is not a ValueError: it must
+    # read as a malformed payload like any other (#1349).
+    import io
+
+    assert _read_payload(io.TextIOWrapper(io.BytesIO(_nested_payload_bytes()))) is None
+
+
+def test_cli_too_deeply_nested_stdin_passes_through_without_a_traceback(
+    caplog: pytest.LogCaptureFixture,
+):
+    with caplog.at_level(logging.DEBUG):
+        result = CliRunner().invoke(
+            cli, ["hook", "--host", "claude"], input=_nested_payload_bytes()
+        )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {}
+    # Under pytest the root logger already has handlers, so the hook's own stderr
+    # handler is not installed; the records are what the hook would print.
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert [r.getMessage() for r in caplog.records if r.exc_info] == []
+
+
 def test_read_payload_decodes_the_byte_stream_as_utf8():
     import io
 

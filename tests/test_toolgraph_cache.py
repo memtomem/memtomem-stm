@@ -520,6 +520,18 @@ class TestCorruptRow:
         assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
         assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
 
+    def test_too_deeply_nested_json_row_is_dropped_as_miss(self, cache):
+        # Well-formed JSON past the decoder's depth raises RecursionError, not a
+        # ValueError; it is corrupt like any other unreadable row (#1349).
+        _put(cache)
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is not None  # the row is live
+        depth = 100_000
+        nested = '{"rejects": ' + "[" * depth + "]" * depth + "}"
+        cache._db.execute("UPDATE toolgraph_consult SET verdict_json = ?", (nested,))
+        cache._db.commit()
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
     @pytest.mark.parametrize(
         "field,value",
         [

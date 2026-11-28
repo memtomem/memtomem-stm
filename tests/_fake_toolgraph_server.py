@@ -18,6 +18,10 @@ Input-driven behaviors (so one fixture covers every adapter path):
 
 * ``profile == "boom"`` raises (unknown-profile mirror) → ``isError`` →
   the adapter raises ``ToolgraphProtocolError``.
+* ``profile == "nested"`` with candidates returns a successful text result
+  holding JSON nested too deeply to decode → the adapter raises
+  ``ToolgraphProtocolError``. The empty-candidate probe gets the normal verdict,
+  so the failure lands on the full consult, past the probe.
 * ``profile == "sleep"`` blocks far longer than any test timeout → the
   adapter's per-consult ``asyncio.wait_for`` fires → ``ToolgraphUnreachableError``.
 * ``agent == "ghost"`` returns ``agent_found=False`` as a *structured*
@@ -70,6 +74,16 @@ def _backend_unavailable() -> CallToolResult:
     )
 
 
+NESTED_DEPTH = 100_000
+
+
+def _nested_verdict() -> CallToolResult:
+    """A successful result whose text is well-formed JSON nested past the decoder's
+    limit: ``json.loads`` raises ``RecursionError`` on every supported Python."""
+    text = '{"agent": ' + "[" * NESTED_DEPTH + "]" * NESTED_DEPTH + "}"
+    return CallToolResult(content=[TextContent(type="text", text=text)], is_error=False)
+
+
 # Arbitrary fixed monotonic graph generation so tests can assert the field is
 # threaded through verbatim. The #494 consult-cache tests need to vary the
 # generation *between* consults of one running server, so it is read from a file
@@ -110,6 +124,8 @@ async def eligible_tools(agent: str, candidates: list[str], profile: str = "stri
         raise ValueError(f"unknown profile {profile!r}")
     if profile == "backend_unavailable":
         return _backend_unavailable()
+    if profile == "nested" and candidates:  # the #494 empty probe stays well-formed
+        return _nested_verdict()
     if profile == "sleep":
         await asyncio.sleep(30)
     if agent == "ghost":

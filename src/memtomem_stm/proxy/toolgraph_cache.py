@@ -324,7 +324,7 @@ class GraphConsultCache:
             return None
         try:
             verdict = json.loads(row[0])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):  # deep nesting exhausts the decoder
             verdict = None
         # Best-effort: a row that is not valid JSON, not a dict, or is missing the
         # expected raw-fact shape (e.g. an old-schema or externally-corrupted row)

@@ -708,7 +708,7 @@ def _read_payload(stream: TextIO) -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except (ValueError, RecursionError):  # deep nesting exhausts the decoder's stack
         return None
     return data if isinstance(data, dict) else None
 
