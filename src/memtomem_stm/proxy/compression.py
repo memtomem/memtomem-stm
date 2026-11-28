@@ -1,4 +1,10 @@
-"""Response compression strategies."""
+"""Response compression strategies.
+
+The response cache stores a strategy's output on its cacheable paths. A
+change that alters that stored output for unchanged settings needs a
+``cache._KEY_SCHEMA_VERSION`` bump; the rule is in the comment above that
+constant.
+"""
 
 from __future__ import annotations
 
