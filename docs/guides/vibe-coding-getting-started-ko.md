@@ -118,7 +118,7 @@ mms register --client auto
 ```
 
 > Codex CLI: `mms import --from codex`는 `CODEX_HOME`(기본 `~/.codex`)의 기존 MCP를 탐색합니다.
-> 현재 디렉터리의 `.codex/config.toml`은 사용자 Codex 설정이 그 디렉터리의 실제 경로를
+> project 설정으로서 현재 디렉터리의 `.codex/config.toml`은 사용자 Codex 설정이 그 디렉터리의 실제 경로를
 > `trust_level = "trusted"`로 표시한 경우에만 읽습니다. `mms import --from codex`는
 > 미리보기이고, `--apply`를 붙여야 `~/.mms/registry.toml`에 씁니다. project 파일에서
 > 발견한 새 항목을 적용하려면 `--allow-project-configs`도 필요합니다. 이 명령은 별도

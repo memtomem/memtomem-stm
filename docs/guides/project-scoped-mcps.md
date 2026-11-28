@@ -9,11 +9,13 @@ Project-scoped MCP state is separate from the STM proxy configuration:
 ## Import host definitions
 
 ```bash
+cd /path/to/project
 mms import --from codex          # preview
 mms import --from codex --apply
 ```
 
-Preview output redacts secrets. Apply writes the real values to the registry.
+Project-local files are looked up in the current directory, so run both commands
+there. Preview output redacts secrets. Apply writes the real values to the registry.
 Apply with the same `--from` value you previewed (`all` covers every host). If
 the preview reports new entries from project-local files, `--apply` refuses
 unless you also pass `--allow-project-configs`:
