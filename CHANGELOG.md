@@ -93,6 +93,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- An upstream connection's own cancellation no longer cuts a signalled
+  shutdown short under anyio 4.16 (#1569, issue #1568). A SIGTERM or SIGINT cancels the
+  upstream connection owner tasks, and anyio 4.16 raises that cancellation out
+  of the owner's unwind. The owner stored it as its cleanup error and re-raised
+  it into the server's teardown, which skipped the rest of the close sequence
+  after the proxy manager stop (the leaked-child sweep still ran) and exited
+  with status 1. A cleanup error that is only
+  cancellation is now reported as a failed close (`ConnectionError`, logged at
+  debug), as connection setup already does. With the locked anyio 4.15.1 the
+  signal-shutdown tests showed no such cleanup error, so their outcome is the
+  same there.
 - `mms doctor` no longer aborts with `OverflowError` when the surfacing deadline
   is above about `9e307` seconds (#1575, issue #1561). Rounding the hook deadline it
   requires up to 0.5 s doubled the value, which overflowed; a value that large

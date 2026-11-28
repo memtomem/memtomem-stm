@@ -20,6 +20,7 @@ from memtomem_stm.proxy.manager import (
     ProxyManager,
     UpstreamConnection,
     _RetiredConnectionResources,
+    _UpstreamConnectionOwner,
 )
 from memtomem_stm.proxy.metrics import TokenTracker
 
@@ -1829,6 +1830,102 @@ class TestTransportCancelsOwner:
         assert transport.exited
         assert mgr._connections["srv"].session is old_session
         old_stack.aclose.assert_not_awaited()
+
+
+async def _finished_owner(cleanup_error: BaseException | None) -> _UpstreamConnectionOwner:
+    """An owner whose task has ended cancelled, as a signalled shutdown leaves it."""
+    loop = asyncio.get_running_loop()
+    owner = _UpstreamConnectionOwner(ready=loop.create_future(), close_requested=asyncio.Event())
+
+    async def cancelled_unwind() -> None:
+        raise asyncio.CancelledError
+
+    owner.task = asyncio.create_task(cancelled_unwind())
+    await asyncio.wait({owner.task})
+    owner.cleanup_error = cleanup_error
+    return owner
+
+
+class _CancelledUnwindSession(_LiveSession):
+    """A session whose exit raises the cancellation pending on the task that
+    exits it, as the SDK's task group does under anyio 4.16 when the owner
+    task itself was cancelled. ``AsyncExitStack.aclose()`` exits with no
+    exception details, so the pending request is read from the task."""
+
+    async def __aexit__(self, *_exc_info):
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError("cancel scope cancelled by the owner")
+        return None
+
+
+class TestOwnerCancelledDuringUnwind:
+    """The owner task's own cancellation, stored as its cleanup error, is a
+    failed close for the caller, never the caller's cancellation (#1568)."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            asyncio.CancelledError(),
+            BaseExceptionGroup("g", [asyncio.CancelledError()]),
+            BaseExceptionGroup("outer", [BaseExceptionGroup("inner", [asyncio.CancelledError()])]),
+        ],
+        ids=["bare", "group", "nested"],
+    )
+    async def test_a_cancellation_cleanup_error_is_a_connection_error(self, error):
+        owner = await _finished_owner(error)
+
+        with pytest.raises(ConnectionError) as raised:
+            await owner.close()
+
+        assert raised.value.__cause__ is error
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("close failed"),
+            KeyboardInterrupt(),
+            BaseExceptionGroup("g", [asyncio.CancelledError(), ValueError("boom")]),
+        ],
+        ids=["exception", "keyboard-interrupt", "mixed-group"],
+    )
+    async def test_any_other_cleanup_error_is_raised_as_is(self, error):
+        owner = await _finished_owner(error)
+
+        with pytest.raises(BaseException) as raised:
+            await owner.close()
+
+        assert raised.value is error
+
+    async def test_an_owner_cancelled_without_a_cleanup_error_closes_cleanly(self):
+        owner = await _finished_owner(None)
+
+        await owner.close()
+
+    async def test_stop_runs_to_the_end_after_the_owner_unwind_is_cancelled(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        transport = _TaskGroupTransport()
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _CancelledUnwindSession(),
+            ),
+        ):
+            await mgr._connect_server("srv", cfg)
+            owner = mgr._connections["srv"].owner
+            assert owner is not None and owner.task is not None
+            # What the signal handler's ``_cancel_everything`` does to the owner.
+            owner.task.cancel()
+            await asyncio.wait({owner.task})
+            assert isinstance(owner.cleanup_error, asyncio.CancelledError)
+
+            await mgr.stop()
+
+        assert mgr._connections == {}
+        assert transport.exited
 
 
 # ── tool name overflow (#261 → exposure-time enforcement via #465) ──────
