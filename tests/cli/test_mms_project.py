@@ -135,12 +135,28 @@ def test_show_marker_renders_enabled_list(runner, sandbox):
     assert "Project: proj" in res.output
     assert "Detected via: marker" in res.output
     assert "Enabled MCPs: filesystem, github" in res.output
+    assert "mms project enable <mcp>" not in res.output
 
 
 def test_show_marker_with_no_enabled(runner, sandbox):
     runner.invoke(project_group, ["init"])
     res = runner.invoke(project_group, ["show"])
-    assert "Enabled MCPs: (none)" in res.output
+    assert res.exit_code == 0, res.output
+    assert res.output.splitlines()[-2:] == [
+        "Enabled MCPs: (none)",
+        "  To enable an MCP from the registry, run `mms project enable <mcp>` inside this project.",
+    ]
+
+    res = runner.invoke(project_group, ["show", "--json"])
+    assert res.exit_code == 0, res.output
+    root = sandbox["cwd"].resolve()
+    assert json.loads(res.output) == {
+        "name": "proj",
+        "root": str(root),
+        "source": "marker",
+        "marker": str(root / state.PROJECT_MARKER_RELPATH),
+        "enabled": [],
+    }
 
 
 def test_show_json_marker(runner, sandbox):
