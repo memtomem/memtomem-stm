@@ -31,6 +31,7 @@ from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
 CONSUMER_MODEL = "MEMTOMEM_STM_PROXY__CONSUMER_MODEL"
 GHOST_OVERRIDE = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GHOST__TIMEOUT"
 CONFIG_PATH = "MEMTOMEM_STM_PROXY__CONFIG_PATH"
+WINDOWS_SET = f"set {CONFIG_PATH} to the file given to --config"
 
 
 class LiveDaemons:
@@ -455,9 +456,9 @@ def _standalone_route(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _named(path: Path) -> str:
-    """The POSIX assignment prefix, or the Windows prose, naming *path*."""
+    """The POSIX assignment prefix naming *path*, or the Windows prose."""
     if sys.platform == "win32":
-        return f"set {CONFIG_PATH} to {path.resolve()}, then run "
+        return f"{WINDOWS_SET}, then run "
     return f"{CONFIG_PATH}={shlex.quote(str(path.resolve()))} "
 
 
@@ -523,7 +524,7 @@ def test_standalone_advice_names_the_config_file(ghost, monkeypatch, tmp_path):
     assert checks["ltm_measurement"]["next_action"] == start
     assert checks["ltm"]["next_action"] == status
     run = (
-        f"set {CONFIG_PATH} to {ghost.resolve()}, then run `mms daemon status`"
+        f"{WINDOWS_SET}, then run `mms daemon status`"
         if sys.platform == "win32"
         else f"run `{status}`"
     )
@@ -582,8 +583,13 @@ def test_direct_route_advice_asks_for_a_rerun_with_the_config(ghost, monkeypatch
         "use_daemon in MEMTOMEM_STM_HOOK) or export MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
     )
     action = explicit["ltm_measurement"]["next_action"]
-    rerun = _shell_join(["mms", "doctor", "--measure-ltm", "--config", str(ghost.resolve())])
-    assert action == f"{setting}then rerun `{rerun}`"
+    argv = ["mms", "doctor", "--measure-ltm", "--config", str(ghost.resolve())]
+    rerun = (
+        "then rerun mms doctor --measure-ltm with the same --config"
+        if sys.platform == "win32"
+        else f"then rerun `{_shell_join(argv)}`"
+    )
+    assert action == setting + rerun
     assert "mms daemon" not in action
     assert implicit["ltm_measurement"]["next_action"] == setting + "mms daemon start"
 
@@ -614,24 +620,27 @@ def test_health_error_names_the_config_only_when_the_flag_did(ghost, monkeypatch
     result = CliRunner().invoke(cli, args)
 
     error = json.loads(result.output)["surfacing"]["ltm_server"]["error"]
-    assert (str(ghost.resolve()) in error) is explicit, error
+    assert (CONFIG_PATH in error) is explicit, error
+    assert (str(ghost.resolve()) in error) is (explicit and sys.platform != "win32"), error
 
 
-def test_windows_form_puts_the_variable_outside_the_command(monkeypatch, tmp_path):
-    from memtomem_stm.cli.proxy import _daemon_command, _run_daemon_command
+def test_windows_advice_never_prints_the_config_path(monkeypatch, tmp_path):
+    # No quoting is right for both cmd.exe and PowerShell, so no path is shown.
+    from memtomem_stm.cli.proxy import _daemon_command, _measure_rerun, _run_daemon_command
 
     monkeypatch.setattr(sys, "platform", "win32")
-    config = tmp_path / "stm proxy.json"
+    config = tmp_path / "R&D $HOME %TEMP%" / "stm proxy.json"
 
     command = _daemon_command("start", hook_command=False, config_file=config)
     phrase = _run_daemon_command("status", hook_command=False, config_file=config)
+    rerun = _measure_rerun(config)
 
-    assert command == f"set {CONFIG_PATH} to {config}, then run mms daemon start"
-    assert phrase == f"set {CONFIG_PATH} to {config}, then run `mms daemon status`"
+    assert command == f"{WINDOWS_SET}, then run mms daemon start"
+    assert phrase == f"{WINDOWS_SET}, then run `mms daemon status`"
+    assert rerun == "then rerun mms doctor --measure-ltm with the same --config"
 
 
-@pytest.mark.parametrize("platform", ["linux", "win32"])
-def test_an_unrenderable_config_path_is_never_wrapped_as_a_command(monkeypatch, platform):
+def test_an_unrenderable_config_path_is_never_wrapped_as_a_command(monkeypatch):
     from memtomem_stm.cli.proxy import (
         _HINT_UNRENDERABLE,
         _daemon_command,
@@ -639,7 +648,7 @@ def test_an_unrenderable_config_path_is_never_wrapped_as_a_command(monkeypatch, 
         _run_daemon_command,
     )
 
-    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(sys, "platform", "linux")
     config = Path("bad\nname.json")
 
     assert _daemon_command("start", hook_command=False, config_file=config) == _HINT_UNRENDERABLE

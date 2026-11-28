@@ -10158,6 +10158,8 @@ def _discovery_key_error(*, hook_command: bool = False, config_file: Path | None
 
 
 _HOOK_COMMAND_OPTION = "--hook-command claude"
+# Windows advice names the variable, never the path (#1504).
+_WIN_SET_CONFIG_PATH = f"set {_CONFIG_PATH_ENV} to the file given to --config"
 
 
 def _daemon_command(sub: str, *, hook_command: bool, config_file: Path | None = None) -> str:
@@ -10170,19 +10172,20 @@ def _daemon_command(sub: str, *, hook_command: bool, config_file: Path | None = 
 
     *config_file* is set on the standalone route when ``--config`` was given
     (#1504): ``mms daemon`` has no such option, so the file goes in the
-    variable it builds from. Windows gets prose, since cmd.exe and PowerShell
-    share no one-line assignment. The two are never both set.
+    variable it builds from. Windows gets prose without the path: cmd.exe and
+    PowerShell share neither a one-line assignment nor quoting rules, and the
+    operator has just typed it. The two are never both set.
     """
     command = f"mms daemon {sub}"
     if hook_command:
         return f"{command} {_HOOK_COMMAND_OPTION}"
     if config_file is None:
         return command
+    if sys.platform == "win32":
+        return f"{_WIN_SET_CONFIG_PATH}, then run {command}"
     value = _shell_join([str(config_file)])
     if value == _HINT_UNRENDERABLE:
         return value
-    if sys.platform == "win32":
-        return f"set {_CONFIG_PATH_ENV} to {config_file}, then run {command}"
     return f"{_CONFIG_PATH_ENV}={value} {command}"
 
 
@@ -10194,10 +10197,10 @@ def _run_daemon_command(sub: str, *, hook_command: bool, config_file: Path | Non
     """
     command = _daemon_command(sub, hook_command=hook_command, config_file=config_file)
     if config_file is not None:
+        if sys.platform == "win32":
+            return f"{_WIN_SET_CONFIG_PATH}, then run `mms daemon {sub}`"
         if command == _HINT_UNRENDERABLE:
             return command
-        if sys.platform == "win32":
-            return f"set {_CONFIG_PATH_ENV} to {config_file}, then run `mms daemon {sub}`"
     return f"run `{command}`"
 
 
@@ -10207,12 +10210,11 @@ def _measure_rerun(config_file: Path) -> str:
     With no daemon route yet, doctor offers two settings that lead to different
     daemons; the rerun's own rows name the command for the one chosen.
     """
-    command = _shell_join(
-        ["mms", "doctor", "--measure-ltm", "--config", str(config_file)],
-    )
-    if command == _HINT_UNRENDERABLE:
-        return "then rerun mms doctor --measure-ltm with the same --config"
-    return f"then rerun `{command}`"
+    same_config = "then rerun mms doctor --measure-ltm with the same --config"
+    if sys.platform == "win32":
+        return same_config
+    command = _shell_join(["mms", "doctor", "--measure-ltm", "--config", str(config_file)])
+    return same_config if command == _HINT_UNRENDERABLE else f"then rerun `{command}`"
 
 
 def _names_hook_command(surfacing_status: Mapping[str, Any]) -> bool:

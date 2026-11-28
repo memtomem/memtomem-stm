@@ -66,12 +66,12 @@ changes inline only. See the deprecation policy in
   `mms daemon start` built from the environment alone, which can be a different
   daemon from the one looked up.
   **Behavior change**: on that route the `next:` lines and the daemon error text
-  (`health --json` included) name the resolved config path: as a
-  `MEMTOMEM_STM_PROXY__CONFIG_PATH=<file>` assignment before the command, or on
-  Windows as a sentence saying to set that variable first. This advice omits a
-  path that cannot be displayed safely. The `--measure-ltm` warning that no
-  daemon route exists now asks for a rerun of
-  `mms doctor --measure-ltm --config <file>` instead of naming
+  (`health --json` included) put a
+  `MEMTOMEM_STM_PROXY__CONFIG_PATH=<file>` assignment, with the resolved path,
+  before the command; a path that cannot be displayed safely is omitted. On
+  Windows they say to set that variable to the file given to `--config` and
+  print no path. The `--measure-ltm` warning that no daemon route exists now
+  asks for a doctor rerun with that `--config` instead of naming
   `mms daemon start`. Output without `--config`, and for the hook's daemon, is
   unchanged. A differently-cased `memtomem_stm_proxy__config_path` already
   exported in the shell can still outrank the advised assignment.

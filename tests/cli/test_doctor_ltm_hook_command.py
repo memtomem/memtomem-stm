@@ -92,11 +92,13 @@ def proxy_file(tmp_path: Path) -> Path:
 def _from_config(config: Path, sub: str) -> str:
     """``mms daemon <sub>`` for the standalone daemon built with *config* (#1504)."""
     if sys.platform == "win32":
-        return f"set {CONFIG_PATH} to {config.resolve()}, then run mms daemon {sub}"
+        return f"set {CONFIG_PATH} to the file given to --config, then run mms daemon {sub}"
     return f"{CONFIG_PATH}={shlex.quote(str(config.resolve()))} mms daemon {sub}"
 
 
 def _rerun(config: Path) -> str:
+    if sys.platform == "win32":
+        return "then rerun mms doctor --measure-ltm with the same --config"
     argv = ["mms", "doctor", "--measure-ltm", "--config", str(config.resolve())]
     return f"then rerun `{_shell_join(argv)}`"
 
@@ -1151,7 +1153,7 @@ def test_an_unusable_discovery_key_names_the_matching_status_command(
     assert checks["ltm"]["next_action"] == expected
     run = f"run `{expected}`"
     if route == "standalone" and sys.platform == "win32":
-        run = f"set {CONFIG_PATH} to {proxy_file.resolve()}, then run `mms daemon status`"
+        run = f"set {CONFIG_PATH} to the file given to --config, then run `mms daemon status`"
     assert checks["ltm"]["detail"].startswith(
         "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
         f"(LocalKeyError); {run}"

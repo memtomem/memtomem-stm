@@ -1456,7 +1456,7 @@ def test_an_unusable_discovery_key_reads_as_an_unreachable_daemon(tmp_path, monk
         if command == "health"
         else proxy_mod._DISCOVERY_KEY_ERROR
     )
-    assert (str(config.resolve()) in expected) is (command == "health")
+    assert ("MEMTOMEM_STM_PROXY__CONFIG_PATH" in expected) is (command == "health")
     assert block["error"] == expected
     assert baseline["error"] != block["error"]
     assert (block["discovery_key_unusable"], baseline["discovery_key_unusable"]) == (True, False)
