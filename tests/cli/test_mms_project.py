@@ -199,9 +199,12 @@ def test_show_by_name(runner, sandbox):
 
 
 def test_show_by_name_not_found(runner, sandbox):
-    res = runner.invoke(project_group, ["show", "missing"])
-    assert res.exit_code != 0
-    assert "not found" in res.output
+    for extra_args in ([], ["--json"]):
+        res = runner.invoke(project_group, ["show", "missing", *extra_args])
+        assert res.exit_code == 1
+        assert res.stdout == ""
+        assert "not found" in res.stderr
+        assert "Run `mms project list` to see known projects." in res.stderr
 
 
 # ---------------------------------------------------------------------------

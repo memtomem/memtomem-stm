@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from memtomem_stm.daemon.latency import (
@@ -25,9 +27,7 @@ from memtomem_stm.daemon.latency import (
         ([1.0, 2.0, 3.0], 50, 2.0),
     ],
 )
-def test_percentile_direct(
-    values: list[float], percentile: float, expected: float
-) -> None:
+def test_percentile_direct(values: list[float], percentile: float, expected: float) -> None:
     assert _percentile(values, percentile) == expected
 
 
@@ -47,6 +47,9 @@ def test_percentile_does_not_reorder_input() -> None:
         (1.0, 1.0),
         (1.26, 1.5),
         (2.75, 3.0),
+        # Doubling these overflows; each is already a multiple of 0.5 (#1561).
+        (9e307, 9e307),
+        (sys.float_info.max, sys.float_info.max),
     ],
 )
 def test_ceil_half_direct(value: float, expected: float) -> None:
@@ -123,4 +126,22 @@ def test_hook_timeout_preserves_inner_budget_plus_loopback_margin() -> None:
             surface_summary=surface,
         )
         == 12.5
+    )
+
+
+@pytest.mark.parametrize(
+    ("deadline", "expected"),
+    [
+        (30.0, 30.5),
+        # Doubling these overflows; each is already a multiple of 0.5 (#1561).
+        (9e307, 9e307),
+        (sys.float_info.max, sys.float_info.max),
+    ],
+)
+def test_hook_timeout_rounds_a_deadline_too_large_to_double(
+    deadline: float, expected: float
+) -> None:
+    assert (
+        hook_timeout_recommendation(surfacing_timeout_seconds=deadline, surface_summary=None)
+        == expected
     )

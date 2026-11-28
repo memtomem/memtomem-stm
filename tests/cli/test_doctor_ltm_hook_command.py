@@ -22,12 +22,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 from pydantic import ValidationError
 
 from helpers import set_home
 from memtomem_stm.cli.host_runtime import HostRuntimePolicy, hook_command_words, hook_launcher
-from memtomem_stm.cli.proxy import _surfacing_bootstrap_status, cli
+from memtomem_stm.cli.proxy import _shell_join, _surfacing_bootstrap_status, cli
 from memtomem_stm.config import HOOK_FLAG_ENV_NAMES, STMConfig, load_env_stm_config
 from memtomem_stm.daemon.discovery import config_fingerprint
 from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
@@ -87,6 +87,20 @@ def proxy_file(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _from_config(config: Path, sub: str) -> str:
+    """``mms daemon <sub>`` for the standalone daemon built with *config* (#1504)."""
+    if sys.platform == "win32":
+        return f"set {CONFIG_PATH} to the file given to --config, then run mms daemon {sub}"
+    return f"{CONFIG_PATH}={shlex.quote(str(config.resolve()))} mms daemon {sub}"
+
+
+def _rerun(config: Path) -> str:
+    if sys.platform == "win32":
+        return "then rerun mms doctor --measure-ltm with the same --config"
+    argv = ["mms", "doctor", "--measure-ltm", "--config", str(config.resolve())]
+    return f"then rerun `{_shell_join(argv)}`"
 
 
 def _settings(home: Path, *handlers: dict[str, Any]) -> Path:
@@ -155,6 +169,12 @@ def _doctor_cli(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str
 ) -> tuple[dict[str, Any], str]:
     """``mms doctor --json`` with upstream probes stubbed: checks by id, raw output."""
+    result = _doctor_cli_result(monkeypatch, tmp_path, *args)
+    return {c["id"]: c for c in json.loads(result.output)["checks"]}, result.output
+
+
+def _doctor_cli_result(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *args: str) -> Result:
+    """``mms doctor --json`` with upstream probes stubbed, as the runner returned it."""
     from memtomem_stm.cli import proxy as proxy_mod
 
     async def fake_probe_servers(servers, timeout):
@@ -164,8 +184,7 @@ def _doctor_cli(
     project = tmp_path / "project"
     project.mkdir(exist_ok=True)
     monkeypatch.chdir(project)
-    result = CliRunner().invoke(cli, ["doctor", "--json", *args])
-    return {c["id"]: c for c in json.loads(result.output)["checks"]}, result.output
+    return CliRunner().invoke(cli, ["doctor", "--json", *args])
 
 
 # --- the issue's cases -------------------------------------------------------
@@ -998,14 +1017,14 @@ def test_measure_ltm_names_the_commands_no_daemon_flag(home, proxy_file, monkeyp
     assert row["next_action"] == (
         f"replace --no-daemon with --use-daemon in the STM hook command at {FIRST} "
         "(Claude Code user settings), or export MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
-        "mms daemon start"
+        f"{_rerun(proxy_file)}"
     ), row
 
 
 _OLD_ROUTE_ACTION = (
     "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
     "use_daemon in MEMTOMEM_STM_HOOK) or export "
-    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start"
+    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
 )
 
 
@@ -1030,7 +1049,7 @@ def test_measure_ltm_keeps_the_setting_advice_when_the_flag_did_not_decide(
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
 
     row = checks["ltm_measurement"]
-    assert row["next_action"] == _OLD_ROUTE_ACTION, row
+    assert row["next_action"] == _OLD_ROUTE_ACTION + _rerun(proxy_file), row
 
 
 _OUTCOME_CASES = pytest.mark.parametrize(
@@ -1077,7 +1096,7 @@ def test_daemon_advice_stays_bare_without_one_hook_command(
 ):
     # Without exactly one command doctor builds from its environment alone,
     # which is what the bare command builds; a --no-daemon command sends it
-    # to the standalone route, whose daemon is not the hook's (#1504).
+    # to the standalone route, whose daemon is built with --config (#1504).
     if case == "several":
         _settings(home, _cmd(_installed()), _cmd(_installed()))
     elif case == "standalone":
@@ -1089,8 +1108,12 @@ def test_daemon_advice_stays_bare_without_one_hook_command(
         monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm"
     )
 
-    assert checks["ltm_measurement"]["next_action"] == "mms daemon start"
-    assert checks["ltm"]["next_action"] == "mms daemon status"
+    if case == "standalone":
+        start, status = (_from_config(proxy_file, sub) for sub in ("start", "status"))
+    else:
+        start, status = "mms daemon start", "mms daemon status"
+    assert checks["ltm_measurement"]["next_action"] == start
+    assert checks["ltm"]["next_action"] == status
     assert HOOKED not in output
 
 
@@ -1128,14 +1151,17 @@ def test_an_unusable_discovery_key_names_the_matching_status_command(
     else:
         _settings(home, _cmd(_installed(use_daemon=False)))
         monkeypatch.setenv(STANDALONE_GATE, "true")
-        expected = "mms daemon status"
+        expected = _from_config(proxy_file, "status")
 
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
 
     assert checks["ltm"]["next_action"] == expected
+    run = f"run `{expected}`"
+    if route == "standalone" and sys.platform == "win32":
+        run = f"set {CONFIG_PATH} to the file given to --config, then run `mms daemon status`"
     assert checks["ltm"]["detail"].startswith(
         "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
-        f"(LocalKeyError); run `{expected}`"
+        f"(LocalKeyError); {run}"
     ), checks["ltm"]
 
 
@@ -1162,7 +1188,7 @@ def test_an_unusable_discovery_key_keeps_the_measurement_row_off_daemon_start(
     else:
         _settings(home, _cmd(_installed(use_daemon=False)))
         monkeypatch.setenv(STANDALONE_GATE, "true")
-        expected = "mms daemon status"
+        expected = _from_config(proxy_file, "status")
 
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
 
@@ -1264,6 +1290,24 @@ def test_timeout_advice_keeps_the_export_when_the_command_does_not_set_it(
     assert checks["hook_daemon_timeout"]["next_action"] == (
         "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=10"
     ), checks["hook_daemon_timeout"]
+
+
+def test_a_surfacing_deadline_too_large_to_double_still_gets_a_report(
+    home, proxy_file, monkeypatch, tmp_path
+):
+    # Finite, so the config accepts it, but doubling it to round to 0.5 s
+    # overflows (#1561).
+    monkeypatch.setenv(SURFACING_TIMEOUT, "9e307")
+    _install(monkeypatch, AnswerEveryDaemon(_telemetry()))
+
+    result = _doctor_cli_result(monkeypatch, tmp_path, "--config", str(proxy_file))
+
+    assert result.exit_code == 0, (result.exception, result.output)
+    row = {c["id"]: c for c in json.loads(result.output)["checks"]}["hook_daemon_timeout"]
+    assert (row["status"], row["next_action"]) == (
+        "WARN",
+        "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=9e+307",
+    ), row
 
 
 def test_an_advice_failure_keeps_the_probe_result(home, proxy_file, monkeypatch, tmp_path):
@@ -1422,7 +1466,9 @@ def test_env_row_reports_a_hook_build_only_the_commands_options_break(
 
     assert row["status"] == "WARN", row
     assert "STMConfig() fails" in hook and _HOOK_PASS_THROUGH in hook, row
-    assert DAEMON_TIMEOUT in hook, row
+    # The surfacing pin reads back as infinity, refused since #1522; the
+    # daemon deadline derived from it is refused as before.
+    assert f"(env var(s) implicated: {DAEMON_TIMEOUT}, {SURFACING_TIMEOUT})" in hook, row
     assert bare.endswith("STMConfig() constructs"), row
     assert row["next_action"] == _command_advice(), row
 
@@ -1666,8 +1712,10 @@ def test_env_row_does_not_advise_unsetting_a_valid_block_the_hint_names(
 ):
     # The command's deadline is the only value rejected at its field, so the
     # hint names it alone, not the valid ``MEMTOMEM_STM_HOOK`` block above it
-    # (#1537), and the advice does not ask to unset that block either.
-    _settings(home, _cmd(_written(_EXTREME, "4")))
+    # (#1537), and the advice does not ask to unset that block either. The
+    # extreme value is the daemon deadline's alone: an extreme surfacing pin
+    # breaks the surfacing field too since #1522.
+    _settings(home, _cmd(_written("3", _EXTREME)))
     monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"compression": {"enabled": true}}')
     _install(monkeypatch, LiveDaemons())
     assert _build_class(None) == "ok"

@@ -13,6 +13,12 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `docs/use-cases.md` adds a scenario for reading how much text native tools
+  return, per host and tool, with `mms stats --source hook`. It says what a
+  row holds and why the totals are an inventory rather than a savings figure
+  or a comparison between hosts, and links the references for the rest. The
+  page's opening and its evidence rules now cover a hook-observed scenario
+  (#1576).
 - `mms prune --help` shows preview and prune examples, and says that the
   upstream stays in STM's config. The sentence "STM's own config is not
   touched." is gone: a prune may update the upstream's recorded origin.
@@ -53,6 +59,38 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- `surfacing.timeout_seconds` must be finite, as `hook.daemon_timeout_seconds`
+  already is (#1564, issue #1522). `inf` was accepted but was not "no
+  deadline": on the shared-daemon route, the LTM operations that use the
+  full surfacing timeout turned it into a request deadline the daemon wire
+  cannot carry, so the daemon client sent nothing; and a hook command drops
+  it when reading its flags. `mms register` and `mms init` now write the
+  largest finite values (such as `1.7976931348623157e308`) into a
+  registration with a spelling that reads back finite; they used to write
+  `1.79769313486232e+308`, which reads back as infinity.
+  **Behavior change**: when the surfacing timeout in effect — after the
+  flags a hook command or an MCP registration pins — is `inf`, `infinity`
+  or a spelling that reads back as infinity, `STMConfig` construction now
+  fails, and the command handles it as it handles any other invalid
+  `MEMTOMEM_STM_*` value. Measured with
+  `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=inf`: `mms hook --host claude`
+  passes the tool output through (`{}`, exit 0) and logs the variable's
+  name; `mms daemon run` and the MCP server log it and exit 1 (all three
+  started with this value before). `mms hook install` exits 1 with
+  "invalid MEMTOMEM_STM_* configuration prevented resolving the hook
+  runtime policy", also with `--surfacing-timeout`; with
+  `--inherit-runtime-env` it still installs, and the installed hook fails
+  its build when it runs only if the value is still in the environment the
+  hook runs in. A hook command that pins a `--surfacing-timeout-seconds`
+  such as `3` builds over an ambient `inf`. Other commands that build
+  `STMConfig` from the environment
+  (`mms daemon start`/`status`/`restart`/`stop`, `mms init`/`register`,
+  `mms doctor`, `mms status`/`list`/`health`, `mms stats`) keep their
+  existing handling of an invalid value; that was not re-measured here.
+- `mms project show NAME` now points to `mms project list` when `NAME` is
+  unknown (#1556, issue #1553).
+  **Behavior change**: the unknown-name error on stderr gains
+  ``Run `mms project list` to see known projects.``, with or without `--json`.
 - `mms project show` now says how to enable an MCP when the project has none
   enabled (#1551, issue #1395).
   **Behavior change**: in text mode one more line follows
@@ -60,6 +98,46 @@ changes inline only. See the deprecation policy in
   is unchanged.
 
 ### Fixed
+
+- An upstream connection's own cancellation no longer cuts a signalled
+  shutdown short under anyio 4.16 (#1569, issue #1568). A SIGTERM or SIGINT cancels the
+  upstream connection owner tasks, and anyio 4.16 raises that cancellation out
+  of the owner's unwind. The owner stored it as its cleanup error and re-raised
+  it into the server's teardown, which skipped the rest of the close sequence
+  after the proxy manager stop (the leaked-child sweep still ran) and exited
+  with status 1. A cleanup error that is only
+  cancellation is now reported as a failed close (`ConnectionError`, logged at
+  debug), as connection setup already does. With the locked anyio 4.15.1 the
+  signal-shutdown tests showed no such cleanup error, so their outcome is the
+  same there.
+- `mms doctor` no longer aborts with `OverflowError` when the surfacing deadline
+  is above about `9e307` seconds (#1575, issue #1561). Rounding the hook deadline it
+  requires up to 0.5 s doubled the value, which overflowed; a value that large
+  is already whole and is now kept as it is.
+  **Behavior change**: a run that reached the hook deadline check with such a
+  deadline exited 1 before emitting any report; it now emits its normal
+  report, including the `hook daemon timeout` row, and the exit code follows
+  the checks as for any other report.
+- `mms doctor` and `mms health` run with `--config` now name that file in the
+  daemon commands for the standalone daemon (#1558, issue #1504). The advised bare
+  `mms daemon start` built from the environment alone, which can be a different
+  daemon from the one looked up.
+  **Behavior change**: on that route the `next:` lines and the daemon error text
+  (`health --json` included) put a
+  `MEMTOMEM_STM_PROXY__CONFIG_PATH=<file>` assignment, with the resolved path,
+  before the command; a path that cannot be displayed safely is omitted. On
+  Windows they say to set that variable to the file given to `--config` and
+  print no path. The `--measure-ltm` warning that no daemon route exists now
+  asks for a doctor rerun with that `--config` instead of naming
+  `mms daemon start`. Output without `--config`, and for the hook's daemon, is
+  unchanged. A differently-cased `memtomem_stm_proxy__config_path` already
+  exported in the shell can still outrank the advised assignment.
+- The docs no longer say that `mms import --from codex` writes the registry
+  without `--apply`, or that a trusted project's `.codex/config.toml` is read
+  only with `--allow-project-configs`: the preview reads it, and the flag is
+  needed to apply a new entry from it. `SECURITY.md` and the CLI reference now
+  name that file in the project-config gate (#1557).
+  **Behavior change**: none external.
 
 - `mms stats --all-time` no longer labels hook status counts all-time after
   a trim that one of the two rollups missed had put them out of step with
