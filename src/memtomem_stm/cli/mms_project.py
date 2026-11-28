@@ -362,8 +362,10 @@ def show_cmd(name: str | None, json_output: bool) -> None:
         idx = state.load_projects_index()
         matches = [e for e in idx.projects if e.name == name]
         if not matches:
+            index_path = _disp(str(state.projects_index_path()))
             raise click.ClickException(
-                f"Project '{_disp(name)}' not found in {_disp(str(state.projects_index_path()))}."
+                f"Project '{_disp(name)}' not found in {index_path}. "
+                "Run `mms project list` to see known projects."
             )
         # The index is keyed by canonical path, so two projects can share a
         # name — mirror _resolve_project_for_mutation's ambiguity error
