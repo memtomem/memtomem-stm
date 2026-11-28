@@ -99,6 +99,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms hook` sizes its outer backstop from the surfacing timeout the settings
+  build, not from the text of `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`
+  (issue #1573). The two could differ: with `MEMTOMEM_STM_SURFACING=null`
+  beside `inf` the build used `3.0` while the backstop was infinite, and a
+  timeout of 60 given in the `MEMTOMEM_STM_SURFACING` JSON, or under a
+  lower-case variable name on POSIX, left the backstop at 12 seconds.
+  **Behavior change**: the backstop follows those spellings, and a flat value
+  that the build ignores no longer lengthens it. It now covers the surfacing
+  call only, so its clock starts after the config load and compression. At
+  expiry it requests cancellation; it is not a ceiling on the hook process.
 - An upstream connection's own cancellation no longer cuts a signalled
   shutdown short under anyio 4.16 (#1569, issue #1568). A SIGTERM or SIGINT cancels the
   upstream connection owner tasks, and anyio 4.16 raises that cancellation out

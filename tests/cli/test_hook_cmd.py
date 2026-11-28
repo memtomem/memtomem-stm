@@ -2433,7 +2433,7 @@ def test_surfacing_timeout_keeps_the_refusal_notice(
         await asyncio.sleep(30)
 
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", stalled)
-    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda _overrides: 0.2)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda _s: 0.2)
     stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
 
     with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
@@ -2444,6 +2444,43 @@ def test_surfacing_timeout_keeps_the_refusal_notice(
     messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert messages[0] == HOST_NOT_EXPLICIT_NOTICE
     assert any("hook processing failed" in m for m in messages[1:])
+
+
+@pytest.mark.parametrize("stalls", [False, True], ids=["control", "expires"])
+def test_surfacing_timeout_drops_the_compression_and_the_metrics_row(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stalls: bool
+):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    compressed = _compressor_calls(monkeypatch)
+    rows: list[bool] = []
+
+    async def surfacing(*_args, **_kwargs):
+        if stalls:
+            await asyncio.sleep(30)
+        return {}
+
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", surfacing)
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd._record_hook_metrics", lambda *_a, **_k: rows.append(True)
+    )
+    if stalls:
+        monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda _s: 0.2)
+    stdin = json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
+        result = CliRunner().invoke(cli, ["hook", "--host", "claude"], input=stdin)
+
+    assert len(compressed) == 1
+    failures = [r for r in caplog.records if "hook processing failed" in r.getMessage()]
+    if stalls:
+        assert json.loads(result.stdout) == {}
+        assert rows == []
+        assert [type(r.exc_info[1]) for r in failures if r.exc_info] == [TimeoutError]
+    else:
+        assert "updatedToolOutput" in json.loads(result.stdout)["hookSpecificOutput"]
+        assert rows == [True]
+        assert failures == []
 
 
 def test_surfacing_timeout_without_a_refusal_still_passes_through(
@@ -2457,7 +2494,7 @@ def test_surfacing_timeout_without_a_refusal_still_passes_through(
         await asyncio.sleep(30)
 
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", stalled)
-    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda _overrides: 0.2)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._hook_budget_seconds", lambda _s: 0.2)
     stdin = json.dumps(_bash_payload({"stdout": "short"}))
 
     with caplog.at_level(logging.WARNING, logger="memtomem_stm.cli.hook_cmd"):
