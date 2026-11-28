@@ -14,7 +14,7 @@ changes inline only. See the deprecation policy in
 ### Added
 
 - `mms host scan --from <host>` suggests scanning every host when the
-  single-host scan returns no entries from that host's configs (issue #1396).
+  single-host scan returns no entries from that host's configs (#1581).
   **Behavior change**: in that case the text output has one more line under
   `No MCP entries discovered in <host>.`:
   ``Run `mms host scan` without --from to check every host.`` A scan of all
