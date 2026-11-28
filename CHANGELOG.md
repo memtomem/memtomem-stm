@@ -106,8 +106,9 @@ changes inline only. See the deprecation policy in
   returning its old text for as long as it stayed in the cache, and a row
   with no TTL has no time-based expiry. The cache key schema moves to v9,
   which empties the response cache on its first successful open after the
-  upgrade; this retires replies the cleaner of 0.7.11 and earlier stored with
-  markup removed across text blocks (#1538, issue #1531). `CONTRIBUTING.md`
+  upgrade; this retires replies 0.7.11 and earlier stored with markup removed
+  across text blocks (#1538, issue #1531) or with a spurious truncation
+  notice (#1536, issue #1530). `CONTRIBUTING.md`
   now says when a change must bump the schema again.
   **Behavior change**: the response cache starts empty once after upgrading;
   metrics and feedback stores are untouched. Stop every proxy of the previous
@@ -346,8 +347,9 @@ changes inline only. See the deprecation policy in
   text, and a truncation warning in the log; the guard now fires only when
   a block with text loses some or all of it. **Behavior change**: such a
   reply is now delivered without that notice and no longer logs the
-  warning; a reply that really is cut is unchanged. A cache hit can still
-  serve a notice stored earlier while that entry stays valid.
+  warning; a reply that really is cut is unchanged. Replies the response
+  cache stored with that notice are purged on its first successful open
+  after the upgrade (cache key schema v9, issue #1540).
 - `mms doctor`'s `env_overrides` row no longer says the hook degrades when
   the registered hook command's options shadow the invalid variable (issue
   #1506). When doctor reads exactly one STM hook command `mms hook install`

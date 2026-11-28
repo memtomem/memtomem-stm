@@ -548,9 +548,10 @@ class CachedResponse(str):
 # budget), and a hit is served before any fit check (#1359).
 # v8: keys are an HMAC under the store's sidecar key instead of a plain SHA-256,
 # so a copy of the database cannot confirm a guessed argument set (#1416).
-# v9: markup removal no longer pairs across upstream text blocks (#1531); a v8
-# row may be missing the text an older cleaner removed between two blocks, and
-# a hit served it (#1540).
+# v9: markup removal no longer pairs across upstream text blocks (#1531) and
+# the SHAPE guard no longer reports a cut that did not happen (#1530); a v8 row
+# may be missing the text an older cleaner removed between two blocks, or carry
+# that spurious notice, and a hit served it (#1540).
 _KEY_SCHEMA_VERSION = 9
 
 # HMAC domain for row keys, and the ``proxy_cache_meta`` slot recording which
