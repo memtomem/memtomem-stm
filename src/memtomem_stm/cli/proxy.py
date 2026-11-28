@@ -8140,7 +8140,20 @@ def tune(
 # entry. ``mms prune`` is the explicit opt-in command that closes that gap.
 
 
-@cli.command()
+PRUNE_EPILOG = """Examples:
+
+Removes the direct registration from the client config; the upstream
+stays in STM's config. Preview with --dry-run first.
+
+\b
+  mms prune --all --dry-run
+  mms prune --all --dry-run --json
+  mms prune filesystem
+  mms prune --all --yes
+"""
+
+
+@cli.command(epilog=PRUNE_EPILOG)
 @click.argument("names", nargs=-1)
 @click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option(
@@ -8184,7 +8197,8 @@ def prune(
     MCP client (``~/.claude.json``, project ``.mcp.json``, Claude Desktop)
     and removes the direct registration so tool calls route through STM —
     picking up compression, caching, and LTM surfacing, and collapsing the
-    duplicate tool advertisement. STM's own config is not touched.
+    duplicate tool advertisement. The upstream stays in STM's config; prune
+    may only update its recorded origin.
 
     Cursor registrations are found but never removed: nothing here writes a
     Cursor config, so each one is reported separately as a manual-only row and
