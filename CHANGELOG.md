@@ -79,6 +79,13 @@ changes inline only. See the deprecation policy in
   `mms daemon start`. Output without `--config`, and for the hook's daemon, is
   unchanged. A differently-cased `memtomem_stm_proxy__config_path` already
   exported in the shell can still outrank the advised assignment.
+- The docs no longer say that `mms import --from codex` writes the registry
+  without `--apply`, or that a trusted project's `.codex/config.toml` is read
+  only with `--allow-project-configs`: the preview reads it, and the flag is
+  needed to apply a new entry from it. `SECURITY.md` and the CLI reference now
+  name that file in the project-config gate (#1557).
+  **Behavior change**: none external.
+
 - `mms stats --all-time` no longer labels hook status counts all-time after
   a trim that one of the two rollups missed had put them out of step with
   the totals beside them (#1547). The status rollup
