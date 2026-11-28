@@ -1449,7 +1449,15 @@ def test_an_unusable_discovery_key_reads_as_an_unreachable_daemon(tmp_path, monk
     assert broken_code == unreachable_code
     block, baseline = _ltm_block(broken_out), _ltm_block(unreachable_out)
     assert block["route"] == baseline["route"] == "daemon"
-    assert block["error"] == proxy_mod._DISCOVERY_KEY_ERROR
+    # health is on the standalone route, so its command names --config (#1504);
+    # doctor takes the hook's route and keeps the bare command.
+    expected = (
+        proxy_mod._discovery_key_error(config_file=config.resolve())
+        if command == "health"
+        else proxy_mod._DISCOVERY_KEY_ERROR
+    )
+    assert ("MEMTOMEM_STM_PROXY__CONFIG_PATH" in expected) is (command == "health")
+    assert block["error"] == expected
     assert baseline["error"] != block["error"]
     assert (block["discovery_key_unusable"], baseline["discovery_key_unusable"]) == (True, False)
     marked = ("error", "discovery_key_unusable")

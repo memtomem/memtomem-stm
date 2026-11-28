@@ -186,6 +186,32 @@ def test_mcp_policy_serializes_shared_daemon_contract() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("seconds", "spelling"),
+    [
+        (3.0, "3"),
+        (1e308, "1e+308"),
+        # ``.15g`` writes ``1.79769313486232e+308``, which reads back as
+        # infinity and is refused by STMConfig (#1522); the registration keeps
+        # the value finite with the shortest spelling that reads back exactly.
+        (1.7976931348623157e308, "1.7976931348623157e+308"),
+    ],
+)
+def test_mcp_env_surfacing_timeout_reads_back_as_written(
+    seconds: float, spelling: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from memtomem_stm.config import STMConfig
+
+    env = HostRuntimePolicy(True, seconds, seconds, False).mcp_env()
+    assert env["MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS"] == spelling
+
+    # The flat variables alone, as a release that predates the channel reads them.
+    for name, value in env.items():
+        if name != "MEMTOMEM_STM_SERVER_FLAGS":
+            monkeypatch.setenv(name, value)
+    assert STMConfig().surfacing.timeout_seconds == seconds
+
+
 def test_explicit_config_path_reaches_the_policy_construction(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
