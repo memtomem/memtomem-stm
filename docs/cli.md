@@ -587,7 +587,7 @@ Options:
                            registration (#261).
 ```
 
-Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. The servers probed are the config file's entries with environment overrides applied (`MEMTOMEM_STM_PROXY` / `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS…`), the same map [`mms doctor`](#doctor) checks; an env-only upstream is probed too. The file must still be shaped as health reads it first: `upstream_servers` set to something other than an object (`null`, a list) exits 1 before any probe, even when the environment would supply the servers. Unlike `stm_admin(action="proxy_health")` (the MCP action), this command probes servers directly — the proxy does not need to be running. It also prints a **Surfacing Bootstrap** section that checks surfacing config, feedback DB readiness, and the configured LTM MCP server. `config_valid` / `config_error` (and the text warning) come from the same startup-aware read as [`mms status`](#status), so an environment startup rejects reports invalid here too; health still exits 0, and with no valid overlaid configuration to trust it probes the servers declared in the file.
+Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. The servers probed are the config file's entries with environment overrides applied (`MEMTOMEM_STM_PROXY` / `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS…`), the same map [`mms doctor`](#doctor) checks; an env-only upstream is probed too. The file must still be shaped as health reads it first: `upstream_servers` set to something other than an object (`null`, a list) exits 1 before any probe, even when the environment would supply the servers. Unlike `stm_admin(action="proxy_health")` (the MCP action), this command probes servers directly — the proxy does not need to be running. It also prints a **Surfacing Bootstrap** section that checks surfacing config, feedback DB readiness, and the configured LTM MCP server. `config_valid` / `config_error` (and the text warning) come from the same startup-aware read as [`mms status`](#status), so an environment startup rejects reports invalid here too; health still exits 0, and with no valid overlaid configuration to trust it probes the servers declared in the file. With `--config` and the standalone daemon route, the error for an unreachable daemon or an unusable discovery key (in `--json` too) names the resolved config path in the command it gives, when the path can be displayed safely.
 
 Probe results are **staged**: a failing server's `DISCONNECTED` line names the last stage that completed (`configured → transport connected → MCP initialized → tools discovered`), so a dead binary, a broken MCP handshake, and a failing `tools/list` are distinguishable at a glance. `--json` server entries carry the additive `stage` / `failed_stage` / `transport` / `nonconforming_tools` keys next to the unchanged `connected` / `tools` / `overflowing` / `error` fields. A tool whose name falls outside the MCP tool-name grammar (`[A-Za-z0-9._-]`, 1–128 characters) is not proxied: it is left out of `tools` and `overflowing` and counted in `nonconforming_tools`, never named. A probe error names the exception type — `ConnectError`, `FileNotFoundError`, `MCPError` — and, for an HTTP error, its status (`HTTP 401 (HTTPStatusError)`); a JSON-RPC error with a reserved code also shows it (`MCPError -32602 (Invalid params)`). The exception's message is never shown: servers and SDKs quote the request URL (query string included), an argument, or part of a header back in it. To see the underlying message, run the server command or reach the endpoint directly. When the SDK rejects a server entry as invalid (a non-string `args` item, say), or a server's reply fails validation, the error names the field location and error type only — `invalid server entry: args.1 (string_type)` / `invalid server response: …` — never the rejected value. For a pass/fail verdict with next actions instead of raw connectivity detail, use [`mms doctor`](#doctor).
 
@@ -719,6 +719,19 @@ The default doctor run is passive: it performs no search or inference and change
 running shared daemon (plus one prime search when cold), discards their content,
 and updates daemon latency telemetry. It never starts a missing daemon and never
 edits STM configuration or LTM content.
+
+When doctor looks up the standalone daemon (the hook's daemon setting is off) and
+`--config` was given, its daemon commands name that file, as
+`MEMTOMEM_STM_PROXY__CONFIG_PATH=<file> mms daemon start` (`status`, `restart`
+likewise; on Windows, as a sentence saying which variable to set first). A bare
+`mms daemon` command builds from the environment alone and can address another
+daemon. The command assumes doctor's environment and working directory otherwise.
+For a path holding characters that cannot be displayed safely, the advice gives
+a note saying so in place of the command.
+With `--config`, the `--measure-ltm` warning that no daemon route exists names
+no daemon command: after the setting it suggests, it asks you to rerun
+`mms doctor --measure-ltm --config <file>` (where that advice cannot display the
+path safely, it says to rerun with the same `--config`).
 
 The surfacing bootstrap payload also carries `rrf_boundary_checks`, using the
 same `id`, `label`, `status`, `detail`, `next_action` row shape as doctor checks.

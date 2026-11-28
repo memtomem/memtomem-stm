@@ -10149,26 +10149,70 @@ def _known_ltm_state(value: object) -> str:
 # Fixed text, not the exception's message: that one quotes ``data_dir`` and
 # the OS error, and this report carries no config-derived values (#1079).
 # ``mms daemon status`` is where the file is named.
-def _discovery_key_error(*, hook_command: bool = False) -> str:
+def _discovery_key_error(*, hook_command: bool = False, config_file: Path | None = None) -> str:
+    run = _run_daemon_command("status", hook_command=hook_command, config_file=config_file)
     return (
         "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
-        f"(LocalKeyError); run `{_daemon_command('status', hook_command=hook_command)}`"
+        f"(LocalKeyError); {run}"
     )
 
 
 _HOOK_COMMAND_OPTION = "--hook-command claude"
 
 
-def _daemon_command(sub: str, *, hook_command: bool) -> str:
-    """``mms daemon <sub>``, with ``--hook-command claude`` for the hook's daemon.
+def _daemon_command(sub: str, *, hook_command: bool, config_file: Path | None = None) -> str:
+    """``mms daemon <sub>``, naming the build of the daemon doctor looked under.
 
     *hook_command* is set when doctor built the hook's configuration from the
     one STM hook command it read (route the hook's, view ``found``): that
     option builds as the command does (#1515), and the bare command, from the
     shell's environment alone, can address another daemon.
+
+    *config_file* is set on the standalone route when ``--config`` was given
+    (#1504): ``mms daemon`` has no such option, so the file goes in the
+    variable it builds from. Windows gets prose, since cmd.exe and PowerShell
+    share no one-line assignment. The two are never both set.
     """
     command = f"mms daemon {sub}"
-    return f"{command} {_HOOK_COMMAND_OPTION}" if hook_command else command
+    if hook_command:
+        return f"{command} {_HOOK_COMMAND_OPTION}"
+    if config_file is None:
+        return command
+    value = _shell_join([str(config_file)])
+    if value == _HINT_UNRENDERABLE:
+        return value
+    if sys.platform == "win32":
+        return f"set {_CONFIG_PATH_ENV} to {config_file}, then run {command}"
+    return f"{_CONFIG_PATH_ENV}={value} {command}"
+
+
+def _run_daemon_command(sub: str, *, hook_command: bool, config_file: Path | None = None) -> str:
+    """:func:`_daemon_command` inside a sentence: ``run `…```.
+
+    The Windows variable stays outside the backticks, and the unrenderable
+    diagnostic is not presented as something to run.
+    """
+    command = _daemon_command(sub, hook_command=hook_command, config_file=config_file)
+    if config_file is not None:
+        if command == _HINT_UNRENDERABLE:
+            return command
+        if sys.platform == "win32":
+            return f"set {_CONFIG_PATH_ENV} to {config_file}, then run `mms daemon {sub}`"
+    return f"run `{command}`"
+
+
+def _measure_rerun(config_file: Path) -> str:
+    """Ask for a second measurement instead of naming a daemon command (#1504).
+
+    With no daemon route yet, doctor offers two settings that lead to different
+    daemons; the rerun's own rows name the command for the one chosen.
+    """
+    command = _shell_join(
+        ["mms", "doctor", "--measure-ltm", "--config", str(config_file)],
+    )
+    if command == _HINT_UNRENDERABLE:
+        return "then rerun mms doctor --measure-ltm with the same --config"
+    return f"then rerun `{command}`"
 
 
 def _names_hook_command(surfacing_status: Mapping[str, Any]) -> bool:
@@ -10188,7 +10232,12 @@ _DISCOVERY_KEY_ERROR = _discovery_key_error()
 
 
 def _ltm_daemon_status(
-    config: Any, timeout: float, *, measure_ltm: bool = False, hook_command: bool = False
+    config: Any,
+    timeout: float,
+    *,
+    measure_ltm: bool = False,
+    hook_command: bool = False,
+    config_file: Path | None = None,
 ) -> dict[str, Any]:
     """Shared-daemon readiness and telemetry; active only with ``measure_ltm``.
 
@@ -10203,11 +10252,15 @@ def _ltm_daemon_status(
 
     try:
         return _ltm_daemon_probe(
-            config, timeout, measure_ltm=measure_ltm, hook_command=hook_command
+            config,
+            timeout,
+            measure_ltm=measure_ltm,
+            hook_command=hook_command,
+            config_file=config_file,
         )
     except LocalKeyError:
         status = _ltm_daemon_status_base(config)
-        status["error"] = _discovery_key_error(hook_command=hook_command)
+        status["error"] = _discovery_key_error(hook_command=hook_command, config_file=config_file)
         status["discovery_key_unusable"] = True
         return status
 
@@ -10234,7 +10287,12 @@ def _ltm_daemon_status_base(config: Any) -> dict[str, Any]:
 
 
 def _ltm_daemon_probe(
-    config: Any, timeout: float, *, measure_ltm: bool, hook_command: bool = False
+    config: Any,
+    timeout: float,
+    *,
+    measure_ltm: bool,
+    hook_command: bool = False,
+    config_file: Path | None = None,
 ) -> dict[str, Any]:
     from memtomem_stm.daemon import client as daemon_client
 
@@ -10245,10 +10303,8 @@ def _ltm_daemon_probe(
         return status
     hs = asyncio.run(daemon_client.ping(config, timeout=max(0.1, float(timeout))))
     if hs is None:
-        status["error"] = (
-            "shared daemon is not reachable; run "
-            f"`{_daemon_command('status', hook_command=hook_command)}`"
-        )
+        run = _run_daemon_command("status", hook_command=hook_command, config_file=config_file)
+        status["error"] = f"shared daemon is not reachable; {run}"
         return status
     # A missing field keeps the old "cold" default; a present value outside
     # the known set is "unknown", whatever it is.
@@ -10295,16 +10351,22 @@ def _ltm_status(
     measure_ltm: bool = False,
     hook_route: bool = False,
     hook_command: bool = False,
+    config_file: Path | None = None,
 ) -> dict[str, Any]:
     # Standalone proxy surfacing and native hooks have independent routing
     # knobs. *hook_route* is the caller's decision that the row describes the
     # hook's daemon (see ``_surfacing_bootstrap_status``), and *config* is then
     # the hook's own build; otherwise this is the standalone route.
     # *hook_command*: that build came from one STM hook command
-    # (:func:`_daemon_command`).
+    # (:func:`_daemon_command`). *config_file*: the explicit ``--config`` of
+    # the standalone build.
     if hook_route or config.surfacing.use_daemon:
         return _ltm_daemon_status(
-            config, timeout, measure_ltm=measure_ltm, hook_command=hook_route and hook_command
+            config,
+            timeout,
+            measure_ltm=measure_ltm,
+            hook_command=hook_route and hook_command,
+            config_file=None if hook_route else config_file,
         )
     return _ltm_mcp_status(config.surfacing, timeout)
 
@@ -10543,6 +10605,9 @@ _HOOK_DAEMON_TIMEOUT_ENV = "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"
 # inputs. Doctor pops it before anything renders the result, so it never
 # reaches ``doctor --json``; ``mms health`` never sets it.
 _HOOK_ADVICE_KEY = "_hook_advice"
+# The explicit ``--config`` of doctor's standalone build, for its daemon advice
+# (#1504). Popped before anything renders the status.
+_STANDALONE_CONFIG_KEY = "_standalone_config"
 # Likewise for the hook view and the build of the hook's configuration doctor
 # routed with, which the ``env_overrides`` row reports (#1506).
 _HOOK_BUILD_KEY = "_hook_build"
@@ -10838,6 +10903,7 @@ def _surfacing_bootstrap_status(
     hook_view: dict[str, Any] | None = None
     hook_advice: _HookAdvice | None = None
     hook_build: _HookBuild | None = None
+    standalone_config: Path | None = None
     try:
         from pydantic import ValidationError
         from pydantic_settings import SettingsError
@@ -10897,8 +10963,16 @@ def _surfacing_bootstrap_status(
                 logger.debug("hook command advice inputs unavailable (%s)", type(exc).__name__)
         if ltm_status is None:
             config = stm_config_for_cli(config_path)
+            if config_path is not None:
+                standalone_config = Path(config_path).expanduser().resolve()
             db_status = inspect_feedback_db(config.surfacing.feedback_db_path)
-            ltm_status = _ltm_status(config, timeout, measure_ltm=measure_ltm, hook_route=False)
+            ltm_status = _ltm_status(
+                config,
+                timeout,
+                measure_ltm=measure_ltm,
+                hook_route=False,
+                config_file=standalone_config,
+            )
         surfacing = config.surfacing
         # Judge Core's profile as it was sent, then render only its projection
         # (#1082): the checks below read the raw snapshot, so a value the
@@ -10949,6 +11023,8 @@ def _surfacing_bootstrap_status(
         status[_HOOK_ADVICE_KEY] = hook_advice
     if hook_build is not None:
         status[_HOOK_BUILD_KEY] = hook_build
+    if prefer_hook_daemon and standalone_config is not None:
+        status[_STANDALONE_CONFIG_KEY] = standalone_config
     return status
 
 
@@ -12593,6 +12669,7 @@ def doctor(
             # Before anything renders the status: never part of ``--json``.
             hook_advice = surfacing_status.pop(_HOOK_ADVICE_KEY, None)
             hook_build = surfacing_status.pop(_HOOK_BUILD_KEY, None)
+            standalone_config = surfacing_status.pop(_STANDALONE_CONFIG_KEY, None)
             hook_command = _names_hook_command(surfacing_status)
             ltm = surfacing_status.get("ltm_server")
             view_note = _hook_view_note(surfacing_status.get("hook_view"), ltm)
@@ -12677,7 +12754,9 @@ def doctor(
                     f"{cause} — only LTM-dependent features (memory surfacing) are "
                     f"disabled; the proxy core is unaffected{view_suffix}",
                     (
-                        _daemon_command("status", hook_command=hook_command)
+                        _daemon_command(
+                            "status", hook_command=hook_command, config_file=standalone_config
+                        )
                         if isinstance(ltm, dict) and ltm.get("route") == "daemon"
                         else "export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=<memtomem-server>"
                         "  # see docs/surfacing.md"
@@ -12748,7 +12827,12 @@ def doctor(
                     "the hook's route, and surfacing.use_daemon is off",
                     "replace --no-daemon with --use-daemon in the STM hook command at "
                     f"{hook_advice.location} (Claude Code user settings), or export "
-                    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
+                    + (
+                        "mms daemon start"
+                        if standalone_config is None
+                        else _measure_rerun(standalone_config)
+                    ),
                 )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("route") != "daemon":
                 # The daemon route is the hook's when its ``hook.use_daemon``
@@ -12762,7 +12846,12 @@ def doctor(
                     "true, the default, or surfacing.use_daemon=true) and a running daemon",
                     "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
                     "use_daemon in MEMTOMEM_STM_HOOK) or export "
-                    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
+                    + (
+                        "mms daemon start"
+                        if standalone_config is None
+                        else _measure_rerun(standalone_config)
+                    ),
                 )
             elif (
                 measure_ltm and isinstance(ltm, dict) and ltm.get("discovery_key_unusable") is True
@@ -12776,7 +12865,9 @@ def doctor(
                     "WARN",
                     "--measure-ltm result unavailable: the daemon discovery key cannot be "
                     "used (see the ltm server row)",
-                    _daemon_command("status", hook_command=hook_command),
+                    _daemon_command(
+                        "status", hook_command=hook_command, config_file=standalone_config
+                    ),
                 )
             elif measure_ltm and isinstance(ltm, dict) and ltm.get("daemon_reachable") is False:
                 check(
@@ -12784,7 +12875,9 @@ def doctor(
                     "ltm measurement",
                     "WARN",
                     "--measure-ltm requires a running daemon for the probed configuration",
-                    _daemon_command("start", hook_command=hook_command),
+                    _daemon_command(
+                        "start", hook_command=hook_command, config_file=standalone_config
+                    ),
                 )
             elif isinstance(ltm, dict) and ltm.get("route") == "daemon":
                 measurement = ltm.get("measurement")
@@ -12954,7 +13047,9 @@ def doctor(
                             "the running daemon predates the surfacing outcome counters; "
                             "its failures are unreported and its timeout recommendation is "
                             "derived from durations that include failed searches",
-                            _daemon_command("restart", hook_command=hook_command),
+                            _daemon_command(
+                                "restart", hook_command=hook_command, config_file=standalone_config
+                            ),
                         )
                     elif failures:
                         # Neutral about the cause on purpose: this population
@@ -12971,7 +13066,9 @@ def doctor(
                             f"warm LTM search ({breakdown['timeout_samples']} timed out, "
                             f"{breakdown['error_samples']} faulted after issuing one, "
                             f"{breakdown['pre_rpc_faults']} never issued one)",
-                            _daemon_command("status", hook_command=hook_command),
+                            _daemon_command(
+                                "status", hook_command=hook_command, config_file=standalone_config
+                            ),
                         )
                     elif isinstance(surface_summary, dict) and surface_summary.get("samples"):
                         # No count on this side: ``samples`` is windowed, so

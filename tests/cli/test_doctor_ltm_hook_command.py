@@ -27,7 +27,7 @@ from pydantic import ValidationError
 
 from helpers import set_home
 from memtomem_stm.cli.host_runtime import HostRuntimePolicy, hook_command_words, hook_launcher
-from memtomem_stm.cli.proxy import _surfacing_bootstrap_status, cli
+from memtomem_stm.cli.proxy import _shell_join, _surfacing_bootstrap_status, cli
 from memtomem_stm.config import HOOK_FLAG_ENV_NAMES, STMConfig, load_env_stm_config
 from memtomem_stm.daemon.discovery import config_fingerprint
 from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
@@ -87,6 +87,18 @@ def proxy_file(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _from_config(config: Path, sub: str) -> str:
+    """``mms daemon <sub>`` for the standalone daemon built with *config* (#1504)."""
+    if sys.platform == "win32":
+        return f"set {CONFIG_PATH} to {config.resolve()}, then run mms daemon {sub}"
+    return f"{CONFIG_PATH}={shlex.quote(str(config.resolve()))} mms daemon {sub}"
+
+
+def _rerun(config: Path) -> str:
+    argv = ["mms", "doctor", "--measure-ltm", "--config", str(config.resolve())]
+    return f"then rerun `{_shell_join(argv)}`"
 
 
 def _settings(home: Path, *handlers: dict[str, Any]) -> Path:
@@ -998,14 +1010,14 @@ def test_measure_ltm_names_the_commands_no_daemon_flag(home, proxy_file, monkeyp
     assert row["next_action"] == (
         f"replace --no-daemon with --use-daemon in the STM hook command at {FIRST} "
         "(Claude Code user settings), or export MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
-        "mms daemon start"
+        f"{_rerun(proxy_file)}"
     ), row
 
 
 _OLD_ROUTE_ACTION = (
     "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
     "use_daemon in MEMTOMEM_STM_HOOK) or export "
-    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start"
+    "MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
 )
 
 
@@ -1030,7 +1042,7 @@ def test_measure_ltm_keeps_the_setting_advice_when_the_flag_did_not_decide(
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
 
     row = checks["ltm_measurement"]
-    assert row["next_action"] == _OLD_ROUTE_ACTION, row
+    assert row["next_action"] == _OLD_ROUTE_ACTION + _rerun(proxy_file), row
 
 
 _OUTCOME_CASES = pytest.mark.parametrize(
@@ -1077,7 +1089,7 @@ def test_daemon_advice_stays_bare_without_one_hook_command(
 ):
     # Without exactly one command doctor builds from its environment alone,
     # which is what the bare command builds; a --no-daemon command sends it
-    # to the standalone route, whose daemon is not the hook's (#1504).
+    # to the standalone route, whose daemon is built with --config (#1504).
     if case == "several":
         _settings(home, _cmd(_installed()), _cmd(_installed()))
     elif case == "standalone":
@@ -1089,8 +1101,12 @@ def test_daemon_advice_stays_bare_without_one_hook_command(
         monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm"
     )
 
-    assert checks["ltm_measurement"]["next_action"] == "mms daemon start"
-    assert checks["ltm"]["next_action"] == "mms daemon status"
+    if case == "standalone":
+        start, status = (_from_config(proxy_file, sub) for sub in ("start", "status"))
+    else:
+        start, status = "mms daemon start", "mms daemon status"
+    assert checks["ltm_measurement"]["next_action"] == start
+    assert checks["ltm"]["next_action"] == status
     assert HOOKED not in output
 
 
@@ -1128,14 +1144,17 @@ def test_an_unusable_discovery_key_names_the_matching_status_command(
     else:
         _settings(home, _cmd(_installed(use_daemon=False)))
         monkeypatch.setenv(STANDALONE_GATE, "true")
-        expected = "mms daemon status"
+        expected = _from_config(proxy_file, "status")
 
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file))
 
     assert checks["ltm"]["next_action"] == expected
+    run = f"run `{expected}`"
+    if route == "standalone" and sys.platform == "win32":
+        run = f"set {CONFIG_PATH} to {proxy_file.resolve()}, then run `mms daemon status`"
     assert checks["ltm"]["detail"].startswith(
         "the daemon discovery key (stm-discovery.key under data_dir) cannot be used "
-        f"(LocalKeyError); run `{expected}`"
+        f"(LocalKeyError); {run}"
     ), checks["ltm"]
 
 
@@ -1162,7 +1181,7 @@ def test_an_unusable_discovery_key_keeps_the_measurement_row_off_daemon_start(
     else:
         _settings(home, _cmd(_installed(use_daemon=False)))
         monkeypatch.setenv(STANDALONE_GATE, "true")
-        expected = "mms daemon status"
+        expected = _from_config(proxy_file, "status")
 
     checks, _ = _doctor_cli(monkeypatch, tmp_path, "--config", str(proxy_file), "--measure-ltm")
 

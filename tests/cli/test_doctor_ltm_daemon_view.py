@@ -11,6 +11,10 @@ which fingerprint doctor (and health) look under.
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +22,7 @@ import pytest
 from click.testing import CliRunner
 from pydantic import ValidationError
 
-from helpers import set_home
+from helpers import detached_daemon_config, set_home
 from memtomem_stm.cli.proxy import _surfacing_bootstrap_status, cli
 from memtomem_stm.config import STMConfig, load_env_stm_config, stm_config_for_cli
 from memtomem_stm.daemon.discovery import config_fingerprint
@@ -440,3 +444,245 @@ def test_doctor_measurement_warning_when_the_bootstrap_fails(ghost, monkeypatch,
     assert "result unavailable" in measurement["detail"], measurement
     assert "daemon route" not in measurement["detail"], measurement
     assert daemons.pinged == []
+
+
+# --- advice that names the --config file (#1504) ------------------------------
+
+
+def _standalone_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__USE_DAEMON", "1")
+
+
+def _named(path: Path) -> str:
+    """The POSIX assignment prefix, or the Windows prose, naming *path*."""
+    if sys.platform == "win32":
+        return f"set {CONFIG_PATH} to {path.resolve()}, then run "
+    return f"{CONFIG_PATH}={shlex.quote(str(path.resolve()))} "
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the advised form is POSIX shell syntax")
+def test_the_advised_standalone_start_builds_the_daemon_doctor_looked_for(
+    ghost, monkeypatch, tmp_path
+):
+    config = tmp_path / "it's a dir" / "ghost.json"
+    config.parent.mkdir()
+    config.write_bytes(ghost.read_bytes())
+    _standalone_route(monkeypatch)
+    _env_b(monkeypatch)
+    # The shell already names another file; the explicit one must win.
+    other = tmp_path / "other.json"
+    other.write_text('{"upstream_servers": {}}', encoding="utf-8")
+    monkeypatch.setenv(CONFIG_PATH, str(other))
+    # Creates the discovery key too: doctor's ping never does.
+    server_fp = _server_fp(monkeypatch, config)
+    assert config_fingerprint(load_env_stm_config().config, create_key=False) != server_fp
+    daemons = LiveDaemons()
+    _install(monkeypatch, daemons)
+
+    checks = _doctor_cli(monkeypatch, tmp_path, "--config", str(config), "--measure-ltm")
+
+    assert daemons.pinged == [server_fp]
+    stub = tmp_path / "bin" / "mms"
+    stub.parent.mkdir()
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "${CONFIG_PATH}" "$@"\n', encoding="utf-8")
+    stub.chmod(0o755)
+    shell = subprocess.run(
+        ["sh", "-c", checks["ltm_measurement"]["next_action"]],
+        env={**os.environ, "PATH": f"{stub.parent}{os.pathsep}{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    value, *argv = shell.stdout.splitlines()
+    assert value == str(config.resolve())
+
+    children: list[str | None] = []
+
+    def spawn_child() -> None:
+        fp = config_fingerprint(detached_daemon_config(), create_key=False)
+        children.append(fp)
+        daemons.live.add(str(fp))
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn._spawn_detached", spawn_child)
+    monkeypatch.setenv(CONFIG_PATH, value)
+
+    result = CliRunner().invoke(cli, argv)
+
+    assert result.exit_code == 0, result.output
+    assert children == [server_fp]
+
+
+def test_standalone_advice_names_the_config_file(ghost, monkeypatch, tmp_path):
+    _standalone_route(monkeypatch)
+    _install(monkeypatch, LiveDaemons())
+
+    checks = _doctor_cli(monkeypatch, tmp_path, "--config", str(ghost), "--measure-ltm")
+
+    start, status = (f"{_named(ghost)}mms daemon {sub}" for sub in ("start", "status"))
+    assert checks["ltm_measurement"]["next_action"] == start
+    assert checks["ltm"]["next_action"] == status
+    run = (
+        f"set {CONFIG_PATH} to {ghost.resolve()}, then run `mms daemon status`"
+        if sys.platform == "win32"
+        else f"run `{status}`"
+    )
+    assert checks["ltm"]["detail"].startswith(f"shared daemon is not reachable; {run}")
+
+
+@pytest.mark.parametrize(
+    ("replied", "subcommand"),
+    [({"timeout_samples": 0}, "status"), (None, "restart")],
+    ids=["failed-requests", "predates-counters"],
+)
+def test_standalone_outcome_advice_names_the_config_file(
+    ghost, monkeypatch, tmp_path, replied, subcommand
+):
+    surface: dict[str, Any] = {"samples": 5}
+    if replied is not None:
+        surface.update(timeout_samples=2, error_samples=0, pre_rpc_faults=0)
+
+    async def ping(config: STMConfig, *, timeout: float = 2.0, **_: Any) -> Any:
+        return {"ltm": "warm", "pid": 1, "port": 2, "latency": {"surface": surface}}
+
+    _standalone_route(monkeypatch)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", ping)
+
+    checks = _doctor_cli(monkeypatch, tmp_path, "--config", str(ghost))
+
+    assert checks["surfacing_outcomes"]["next_action"] == f"{_named(ghost)}mms daemon {subcommand}"
+
+
+def test_standalone_advice_stays_bare_without_an_explicit_config(ghost, monkeypatch, tmp_path):
+    # The environment names the file, so a bare command builds from it too.
+    _standalone_route(monkeypatch)
+    monkeypatch.setenv(CONFIG_PATH, str(ghost))
+    _install(monkeypatch, LiveDaemons())
+
+    checks = _doctor_cli(monkeypatch, tmp_path, "--measure-ltm")
+
+    assert checks["ltm_measurement"]["next_action"] == "mms daemon start"
+    assert checks["ltm"]["next_action"] == "mms daemon status"
+
+
+def test_direct_route_advice_asks_for_a_rerun_with_the_config(ghost, monkeypatch, tmp_path):
+    from memtomem_stm.cli.proxy import _shell_join
+
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    _install(monkeypatch, LiveDaemons())
+
+    explicit = _doctor_cli(monkeypatch, tmp_path, "--config", str(ghost), "--measure-ltm")
+    monkeypatch.setenv(CONFIG_PATH, str(ghost))
+    second = tmp_path / "second"
+    second.mkdir()
+    implicit = _doctor_cli(monkeypatch, second, "--measure-ltm")
+
+    setting = (
+        "set hook.use_daemon back to true (MEMTOMEM_STM_HOOK__USE_DAEMON, or "
+        "use_daemon in MEMTOMEM_STM_HOOK) or export MEMTOMEM_STM_SURFACING__USE_DAEMON=true; "
+    )
+    action = explicit["ltm_measurement"]["next_action"]
+    rerun = _shell_join(["mms", "doctor", "--measure-ltm", "--config", str(ghost.resolve())])
+    assert action == f"{setting}then rerun `{rerun}`"
+    assert "mms daemon" not in action
+    assert implicit["ltm_measurement"]["next_action"] == setting + "mms daemon start"
+
+
+async def _no_probes(servers: Any, timeout: float) -> dict[str, Any]:
+    return {}
+
+
+def test_the_json_report_does_not_carry_the_private_config_key(ghost, monkeypatch, tmp_path):
+    _standalone_route(monkeypatch)
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setattr("memtomem_stm.cli.proxy._probe_servers", _no_probes)
+
+    result = CliRunner().invoke(cli, ["doctor", "--json", "--config", str(ghost)])
+
+    surfacing = json.loads(result.output)["surfacing"]
+    assert not [key for key in surfacing if key.startswith("_")], surfacing
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["flag", "environment"])
+def test_health_error_names_the_config_only_when_the_flag_did(ghost, monkeypatch, explicit):
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__USE_DAEMON", "1")
+    monkeypatch.setenv(CONFIG_PATH, str(ghost))
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setattr("memtomem_stm.cli.proxy._probe_servers", _no_probes)
+    args = ["health", "--json"] + (["--config", str(ghost)] if explicit else [])
+
+    result = CliRunner().invoke(cli, args)
+
+    error = json.loads(result.output)["surfacing"]["ltm_server"]["error"]
+    assert (str(ghost.resolve()) in error) is explicit, error
+
+
+def test_windows_form_puts_the_variable_outside_the_command(monkeypatch, tmp_path):
+    from memtomem_stm.cli.proxy import _daemon_command, _run_daemon_command
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    config = tmp_path / "stm proxy.json"
+
+    command = _daemon_command("start", hook_command=False, config_file=config)
+    phrase = _run_daemon_command("status", hook_command=False, config_file=config)
+
+    assert command == f"set {CONFIG_PATH} to {config}, then run mms daemon start"
+    assert phrase == f"set {CONFIG_PATH} to {config}, then run `mms daemon status`"
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_an_unrenderable_config_path_is_never_wrapped_as_a_command(monkeypatch, platform):
+    from memtomem_stm.cli.proxy import (
+        _HINT_UNRENDERABLE,
+        _daemon_command,
+        _measure_rerun,
+        _run_daemon_command,
+    )
+
+    monkeypatch.setattr(sys, "platform", platform)
+    config = Path("bad\nname.json")
+
+    assert _daemon_command("start", hook_command=False, config_file=config) == _HINT_UNRENDERABLE
+    assert (
+        _run_daemon_command("status", hook_command=False, config_file=config) == _HINT_UNRENDERABLE
+    )
+    assert _measure_rerun(config) == "then rerun mms doctor --measure-ltm with the same --config"
+
+
+def test_a_late_bootstrap_failure_does_not_leak_the_private_config_key(ghost, monkeypatch):
+    # The key is recorded before this read, so the failed report carries it too.
+    def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("summary unreadable")
+
+    _standalone_route(monkeypatch)
+    _install(monkeypatch, LiveDaemons())
+    monkeypatch.setattr("memtomem_stm.surfacing.feedback_store.read_surfacing_summary", broken)
+    monkeypatch.setattr("memtomem_stm.cli.proxy._probe_servers", _no_probes)
+    assert "_standalone_config" in _doctor(ghost)  # the case under test is reached
+
+    result = CliRunner().invoke(cli, ["doctor", "--json", "--config", str(ghost)])
+
+    surfacing = json.loads(result.output)["surfacing"]
+    assert surfacing["error"], surfacing
+    assert not [key for key in surfacing if key.startswith("_")], surfacing
+
+
+def test_health_key_error_stays_bare_when_only_the_environment_names_the_config(
+    ghost, monkeypatch, tmp_path
+):
+    from memtomem_stm.daemon import discovery
+
+    data_dir = tmp_path / "cnryDataDir"
+    data_dir.mkdir()
+    discovery.discovery_key_path(data_dir).write_bytes(b"not a key\n")
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__USE_DAEMON", "1")
+    monkeypatch.setenv(CONFIG_PATH, str(ghost))
+    monkeypatch.setattr("memtomem_stm.cli.proxy._probe_servers", _no_probes)
+
+    result = CliRunner().invoke(cli, ["health", "--json"])
+
+    block = json.loads(result.output)["surfacing"]["ltm_server"]
+    assert block["discovery_key_unusable"] is True, block
+    assert block["error"].endswith("(LocalKeyError); run `mms daemon status`"), block
+    assert "cnryDataDir" not in result.output
