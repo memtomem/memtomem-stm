@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -353,6 +353,26 @@ class TestFormatterInjection:
 
         assert "**auth.md**" in output
         assert "**/auth.md**" not in output
+
+    # Pure paths pin the flavour, so each row means the same on every platform.
+    @pytest.mark.parametrize(
+        ("source_file", "expected"),
+        [
+            pytest.param(
+                PurePosixPath("/notes/2026-q1/auth.md"),
+                "2026-q1/auth.md",
+                id="parent-and-basename",
+            ),
+            pytest.param(PurePosixPath("/auth.md"), "auth.md", id="top-level"),
+            pytest.param(PurePosixPath("notes/m1.md"), "notes/m1.md", id="relative"),
+            pytest.param(PurePosixPath("/a/b/c/d.md"), "c/d.md", id="deep"),
+            pytest.param(PurePosixPath("/"), "/", id="posix-root"),
+            pytest.param(PureWindowsPath(r"C:\notes\a\b.md"), "a/b.md", id="windows-nested"),
+            pytest.param(PureWindowsPath("C:\\"), "C:\\", id="windows-root"),
+        ],
+    )
+    def test_format_source(self, source_file: PurePath, expected: str):
+        assert SurfacingFormatter._format_source(source_file) == expected
 
     def test_default_namespace_none_renders_default_badge(self):
         fmt = SurfacingFormatter(SurfacingConfig(default_namespace=None))
