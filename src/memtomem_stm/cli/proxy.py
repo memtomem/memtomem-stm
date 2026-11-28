@@ -1983,6 +1983,18 @@ def _gateway_runtime_config(
             cause=exc,
             path=resolved,
         )
+    except OSError as exc:
+        # The file became unreachable after ``_load`` read it: the shared
+        # loader probes it outside its own error handler. Named by type only,
+        # like every other config-read failure here.
+        _gateway_fail(
+            action,
+            "config_unreadable",
+            f"config could not be read ({type(exc).__name__})",
+            as_json=as_json,
+            cause=exc,
+            path=resolved,
+        )
     if runtime.startup_error or runtime.config is None:
         _gateway_fail(
             action,

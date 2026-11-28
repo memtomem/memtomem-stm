@@ -1708,6 +1708,40 @@ def test_gateway_commands_report_a_config_unreadable_on_the_second_read(
     assert "secret-1583" not in result.stdout and "secret-1583" not in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("action", "argv"),
+    [("gateway-status", ["status"]), ("gateway-explain", ["explain", "graph-srv::read"])],
+)
+def test_gateway_commands_report_a_config_unreadable_on_the_second_probe(
+    tmp_path, monkeypatch, action, argv
+):
+    # The startup-shaped read probes the file with exists() before its own
+    # error handler; a failure there must still yield the one document.
+    config, _ = _gateway_file(tmp_path)
+    real_exists = Path.exists
+    probes = {"count": 0}
+
+    def exists(self, *args, **kwargs):
+        if self == config.resolve():
+            probes["count"] += 1
+            if probes["count"] > 1:
+                raise PermissionError(13, "secret-1583 denied")
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", exists)
+
+    result = CliRunner().invoke(cli, ["gateway", *argv, "--config", str(config), "--json"])
+
+    assert probes["count"] == 2
+    assert result.exit_code == 1
+    document = json.loads(result.stdout)
+    assert document["action"] == action
+    assert document["error"] == "config_unreadable"
+    assert document["message"] == "config could not be read (PermissionError)"
+    assert document["path"] == str(config.resolve())
+    assert "secret-1583" not in result.stdout and "secret-1583" not in result.stderr
+
+
 def test_gateway_explain_keeps_bundle_invalid_for_a_too_deep_bundle(tmp_path):
     config, bundle = _gateway_file(tmp_path)
     bundle.write_bytes(b"[" * 100_000 + b"]" * 100_000)

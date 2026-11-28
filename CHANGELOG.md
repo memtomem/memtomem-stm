@@ -101,7 +101,7 @@ changes inline only. See the deprecation policy in
 
 - `mms gateway status` and `mms gateway explain` now read the configuration the
   way the server starts, with `MEMTOMEM_STM_*` environment values applied over
-  the file (issue #1583). They used to validate the file as written, so an
+  the file (#1587, issue #1583). They used to validate the file as written, so an
   inherited `MEMTOMEM_STM_PROXY__TOOLGRAPH__ENABLED=false`, `__AGENT_ID`,
   `__BUNDLE_PATH` or `MEMTOMEM_STM_PROXY__EXPOSURE__PROFILE` was not in their
   answer. The environment is the command's own; a variable set only in an MCP
@@ -112,8 +112,10 @@ changes inline only. See the deprecation policy in
   `toolgraph_enabled` and `profile`, and its human output says when either
   switch is off. `status` labels a valid bundle `validated:` rather than
   `active:` when the proxy is disabled. A `config_invalid` message for a failed
-  validation now reads `invalid proxy config: N validation error(s): …`, and a
-  runtime configuration the server cannot start from is now `config_invalid`
+  validation now reads `invalid proxy config: N validation error(s): …`; a file
+  that becomes unreadable between the command's two reads is
+  `config_unreadable`; and a runtime configuration the server cannot start
+  from is now `config_invalid`
   (with `--config` given: without it, a `MEMTOMEM_STM_PROXY` value nested too
   deeply to parse still stops both commands with a traceback, when the config
   path is resolved, before this read). The bundle path is resolved as the
