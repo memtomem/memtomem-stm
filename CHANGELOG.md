@@ -65,6 +65,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- An upstream connection's own cancellation no longer cuts a signalled
+  shutdown short under anyio 4.16 (issue #1568). A SIGTERM or SIGINT cancels the
+  upstream connection owner tasks, and anyio 4.16 raises that cancellation out
+  of the owner's unwind. The owner stored it as its cleanup error and re-raised
+  it into the server's teardown, which skipped the rest of the close sequence
+  after the proxy manager stop (the leaked-child sweep still ran) and exited
+  with status 1. A cleanup error that is only
+  cancellation is now reported as a failed close (`ConnectionError`, logged at
+  debug), as connection setup already does. With the locked anyio 4.15.1 the
+  signal-shutdown tests showed no such cleanup error, so their outcome is the
+  same there.
 - `mms doctor` and `mms health` run with `--config` now name that file in the
   daemon commands for the standalone daemon (#1558, issue #1504). The advised bare
   `mms daemon start` built from the environment alone, which can be a different
