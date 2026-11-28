@@ -54,13 +54,13 @@ changes inline only. See the deprecation policy in
 ### Changed
 
 - `surfacing.timeout_seconds` must be finite, as `hook.daemon_timeout_seconds`
-  already is (#1522). `inf` was accepted but was not "no deadline": on the
-  shared-daemon route, the LTM operations that use the full surfacing
-  timeout turned it into a request deadline the daemon wire cannot carry, so
-  the daemon client sent nothing; and a hook command drops it when reading
-  its flags. `mms register` and `mms init` now write the largest finite
-  values (such as `1.7976931348623157e308`) into a registration with a
-  spelling that reads back finite; they used to write
+  already is (#1564, issue #1522). `inf` was accepted but was not "no
+  deadline": on the shared-daemon route, the LTM operations that use the
+  full surfacing timeout turned it into a request deadline the daemon wire
+  cannot carry, so the daemon client sent nothing; and a hook command drops
+  it when reading its flags. `mms register` and `mms init` now write the
+  largest finite values (such as `1.7976931348623157e308`) into a
+  registration with a spelling that reads back finite; they used to write
   `1.79769313486232e+308`, which reads back as infinity.
   **Behavior change**: when the surfacing timeout in effect — after the
   flags a hook command or an MCP registration pins — is `inf`, `infinity`
