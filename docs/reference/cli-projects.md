@@ -3,8 +3,8 @@
 ## Registry import
 
 `mms import --from <host|all>` previews definitions discovered in supported
-host configs. `--apply` stores them in `~/.mms/registry.toml`; project-local
-sources require `--allow-project-configs`.
+host configs. `--apply` stores them in `~/.mms/registry.toml`; applying a new
+entry discovered in a project-local file also requires `--allow-project-configs`.
 
 Secrets are redacted in plans but retained in the applied local registry.
 Conflicts require an explicit resolution and dangerous environment keys are

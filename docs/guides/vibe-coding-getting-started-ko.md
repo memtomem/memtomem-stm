@@ -118,11 +118,13 @@ mms register --client auto
 ```
 
 > Codex CLI: `mms import --from codex`는 `CODEX_HOME`(기본 `~/.codex`)의 기존 MCP를 탐색합니다.
-> 신뢰된 프로젝트의 `.codex/config.toml`은 `--allow-project-configs`로
-> 명시적으로 허용할 때만 가져옵니다. `mms import --from codex`는
-> `~/.mms/registry.toml`을 채우는 별도 프로젝트 레지스트리 기능이며,
-> `~/.memtomem/stm_proxy.json`에 upstream을 추가하지 않습니다. 또한 Codex
-> local memory의 기본 경로인 `~/.codex/memories/`를 색인하는 명령도 아닙니다.
+> 현재 디렉터리의 `.codex/config.toml`은 사용자 Codex 설정이 그 디렉터리의 실제 경로를
+> `trust_level = "trusted"`로 표시한 경우에만 읽습니다. `mms import --from codex`는
+> 미리보기이고, `--apply`를 붙여야 `~/.mms/registry.toml`에 씁니다. project 파일에서
+> 발견한 새 항목을 적용하려면 `--allow-project-configs`도 필요합니다. 이 명령은 별도
+> 프로젝트 레지스트리 기능이며, `~/.memtomem/stm_proxy.json`에 upstream을 추가하지
+> 않습니다. 또한 Codex local memory의 기본 경로인 `~/.codex/memories/`를 색인하는
+> 명령도 아닙니다.
 
 이미 `~/.memtomem/stm_proxy.json`이 있다면 다음처럼 등록 단계를 이어갑니다.
 
