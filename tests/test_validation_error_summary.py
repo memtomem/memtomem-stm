@@ -144,11 +144,9 @@ def test_references_are_the_reviewed_set():
     refs, renames = _references()
     assert renames == []
     assert dict(refs) == {
+        # Also ``mms gateway status`` / ``explain``, which read through it (#1583).
         ("cli/proxy.py", "_runtime_proxy_read"): 1,
         ("cli/proxy.py", "_probe_failure_message"): 1,
-        # ``mms gateway``: the same ProxyConfig the config-load path validates.
-        ("cli/proxy.py", "gateway_status"): 1,
-        ("cli/proxy.py", "gateway_explain"): 1,
         # ``mms project route --json``: the routed ProxyConfig dict; keys are
         # upstream server, tool and env-variable names (#1138).
         ("cli/proxy.py", "_schema_validation_summary"): 1,

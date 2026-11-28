@@ -141,6 +141,31 @@ changes inline only. See the deprecation policy in
   rows after the purge, which the new release does not read but which count
   against `max_entries` until they are removed, and which a process of the
   previous release can still serve while they are valid.
+- `mms gateway status` and `mms gateway explain` now read the configuration the
+  way the server starts, with `MEMTOMEM_STM_*` environment values applied over
+  the file (#1587, issue #1583). They used to validate the file as written, so an
+  inherited `MEMTOMEM_STM_PROXY__TOOLGRAPH__ENABLED=false`, `__AGENT_ID`,
+  `__BUNDLE_PATH` or `MEMTOMEM_STM_PROXY__EXPOSURE__PROFILE` was not in their
+  answer. The environment is the command's own; a variable set only in an MCP
+  client registration's `env` applies when the command is run with it.
+  **Behavior change**: under such an environment both commands describe the
+  overridden config. Their `--json` success documents gain `env_overrides` (the
+  gateway fields the environment set) and `proxy_enabled`; `explain` also gains
+  `toolgraph_enabled` and `profile`, and its human output says when either
+  switch is off. `status` labels a valid bundle `validated:` rather than
+  `active:` when the proxy is disabled. A `config_invalid` message for a failed
+  validation now reads `invalid proxy config: N validation error(s): …`; a file
+  that becomes unreadable between the command's two reads is
+  `config_unreadable`; and a runtime configuration the server cannot start
+  from is now `config_invalid`
+  (with `--config` given: without it, a `MEMTOMEM_STM_PROXY` value nested too
+  deeply to parse still stops both commands with a traceback, when the config
+  path is resolved, before this read). The bundle path is resolved as the
+  server resolves it: one that cannot be expanded (unknown `~user`), holds a
+  NUL or cannot be `stat`ed is reported as an invalid bundle (`status`) or
+  `bundle_unreadable` (`explain`) instead of a traceback or a bundle the server
+  would reject. `explain`'s `unknown_tool` message says "not in the bundle"
+  rather than "not in the active bundle".
 - An upstream connection's own cancellation no longer cuts a signalled
   shutdown short under anyio 4.16 (#1569, issue #1568). A SIGTERM or SIGINT cancels the
   upstream connection owner tasks, and anyio 4.16 raises that cancellation out

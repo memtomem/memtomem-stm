@@ -34,6 +34,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_TOOLGRAPH_UNMAPPED,
 )
 from memtomem_stm.proxy import toolgraph_bundle as toolgraph_bundle_mod
+from memtomem_stm.proxy import config as proxy_config_mod
 from memtomem_stm.proxy.toolgraph_bundle import (
     PolicyBundleError,
     bundle_provenance_warnings,
@@ -1243,7 +1244,10 @@ def test_gateway_invalid_config_error_omits_configured_values(tmp_path, monkeypa
     result = CliRunner().invoke(cli, [*argv, "--config", str(config)])
 
     assert result.exit_code != 0
-    assert "invalid proxy config: upstream_servers.x (value_error)" in result.output
+    assert (
+        "invalid proxy config: 1 validation error(s): upstream_servers.x (value_error)"
+        in result.output
+    )
     assert "7777" not in result.output
 
 
@@ -1339,6 +1343,428 @@ def test_gateway_status_and_explain_bundle(tmp_path):
     )
     assert plain.exit_code == 0, plain.output
     assert "risk score: n/a" in plain.output
+
+
+# ---------------------------------------------------------------------------
+# gateway status / explain read the config the way the server starts (#1583)
+# ---------------------------------------------------------------------------
+
+_GATEWAY_ENV = "MEMTOMEM_STM_PROXY__"
+
+
+def _gateway_file(tmp_path: Path, *, agent: str = "stm-proxy", decision: str = "eligible"):
+    """A strict bundle config whose bundle is valid for ``agent``."""
+    config = tmp_path / "proxy.json"
+    bundle = tmp_path / f"bundle-{agent}.json"
+    document = _bundle(_tool(), decision=decision)
+    document["agent"] = agent
+    _write_bundle(bundle, document)
+    config.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "upstream_servers": {},
+                "exposure": {"profile": "strict"},
+                "toolgraph": {
+                    "enabled": True,
+                    "source": "bundle",
+                    "bundle_path": str(bundle),
+                    "agent_id": agent,
+                    "query_profile": "strict",
+                },
+            }
+        )
+    )
+    return config, bundle
+
+
+def _gateway_json(argv: list[str], config: Path) -> tuple[int, dict]:
+    result = CliRunner().invoke(cli, ["gateway", *argv, "--config", str(config), "--json"])
+    return result.exit_code, json.loads(result.stdout)
+
+
+def _gateway_human(argv: list[str], config: Path):
+    return CliRunner().invoke(cli, ["gateway", *argv, "--config", str(config)])
+
+
+def test_gateway_status_applies_an_inherited_toolgraph_disable(tmp_path, monkeypatch):
+    config, _ = _gateway_file(tmp_path)
+    monkeypatch.setenv(_GATEWAY_ENV + "TOOLGRAPH__ENABLED", "false")
+
+    code, document = _gateway_json(["status"], config)
+
+    assert code == 0, document
+    assert document["enabled"] is False
+    assert "valid" not in document
+    assert document["env_overrides"] == ["toolgraph.enabled"]
+    assert document["proxy_enabled"] is True
+
+
+def test_gateway_status_and_explain_apply_env_agent_and_bundle(tmp_path, monkeypatch):
+    config, _ = _gateway_file(tmp_path)
+    reviewer = tmp_path / "reviewer"
+    reviewer.mkdir()
+    _, reviewer_bundle = _gateway_file(reviewer, agent="reviewer", decision="rejected")
+    monkeypatch.setenv(_GATEWAY_ENV + "TOOLGRAPH__AGENT_ID", "reviewer")
+    monkeypatch.setenv(_GATEWAY_ENV + "TOOLGRAPH__BUNDLE_PATH", str(reviewer_bundle))
+
+    code, status = _gateway_json(["status"], config)
+    assert code == 0, status
+    assert status["agent"] == "reviewer"
+    assert status["bundle_path"] == str(reviewer_bundle)
+    assert status["valid"] is True
+    assert status["env_overrides"] == ["toolgraph.agent_id", "toolgraph.bundle_path"]
+
+    code, explain = _gateway_json(["explain", "graph-srv::read"], config)
+    assert code == 0, explain
+    assert explain["decision"] == "rejected"
+    assert explain["env_overrides"] == ["toolgraph.agent_id", "toolgraph.bundle_path"]
+
+
+def test_gateway_commands_apply_an_env_profile(tmp_path, monkeypatch):
+    config, _ = _gateway_file(tmp_path)
+    monkeypatch.setenv(_GATEWAY_ENV + "EXPOSURE__PROFILE", "review")
+
+    code, status = _gateway_json(["status"], config)
+    assert code == 0, status
+    assert status["profile"] == "review"
+    assert status["valid"] is False
+    assert status["env_overrides"] == ["exposure.profile"]
+
+    code, explain = _gateway_json(["explain", "graph-srv::read"], config)
+    assert code == 1
+    assert explain["error"] == "profile_mismatch"
+
+
+def test_gateway_commands_without_env_report_no_overrides(tmp_path):
+    config, _ = _gateway_file(tmp_path)
+
+    code, status = _gateway_json(["status"], config)
+    assert code == 0, status
+    assert status["env_overrides"] == []
+    assert status["proxy_enabled"] is True
+    code, explain = _gateway_json(["explain", "graph-srv::read"], config)
+    assert code == 0, explain
+    assert explain["env_overrides"] == []
+    assert explain["proxy_enabled"] is True
+    assert explain["toolgraph_enabled"] is True
+    assert explain["profile"] == "strict"
+
+    human = _gateway_human(["status"], config)
+    assert human.exit_code == 0, human.output
+    assert "environment overrides" not in human.output
+    assert "  active: graph generation 7" in human.output
+    plain = _gateway_human(["explain", "graph-srv::read"], config)
+    assert plain.exit_code == 0, plain.output
+    assert "environment overrides" not in plain.output
+    assert "not applied" not in plain.output
+
+
+@pytest.mark.parametrize("argv", [["status"], ["explain", "graph-srv::read"]])
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("MEMTOMEM_STM_PROXY", "[]"), ("MEMTOMEM_STM_LOG_LEVEL", "bogus-1583")],
+    ids=["bare-proxy-not-object", "non-proxy-setting"],
+)
+def test_gateway_commands_fail_when_the_server_cannot_start(
+    tmp_path, monkeypatch, argv, name, value
+):
+    config, _ = _gateway_file(tmp_path)
+    monkeypatch.setenv(name, value)
+
+    code, document = _gateway_json(argv, config)
+
+    assert code == 1
+    assert document["error"] == "config_invalid"
+    assert document["message"].startswith(
+        "runtime configuration invalid — the server cannot start: "
+    )
+    assert "bogus-1583" not in document["message"]
+
+
+def test_gateway_status_describes_an_env_only_policy_when_the_file_is_missing(
+    tmp_path, monkeypatch
+):
+    _, bundle = _gateway_file(tmp_path)
+    missing = tmp_path / "absent.json"
+    for key, value in {
+        "ENABLED": "true",
+        "TOOLGRAPH__ENABLED": "true",
+        "TOOLGRAPH__SOURCE": "bundle",
+        "TOOLGRAPH__BUNDLE_PATH": str(bundle),
+    }.items():
+        monkeypatch.setenv(_GATEWAY_ENV + key, value)
+
+    code, document = _gateway_json(["status"], missing)
+
+    assert code == 0, document
+    assert document["valid"] is True
+    assert document["proxy_enabled"] is True
+    assert document["env_overrides"] == [
+        "enabled",
+        "toolgraph.bundle_path",
+        "toolgraph.enabled",
+        "toolgraph.source",
+    ]
+
+
+def test_gateway_status_accepts_a_file_the_env_repairs(tmp_path, monkeypatch):
+    config, _ = _gateway_file(tmp_path)
+    data = json.loads(config.read_text())
+    data["exposure"]["profile"] = "bogus"
+    config.write_text(json.dumps(data))
+    monkeypatch.setenv(_GATEWAY_ENV + "EXPOSURE__PROFILE", "strict")
+
+    code, document = _gateway_json(["status"], config)
+
+    assert code == 0, document
+    assert document["valid"] is True
+
+
+@pytest.mark.parametrize("argv", [["status"], ["explain", "graph-srv::read"]])
+def test_gateway_commands_fail_when_the_env_merge_fails(tmp_path, monkeypatch, argv):
+    config, _ = _gateway_file(tmp_path)
+    data = json.loads(config.read_text())
+    data["upstream_servers"] = {"a": {"command": "echo", "prefix": "dup1583"}}
+    config.write_text(json.dumps(data))
+    monkeypatch.setenv(
+        _GATEWAY_ENV + "UPSTREAM_SERVERS__B",
+        json.dumps({"command": "echo", "prefix": "dup1583"}),
+    )
+
+    code, document = _gateway_json(argv, config)
+
+    assert code == 1
+    assert document["error"] == "config_invalid"
+    assert document["message"].startswith("invalid proxy config: ")
+    assert "dup1583" not in document["message"]
+    assert document["path"] == str(config.resolve())
+
+
+def test_gateway_explain_says_a_disabled_toolgraph_does_not_apply(tmp_path, monkeypatch):
+    config, _ = _gateway_file(tmp_path)
+    monkeypatch.setenv(_GATEWAY_ENV + "TOOLGRAPH__ENABLED", "false")
+
+    code, document = _gateway_json(["explain", "graph-srv::read"], config)
+    assert code == 0, document
+    assert document["decision"] == "eligible"
+    assert document["toolgraph_enabled"] is False
+
+    plain = _gateway_human(["explain", "graph-srv::read"], config)
+    assert plain.exit_code == 0, plain.output
+    assert "  not applied: toolgraph.enabled is false" in plain.output
+    assert "  environment overrides: toolgraph.enabled" in plain.output
+
+
+def test_gateway_commands_report_a_proxy_disabled_by_env(tmp_path, monkeypatch):
+    config, _ = _gateway_file(tmp_path)
+    monkeypatch.setenv(_GATEWAY_ENV + "ENABLED", "false")
+
+    for argv in (["status"], ["explain", "graph-srv::read"]):
+        code, document = _gateway_json(argv, config)
+        assert code == 0, document
+        assert document["env_overrides"] == ["enabled"]
+        assert document["proxy_enabled"] is False
+
+    human = _gateway_human(["status"], config)
+    assert human.exit_code == 0, human.output
+    assert "Gateway policy: enabled (bundle); proxy disabled" in human.output
+    assert "  validated: graph generation 7" in human.output
+    assert "  active:" not in human.output
+    plain = _gateway_human(["explain", "graph-srv::read"], config)
+    assert plain.exit_code == 0, plain.output
+    assert "  not applied: enabled is false" in plain.output
+
+
+def test_gateway_commands_survive_a_bundle_path_that_cannot_expand(tmp_path, monkeypatch):
+    config, _ = _gateway_file(tmp_path)
+    raw = "~nosuchuser-1583/policy.json"
+    monkeypatch.setenv(_GATEWAY_ENV + "TOOLGRAPH__BUNDLE_PATH", raw)
+    real_expanduser = Path.expanduser
+
+    def expanduser(self):
+        # Injected rather than relying on an absent account, so the case runs
+        # the same on every platform.
+        if str(self).startswith("~nosuchuser-1583"):
+            raise RuntimeError("Could not determine home directory.")
+        return real_expanduser(self)
+
+    monkeypatch.setattr(Path, "expanduser", expanduser)
+
+    shown = str(Path(raw))  # the platform's separator, as the commands print it
+    code, status = _gateway_json(["status"], config)
+    assert code == 0, status
+    assert status["valid"] is False
+    assert status["bundle_path"] == shown
+    assert "RuntimeError" in status["error"]
+
+    code, explain = _gateway_json(["explain", "graph-srv::read"], config)
+    assert code == 1
+    assert explain["error"] == "bundle_unreadable"
+    assert explain["bundle_path"] == shown
+
+
+@pytest.mark.parametrize(
+    "bundle_path",
+    # A NUL in a later segment reaches stat(); one in the ``~user`` segment
+    # makes expanduser() itself raise — ValueError on POSIX, possibly
+    # RuntimeError on Windows. Either is the barrier's "cannot resolve".
+    ["pol\u0000icy.json", "~root\u0000/policy.json"],
+    ids=["nul-in-name", "nul-in-user"],
+)
+def test_gateway_commands_survive_a_bundle_path_with_a_nul(tmp_path, monkeypatch, bundle_path):
+    config, _ = _gateway_file(tmp_path)
+    # json.dumps writes the NUL as the escape ``\u0000``, so the variable
+    # itself holds none; settings decodes it into the path.
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_PROXY", json.dumps({"toolgraph": {"bundle_path": bundle_path}})
+    )
+
+    code, status = _gateway_json(["status"], config)
+    assert code == 0, status
+    assert status["valid"] is False
+    assert status["error"].startswith("cannot resolve policy bundle path ")
+
+    code, explain = _gateway_json(["explain", "graph-srv::read"], config)
+    assert code == 1
+    assert explain["error"] == "bundle_unreadable"
+
+
+def test_gateway_commands_reject_a_bundle_the_runtime_cannot_stat(tmp_path, monkeypatch):
+    # The runtime rejects on a failed stat() even if a read would succeed.
+    config, bundle = _gateway_file(tmp_path)
+    real_stat = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self == bundle:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+    code, status = _gateway_json(["status"], config)
+    assert code == 0, status
+    assert status["valid"] is False
+    assert status["error"].startswith(f"cannot read policy bundle {bundle}: ")
+
+    code, explain = _gateway_json(["explain", "graph-srv::read"], config)
+    assert code == 1
+    assert explain["error"] == "bundle_unreadable"
+    assert explain["bundle_path"] == str(bundle)
+
+
+@pytest.mark.parametrize("argv", [["status"], ["explain", "graph-srv::read"]])
+def test_gateway_commands_fail_cleanly_on_a_too_deep_env_value(tmp_path, monkeypatch, argv):
+    # Injected at the overlay instead of a real 200K-character payload, which
+    # would exceed the Windows environment-variable limit.
+    config, _ = _gateway_file(tmp_path)
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY", "{}")
+
+    def too_deep(*_args, **_kwargs):
+        raise RecursionError("injected decoder recursion limit")
+
+    monkeypatch.setattr(proxy_config_mod, "collect_proxy_env_overrides", too_deep)
+
+    code, document = _gateway_json(argv, config)
+
+    assert code == 1
+    assert document["error"] == "config_invalid"
+    assert document["message"] == (
+        "runtime configuration invalid — the server cannot start: "
+        "a MEMTOMEM_STM_* value is nested too deeply to parse"
+    )
+    assert document["path"] == str(config.resolve())
+
+
+@pytest.mark.parametrize(
+    ("action", "argv"),
+    [("gateway-status", ["status"]), ("gateway-explain", ["explain", "graph-srv::read"])],
+)
+def test_gateway_commands_report_a_config_unreadable_on_the_second_read(
+    tmp_path, monkeypatch, action, argv
+):
+    # ``_load`` reads the file first; the startup-shaped read is the second.
+    config, _ = _gateway_file(tmp_path)
+    real_read_text = Path.read_text
+    reads = {"count": 0}
+
+    def read_text(self, *args, **kwargs):
+        if self == config.resolve():
+            reads["count"] += 1
+            if reads["count"] > 1:
+                raise PermissionError(13, "secret-1583 denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+    result = CliRunner().invoke(cli, ["gateway", *argv, "--config", str(config), "--json"])
+
+    assert reads["count"] == 2
+    assert result.exit_code == 1
+    document = json.loads(result.stdout)
+    assert document["action"] == action
+    assert document["error"] == "config_unreadable"
+    assert document["path"] == str(config.resolve())
+    assert "secret-1583" not in result.stdout and "secret-1583" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("action", "argv"),
+    [("gateway-status", ["status"]), ("gateway-explain", ["explain", "graph-srv::read"])],
+)
+def test_gateway_commands_report_a_config_unreadable_on_the_second_probe(
+    tmp_path, monkeypatch, action, argv
+):
+    # The startup-shaped read probes the file with exists() before its own
+    # error handler; a failure there must still yield the one document.
+    config, _ = _gateway_file(tmp_path)
+    real_exists = Path.exists
+    probes = {"count": 0}
+
+    def exists(self, *args, **kwargs):
+        if self == config.resolve():
+            probes["count"] += 1
+            if probes["count"] > 1:
+                raise PermissionError(13, "secret-1583 denied")
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", exists)
+
+    result = CliRunner().invoke(cli, ["gateway", *argv, "--config", str(config), "--json"])
+
+    assert probes["count"] == 2
+    assert result.exit_code == 1
+    document = json.loads(result.stdout)
+    assert document["action"] == action
+    assert document["error"] == "config_unreadable"
+    assert document["message"] == "config could not be read (PermissionError)"
+    assert document["path"] == str(config.resolve())
+    assert "secret-1583" not in result.stdout and "secret-1583" not in result.stderr
+
+
+def test_gateway_explain_keeps_bundle_invalid_for_a_too_deep_bundle(tmp_path):
+    config, bundle = _gateway_file(tmp_path)
+    bundle.write_bytes(b"[" * 100_000 + b"]" * 100_000)
+
+    code, explain = _gateway_json(["explain", "graph-srv::read"], config)
+
+    assert code == 1
+    assert explain["error"] == "bundle_invalid"
+
+
+def test_gateway_env_overrides_name_declared_fields_only(tmp_path, monkeypatch):
+    config, _ = _gateway_file(tmp_path)
+    monkeypatch.setenv(_GATEWAY_ENV + "TOOLGRAPH__SERVER_NAME_MAP", json.dumps({"srv": "x1583"}))
+
+    code, document = _gateway_json(["status"], config)
+    assert code == 0, document
+    assert document["env_overrides"] == ["toolgraph.server_name_map"]
+
+    monkeypatch.delenv(_GATEWAY_ENV + "TOOLGRAPH__SERVER_NAME_MAP")
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY", json.dumps({"toolgraph": {"enabeld": True}}))
+    code, document = _gateway_json(["status"], config)
+    assert code == 0, document
+    assert document["env_overrides"] == []
 
 
 class TestBindFailureDiagnostics:

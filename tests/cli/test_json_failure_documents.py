@@ -212,7 +212,9 @@ def test_gateway_json_typed_validation_failure_emits_config_invalid(tmp_path, ac
 
     document = _failure_document(result, action, "config_invalid")
     assert document["path"] == str(path.resolve())
-    assert document["message"] == "invalid proxy config: default_max_result_chars (greater_than)"
+    assert document["message"] == (
+        "invalid proxy config: 1 validation error(s): default_max_result_chars (greater_than)"
+    )
 
 
 def test_gateway_explain_json_source_not_bundle(tmp_path):

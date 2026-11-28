@@ -70,6 +70,27 @@ refresh which tools appear in the external MCP `tools/list`. See the
 [Toolgraph Policy Gateway guide](../guides/toolgraph-policy-gateway.md) for the
 review-first workflow.
 
+`status` and `explain` read the configuration the way the server starts:
+`MEMTOMEM_STM_*` values in the command's own environment apply over the file,
+and `env_overrides` in `--json` (an `environment overrides:` line otherwise)
+names the gateway fields they set, such as `toolgraph.agent_id` or
+`exposure.profile`. A runtime configuration the server could not start from is
+reported as `config_invalid`. So is a file that fails validation as merged: the
+server then starts from the environment and defaults alone, and these commands
+report the failure instead of describing that fallback. In
+`status --json`, `enabled` is the Toolgraph switch (`toolgraph.enabled`) and
+`proxy_enabled` the proxy switch (`enabled`); `explain --json` carries both
+(`toolgraph_enabled`, `proxy_enabled`) with `profile`, and its human output says
+when either switch is off. The environment is the command's, not an MCP client
+registration's: to check what a registration's `env` block does, run the
+command with those variables set. To check the file alone, run it without
+`MEMTOMEM_STM_*` variables and confirm `env_overrides` is empty. Two more cases
+differ from startup: a file whose `upstream_servers` is not an object fails
+here even when the environment would replace it, and an empty
+`MEMTOMEM_STM_PROXY__CONFIG_PATH` selects the default file here, while the
+server tries the working directory, cannot read it as a file, and falls back to
+the environment and defaults.
+
 `mms --version` and `mms version` are equivalent. `mms stats --source mcp`
 selects proxied calls; `--source hook` selects native-hook metrics.
 

@@ -67,6 +67,15 @@ generation, and eligible/rejected counts. Automation should inspect `valid`;
 status commands remain informational and can return a JSON diagnostic for an
 invalid artifact. `explain` reads the bundle only and never calls the upstream.
 
+Both read the configuration the way the server starts, so `MEMTOMEM_STM_*`
+values exported in your shell apply over the file; `env_overrides` names the
+gateway fields they set. Variables set only in an MCP client registration's
+`env` block are not in your shell: run the command with them set to see the
+configuration and bundle decisions that registration starts with. Neither
+command sees a running server's live catalog. See the
+[gateway CLI reference](../reference/cli-gateway.md#toolgraph-policy-gateway)
+for the fields and the cases that still differ from startup.
+
 Restart the MCP client after applying the bundle. STM registers its advertised
 tool list when the MCP server starts, so the client should reconnect before
 you judge which tools are visible.
