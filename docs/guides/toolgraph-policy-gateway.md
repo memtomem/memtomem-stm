@@ -107,10 +107,9 @@ An STM process enforces one Toolgraph agent, so roles such as a reviewer and
 an implementer each get their own bundle, config file and MCP registration.
 In Toolgraph, declare each role as an agent and grant it its tools.
 `ingest-manifest` replaces the graph's authored governance, so edit the full
-manifest rather than loading a fragment. Toolgraph's
-[policy impact preview](https://github.com/memtomem/toolgraph/blob/main/docs/policy-impact.md)
-shows which decisions a change would make; ingest the edited manifest, then
-compile one bundle per role:
+manifest rather than loading a fragment. In the quickstart fixture, also
+remove the DENY binding on the drafts resource, which rejects `publish_note`
+for every agent. Ingest the edited manifest, then compile one bundle per role:
 
 ```bash
 uv run toolgraph policy compile --agent reviewer --profile strict \
@@ -138,8 +137,9 @@ directory writes a `.mcp.json` entry that sets
 `memtomem-stm` entry unless you pass `--replace-registration`, and replacing
 an entry keeps environment values it does not manage. Check that each entry
 points at its role's file and carries no other `MEMTOMEM_STM_PROXY__TOOLGRAPH__*`
-or `MEMTOMEM_STM_PROXY__EXPOSURE__*` value, then restart each client and list
-its tools. After the restart, a strict registration advertises only the proxied
+or `MEMTOMEM_STM_PROXY__EXPOSURE__*` value, and that the client does not pass
+one to STM from its own environment. Then restart each client and list its
+tools. After the restart, a strict registration advertises only the proxied
 tools its role's bundle makes eligible, a call to a name it does not advertise
 fails as an unknown tool, and advertised tools still pass the policy check on
 every call. A bundle whose agent or profile does not match the file makes
