@@ -13,6 +13,11 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `mms init --help` and `mms register --help` now describe where `init` looks
+  for servers and mark `--mcp` as the older flag; `docs/cli.md` matches, and
+  its scripting examples use `--client`. (#1554)
+  **Behavior change**: the `--help` text changed; the commands' options,
+  defaults and behavior did not.
 - `mms prune --help` shows preview and prune examples, and says that the
   upstream stays in STM's config. The sentence "STM's own config is not
   touched." is gone: a prune may update the upstream's recorded origin.
