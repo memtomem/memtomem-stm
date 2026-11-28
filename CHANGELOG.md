@@ -94,7 +94,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - `mms doctor` no longer aborts with `OverflowError` when the surfacing deadline
-  is above about `9e307` seconds (issue #1561). Rounding the hook deadline it
+  is above about `9e307` seconds (#1575, issue #1561). Rounding the hook deadline it
   requires up to 0.5 s doubled the value, which overflowed; a value that large
   is already whole and is now kept as it is.
   **Behavior change**: a run that reached the hook deadline check with such a
