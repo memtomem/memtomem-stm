@@ -65,6 +65,20 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms doctor` and `mms health` run with `--config` now name that file in the
+  daemon commands for the standalone daemon (#1558, issue #1504). The advised bare
+  `mms daemon start` built from the environment alone, which can be a different
+  daemon from the one looked up.
+  **Behavior change**: on that route the `next:` lines and the daemon error text
+  (`health --json` included) put a
+  `MEMTOMEM_STM_PROXY__CONFIG_PATH=<file>` assignment, with the resolved path,
+  before the command; a path that cannot be displayed safely is omitted. On
+  Windows they say to set that variable to the file given to `--config` and
+  print no path. The `--measure-ltm` warning that no daemon route exists now
+  asks for a doctor rerun with that `--config` instead of naming
+  `mms daemon start`. Output without `--config`, and for the hook's daemon, is
+  unchanged. A differently-cased `memtomem_stm_proxy__config_path` already
+  exported in the shell can still outrank the advised assignment.
 - The docs no longer say that `mms import --from codex` writes the registry
   without `--apply`, or that a trusted project's `.codex/config.toml` is read
   only with `--allow-project-configs`: the preview reads it, and the flag is
