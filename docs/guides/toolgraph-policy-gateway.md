@@ -167,10 +167,9 @@ calls that go through its registration. An agent that runs with the
 operator's file or shell access can edit its own bundle and config, or start
 the upstream itself, so where the split is a security boundary, the host must
 also keep each role away from the policy files, the other registration and the
-upstream. On POSIX systems STM warns when the owner or mode bits of a bundle,
-a directory above it, or a symlink on its path suggest another user could
-replace it, but still loads it in `strict` (#707). The check does not read
-ACLs, so no warning is not an assurance.
+upstream. On POSIX systems STM logs a best-effort warning for some ownership
+and permission problems on the bundle's path, but still loads it in `strict`
+(#707). The check is incomplete, so no warning is not an assurance.
 
 The roles separate tool sets, not STM's state. Unless the files set their
 own paths, both processes use the same response cache, metrics and feedback
