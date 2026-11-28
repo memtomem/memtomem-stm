@@ -38,6 +38,8 @@ import os
 import signal
 from collections.abc import Callable
 
+from memtomem_stm.utils.anyio_shutdown import is_only_cancellation
+
 logger = logging.getLogger(__name__)
 
 # Set once, process-wide, by the first deliberate shutdown — a signal, or the
@@ -107,27 +109,12 @@ def was_signal_shutdown(exc: BaseException) -> bool:
     Requires both halves: a shutdown was started here (a signal, or
     :meth:`ShutdownSignals.trigger`), and the exception is nothing but
     cancellation. A real failure that happens to arrive afterwards is still a
-    failure, and cancellation with nothing behind it is not this.
-
-    anyio's strict task groups deliver the unwind as a ``BaseExceptionGroup``
-    (``CancelledError`` is a ``BaseException``, so the group cannot be a plain
-    ``ExceptionGroup``), and those nest, hence the recursion — with the
-    requirement that something actually matched, since ``all([])`` would
-    otherwise read an empty group as a clean shutdown.
+    failure, and cancellation with nothing behind it is not this. Grouped and
+    nested unwinds are read by :func:`is_only_cancellation`.
     """
     if not _signalled:
         return False
-    return _is_only_cancellation(exc)
-
-
-def _is_only_cancellation(exc: BaseException) -> bool:
-    if isinstance(exc, asyncio.CancelledError):
-        return True
-    if isinstance(exc, BaseExceptionGroup):
-        return bool(exc.exceptions) and all(
-            _is_only_cancellation(inner) for inner in exc.exceptions
-        )
-    return False
+    return is_only_cancellation(exc)
 
 
 # 128 + signum, the shell convention for "died from this signal".
