@@ -52,6 +52,22 @@ def is_clean_cancel_scope_shutdown(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and is_anyio_cancel_scope_shutdown_error(exc)
 
 
+def is_only_cancellation(exc: BaseException) -> bool:
+    """True when *exc* is a ``CancelledError`` or a group of nothing else.
+
+    AnyIO's strict task groups deliver a cancellation unwind as a
+    ``BaseExceptionGroup`` (``CancelledError`` is a ``BaseException``, so the
+    group cannot be a plain ``ExceptionGroup``), and those nest, hence the
+    recursion. An empty group is not cancellation: ``all([])`` would otherwise
+    read it as one. A group that mixes in any other exception is not either.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(is_only_cancellation(inner) for inner in exc.exceptions)
+    return False
+
+
 # Grace added to an in-flight call's own captured deadline to get the drain
 # ceiling. The call is already bounded by the timeout it captured when it
 # started; this only covers the hop from that deadline firing to the
