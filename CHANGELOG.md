@@ -111,9 +111,10 @@ changes inline only. See the deprecation policy in
   `memtomem_stm_proxy__config_path` naming another file could outrank the
   advised assignment in `sh` and `bash`, and the command then addressed the
   other file's daemon.
-  **Behavior change**: on POSIX the command now starts with `env` and lists
-  each spelling doctor's environment holds, canonical last
-  (`env MEMTOMEM_STM_PROXY__CONFIG_PATH=<file> mms daemon start` with none).
+  **Behavior change**: on POSIX the command now starts with `env` and assigns
+  the file to each differently-cased spelling the environment holds, followed
+  by the canonical name (`env MEMTOMEM_STM_PROXY__CONFIG_PATH=<file> mms daemon start`
+  when there is none).
   For a path that cannot be displayed safely, the note that no copy/paste hint
   is available is replaced by an instruction, in words and without the path,
   to run the command through `env` with each spelling set to the file given to

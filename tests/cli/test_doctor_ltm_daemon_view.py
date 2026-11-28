@@ -680,6 +680,7 @@ def test_config_path_spellings_fold_case_as_settings_does():
         CONFIG_PATH,
     ]
     assert _config_path_spellings({}) == [CONFIG_PATH]
+    assert _config_path_spellings({CONFIG_PATH: "a"}) == [CONFIG_PATH]
 
 
 def test_a_shadowing_spelling_is_given_the_same_file(monkeypatch, tmp_path):
@@ -698,7 +699,7 @@ def test_a_shadowing_spelling_is_given_the_same_file(monkeypatch, tmp_path):
 
 
 def test_an_unrenderable_path_names_every_spelling_to_set(monkeypatch):
-    from memtomem_stm.cli.proxy import _daemon_command
+    from memtomem_stm.cli.proxy import _daemon_command, _run_daemon_command
 
     monkeypatch.setattr(sys, "platform", "linux")
     second = "Memtomem_Stm_Proxy__Config_Path"
@@ -713,6 +714,8 @@ def test_an_unrenderable_path_names_every_spelling_to_set(monkeypatch):
     # Pasted into zsh with INTERACTIVE_COMMENTS off, the line is parsed: no
     # character may substitute, redirect, glob, group or chain (#1566 review).
     assert re.fullmatch(r"# [A-Za-z0-9_ ,-]+", command), command
+    phrase = _run_daemon_command("status", hook_command=False, config_file=Path("bad\nname.json"))
+    assert phrase == command.removeprefix("# ").replace("start", "status")
 
 
 def test_windows_advice_ignores_the_environment(monkeypatch, tmp_path):
