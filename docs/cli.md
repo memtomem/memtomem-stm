@@ -727,8 +727,8 @@ likewise). On Windows they say to set that variable to the file given to
 `--config` and do not print the path. A bare
 `mms daemon` command builds from the environment alone and can address another
 daemon. The command assumes doctor's environment and working directory otherwise.
-For a path holding characters that cannot be displayed safely, the advice gives
-a note saying so in place of the command.
+On POSIX, for a path holding characters that cannot be displayed safely, the
+advice gives a note saying so in place of the command.
 With `--config`, the `--measure-ltm` warning that no daemon route exists names
 no daemon command: after the setting it suggests, it asks you to rerun
 `mms doctor --measure-ltm --config <file>` (on Windows, or where it cannot

@@ -10147,8 +10147,9 @@ def _known_ltm_state(value: object) -> str:
 
 
 # Fixed text, not the exception's message: that one quotes ``data_dir`` and
-# the OS error, and this report carries no config-derived values (#1079).
-# ``mms daemon status`` is where the file is named.
+# the OS error, which stay out of this report (#1079). ``mms daemon status`` is
+# where the key file is named. On POSIX the command may carry the operator's
+# own ``--config`` path (#1504).
 def _discovery_key_error(*, hook_command: bool = False, config_file: Path | None = None) -> str:
     run = _run_daemon_command("status", hook_command=hook_command, config_file=config_file)
     return (
