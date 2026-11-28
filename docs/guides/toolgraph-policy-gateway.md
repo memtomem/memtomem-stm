@@ -101,6 +101,65 @@ tools are no longer advertised, and direct calls through an already registered
 handler are blocked before telemetry, response-cache lookup, or upstream
 dispatch.
 
+## Give each agent role its own tool set
+
+An STM process enforces one Toolgraph agent, so roles such as a reviewer and
+an implementer each get their own bundle, config file and MCP registration.
+In Toolgraph, declare each role as an agent and grant it its tools.
+`ingest-manifest` replaces the graph's authored governance, so edit the full
+manifest rather than loading a fragment. Toolgraph's
+[policy impact preview](https://github.com/memtomem/toolgraph/blob/main/docs/policy-impact.md)
+shows which decisions a change would make; ingest the edited manifest, then
+compile one bundle per role:
+
+```bash
+uv run toolgraph policy compile --agent reviewer --profile strict \
+  --output ~/.memtomem/toolgraph/reviewer.json
+uv run toolgraph policy compile --agent implementer --profile strict \
+  --output ~/.memtomem/toolgraph/implementer.json
+```
+
+Copy the working STM config once per role, for example to
+`~/.memtomem/stm_proxy.reviewer.json`, and make later upstream edits in every
+copy. In each copy set `toolgraph.agent_id` to the role and
+`toolgraph.bundle_path` to its bundle, then run
+`mms gateway mode strict --config <file> --apply`.
+`mms gateway status --config <file> --json` should report `valid: true`, the
+role as `agent` and `profile: "strict"`, and
+`mms gateway explain policy-gateway::publish_note --config <file>` looks up
+that role's decision for one tool. Keep one file per role rather than overriding
+the agent or bundle with environment variables: `status` and `explain` read
+the file as written.
+
+Register STM once per role, in that role's own client configuration. For
+example, `mms register --config <file> --client json` in a role's project
+directory writes a `.mcp.json` entry that sets
+`MEMTOMEM_STM_PROXY__CONFIG_PATH` to the file. It keeps an existing
+`memtomem-stm` entry unless you pass `--replace-registration`, and replacing
+an entry keeps environment values it does not manage. Check that each entry
+points at its role's file and carries no other `MEMTOMEM_STM_PROXY__TOOLGRAPH__*`
+or `MEMTOMEM_STM_PROXY__EXPOSURE__*` value, then restart each client and list
+its tools. After the restart, a strict registration advertises only the proxied
+tools its role's bundle makes eligible, a call to a name it does not advertise
+fails as an unknown tool, and advertised tools still pass the policy check on
+every call. A bundle whose agent or profile does not match the file makes
+startup fail.
+
+STM does not know which agent is calling: the registration is the role. The
+separation holds only when each role's session is given only its own
+registration, and no direct registration of the same upstream; which session
+sees which registration is the host's configuration. On POSIX systems STM
+warns when another user owns or can write a bundle or a directory above it,
+but still loads it in `strict` (#707), so keep the role bundles and files, and
+their directories, where only the operator can write.
+
+The roles separate tool sets, not STM's state. Unless the files set their
+own paths, both processes use the same response cache, metrics and feedback
+stores. One role can be served a response the other role cached when both
+files configure that upstream identically, and strict health filtering
+counts both roles' upstream errors, so one role's failures can withhold a tool
+the other role's bundle grants at its next startup.
+
 ## Updating policy safely
 
 1. Crawl the live upstream again when its tool contract changes.
