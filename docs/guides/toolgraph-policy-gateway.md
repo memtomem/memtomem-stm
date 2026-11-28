@@ -210,6 +210,9 @@ tool becomes `toolgraph_unmapped` or `toolgraph_drifted` instead.
 - A bundle whose agent or profile does not match is rejected, never adopted.
   Under `strict` that fails closed; under `review` or `explore` STM warns,
   reports degraded status, and keeps its last known good snapshot (none at
-  startup, so calls go through).
+  startup, so calls go through). The match is checked when STM loads the
+  bundle — at startup, or when the bundle file changes. Changing only the
+  config's agent or profile while STM runs does not re-check an unchanged
+  bundle; restart STM after such a change.
 - STM bundle mode never launches Toolgraph. Toolgraph and Ladybug may be fully
   stopped after the bundle is published.
