@@ -17,7 +17,7 @@ mms import --from codex --apply
 The preview redacts environment values classified as secret; apply writes the real
 values to the registry. Check a project's own config file before applying it: new
 project-local definitions are refused unless `--allow-project-configs` is passed.
-For where project files are looked up and when Codex's is read, see
+For when Codex's project file is read, see
 [Getting started](../getting-started.md#3-register-stm-with-a-client).
 
 ## Initialize and select a project
