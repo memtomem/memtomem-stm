@@ -73,6 +73,18 @@ session; `in_flight` sitting at `concurrency` while `queued` grows is the
 evidence that raising the bound — or introducing a session pool — is the next
 step rather than a guess.
 
+## Give each agent role its own tool set
+
+When a reviewer and an implementer reach the same upstream, a Toolgraph policy
+bundle per role lets one strict STM registration per role advertise and
+dispatch only the proxied tools that role is granted. The
+[policy gateway guide](guides/toolgraph-policy-gateway.md#give-each-agent-role-its-own-tool-set)
+gives the steps. The gateway is experimental and off by default.
+
+The registration, not the caller, carries the role, and the two processes
+still share STM's caches and metrics unless configured otherwise; the guide
+says what that sharing changes.
+
 ## See where native-tool output goes
 
 A host's built-in tools never reach the proxy, so the scenarios above do not

@@ -13,6 +13,10 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- The Toolgraph policy gateway guide adds a section on giving each agent role
+  its own tool set: one bundle, config file and STM registration per role. It
+  says that the registration, not the caller, carries the role, and which STM
+  stores the roles still share. `docs/use-cases.md` links it (#1584).
 - `mms host scan --from <host>` suggests scanning every host when the
   single-host scan returns no entries from that host's configs (#1581).
   **Behavior change**: in that case the text output has one more line under
