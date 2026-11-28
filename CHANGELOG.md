@@ -13,6 +13,12 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `docs/use-cases.md` adds a scenario for reading how much text native tools
+  return, per host and tool, with `mms stats --source hook`. It says what a
+  row holds and why the totals are an inventory rather than a savings figure
+  or a comparison between hosts, and links the references for the rest. The
+  page's opening and its evidence rules now cover a hook-observed scenario
+  (#1576).
 - `mms prune --help` shows preview and prune examples, and says that the
   upstream stays in STM's config. The sentence "STM's own config is not
   touched." is gone: a prune may update the upstream's recorded origin.
@@ -104,6 +110,14 @@ changes inline only. See the deprecation policy in
   debug), as connection setup already does. With the locked anyio 4.15.1 the
   signal-shutdown tests showed no such cleanup error, so their outcome is the
   same there.
+- `mms doctor` no longer aborts with `OverflowError` when the surfacing deadline
+  is above about `9e307` seconds (#1575, issue #1561). Rounding the hook deadline it
+  requires up to 0.5 s doubled the value, which overflowed; a value that large
+  is already whole and is now kept as it is.
+  **Behavior change**: a run that reached the hook deadline check with such a
+  deadline exited 1 before emitting any report; it now emits its normal
+  report, including the `hook daemon timeout` row, and the exit code follows
+  the checks as for any other report.
 - The standalone daemon commands that `mms doctor` and `mms health` advise with
   `--config` now give the file to every letter-case spelling of
   `MEMTOMEM_STM_PROXY__CONFIG_PATH` in the environment (issue #1566). Settings
