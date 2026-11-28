@@ -45,6 +45,14 @@ changes inline only. See the deprecation policy in
   then from `progressive_reads_rollup` in one transaction; never `DROP` the
   rollup table while its trigger exists.
 
+### Changed
+
+- `mms project show` now says how to enable an MCP when the project has none
+  enabled (#1551, issue #1395).
+  **Behavior change**: in text mode one more line follows
+  `Enabled MCPs: (none)`, naming `mms project enable <mcp>`; `--json` output
+  is unchanged.
+
 ### Fixed
 
 - `mms stats --all-time` no longer labels hook status counts all-time after
