@@ -6861,9 +6861,9 @@ def _confirm_validation() -> bool:
     type=click.Choice(["claude", "json", "skip"]),
     default=None,
     help=(
-        "Pre-answer the MCP-registration prompt for scripted runs: "
+        "Legacy alias for --client, kept for older scripts: "
         "'claude' = `claude mcp add`, 'json' = write .mcp.json, 'skip' = "
-        "no registration. Omit the flag for the interactive prompt."
+        "no registration. Omit both flags for the interactive prompt."
     ),
 )
 @click.option(
@@ -6950,7 +6950,11 @@ def init(
 ) -> None:
     """Guided first-time setup for memtomem-stm.
 
-    Prompts for a single upstream server and writes the config file. Without
+    Looks for servers in existing MCP client configs first and imports the ones
+    you pick, which can be several; project-local entries are offered only with
+    ``--allow-project-configs``. Picking none exits without writing a config. If
+    none are eligible, prompts for one upstream server manually. ``--demo`` skips
+    discovery and configures the bundled read-only demo server. Without
     ``--resume``, aborts when the config already exists; ``--resume`` preserves
     that config and continues client registration. Use ``mms add`` to append
     more servers.
@@ -7268,9 +7272,9 @@ def init(
     type=click.Choice(["claude", "json", "skip"]),
     default=None,
     help=(
-        "Pre-answer the registration prompt for scripted runs: "
+        "Legacy alias for --client, kept for older scripts: "
         "'claude' = `claude mcp add`, 'json' = write .mcp.json, 'skip' = "
-        "print manual hints. Omit for the interactive prompt."
+        "print manual hints. Omit both flags for the interactive prompt."
     ),
 )
 @click.option(
@@ -7305,6 +7309,8 @@ def register(
     Requires that ``mms init`` has been run so ``~/.memtomem/stm_proxy.json``
     (or the ``--config`` path) exists. Safe to re-run; pre-checks existing
     Claude Code registration and defaults to 'keep' when already registered.
+    ``--client`` selects the downstream client; ``--mcp`` is the older flag, kept
+    for older scripts.
     """
     config_path = resolve_cli_config_path(config_path).path
     resolved = Path(config_path).expanduser().resolve()

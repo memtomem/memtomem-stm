@@ -96,14 +96,13 @@ Options:
   --config TEXT             [default: (~/.memtomem/stm_proxy.json)]
   --no-validate             Skip the connectivity probe entirely (default:
                             prompt, probe on yes).
-  --mcp [claude|json|skip]  Pre-answer the MCP-registration prompt for
-                            scripted runs: 'claude' = `claude mcp add`,
-                            'json' = write .mcp.json, 'skip' = no
-                            registration. Omit the flag for the interactive
-                            prompt.
+  --mcp [claude|json|skip]  Legacy alias for --client, kept for older
+                            scripts: 'claude' = `claude mcp add`, 'json' =
+                            write .mcp.json, 'skip' = no registration. Omit
+                            both flags for the interactive prompt.
   --client [auto|claude|codex|json|skip]
-                            Select a downstream client. --mcp remains as a
-                            backwards-compatible alias for older scripts.
+                            Select a downstream client (the current flag;
+                            --mcp is the older alias).
   --resume                  Continue registration when config already exists.
   --demo                    Use the bundled deterministic read-only demo.
   --freshness [live|balanced|reuse]
@@ -124,13 +123,13 @@ Options:
                             'ko' sets the calibrated Korean budget preset.
 ```
 
-Interactive wizard for the first-time setup. Prompts for a single upstream server (name, prefix, transport, command/URL), optionally probes connectivity, writes the config, then offers a 3-way MCP-client registration prompt:
+Interactive wizard for the first-time setup. It first looks for servers in existing MCP client configs and imports the ones you pick — several are allowed; project-local entries are offered only with `--allow-project-configs`. Picking none exits without writing a config. If no entry is eligible (this can happen even when client config files exist), it prompts for one upstream server (name, prefix, transport, command/URL). `--demo` skips discovery and configures the bundled read-only demo server. Either way it optionally probes connectivity, writes the config, then offers a 3-way MCP-client registration prompt:
 
 1. **Add to Claude Code** — shells out to `claude mcp add` for you.
 2. **Generate `.mcp.json`** — writes a project-scoped snippet in the current directory, then prints per-client paste targets for Cursor, Windsurf, Claude Desktop (OS-appropriate path), and Gemini CLI.
 3. **Skip** — prints a manual-registration cheat sheet (`claude mcp add` one-liner plus a generic `mcpServers` JSON stanza) so you can wire it up by hand later.
 
-Use `--mcp claude|json|skip` to pre-answer the prompt from scripts, CI, or any caller where stdin isn't a TTY — interactive callers should omit the flag.
+Use `--client auto|claude|codex|json|skip` to pre-answer the prompt from scripts, CI, or any caller where stdin isn't a TTY — interactive callers should omit the flag. `--mcp claude|json|skip` is the older flag, kept for older scripts; passing both flags fails.
 
 Without `--resume`, aborts if the config file already exists. `--resume`
 preserves the config and re-enters client registration; use [`register`](#register)
@@ -158,9 +157,9 @@ An enabled Claude Code plugin can register its own MCP server (shown in `/mcp` a
 ```bash
 mms init                          # interactive wizard
 mms init --no-validate            # skip the connectivity probe prompt entirely
-mms init --mcp claude             # scripted: auto-register with Claude Code
-mms init --mcp skip               # scripted: write config, print paste hints, exit
-mms init --mcp claude --prune-originals  # scripted: import, register, remove writable direct registrations
+mms init --client claude          # scripted: auto-register with Claude Code
+mms init --client skip            # scripted: write config, print paste hints, exit
+mms init --client claude --prune-originals  # scripted: import, register, remove writable direct registrations
 mms init --lang ko                # Korean-content preset for token-aware budgets
 mms init --demo --client auto     # shortest native Windows/macOS/Linux path
 mms init --resume --client codex  # continue an existing setup
@@ -181,24 +180,25 @@ Options:
   --config TEXT             Path to the proxy config (must already exist —
                             run `mms init` first).  [default:
                             (~/.memtomem/stm_proxy.json)]
-  --mcp [claude|json|skip]  Pre-answer the registration prompt for scripted
-                            runs: 'claude' = `claude mcp add`, 'json' =
+  --mcp [claude|json|skip]  Legacy alias for --client, kept for older
+                            scripts: 'claude' = `claude mcp add`, 'json' =
                             write .mcp.json, 'skip' = print manual hints.
-                            Omit for the interactive prompt.
+                            Omit both flags for the interactive prompt.
   --client [auto|claude|codex|json|skip]
-                            Select the downstream client explicitly.
+                            Select the downstream client (the current flag;
+                            --mcp is the older alias).
   --replace-registration   Replace an existing selected-client registration.
   --json                   Emit one secret-safe JSON result document.
 ```
 
 Re-runs the 3-way MCP-client registration prompt from `init` without re-entering the first-time setup wizard. Use this after `mms init` if you initially picked "skip", or when registering the same STM install with a second client.
 
-Requires that `mms init` has already been run so the config file exists — otherwise exits with an error and a hint. Safe to re-run: pre-checks existing Claude Code registration and defaults to **keep** when already registered (no-op — existing registration is preserved even with `--mcp claude`).
+Requires that `mms init` has already been run so the config file exists — otherwise exits with an error and a hint. Safe to re-run: pre-checks existing Claude Code registration and defaults to **keep** when already registered (no-op — existing registration is preserved even with `--client claude`).
 
 ```bash
 mms register              # interactive prompt
-mms register --mcp json   # scripted: write .mcp.json in CWD, exit
-mms register --mcp skip   # scripted: print manual paste hints, exit
+mms register --client json   # scripted: write .mcp.json in CWD, exit
+mms register --client skip   # scripted: print manual paste hints, exit
 ```
 
 ### `add`
