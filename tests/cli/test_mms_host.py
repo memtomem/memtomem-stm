@@ -703,6 +703,7 @@ class TestScan:
         assert "Claude Code (user)" not in res.output
         # Pin both singular forms — `entry`/`host` (not `entries`/`hosts`).
         assert "1 entry across 1 host" in res.output
+        assert "without --from" not in res.output  # hint is for empty scans only
 
     def test_scan_from_invalid_host_errors(self, runner, sandbox):
         res = _scan(runner, "--from", "foo")
@@ -715,6 +716,14 @@ class TestScan:
         res = _scan(runner)
         assert res.exit_code == 0, res.output
         assert "No MCP entries discovered across host configs." in res.output
+        assert "without --from" not in res.output
+
+        # Click canonicalizes ``ALL`` to ``all``, so an explicit all-host scan
+        # takes the same unscoped path and prints no hint either.
+        res = _scan(runner, "--from", "ALL")
+        assert res.exit_code == 0, res.output
+        assert "No MCP entries discovered across host configs." in res.output
+        assert "without --from" not in res.output
 
     def test_scan_empty_no_host_configs_json(self, runner, sandbox):
         res = _scan(runner, "--json")
@@ -736,7 +745,10 @@ class TestScan:
 
         res = _scan(runner, "--from", "cursor")
         assert res.exit_code == 0, res.output
-        assert "No MCP entries discovered in cursor." in res.output
+        assert (
+            "No MCP entries discovered in cursor.\n"
+            "  Run `mms host scan` without --from to check every host.\n"
+        ) in res.output
         assert "across host configs" not in res.output
 
         json_res = _scan(runner, "--from", "cursor", "--json")
@@ -2804,6 +2816,21 @@ class TestNotInspected:
 
         text = _scan(runner)
         assert "Claude Code (user) not inspected:" in text.output
+
+    def test_scan_empty_single_host_hint_precedes_skipped_sources(self, runner, sandbox):
+        """#1396: the rerun hint sits under the scoped header, before the gap notes."""
+        (sandbox["home"] / ".claude.json").write_text("{not json", encoding="utf-8")
+
+        res = _scan(runner, "--from", "claude-code")
+        assert res.exit_code == 0, res.output
+        out = res.output
+        assert (
+            "No MCP entries discovered in claude-code.\n"
+            "  Run `mms host scan` without --from to check every host.\n"
+        ) in out
+        assert "Claude Code (user) not inspected:" in out
+        assert "Claude Code (project) not inspected:" in out
+        assert out.index("without --from") < out.index("not inspected:")
 
 
 class TestClaudeConfigLocation:

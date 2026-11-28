@@ -13,6 +13,12 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `mms host scan --from <host>` suggests scanning every host when the
+  single-host scan returns no entries from that host's configs (#1581).
+  **Behavior change**: in that case the text output has one more line under
+  `No MCP entries discovered in <host>.`:
+  ``Run `mms host scan` without --from to check every host.`` A scan of all
+  hosts, a scan that returns entries and `--json` output are unchanged.
 - `docs/use-cases.md` adds a scenario for reading how much text native tools
   return, per host and tool, with `mms stats --source hook`. It says what a
   row holds and why the totals are an inventory rather than a savings figure
