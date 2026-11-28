@@ -2266,14 +2266,15 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0  # legacy rows wiped
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 8
+            assert version == 9
         finally:
             reopened.close()
 
     # v6 rows may hold a structured SELECTIVE/HYBRID success over its
     # serialized budget, served on a hit before any fit check (#1359); v7 rows
-    # are keyed by a plain SHA-256 of the call (#1416).
-    @pytest.mark.parametrize("old_version", [4, 5, 6, 7])
+    # are keyed by a plain SHA-256 of the call (#1416); v8 rows may be missing
+    # text an older cleaner removed between two text blocks (#1531, #1540).
+    @pytest.mark.parametrize("old_version", [4, 5, 6, 7, 8])
     def test_prior_rows_are_purged_by_current_version_without_touching_other_tables(
         self, tmp_path, old_version
     ):
@@ -2293,7 +2294,7 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 8
+            assert version == 9
             assert (
                 reopened._db.execute("SELECT value FROM unrelated_metrics").fetchone()[0] == "keep"
             )
@@ -2350,7 +2351,7 @@ class TestKeySchemaVersionPurge:
             assert "envelope_safe" in columns
             assert "envelope_json" in columns
             (version,) = cache._db.execute("PRAGMA user_version").fetchone()
-            assert version == 8
+            assert version == 9
         finally:
             cache.close()
 
@@ -2478,7 +2479,8 @@ class TestSurrogateRoundTrip:
         # orphans every stored entry and must be acknowledged deliberately.
         # (v4 → v5 was such a bump: the framing fix #784 changed every key,
         # and the startup purge dropped the orphaned rows. v6 → v7 (#1359)
-        # drops rows that may hold a structured result over its budget.)
+        # drops rows that may hold a structured result over its budget, and
+        # v8 → v9 (#1540) rows a pre-#1531 cleaner wrote.)
         # Components chosen so BYTE length differs from character length in
         # three ways at once: a 3-byte CJK character, a 2-byte accented one,
         # and a lone surrogate that only ``surrogatepass`` can encode (3
@@ -2489,7 +2491,7 @@ class TestSurrogateRoundTrip:
         args = {"k": "\u4e2d"}
         fingerprint = "fp\ud800"
         parts = [
-            "8",
+            "9",
             server,
             tool,
             json.dumps(args, sort_keys=True, ensure_ascii=False),
@@ -2555,15 +2557,18 @@ class TestKeyedRowKeys:
         # recomputes every unkeyed derivation and matches nothing.
         guesses = {
             _unkeyed_v7_key("s", "search", self.ARGS, self.QUERY),
-            framed_digest(
-                (
-                    "8",
-                    "s",
-                    "search",
-                    json.dumps(self.ARGS, sort_keys=True, ensure_ascii=False),
-                    "",
-                    json.dumps(self.QUERY, ensure_ascii=False),
+            *(
+                framed_digest(
+                    (
+                        version,
+                        "s",
+                        "search",
+                        json.dumps(self.ARGS, sort_keys=True, ensure_ascii=False),
+                        "",
+                        json.dumps(self.QUERY, ensure_ascii=False),
+                    )
                 )
+                for version in ("8", "9")
             ),
         }
         assert stored.isdisjoint(guesses)

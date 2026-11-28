@@ -537,9 +537,11 @@ def _scan_rows(
 def _render_scan_text(rows: list[dict], from_host: str, gaps: dict[str, str]) -> None:
     """Default human-readable scan renderer.
 
-    Empty case: scoped one-liner — ``across host configs`` when no
+    Empty case: a scoped header — ``across host configs`` when no
     filter is in play, ``in <host>`` when ``--from <host>`` filters to
-    one scanner. Non-empty: 3-column table (NAME / HOST / IN_REGISTRY)
+    one scanner. With ``--from <host>``, a second line suggests
+    rerunning without ``--from`` to check every host; it prints before
+    any "not inspected" notes. Non-empty: 3-column table (NAME / HOST / IN_REGISTRY)
     followed by a summary line. ``Yes``/``No`` for the boolean column —
     universal terminal encoding (no ✓/✗ glyphs that break on Windows
     cmd or restrictive SSH clients).
@@ -559,6 +561,8 @@ def _render_scan_text(rows: list[dict], from_host: str, gaps: dict[str, str]) ->
     if not rows:
         scope = "across host configs" if from_host == "all" else f"in {from_host}"
         click.echo(f"No MCP entries discovered {scope}.\n", nl=False)
+        if from_host != "all":
+            click.echo("  Run `mms host scan` without --from to check every host.")
         _render_scan_gaps(gaps)
         return
     click.echo(f" {'NAME':<20} {'HOST':<22} IN_REGISTRY")

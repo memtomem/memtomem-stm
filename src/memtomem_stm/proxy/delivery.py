@@ -418,6 +418,10 @@ def plain_result_fits(text: str) -> bool:
 
     Measured as the single-text MCP result the passthrough becomes, so JSON
     escaping and the result wrapper count, as they do for STM envelopes.
+
+    The answer decides whether a response stays plain and cacheable, so a
+    change to it that alters a stored row or whether one is stored needs a
+    ``cache._KEY_SCHEMA_VERSION`` bump (rule above that constant).
     """
     from mcp.types import CallToolResult, TextContent
 
