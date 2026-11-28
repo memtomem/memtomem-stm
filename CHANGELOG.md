@@ -76,8 +76,9 @@ changes inline only. See the deprecation policy in
   `--inherit-runtime-env` it still installs, and the installed hook fails
   its build when it runs only if the value is still in the environment the
   hook runs in. A hook command that pins a `--surfacing-timeout-seconds`
-  such as `3` builds over an ambient `inf`. Other commands that
-  build `STMConfig` from the environment (`mms daemon start`/`status`/`stop`,
+  such as `3` builds over an ambient `inf`. Other commands that build
+  `STMConfig` from the environment
+  (`mms daemon start`/`status`/`restart`/`stop`, `mms init`/`register`,
   `mms doctor`, `mms status`/`list`/`health`, `mms stats`) keep their
   existing handling of an invalid value; that was not re-measured here.
 - `mms project show NAME` now points to `mms project list` when `NAME` is
