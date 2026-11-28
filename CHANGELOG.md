@@ -66,7 +66,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - An upstream connection's own cancellation no longer cuts a signalled
-  shutdown short under anyio 4.16 (issue #1568). A SIGTERM or SIGINT cancels the
+  shutdown short under anyio 4.16 (#1569, issue #1568). A SIGTERM or SIGINT cancels the
   upstream connection owner tasks, and anyio 4.16 raises that cancellation out
   of the owner's unwind. The owner stored it as its cleanup error and re-raised
   it into the server's teardown, which skipped the rest of the close sequence
