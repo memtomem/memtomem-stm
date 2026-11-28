@@ -811,6 +811,9 @@ def _scrub_model_surrogates(model: BaseModel) -> None:
 def _scrub_result_surrogates(result: Any) -> None:
     """Escape lone surrogates in an upstream ``CallToolResult``, in place (#761, #1101).
 
+    Its output reaches the response cache: a change to it that alters a stored
+    row needs a ``cache._KEY_SCHEMA_VERSION`` bump (rule above that constant).
+
     Every string the result serializes is escaped, dict keys included: each
     content block of every kind with its ``_meta`` and ``annotations``,
     ``structuredContent`` of any JSON type, the result's ``_meta`` and
@@ -6856,6 +6859,10 @@ class ProxyManager:
         record the 0/0 passthrough metric and return either the non-text list or
         the ``"[empty response]"`` sentinel (#558). The caller stays the single
         owner of metric writes and return shapes (R8).
+
+        What this returns feeds the response cache: a change to it that alters a
+        stored row, or whether a response is stored, for unchanged settings
+        needs a ``cache._KEY_SCHEMA_VERSION`` bump (rule above that constant).
         """
         max_upstream = cfg_snap.max_upstream_chars
         text_parts: list[str] = []
@@ -8006,6 +8013,11 @@ class ProxyManager:
     ) -> Callable[[], None] | None:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
         (so memories stay fresh and surfacing re-runs on a hit).
+
+        A change to what may be stored here — these gates and the INDEX/EXTRACT
+        outcomes behind ``postprocess_retry_required`` — or to what a stored row
+        holds, for unchanged settings, needs a ``cache._KEY_SCHEMA_VERSION``
+        bump (rule above that constant).
 
         Split in two (#1329): the decision runs here and counts an unstorable
         outcome at once, so the call's metrics write, which runs next, carries
