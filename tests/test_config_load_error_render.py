@@ -253,7 +253,10 @@ def test_gateway_invalid_config_escapes_the_key(tmp_path, argv):
 
     assert isinstance(result.exception, SystemExit), result.exception
     assert result.exit_code == 1
-    assert f"invalid proxy config: upstream_servers.{ESCAPED_KEY} (model_type)" in result.output
+    assert (
+        f"invalid proxy config: 1 validation error(s): upstream_servers.{ESCAPED_KEY} (model_type)"
+        in result.output
+    )
     assert "\nSuccess" not in result.output and "‮" not in result.output
 
 

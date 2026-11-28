@@ -601,6 +601,11 @@ class _RuntimeProxyRead:
     startup_error: bool = False
     file_fallback: bool = False
     completed_file_server_names: frozenset[str] = frozenset()
+    error_kind: Literal["unreadable", "invalid"] | None = None
+    # The overlay fragment this read loaded with, so a caller naming what the
+    # environment set reads the same overlay the config came from. Kept out of
+    # the repr: a fragment can carry a credential.
+    env_fragment: dict[str, Any] = dataclass_field(default_factory=dict, repr=False)
 
 
 def _runtime_proxy_read(
@@ -672,8 +677,10 @@ def _runtime_proxy_read(
             env_names,
             file_fallback=True,
             completed_file_server_names=frozenset(completed),
+            error_kind=loaded.error_kind,
+            env_fragment=overlay.fragment,
         )
-    return _RuntimeProxyRead(loaded.config, None, env_names)
+    return _RuntimeProxyRead(loaded.config, None, env_names, env_fragment=overlay.fragment)
 
 
 _CONFIG_INVALID_WARNING = (
@@ -1925,40 +1932,135 @@ def gateway_group() -> None:
     """Inspect and configure Toolgraph-backed gateway policy."""
 
 
+def _gateway_env_fields(fragment: dict[str, Any]) -> list[str]:
+    """The gateway fields the ``MEMTOMEM_STM_PROXY*`` environment set, sorted.
+
+    Read from the overlay fragment the config was loaded with: settings' own
+    resolution of the environment, so these are field names, never variable
+    names reconstructed from them (#843). Only declared fields count — a key
+    the model ignores set nothing — and a mapping-valued field is named, not
+    its keys.
+    """
+    from memtomem_stm.proxy.config import ExposureConfig, ToolgraphConfig
+
+    fields = ["enabled"] if "enabled" in fragment else []
+    for section, model in (("exposure", ExposureConfig), ("toolgraph", ToolgraphConfig)):
+        values = fragment.get(section)
+        if isinstance(values, dict):
+            fields.extend(f"{section}.{key}" for key in values if key in model.model_fields)
+    return sorted(fields)
+
+
+def _gateway_runtime_config(
+    path: Path, config_path: str, *, action: str, as_json: bool
+) -> tuple[ProxyConfig, list[str]]:
+    """The proxy config the server would start with, and the gateway fields env set.
+
+    The file's read and shape guards run first, so an unreadable or unparsable
+    file keeps its failure document. The config itself is read the way startup
+    reads it (``_runtime_proxy_read``): settings over the whole environment,
+    then the file with the proxy overlay on top (#1583). A read the server
+    could not start from, or one where it would fall back to env/defaults
+    because the file or the merge fails, is a failure here, not a description.
+    """
+    data = _load(path, json_action=action if as_json else None)
+    servers = data.get("upstream_servers")
+    resolved = str(path.expanduser().resolve())
+    try:
+        runtime = _runtime_proxy_read(
+            path, config_path, servers if isinstance(servers, dict) else None
+        )
+    except RecursionError as exc:
+        # A MEMTOMEM_STM_* JSON value nested too deeply for the decoder; the
+        # server's own ``STMConfig()`` raises the same. Before this read applied
+        # the environment, an explicit --config never decoded it, so it must
+        # not turn into an empty --json stdout here.
+        _gateway_fail(
+            action,
+            "config_invalid",
+            f"{_STARTUP_INVALID_WARNING}: a MEMTOMEM_STM_* value is nested too deeply to parse",
+            as_json=as_json,
+            cause=exc,
+            path=resolved,
+        )
+    if runtime.startup_error or runtime.config is None:
+        _gateway_fail(
+            action,
+            "config_invalid",
+            f"{_STARTUP_INVALID_WARNING}: {runtime.error}",
+            as_json=as_json,
+            path=resolved,
+        )
+    if runtime.error is not None:
+        if runtime.error_kind == "unreadable":
+            code, message = "config_unreadable", f"config could not be read ({runtime.error})"
+        else:
+            code, message = "config_invalid", f"invalid proxy config: {runtime.error}"
+        _gateway_fail(action, code, message, as_json=as_json, path=resolved)
+    return runtime.config, _gateway_env_fields(runtime.env_fragment)
+
+
+class _GatewayBundlePath(NamedTuple):
+    shown: str
+    """The path to display: expanded when expansion worked, else as configured."""
+    path: Path | None
+    """The expanded path to load, or ``None`` when ``error`` says why not."""
+    error: str | None
+
+
+def _gateway_bundle_path(raw: Path) -> _GatewayBundlePath:
+    """Resolve the bundle path inside the runtime's own reject barrier.
+
+    ``ProxyManager._refresh_toolgraph_bundle`` runs ``expanduser()`` and
+    ``stat()`` under one ``except Exception`` and rejects the bundle on any
+    failure, because their failures are not all ``OSError`` (an unknown
+    ``~user`` raises ``RuntimeError``, a NUL ``ValueError``). The same barrier
+    here, so these commands reject what startup rejects. A ``stat()``
+    ``OSError`` keeps the bundle loader's wording, so a missing bundle reads
+    as it always has; anything else is named by type only.
+    """
+    expanded: Path | None = None
+    try:
+        expanded = raw.expanduser()
+        expanded.stat()
+    except Exception as exc:
+        if isinstance(exc, OSError) and expanded is not None:
+            error = f"cannot read policy bundle {expanded}: {exc}"
+        else:
+            error = f"cannot resolve policy bundle path {raw}: {type(exc).__name__}"
+        return _GatewayBundlePath(str(expanded if expanded is not None else raw), None, error)
+    return _GatewayBundlePath(str(expanded), expanded, None)
+
+
 @gateway_group.command(name="status")
 @click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
-    """Show the configured policy source and validate the active bundle."""
-    config_path = resolve_cli_config_path(config_path).path
-    from pydantic import ValidationError
+    """Show the policy source the server would start with and validate its bundle.
 
-    from memtomem_stm.proxy.config import ProxyConfig, validation_error_summary
+    The config is read the way the server starts: ``MEMTOMEM_STM_*`` values in
+    this command's environment apply over the file, and the output names the
+    gateway fields they set.
+    """
+    config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
 
     path = Path(config_path)
-    try:
-        config = ProxyConfig.model_validate(
-            _load(path, json_action="gateway-status" if as_json else None)
-        )
-    except ValidationError as exc:
-        _gateway_fail(
-            "gateway-status",
-            "config_invalid",
-            f"invalid proxy config: {validation_error_summary(exc)}",
-            as_json=as_json,
-            cause=exc,
-            path=str(path.expanduser().resolve()),
-        )
+    config, env_fields = _gateway_runtime_config(
+        path, config_path, action="gateway-status", as_json=as_json
+    )
     tg = config.toolgraph
     result: dict[str, Any] = {
         "enabled": tg.enabled,
         "source": tg.source,
         "agent": tg.agent_id,
         "profile": config.exposure.profile.value,
+        "proxy_enabled": config.enabled,
+        "env_overrides": env_fields,
     }
     if tg.enabled and tg.source == "bundle":
-        result["bundle_path"] = str(tg.bundle_path.expanduser())
+        bundle = _gateway_bundle_path(tg.bundle_path)
+        result["bundle_path"] = bundle.shown
         if tg.query_profile != config.exposure.profile.value:
             result.update(
                 {
@@ -1966,10 +2068,12 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
                     "error": "toolgraph.query_profile must match exposure.profile in bundle mode",
                 }
             )
+        elif bundle.path is None:
+            result.update({"valid": False, "error": bundle.error})
         else:
             try:
                 snapshot = load_policy_bundle(
-                    tg.bundle_path,
+                    bundle.path,
                     expected_agent=tg.agent_id,
                     expected_profile=config.exposure.profile.value,
                 )
@@ -1990,13 +2094,22 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
     if as_json:
         click.echo(_json_dumps(result, ensure_ascii=False, sort_keys=True))
         return
-    click.echo(f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} ({_disp(tg.source)})")
+    proxy_note = "" if config.enabled else "; proxy disabled"
+    click.echo(
+        f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} "
+        f"({_disp(tg.source)}){proxy_note}"
+    )
     click.echo(f"  agent/profile: {_disp(tg.agent_id)} / {config.exposure.profile.value}")
+    if env_fields:
+        click.echo(f"  environment overrides: {', '.join(env_fields)}")
     if tg.source == "bundle" and tg.enabled:
         click.echo(f"  bundle: {_disp(str(result['bundle_path']))}")
         if result.get("valid"):
+            # With the proxy off, startup never loads the bundle: it is only
+            # checked here, not in force.
+            label = "active" if config.enabled else "validated"
             click.echo(
-                f"  active: graph generation {result['graph_generation']}, "
+                f"  {label}: graph generation {result['graph_generation']}, "
                 f"{result['eligible']} eligible / {result['rejected']} rejected"
             )
             click.echo(f"  digest: {_disp(str(result['bundle_digest']))}")
@@ -2010,27 +2123,19 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
 @click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = False) -> None:
-    """Explain one qualified ``server::tool`` decision from the bundle."""
-    config_path = resolve_cli_config_path(config_path).path
-    from pydantic import ValidationError
+    """Explain one qualified ``server::tool`` decision from the bundle.
 
-    from memtomem_stm.proxy.config import ProxyConfig, validation_error_summary
+    The config is read the way the server starts, as ``gateway status`` reads
+    it. The decision is the bundle's; the output says when a switch keeps the
+    server from applying it.
+    """
+    config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
 
     path = Path(config_path)
-    try:
-        config = ProxyConfig.model_validate(
-            _load(path, json_action="gateway-explain" if as_json else None)
-        )
-    except ValidationError as exc:
-        _gateway_fail(
-            "gateway-explain",
-            "config_invalid",
-            f"invalid proxy config: {validation_error_summary(exc)}",
-            as_json=as_json,
-            cause=exc,
-            path=str(path.expanduser().resolve()),
-        )
+    config, env_fields = _gateway_runtime_config(
+        path, config_path, action="gateway-explain", as_json=as_json
+    )
     # Each failure keeps its own code: the first two are config problems a
     # script fixes with `mms gateway mode`, the third is the bundle file itself.
     if config.toolgraph.source != "bundle":
@@ -2047,10 +2152,18 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
             "toolgraph.query_profile must match exposure.profile in bundle mode",
             as_json=as_json,
         )
-    bundle_path = config.toolgraph.bundle_path.expanduser()
+    bundle = _gateway_bundle_path(config.toolgraph.bundle_path)
+    if bundle.path is None:
+        _gateway_fail(
+            "gateway-explain",
+            "bundle_unreadable",
+            str(bundle.error),
+            as_json=as_json,
+            bundle_path=bundle.shown,
+        )
     try:
         snapshot = load_policy_bundle(
-            config.toolgraph.bundle_path,
+            bundle.path,
             expected_agent=config.toolgraph.agent_id,
             expected_profile=config.exposure.profile.value,
         )
@@ -2065,14 +2178,16 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
             str(exc),
             as_json=as_json,
             cause=exc,
-            bundle_path=str(bundle_path),
+            bundle_path=bundle.shown,
         )
     decision = snapshot.decisions.get(tool_key)
     if decision is None:
+        # "the bundle", not "the active bundle": with a switch off, startup
+        # never loads it.
         _gateway_fail(
             "gateway-explain",
             "unknown_tool",
-            f"{tool_key!r} is not in the active bundle; strict mode treats it as unmapped",
+            f"{tool_key!r} is not in the bundle; strict mode treats it as unmapped",
             as_json=as_json,
             tool_key=tool_key,
         )
@@ -2084,6 +2199,10 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
         "tool_contract_digest": decision.contract_digest,
         "bundle_digest": snapshot.bundle_digest,
         "graph_generation": snapshot.generation,
+        "profile": config.exposure.profile.value,
+        "proxy_enabled": config.enabled,
+        "toolgraph_enabled": config.toolgraph.enabled,
+        "env_overrides": env_fields,
     }
     if as_json:
         click.echo(_json_dumps(result, ensure_ascii=False, sort_keys=True))
@@ -2094,6 +2213,13 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
         risk_score = decision.risk_score if decision.risk_score is not None else "n/a"
         click.echo(f"  risk score: {risk_score}")
         click.echo(f"  graph generation: {snapshot.generation}")
+        switches = (("enabled", config.enabled), ("toolgraph.enabled", config.toolgraph.enabled))
+        off = [name for name, on in switches if not on]
+        if off:
+            verb = "is" if len(off) == 1 else "are"
+            click.echo(f"  not applied: {' and '.join(off)} {verb} false")
+        if env_fields:
+            click.echo(f"  environment overrides: {', '.join(env_fields)}")
 
 
 @gateway_group.command(name="mode")
