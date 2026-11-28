@@ -398,6 +398,10 @@ def _emit_show(proj: Project, json_output: bool, *, cwd: Path) -> None:
             click.echo(f"Enabled MCPs: {_disp(', '.join(enabled))}")
         else:
             click.echo("Enabled MCPs: (none)")
+            click.echo(
+                "  To enable an MCP from the registry, "
+                "run `mms project enable <mcp>` inside this project."
+            )
         return
 
     if proj.source is Source.GIT:
