@@ -1470,7 +1470,7 @@ route target:
 
 | Path | Purpose | Commit? |
 |------|---------|---------|
-| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import`; not by `mms add`) | **No** — gitignore |
+| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import --apply`; not by `mms add`) | **No** — gitignore |
 | `~/.mms/projects.toml` | Auto-managed projects index (path + last_seen) | **No** — gitignore |
 | `<project>/.mms/project.toml` | Per-project enabled MCP names | **Yes** |
 | `~/.mms/import_state.toml` | Drift-detection sidecar: the per-server baseline `mms import` records and `mms host` compares against; one per machine, with its own schema version | **No** — gitignore |
@@ -1594,7 +1594,7 @@ state code for a corrupt `~/.mms` file, a `~/.mms` lock that cannot be opened
 
 ## `mms import` — populate the registry from host configs
 
-`mms import` reads MCP definitions out of your existing host configs (Claude Code, Cursor, Codex CLI, Claude Desktop) and writes them to `~/.mms/registry.toml`. `mms add` writes to `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap) instead — the mms registry and the STM proxy config are separate files. `mms host sync --apply` (below) also mutates the registry, reconciling it against host config drift.
+`mms import` reads MCP definitions out of your existing host configs (Claude Code, Cursor, Codex CLI, Claude Desktop) and previews what it would register; with `--apply` it adds the new ones to `~/.mms/registry.toml`, keeping existing definitions. `mms add` writes to `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap) instead — the mms registry and the STM proxy config are separate files. `mms host sync --apply` (below) also mutates the registry, reconciling it against host config drift.
 
 ```
 Usage: mms import [OPTIONS]
@@ -1612,7 +1612,7 @@ Options:
                           Without this flag, --apply refuses to register them.
 ```
 
-`--apply` refuses to register candidates discovered in `<cwd>/.mcp.json` or `<cwd>/.cursor/mcp.json` unless `--allow-project-configs` is passed — a repository checkout can ship those files, so adopting them without acknowledgement would let a checkout register a command that later runs with your privileges. Entries from Claude Code's global config (including the `Claude Code (project)` label) are unaffected, since that file is your own config, not the checkout's. The gate only enforces on `--apply`; `--plan` just prints a footer warning that `--apply` will require the flag.
+`--apply` refuses to register new entries discovered in `<cwd>/.mcp.json`, `<cwd>/.cursor/mcp.json` or a trusted project's `<cwd>/.codex/config.toml` unless `--allow-project-configs` is passed. One such entry refuses the whole apply, before the registry, import-state sidecar or drift key is written. A repository checkout can ship those files, so adopting them without acknowledgement would let a checkout register a command that later runs with your privileges. Entries from Claude Code's global config (including the `Claude Code (project)` label) are unaffected, since that file is your own config, not the checkout's. The gate only enforces on `--apply`; `--plan` prints a footer warning that `--apply` will require the flag when it finds a new project-local entry and the flag was not passed.
 
 Where each host config lives:
 

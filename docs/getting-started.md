@@ -106,11 +106,12 @@ For other JSON-based clients:
 ```
 
 Codex discovery honors `CODEX_HOME` when it is an absolute path with no `.` or
-`..` component (an empty one means `~/.codex`). A project-local `.codex/config.toml` is
-read only when the project is marked trusted in the user Codex config and the
-caller acknowledges project configs. `mms import --from codex` populates the
-separate project registry at
-`~/.mms/registry.toml`; it does not add an upstream to
+`..` component (an empty one means `~/.codex`). As a project config, the current
+directory's `.codex/config.toml` is read only when the user Codex config marks that
+directory's resolved path with `trust_level = "trusted"`. `mms import --from codex` previews
+what it finds; add `--apply` to write the separate project registry at
+`~/.mms/registry.toml`. Applying a new entry from the project file also needs
+`--allow-project-configs`. The command does not add an upstream to
 `~/.memtomem/stm_proxy.json` and does not ingest Codex's
 `$CODEX_HOME/memories` store.
 
