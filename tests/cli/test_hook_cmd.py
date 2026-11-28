@@ -664,6 +664,51 @@ def test_cli_invalid_managed_timeout_fails_open(monkeypatch: pytest.MonkeyPatch)
     assert result.output.strip() == "{}"
 
 
+@pytest.mark.parametrize(
+    ("args", "builds"),
+    [
+        pytest.param(["hook", "--host", "claude"], False, id="bare"),
+        pytest.param(
+            ["hook", "--host", "claude", "--surfacing-timeout-seconds", "3"], True, id="pinned"
+        ),
+    ],
+)
+def test_cli_an_infinite_environment_surfacing_timeout_is_invalid_unless_pinned(
+    args: list[str],
+    builds: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#1522: ``inf`` fails the hook's config build, which passes the tool
+    output through. A valid pin in the command is applied over the
+    environment (#1543), so the same environment builds under it."""
+    from memtomem_stm.cli import hook_cmd
+
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf")
+    built: list[float] = []
+    real_load = hook_cmd._load_hook_config
+
+    def spy(context: str) -> Any:
+        load = real_load(context)
+        built.append(load.config.surfacing.timeout_seconds)
+        return load
+
+    monkeypatch.setattr(hook_cmd, "_load_hook_config", spy)
+    with caplog.at_level(logging.WARNING):
+        result = CliRunner().invoke(cli, args, input=json.dumps(_READ_PAYLOAD))
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {}
+    hints = [r for r in caplog.records if "invalid MEMTOMEM_STM_* configuration" in r.getMessage()]
+    if builds:
+        assert built and built[0] == 3.0
+        assert hints == []
+    else:
+        assert built == []
+        assert len(hints) == 1
+        assert "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS" in hints[0].getMessage()
+
+
 def test_cli_install_missing_host_value_is_usage_error():
     # Symmetric guard: the operator `install` command's --host is NOT optional —
     # a bare `--host` there is still a usage error (exit 2). Pins that the runtime

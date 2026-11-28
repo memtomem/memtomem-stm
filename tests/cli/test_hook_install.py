@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import sys
 import tomllib
@@ -3125,8 +3126,9 @@ def test_install_still_writes_a_large_surfacing_timeout_that_reads_back(redirect
 @pytest.mark.parametrize(
     ("variable", "value", "field"),
     [
-        ("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf", "surfacing.timeout_seconds"),
-        ("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "infinity", "surfacing.timeout_seconds"),
+        # ``inf`` itself no longer gets this far: STMConfig refuses it (#1522,
+        # see the invalid-environment test below). The largest finite double
+        # is valid configuration whose 15-digit spelling reads back as infinity.
         (
             "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
             "1.7976931348623157e308",
@@ -3173,7 +3175,7 @@ def test_a_surfacing_timeout_flag_overrides_an_unwritable_environment_value(
     redirect, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = redirect("claude")
-    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "1.7976931348623157e308")
 
     result = _install("claude", "--surfacing-timeout", "5", "--apply")
 
@@ -3184,6 +3186,59 @@ def test_a_surfacing_timeout_flag_overrides_an_unwritable_environment_value(
 def test_inherit_runtime_env_installs_beside_an_unwritable_environment_value(
     redirect, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    path = redirect("claude")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "1.7976931348623157e308")
+
+    result = _install("claude", "--inherit-runtime-env", "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert "--surfacing-timeout-seconds" not in _claude_commands(path)[0]
+
+
+# ``inf`` is invalid configuration (#1522), not a deadline the command cannot
+# carry: the policy's STMConfig construction fails first, so install reports
+# the invalid environment the way it reports any other invalid value.
+
+
+@pytest.mark.parametrize("value", ["inf", "infinity"])
+@pytest.mark.parametrize(
+    "options", [(), ("--surfacing-timeout", "5")], ids=["resolved", "flag-given"]
+)
+@pytest.mark.parametrize("apply_", [True, False])
+def test_install_reports_an_infinite_environment_surfacing_timeout_as_invalid(
+    value: str,
+    options: tuple[str, ...],
+    apply_: bool,
+    redirect,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = redirect("claude")
+    before = _seed_owned("claude", path, [_CMD.format(host="claude")])
+    before_bytes = path.read_bytes()
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", value)
+
+    result = _install("claude", *options, *(["--apply"] if apply_ else []))
+
+    _assert_refused(
+        result,
+        path,
+        before,
+        "invalid MEMTOMEM_STM_* configuration prevented resolving the hook runtime policy",
+        "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+    )
+    assert path.read_bytes() == before_bytes
+    # Not the #1521 refusal, which is about a valid value.
+    assert "cannot be written into the hook command" not in result.output
+    # The value is not echoed back, in any quoting: no standalone token.
+    assert re.search(rf"(?<![A-Za-z0-9_]){value}(?![A-Za-z0-9_])", result.output) is None
+
+
+def test_inherit_runtime_env_installs_beside_an_invalid_environment_value(
+    redirect, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This path builds no STMConfig, so it does not validate the environment
+    # it defers to; the installed hook fails its build only if the value is
+    # still in the environment the hook runs in.
     path = redirect("claude")
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "inf")
 
