@@ -47,6 +47,10 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- `mms project show NAME` now points to `mms project list` when `NAME` is
+  unknown (#1556, issue #1553).
+  **Behavior change**: the unknown-name error on stderr gains
+  ``Run `mms project list` to see known projects.``, with or without `--json`.
 - `mms project show` now says how to enable an MCP when the project has none
   enabled (#1551, issue #1395).
   **Behavior change**: in text mode one more line follows
