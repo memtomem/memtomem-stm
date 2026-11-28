@@ -62,7 +62,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - `mms doctor` and `mms health` run with `--config` now name that file in the
-  daemon commands for the standalone daemon (#1504). The advised bare
+  daemon commands for the standalone daemon (#1558, issue #1504). The advised bare
   `mms daemon start` built from the environment alone, which can be a different
   daemon from the one looked up.
   **Behavior change**: on that route the `next:` lines and the daemon error text
