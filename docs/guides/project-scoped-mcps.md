@@ -11,27 +11,14 @@ Project-scoped MCP state is separate from the STM proxy configuration:
 ```bash
 cd /path/to/project
 mms import --from codex          # preview
-```
-
-Project-local files are looked up in the current directory, so run every step
-there. The preview is a summary and redacts secrets. A repository checkout can
-ship project-local files, so before applying, open the file itself
-(`.codex/config.toml` for Codex) and check each server's command, arguments and
-environment. Apply reads the files again and writes the real values to the
-registry:
-
-```bash
 mms import --from codex --apply
 ```
 
-Apply with the same `--from` value you previewed (`all` covers every host). If
-the preview reports new entries from project-local files, `--apply` refuses
-unless you also pass `--allow-project-configs`. Add the flag only after you have
-checked those files:
-
-```bash
-mms import --from codex --apply --allow-project-configs
-```
+The preview redacts environment values classified as secret; apply writes the real
+values to the registry. Check a project's own config file before applying it: new
+project-local definitions are refused unless `--allow-project-configs` is passed.
+For where project files are looked up and when Codex's is read, see
+[Getting started](../getting-started.md#3-register-stm-with-a-client).
 
 ## Initialize and select a project
 
