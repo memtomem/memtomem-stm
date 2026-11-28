@@ -13,6 +13,15 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `MEMTOMEM_STM_ALWAYS_LOAD_FEEDBACK_TOOL=true` adds
+  `_meta: {"anthropic/alwaysLoad": true}` to `stm_surfacing_feedback` only.
+  Claude Code reads the key as "load this tool upfront" instead of deferring it
+  behind tool search; with tool search active, a server entry with
+  `"alwaysLoad": false` still defers it. Off by default; read once when the
+  server starts. In the owner's #1033 pilot of the same metadata, the initial
+  request's input total (cached input and host overhead included) was 657
+  tokens higher in every pair. Whether it raises rating uptake in practice is
+  not measured (#1033).
 - `docs/use-cases.md` adds a scenario for reading how much text native tools
   return, per host and tool, with `mms stats --source hook`. It says what a
   row holds and why the totals are an inventory rather than a savings figure

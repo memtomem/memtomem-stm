@@ -95,6 +95,19 @@ defers MCP tool schemas via its own `ToolSearch` mechanism so this flag
 has no practical effect there; it's primarily useful for eager-loading
 clients that lack a per-server `disabled_tools` filter of their own.
 
+```bash
+export MEMTOMEM_STM_ALWAYS_LOAD_FEEDBACK_TOOL=true   # opt in
+```
+
+Set it where STM's server process gets its environment — for an MCP client,
+the `env` block of STM's server entry. Off by default. When `true`, STM adds
+`_meta: {"anthropic/alwaysLoad": true}` to `stm_surfacing_feedback` only, which
+Claude Code reads as "load this tool upfront" instead of deferring it behind tool
+search; with tool search active, `"alwaysLoad": false` on the server entry still
+keeps it deferred. Read once at start — restart STM to
+apply a change. What it costs and where it applies:
+[MCP Tools](reference/mcp-tools.md#loading-the-feedback-tool-upfront).
+
 ### Proxy
 
 ```bash

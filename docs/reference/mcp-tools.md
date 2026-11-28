@@ -27,6 +27,27 @@ Use `next_offset` unchanged; JavaScript UTF-16 string indices are not these offs
 A selection too large for the stored structured budget returns `budget_exceeded`:
 select fewer sections or explicitly request legacy output rather than losing data.
 
+### Loading the feedback tool upfront
+
+Off by default. With `MEMTOMEM_STM_ALWAYS_LOAD_FEEDBACK_TOOL=true`, STM adds
+`_meta: {"anthropic/alwaysLoad": true}` to `stm_surfacing_feedback` only; the opt-in
+adds it to no other tool (a proxied upstream tool keeps whatever `_meta` its own
+server sends). Claude Code reads the key as "load this tool's schema upfront"
+instead of deferring it behind tool search. Whether other hosts read the key is not
+known. Set the variable in the STM server's environment (for an MCP client, the
+`env` block of STM's server entry) and restart STM: it is read once at start. It
+applies when STM is started through `mms` / `memtomem-stm` / `memtomem-stm-proxy` or
+`memtomem_stm.server.main()`. An embedder that runs the `mcp` object directly skips
+it and gets the registry as it stands, including a hint left by an earlier
+`main()` call in the same process that had it enabled.
+
+The client decides. When Claude Code's tool search is active, `"alwaysLoad": false`
+on STM's server entry keeps every STM tool behind tool search, this one included.
+
+Cost: in the owner's #1033 pilot, the initial request's input total (cached input
+and host / tool-search overhead included) was 657 tokens higher in every pair with
+the tool loaded upfront. That is that pilot's number, not a schema size.
+
 ## Full tool metadata
 
 `stm_proxy_describe_tool(name)` reads the effective instructions for the exact

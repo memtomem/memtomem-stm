@@ -639,6 +639,19 @@ class STMConfig(BaseSettings):
     the flag costs nothing there either way. Read via env var
     ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` at server import time."""
 
+    always_load_feedback_tool: bool = False
+    """Whether ``stm_surfacing_feedback`` is advertised with
+    ``_meta: {"anthropic/alwaysLoad": true}`` — a per-tool hint that Claude
+    Code documents as loading that tool's schema upfront instead of deferring
+    it behind tool search. The opt-in adds it to no other tool (proxied
+    upstream tools keep the ``_meta`` their servers send). Whether other hosts read
+    the key is not known, and the client's own deferral settings decide.
+    Set ``MEMTOMEM_STM_ALWAYS_LOAD_FEEDBACK_TOOL=true`` in the STM server's
+    environment; it is read once when ``server.main()`` starts, so a change
+    needs a restart. Cost: in the owner's #1033 pilot the initial request's
+    input total, cached input and host overhead included, was 657 tokens
+    higher in every pair — that pilot's number, not a schema size."""
+
     @classmethod
     def settings_customise_sources(
         cls,
