@@ -229,6 +229,7 @@ Status meanings:
 | `MEMTOMEM_STM_DAEMON__MAX_CONCURRENT_LTM_OPS` | integer `1..16` | `4` | Admitted requests allowed to hold the LTM session at once; `1` serializes. | Startup |
 | `MEMTOMEM_STM_DATA_DIR` | path | `~/.memtomem` | Daemon handshakes, locks, and detached-log directory. | Startup |
 | `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` | boolean | `false` | Advertise the `stm_admin` tool (eight operator/admin actions) at import time. | Startup |
+| `MEMTOMEM_STM_ALWAYS_LOAD_FEEDBACK_TOOL` | boolean | `false` | Publish `_meta: {"anthropic/alwaysLoad": true}` on `stm_surfacing_feedback` only; see [MCP Tools](mcp-tools.md#loading-the-feedback-tool-upfront). | Startup |
 <!-- stmconfig-env:end -->
 
 ### Caveat: `EXTRACTION__LLM__*` defaults are not the extractor's defaults

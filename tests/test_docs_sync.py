@@ -2030,6 +2030,17 @@ def test_toolgraph_gateway_guide_pins_observability_contract() -> None:
     assert counter in guide and counter in manager
 
 
+def test_mcp_tools_reference_documents_the_feedback_always_load_hint() -> None:
+    """The opt-in's variable and wire key, as the tools reference states them (#1033)."""
+    reference = _read("docs/reference/mcp-tools.md")
+    server = _read("src/memtomem_stm/server.py")
+
+    assert "MEMTOMEM_STM_ALWAYS_LOAD_FEEDBACK_TOOL" in reference
+    assert '"anthropic/alwaysLoad"' in server
+    assert '"anthropic/alwaysLoad": true' in reference
+    assert '"alwaysLoad": false' in reference
+
+
 # (pin, Core's declared mcp requirement, redundant?) — the shapes the advisory
 # will actually meet. The unsafe direction is a wrong "drop the pin", so every
 # ambiguous shape must land on False.
