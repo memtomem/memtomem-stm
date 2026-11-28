@@ -13,6 +13,12 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `mms prune --help` shows preview and prune examples, and says that the
+  upstream stays in STM's config. The sentence "STM's own config is not
+  touched." is gone: a prune may update the upstream's recorded origin.
+  (#1552, issue #1397)
+  **Behavior change**: `mms prune --help` output is longer and one sentence in
+  it is corrected; the command's options and behavior are unchanged.
 - `mms stats` reports how many proxied responses carried `_context_query`
   (#1542).
   Query-aware compression needs the agent to supply that argument, and
