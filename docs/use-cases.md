@@ -2,7 +2,8 @@
 
 memtomem-stm is a local-first context-efficiency layer for MCP traffic. These
 scenarios separate what compression, caching, and LTM surfacing each prove.
-They do not assume that client-native tools pass through the MCP proxy.
+They do not assume that client-native tools pass through the MCP proxy; the
+last scenario reads what the native hook recorded about those tools instead.
 
 ## Read only the useful parts of a large response
 
@@ -72,13 +73,35 @@ session; `in_flight` sitting at `concurrency` while `queued` grows is the
 evidence that raising the bound — or introducing a session pool — is the next
 step rather than a guess.
 
+## See where native-tool output goes
+
+A host's built-in tools never reach the proxy, so the scenarios above do not
+measure them. With the native hook
+[installed](guides/native-hooks.md#install-or-remove-a-hook) on a host, each
+call the hook records adds a metrics row, and `mms stats --source hook` totals
+the rows by host and tool. [`mms stats`](cli.md#stats) describes the fields,
+the row cap and what each total covers, and the
+[native-hook guide](guides/native-hooks.md#host-capabilities) says which
+hosts can replace output.
+
+This is an inventory, not a savings or token claim, and not a comparison
+between hosts: which tools a hook sees depends on the host and on how the hook
+is registered, a row carries the host's own name for the tool, and it counts
+the characters of the hook's text form of a result. A row written by the
+current hook holds the host, the tool name, character counts, the compression
+decision and a timestamp, never the tool's arguments or output. Recording is
+best effort, so a call count is a count of rows, not of how often a tool ran.
+
 ## Common evidence rules
 
 - Compare direct upstream, STM passthrough, and STM feature-on separately.
 - Record core and STM versions, fixture hashes, tokenizer identity, and config,
   including `delivery_format`.
 - Report answer quality and additional round trips beside any size reduction.
-- Label examples as MCP-routed; built-in `Read`, `Bash`, or editor tools may
-  bypass the proxy.
+- Label each example as MCP-routed or hook-observed; built-in `Read`, `Bash`,
+  or editor tools may bypass the proxy.
 - Treat static and Unicode runtime token estimates as estimates, not provider
   billing counts.
+- The rules above that name upstreams, core, fixtures, tokenizers, or
+  `delivery_format` are for MCP-routed examples. For the hook-observed
+  scenario, record the host and STM versions and the hook registration.
