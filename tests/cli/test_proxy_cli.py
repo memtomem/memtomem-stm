@@ -10318,6 +10318,37 @@ class TestPruneCommand:
         monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
         return state
 
+    def test_help_shows_preview_then_prune_examples(self, runner):
+        result = runner.invoke(cli, ["prune", "--help"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        assert "Examples:" in [line.strip() for line in lines]
+        example_lines = [line for line in lines if line.strip().startswith("mms ")]
+        examples = [line.strip() for line in example_lines]
+        assert examples == [
+            "mms prune --all --dry-run",
+            "mms prune --all --dry-run --json",
+            "mms prune filesystem",
+            "mms prune --all --yes",
+        ]
+        # The ``\b`` block prints verbatim, so nothing else keeps it narrow.
+        assert all(len(line) <= 80 for line in example_lines)
+        # Click rewraps the prose, so compare it with the whitespace joined.
+        text = " ".join(result.output.split())
+        assert (
+            "Removes the direct registration from the client config; the upstream "
+            "stays in STM's config. Preview with --dry-run first."
+        ) in text
+        assert (
+            "The upstream stays in STM's config; prune may only update its recorded origin."
+        ) in text
+        assert "STM's own config is not touched" not in text
+        # Parse (never run) each example, so a renamed or removed flag fails here.
+        for example in examples:
+            with cli.commands["prune"].make_context("prune", shlex.split(example)[2:]):
+                pass
+
     def test_no_args_is_usage_error(self, runner, config):
         """Destructive command with no scope: refuse instead of "everything"."""
         self._seed_config(config, [])
