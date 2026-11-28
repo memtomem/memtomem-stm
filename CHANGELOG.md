@@ -118,6 +118,21 @@ changes inline only. See the deprecation policy in
   deadline exited 1 before emitting any report; it now emits its normal
   report, including the `hook daemon timeout` row, and the exit code follows
   the checks as for any other report.
+- The standalone daemon commands that `mms doctor` and `mms health` advise with
+  `--config` now give the file to every letter-case spelling of
+  `MEMTOMEM_STM_PROXY__CONFIG_PATH` in the environment (issue #1566). Settings
+  reads the variable case-insensitively, so an exported
+  `memtomem_stm_proxy__config_path` naming another file could outrank the
+  advised assignment in `sh` and `bash`, and the command then addressed the
+  other file's daemon.
+  **Behavior change**: on POSIX the command now starts with `env` and assigns
+  the file to each differently-cased spelling the environment holds, followed
+  by the canonical name (`env MEMTOMEM_STM_PROXY__CONFIG_PATH=<file> mms daemon start`
+  when there is none).
+  For a path that cannot be displayed safely, the note that no copy/paste hint
+  is available is replaced by an instruction, in words and without the path,
+  to run the command through `env` with each spelling set to the file given to
+  `--config`. Windows output is unchanged.
 - `mms doctor` and `mms health` run with `--config` now name that file in the
   daemon commands for the standalone daemon (#1558, issue #1504). The advised bare
   `mms daemon start` built from the environment alone, which can be a different
@@ -130,8 +145,8 @@ changes inline only. See the deprecation policy in
   print no path. The `--measure-ltm` warning that no daemon route exists now
   asks for a doctor rerun with that `--config` instead of naming
   `mms daemon start`. Output without `--config`, and for the hook's daemon, is
-  unchanged. A differently-cased `memtomem_stm_proxy__config_path` already
-  exported in the shell can still outrank the advised assignment.
+  unchanged. On POSIX the command now goes through `env` and covers every
+  letter-case spelling of the variable (issue #1566, the entry above).
 - The docs no longer say that `mms import --from codex` writes the registry
   without `--apply`, or that a trusted project's `.codex/config.toml` is read
   only with `--allow-project-configs`: the preview reads it, and the flag is
