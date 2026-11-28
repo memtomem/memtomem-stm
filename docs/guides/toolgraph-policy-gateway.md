@@ -142,8 +142,9 @@ directory writes a `.mcp.json` entry that sets
 an entry keeps environment values it does not manage. Check that each entry
 points at its role's file, then restart each client and confirm in each role's
 session that the proxied tools listed are only that role's (STM's own `stm_*`
-tools appear alongside them) and that calling one of the other role's tools is
-refused. `mms gateway status` reads only the file, so it cannot show an
+tools appear alongside them). With the quickstart grants, the reviewer's call
+to `demo__publish_note` is refused and the implementer's succeeds.
+`mms gateway status` reads only the file, so it cannot show an
 override that reaches STM from the client's environment, in any of its forms
 (#1583). The session checks verify behavior, not which file was loaded: two
 bundles with the same decisions pass them alike. To confirm the artifact,
@@ -166,10 +167,10 @@ calls that go through its registration. An agent that runs with the
 operator's file or shell access can edit its own bundle and config, or start
 the upstream itself, so where the split is a security boundary, the host must
 also keep each role away from the policy files, the other registration and the
-upstream. On POSIX systems STM warns when a bundle or a directory above it is
-group- or world-writable, or owned by a user other than STM's own or root,
-but still loads it in `strict` (#707). The check reads owner and mode bits
-only, not ACLs, so no warning is not an assurance.
+upstream. On POSIX systems STM warns when the owner or mode bits of a bundle,
+a directory above it, or a symlink on its path suggest another user could
+replace it, but still loads it in `strict` (#707). The check does not read
+ACLs, so no warning is not an assurance.
 
 The roles separate tool sets, not STM's state. Unless the files set their
 own paths, both processes use the same response cache, metrics and feedback
