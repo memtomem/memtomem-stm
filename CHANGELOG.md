@@ -100,7 +100,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - The response cache no longer serves a reply stored by a release whose
-  cleaner wrote it differently (issue #1540). The cache key covers the
+  cleaner wrote it differently (#1580, issue #1540). The cache key covers the
   cleaning and compression settings, not what the code does with them, and a
   hit is served before cleaning runs, so a row from the previous release kept
   returning its old text for as long as it stayed in the cache, and a row
