@@ -17,7 +17,8 @@ changes inline only. See the deprecation policy in
   return, per host and tool, with `mms stats --source hook`. It says what a
   row holds and why the totals are an inventory rather than a savings figure
   or a comparison between hosts, and links the references for the rest. The
-  page's opening and its evidence rules now cover a hook-observed scenario.
+  page's opening and its evidence rules now cover a hook-observed scenario
+  (#1576).
 - `mms prune --help` shows preview and prune examples, and says that the
   upstream stays in STM's config. The sentence "STM's own config is not
   touched." is gone: a prune may update the upstream's recorded origin.
