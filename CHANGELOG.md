@@ -66,7 +66,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - Three JSON reads no longer let a `RecursionError` escape on input nested too
-  deeply to decode (issue #1349): the `mms hook` payload, the tool-graph
+  deeply to decode (#1559, issue #1349): the `mms hook` payload, the tool-graph
   `eligible_tools` reply, and a tool-graph consult-cache row. Python's decoder
   raises `RecursionError` there, which is not a `ValueError`, so the `except`
   clauses meant for malformed JSON let it through. Separately,
@@ -78,9 +78,9 @@ changes inline only. See the deprecation policy in
   `ToolgraphStartupError` instead of an uncaught `RecursionError`. Such a
   consult-cache row reads as a miss, and the cache tries to delete it.
   `mms hook` treats such a payload as no payload and no longer logs a
-  traceback for it; this covers decoding only. An out-of-range escape such as `\U99999999` is no longer
-  decoded: like any other `\X`, it keeps the `U` and the digits and loses the
-  backslash.
+  traceback for it; this covers decoding only. An out-of-range escape such
+  as `\U99999999` is no longer decoded: like any other `\X`, it keeps the `U`
+  and the digits and loses the backslash.
 - `mms stats --all-time` no longer labels hook status counts all-time after
   a trim that one of the two rollups missed had put them out of step with
   the totals beside them (#1547). The status rollup
