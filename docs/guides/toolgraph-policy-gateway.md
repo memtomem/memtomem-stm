@@ -207,6 +207,9 @@ tool becomes `toolgraph_unmapped` or `toolgraph_drifted` instead.
   annotations changed after Toolgraph crawled the server.
 - `toolgraph_unmapped` usually means STM's upstream connection key does not
   match the server name Toolgraph crawled.
-- Agent/profile mismatch is rejected rather than silently degraded.
+- A bundle whose agent or profile does not match is rejected, never adopted.
+  Under `strict` that fails closed; under `review` or `explore` STM warns,
+  reports degraded status, and keeps its last known good snapshot (none at
+  startup, so calls go through).
 - STM bundle mode never launches Toolgraph. Toolgraph and Ladybug may be fully
   stopped after the bundle is published.
