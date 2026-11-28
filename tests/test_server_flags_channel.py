@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -246,22 +247,52 @@ def test_a_channel_the_registration_did_not_write_stops_the_server(
         assert '"true"' not in err
 
 
+@pytest.mark.parametrize(
+    "value",
+    # ``1.79769313486232e+308`` is what releases before #1522 wrote for the
+    # largest finite double; it reads back as infinity, which is refused.
+    ["-4", "inf", "1.79769313486232e+308"],
+)
 def test_a_rejected_channel_value_names_the_channel_and_its_key(
-    registration_env, capsys, _restore_root_logging
+    registration_env, value, capsys, _restore_root_logging
 ):
     from memtomem_stm import server
 
-    flags = {PERSIST: "false", TIMEOUT: "-4", USE_DAEMON: "true"}
+    flags = {PERSIST: "false", TIMEOUT: value, USE_DAEMON: "true"}
     registration_env.setenv(CHANNEL, json.dumps(flags))
+    # A value validation let through must not reach the real stdio transport.
+    ran: list[bool] = []
+    registration_env.setattr(server.mcp, "run", lambda: ran.append(True))
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exit_:
         server.main()
     err = capsys.readouterr().err
 
+    assert exit_.value.code == 1
+    assert ran == []
     [line] = [ln for ln in err.splitlines() if "environment configuration" in ln]
     assert f"{CHANNEL}[{TIMEOUT}]" in line
-    assert f" {TIMEOUT}" not in line.replace(f"{CHANNEL}[{TIMEOUT}]", "")
-    assert "-4" not in line
+    rest = line.replace(f"{CHANNEL}[{TIMEOUT}]", "")
+    assert f" {TIMEOUT}" not in rest
+    # The value is not echoed back: no standalone token of it.
+    token = rf"(?<![A-Za-z0-9_.+-]){re.escape(value)}(?![A-Za-z0-9_.+-])"
+    assert re.search(token, rest) is None
+
+
+@pytest.mark.parametrize("seconds", [3.0, 1e308, 1.7976931348623157e308])
+def test_the_server_reads_a_registrations_largest_finite_timeout(
+    registration_env, seconds, _restore_root_logging
+):
+    """The channel ``mcp_env()`` writes outranks a conflicting flat value and
+    reads back as the same finite timeout in both builds (#1522)."""
+    for name, value in HostRuntimePolicy(True, seconds, seconds, False).mcp_env().items():
+        registration_env.setenv(name, value)
+    registration_env.setenv(TIMEOUT, "2.5")
+
+    seen = _run_main(registration_env)
+
+    assert seen["startup"].surfacing.timeout_seconds == seconds
+    assert seen["lifespan"].surfacing.timeout_seconds == seconds
 
 
 def test_another_error_keeps_the_environments_attribution(

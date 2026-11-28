@@ -387,9 +387,16 @@ class HostRuntimePolicy:
         ``null`` parent block and a case variant of the field in its JSON
         (#1544). The channel wins, so a flat variable edited alone changes
         nothing."""
+        surfacing = self.surfacing_timeout_seconds
         flat = {
             _SURFACING_USE_DAEMON_ENV: "true" if self.use_daemon else "false",
-            _SURFACING_TIMEOUT_ENV: format_seconds(self.surfacing_timeout_seconds),
+            # ``format_seconds`` rounds the largest doubles to a spelling that
+            # reads back as infinity, which STMConfig refuses (#1522). The
+            # server reads this with STMConfig, not the hook's reader, so keep
+            # such a value finite with its shortest exact spelling.
+            _SURFACING_TIMEOUT_ENV: (
+                format_seconds(surfacing) if writable_seconds(surfacing) else repr(surfacing)
+            ),
             _PERSIST_QUERY_TEXT_ENV: "true" if self.persist_query_text else "false",
         }
         return {**flat, SERVER_FLAGS_CHANNEL_ENV: encode_hook_flags_channel(flat)}

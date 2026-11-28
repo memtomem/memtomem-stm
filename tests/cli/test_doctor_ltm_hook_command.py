@@ -1443,7 +1443,9 @@ def test_env_row_reports_a_hook_build_only_the_commands_options_break(
 
     assert row["status"] == "WARN", row
     assert "STMConfig() fails" in hook and _HOOK_PASS_THROUGH in hook, row
-    assert DAEMON_TIMEOUT in hook, row
+    # The surfacing pin reads back as infinity, refused since #1522; the
+    # daemon deadline derived from it is refused as before.
+    assert f"(env var(s) implicated: {DAEMON_TIMEOUT}, {SURFACING_TIMEOUT})" in hook, row
     assert bare.endswith("STMConfig() constructs"), row
     assert row["next_action"] == _command_advice(), row
 
@@ -1687,8 +1689,10 @@ def test_env_row_does_not_advise_unsetting_a_valid_block_the_hint_names(
 ):
     # The command's deadline is the only value rejected at its field, so the
     # hint names it alone, not the valid ``MEMTOMEM_STM_HOOK`` block above it
-    # (#1537), and the advice does not ask to unset that block either.
-    _settings(home, _cmd(_written(_EXTREME, "4")))
+    # (#1537), and the advice does not ask to unset that block either. The
+    # extreme value is the daemon deadline's alone: an extreme surfacing pin
+    # breaks the surfacing field too since #1522.
+    _settings(home, _cmd(_written("3", _EXTREME)))
     monkeypatch.setenv("MEMTOMEM_STM_HOOK", '{"compression": {"enabled": true}}')
     _install(monkeypatch, LiveDaemons())
     assert _build_class(None) == "ok"

@@ -1192,11 +1192,17 @@ install writes it, it must read back as a positive finite number. A
 `--surfacing-timeout` that does not (`inf`, `nan`, or a value so large that
 its 15-digit spelling reads back as infinity, such as
 `1.7976931348623157e308`) is a usage error. A deadline resolved from STM's
-configuration that does not (`MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=inf`,
-or such a large `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS`) stops install the
-same way a conflict does: non-zero exit, config left as it was, no backup.
+configuration that does not (such a large
+`MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` or
+`MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS`) stops install the same way a
+conflict does: non-zero exit, config left as it was, no backup.
 The error names the setting and its variable, never the value, and offers
 `--surfacing-timeout` (for the surfacing deadline) or `--inherit-runtime-env`.
+`inf` itself is not valid configuration for either setting: install reports
+it as an invalid `MEMTOMEM_STM_*` value, even beside `--surfacing-timeout`,
+and the variable has to be corrected or unset first. `--inherit-runtime-env`
+reads neither setting and installs; the hook then fails its build only if
+the invalid value is still in the environment it runs in.
 A handler releases wrote with such a deadline is still install's own; its
 deadline is not carried over, so re-installing replaces it.
 
