@@ -63,6 +63,15 @@ class TestUnsanitize:
         assert unsanitize(_sanitize("\\u0041lpha")) == "\\u0041lpha"
         assert unsanitize("\\u0041lpha") == "Alpha"
 
+    def test_out_of_range_escape_takes_the_plain_backslash_rule(self) -> None:
+        # _sanitize never writes an escape past U+10FFFF, so one cannot be
+        # decoded; it falls back to the "\\X becomes X" rule instead of raising
+        # from chr() (#1349). The largest code point still decodes.
+        assert unsanitize("\\U99999999") == "U99999999"
+        assert unsanitize("a \\U00110000 b") == "a U00110000 b"
+        assert unsanitize("\\U0010FFFF") == "\U0010ffff"
+        assert unsanitize(_sanitize("\U0010ffff")) == "\U0010ffff"
+
 
 def _word_list(text: str) -> list[str]:
     import re

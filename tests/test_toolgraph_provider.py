@@ -525,6 +525,13 @@ class TestParseTextVerdict:
         # TextContent.text=None degrades to "" → unparseable → None
         assert _parse_text_verdict(_text_result(None)) is None
 
+    def test_too_deeply_nested_json_returns_none(self):
+        # Well-formed JSON past the decoder's depth raises RecursionError, which
+        # is not a ValueError; it must read as unparseable like any other (#1349).
+        depth = 100_000
+        text = '{"agent": ' + "[" * depth + "]" * depth + "}"
+        assert _parse_text_verdict(_text_result(text)) is None
+
 
 # ── startup consult wired through ProxyManager (real fake stdio child) ───────
 
@@ -1047,6 +1054,64 @@ class TestToolgraphConsultWiring:
         await mgr._consult_toolgraph()
         assert mgr._toolgraph_withhold_all == REASON_TOOLGRAPH_PROTOCOL_ERROR
         assert mgr.get_proxy_tools() == []
+
+    # A verdict nested too deeply to decode is a protocol error, so it rides
+    # on_protocol_error instead of escaping start() as a RecursionError (#1349).
+    # The call log pins where it lands: the #494 empty probe answers normally and
+    # the full consult of both candidates carries the nesting.
+
+    _PROBE_THEN_FULL = ["eligible_tools:0", "eligible_tools:2"]
+
+    async def test_nested_verdict_open_degrades(self, tmp_path):
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            query_profile="nested",
+            on_protocol_error="open",
+            env={"FAKE_TG_CALL_LOG": str(call_log)},
+        )
+        # finally-stop: a failing assert must not leave the consult cache's sqlite
+        # handle open for Windows tmp_path cleanup (#714).
+        try:
+            await mgr._consult_toolgraph()
+            assert _read_calls(call_log) == self._PROBE_THEN_FULL
+            assert mgr._toolgraph_degraded is True
+            assert mgr._toolgraph_degraded_reason == REASON_TOOLGRAPH_PROTOCOL_ERROR
+            assert [i.prefixed_name for i in mgr.get_proxy_tools()] == [
+                "srv__read_file",
+                "srv__blocked",
+            ]
+        finally:
+            await mgr.stop()
+
+    async def test_nested_verdict_closed_withholds_all(self, tmp_path):
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            query_profile="nested",
+            on_protocol_error="closed",
+            env={"FAKE_TG_CALL_LOG": str(call_log)},
+        )
+        try:
+            await mgr._consult_toolgraph()
+            assert _read_calls(call_log) == self._PROBE_THEN_FULL
+            assert mgr._toolgraph_withhold_all == REASON_TOOLGRAPH_PROTOCOL_ERROR
+            assert mgr.get_proxy_tools() == []
+        finally:
+            await mgr.stop()
+
+    async def test_nested_verdict_fail_start_aborts_public_start(self, tmp_path):
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(  # on_protocol_error defaults fail_start
+            tmp_path, query_profile="nested", env={"FAKE_TG_CALL_LOG": str(call_log)}
+        )
+        try:
+            with pytest.raises(ToolgraphStartupError, match=REASON_TOOLGRAPH_PROTOCOL_ERROR):
+                await mgr.start()
+            assert _read_calls(call_log) == self._PROBE_THEN_FULL
+            assert mgr._advertised_infos == []
+        finally:
+            await mgr.stop()
 
     async def test_typed_backend_unavailable_default_open_degrades(self, tmp_path):
         mgr, _ = _tg_manager(tmp_path, query_profile="backend_unavailable")

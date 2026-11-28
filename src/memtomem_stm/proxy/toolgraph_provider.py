@@ -368,7 +368,7 @@ def _parse_text_verdict(result: Any) -> dict[str, Any] | None:
         return None
     try:
         parsed = json.loads("\n".join(parts))
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):  # deep nesting exhausts the decoder's stack
         return None
     return parsed if isinstance(parsed, dict) else None
 

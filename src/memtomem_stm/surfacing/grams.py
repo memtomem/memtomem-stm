@@ -74,8 +74,10 @@ def unsanitize(text: str) -> str:
     ``_sanitize`` writes ``<>&``, a backtick, control and structural
     characters as ``\\uXXXX`` / ``\\UXXXXXXXX``, and puts a backslash before
     every Markdown metacharacter — the backslash itself included. Scanning
-    left to right, ``\\uXXXX`` / ``\\UXXXXXXXX`` decode and any other ``\\X``
-    becomes ``X``, which is exact for everything ``_sanitize`` emits. Only
+    left to right, ``\\uXXXX`` and an in-range ``\\UXXXXXXXX`` (at most
+    U+10FFFF) decode and any other ``\\X`` becomes ``X`` — an out-of-range
+    ``\\UXXXXXXXX`` included, which ``_sanitize`` never writes. That is exact
+    for everything ``_sanitize`` emits. Only
     formatter output may be passed here: agent-written text such as a literal
     ``\\u0041lpha`` must keep its own tokens, and would be decoded.
 
@@ -96,9 +98,13 @@ def unsanitize(text: str) -> str:
         if width:
             digits = text[i + 2 : i + 2 + width]
             if len(digits) == width and all(c in "0123456789abcdefABCDEF" for c in digits):
-                out.append(chr(int(digits, 16)))
-                i += 2 + width
-                continue
+                code_point = int(digits, 16)
+                # ``_sanitize`` never writes one past U+10FFFF; such text was not
+                # written by it, so it takes the plain ``\X`` rule below.
+                if code_point <= sys.maxunicode:
+                    out.append(chr(code_point))
+                    i += 2 + width
+                    continue
         out.append(nxt)
         i += 2
     return "".join(out)
