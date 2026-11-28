@@ -212,6 +212,49 @@ class TestSurfacingLtmTransportConfig:
         assert cfg.ltm_mcp_headers == {"Authorization": "Bearer token"}
 
 
+class TestSurfacingTimeoutFinite:
+    """``surfacing.timeout_seconds`` must be finite (#1522), as
+    ``hook.daemon_timeout_seconds`` is: ``+inf`` is not a long budget but a
+    deadline the daemon wire refuses to send and the hook reader drops."""
+
+    @pytest.mark.parametrize(
+        ("value", "error_type"),
+        [
+            (float("inf"), "finite_number"),
+            (float("-inf"), "finite_number"),
+            (float("nan"), "finite_number"),
+        ],
+    )
+    def test_non_finite_is_rejected(self, value: float, error_type: str) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            SurfacingConfig(timeout_seconds=value)
+
+        errors = excinfo.value.errors()
+        assert [(e["loc"], e["type"]) for e in errors] == [(("timeout_seconds",), error_type)]
+
+    @pytest.mark.parametrize("raw", ["inf", "infinity", "1.79769313486232e+308"])
+    def test_env_spelling_of_infinity_fails_config_construction(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", raw)
+
+        with pytest.raises(ValidationError) as excinfo:
+            STMConfig()
+
+        errors = excinfo.value.errors()
+        assert [(e["loc"], e["type"]) for e in errors] == [
+            (("surfacing", "timeout_seconds"), "finite_number")
+        ]
+
+    @pytest.mark.parametrize("raw", ["1e308", "1.7976931348623157e308"])
+    def test_largest_finite_values_are_accepted(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", raw)
+
+        assert STMConfig().surfacing.timeout_seconds == float(raw)
+
+
 class TestSurfacingMinScoreDefault:
     """#875 — the default ``min_score`` is drawn on the baseline RRF scale.
 

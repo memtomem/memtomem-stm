@@ -130,7 +130,13 @@ class SurfacingConfig(BaseModel):
     max_results: int = Field(default=3, gt=0)
     min_query_tokens: int = Field(default=3, gt=0)
     cooldown_seconds: float = Field(default=5.0, ge=0.0)
-    timeout_seconds: float = Field(default=3.0, gt=0.0)
+    timeout_seconds: float = Field(default=3.0, gt=0.0, allow_inf_nan=False)
+    """Budget for one LTM round trip. Must be finite, as
+    ``hook.daemon_timeout_seconds`` is (#1522): ``+inf`` is not "no
+    deadline". On the shared-daemon route, the LTM operations that use this
+    full budget turn it into a request deadline the daemon wire cannot carry,
+    so the daemon client sends nothing; a hook command drops it when reading
+    its flags. A long wait is asked for with a large finite value."""
     # #348: default flipped from ``"prepend"`` to ``"append"`` so the
     # progressive-delivery path actually surfaces memories. ``"prepend"``
     # would shift character offsets and break the

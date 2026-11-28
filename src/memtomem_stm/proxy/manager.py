@@ -209,6 +209,7 @@ from memtomem_stm.proxy.toolgraph_provider import (
     ToolgraphUnreachableError,
     validate_toolgraph_identifier,
 )
+from memtomem_stm.utils.anyio_shutdown import is_only_cancellation
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.display import _disp
 from memtomem_stm.utils.local_key import LocalKeyError
@@ -573,14 +574,24 @@ class _UpstreamConnectionOwner:
                 await asyncio.shield(self.task)
             except asyncio.CancelledError:
                 # When nothing cancelled this caller, the owner itself ended
-                # cancelled, and once the session is published only the SDK
-                # task groups it entered do that: one cancels it when the
-                # connection fails. The connection is already unwound; report how the
-                # unwind went rather than cancelling the caller (#1132).
+                # cancelled: an SDK task group it entered cancels it when the
+                # connection fails (#1132), and a signalled shutdown cancels it
+                # directly (#1568). The connection is already unwound; report
+                # how the unwind went rather than cancelling the caller.
                 if current is not None and current.cancelling():
                     raise
-        if self.cleanup_error is not None:
-            raise self.cleanup_error
+        failure = self.cleanup_error
+        if failure is None:
+            return
+        if is_only_cancellation(failure):
+            # The owner's own cancellation, raised out of its unwind (a
+            # signalled shutdown cancels the owner tasks), is not the caller's:
+            # re-raised here it would pass every ``except Exception`` in the
+            # caller's teardown and cut it short (#1568). Report it as the
+            # failed close it is, as the setup path in ``_establish_connection``
+            # does.
+            raise ConnectionError("upstream connection unwind was cancelled") from failure
+        raise failure
 
 
 @dataclass
