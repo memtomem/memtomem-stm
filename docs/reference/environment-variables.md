@@ -158,7 +158,7 @@ Status meanings:
 | `MEMTOMEM_STM_SURFACING__MAX_RESULTS` | positive integer | `3` | Maximum injected retrieval results. | Bundled |
 | `MEMTOMEM_STM_SURFACING__MIN_QUERY_TOKENS` | positive integer | `3` | Minimum extracted query size; one fewer (at least 1) for a native-tool query made only of path tokens. | Bundled |
 | `MEMTOMEM_STM_SURFACING__COOLDOWN_SECONDS` | non-negative float | `5.0` | Per-query cooldown. | Bundled |
-| `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` | positive float | `3.0` | LTM search deadline. | Bundled |
+| `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` | positive finite float | `3.0` | LTM search deadline. `inf` is refused. | Bundled |
 | `MEMTOMEM_STM_SURFACING__INJECTION_MODE` | `prepend / append / section` | `append` | Memory-block placement. | Bundled |
 | `MEMTOMEM_STM_SURFACING__SECTION_HEADER` | string | `## Relevant Memories` | Header for section-mode injection. | Bundled |
 | `MEMTOMEM_STM_SURFACING__DEFAULT_NAMESPACE` | string or `null` | — | Default Core namespace. | Bundled |
