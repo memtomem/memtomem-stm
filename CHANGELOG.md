@@ -48,7 +48,7 @@ changes inline only. See the deprecation policy in
 ### Changed
 
 - `mms project show` now says how to enable an MCP when the project has none
-  enabled (issue #1395).
+  enabled (#1551, issue #1395).
   **Behavior change**: in text mode one more line follows
   `Enabled MCPs: (none)`, naming `mms project enable <mcp>`; `--json` output
   is unchanged.
