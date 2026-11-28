@@ -131,8 +131,8 @@ changes inline only. See the deprecation policy in
   print no path. The `--measure-ltm` warning that no daemon route exists now
   asks for a doctor rerun with that `--config` instead of naming
   `mms daemon start`. Output without `--config`, and for the hook's daemon, is
-  unchanged. A differently-cased `memtomem_stm_proxy__config_path` already
-  exported in the shell can still outrank the advised assignment.
+  unchanged. On POSIX the command now goes through `env` and covers every
+  letter-case spelling of the variable (issue #1566, the entry above).
 - The docs no longer say that `mms import --from codex` writes the registry
   without `--apply`, or that a trusted project's `.codex/config.toml` is read
   only with `--allow-project-configs`: the preview reads it, and the flag is
